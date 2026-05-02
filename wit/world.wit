@@ -1,0 +1,8 @@
+// World we generate host bindings for. We only need the filesystem
+// interfaces — wasi:io, wasi:clocks, etc. are reused from `wasmtime-wasi`.
+package s3fs:host;
+
+world s3fs-host {
+    import wasi:filesystem/types@0.2.3;
+    import wasi:filesystem/preopens@0.2.3;
+}
