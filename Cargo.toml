@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/s3fs-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "Apache-2.0"
+repository = "https://github.com/joshua/s3-wasi-fs"
+
+[workspace.dependencies]
+tokio       = { version = "1", default-features = false }
+bytes       = "1"
+tracing     = "0.1"
+thiserror   = "1"
+anyhow      = "1"
+async-trait = "0.1"
+futures     = "0.3"
+parking_lot = "0.12"
+fastrand    = "2"
+siphasher   = "1"
+hashlink    = "0.9"
+bitvec      = "1"
+percent-encoding = "2"
+
+aws-config             = { version = "1", default-features = false }
+aws-sdk-s3             = { version = "1", default-features = false }
+aws-smithy-runtime-api = "1"
+aws-smithy-types       = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

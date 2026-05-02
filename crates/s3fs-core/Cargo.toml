@@ -1,0 +1,38 @@
+[package]
+name = "s3fs-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Async S3-backed filesystem engine. Backend trait + in-memory + (planned) AWS S3 backends, MPU state machine, buffer pool, inode cache, public Fs handle."
+
+[features]
+default = []
+# When enabled, builds the AWS S3 backend (pulls in aws-sdk-s3 + rustls).
+aws = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-runtime-api", "dep:aws-smithy-types"]
+
+[dependencies]
+tokio       = { workspace = true, features = ["sync", "rt", "macros", "io-util", "time"] }
+bytes       = { workspace = true }
+tracing     = { workspace = true }
+thiserror   = { workspace = true }
+async-trait = { workspace = true }
+futures     = { workspace = true }
+parking_lot = { workspace = true }
+fastrand    = { workspace = true }
+siphasher   = { workspace = true }
+hashlink    = { workspace = true }
+bitvec      = { workspace = true }
+percent-encoding = { workspace = true }
+
+aws-config             = { workspace = true, optional = true, features = ["behavior-version-latest", "rt-tokio"] }
+aws-sdk-s3             = { workspace = true, optional = true, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-smithy-runtime-api = { workspace = true, optional = true }
+aws-smithy-types       = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "io-util", "time"] }
+anyhow = { workspace = true }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["minio"] }

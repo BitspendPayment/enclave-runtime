@@ -1,0 +1,5 @@
+[build]
+# Default target left to host. Wasm guests build with explicit --target wasm32-wasip2.
+
+[term]
+verbose = false
