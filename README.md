@@ -96,7 +96,9 @@ The full matrix — what's POSIX-equivalent, what's weakened, what's unsupported
 - ✅ **`O_TRUNC`** synchronous zero-byte PUT on open.
 - ✅ **`set_size`** (truncate + capped grow) and **`set_times{,-at}`** (persisted as `x-amz-meta-s3wasifs-{atime,mtime}`).
 - ✅ **In-place updates** of large files via MPU + `UploadPartCopy` for unchanged parts (GeeseFS-parity).
-- ⚠️ **`rename`** is not POSIX-atomic (CopyObject + DeleteObject is two calls).
+- ✅ **Eager background `UploadPart`** — `pwrite` of a fully-filled part hands off to a long-running flusher task; `sync` drains the parked replies. Caps in-flight uploads at `max_parallel_parts` across the whole `Fs`.
+- ✅ **Async rename** — `Fs::rename` rewires the inode tree synchronously and returns immediately; the worker handles `CopyObject` + `DeleteObject` (or paginated recursion for directories) in the background. Reads/writes against the new path during the in-flight window resolve to the old key via `current_s3_key`.
+- ⚠️ **`rename`** is not POSIX-atomic (CopyObject + DeleteObject is two calls); a host crash mid-window leaves both keys.
 - ⚠️ **`unlink` while fd is open** doesn't keep the file readable on stale handles.
 - ⚠️ **Concurrent writers to the same key**: last writer wins (no fencing).
 - ❌ **`link_at` (hardlinks)** — S3 has no shared-identity-across-keys.
