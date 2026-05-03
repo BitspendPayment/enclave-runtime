@@ -27,18 +27,18 @@ S3 is an object store, not a filesystem. Some POSIX semantics map cleanly, some 
 | `readlink-at` | Single `GetObject`; non-symlink target → `error-code::invalid` per POSIX. |
 | `unlink-file-at` | `DeleteObject`. Inode marked `Deleted`; further ops on stale handles return `bad-descriptor`/`no-entry`. |
 | `remove-directory-at` | List with `MaxKeys=2` for emptiness check, then `DeleteObject` of marker if present. Non-empty → `error-code::not-empty` (POSIX). |
-| `rename-at` (file or symlink) | `CopyObject` + `DeleteObject`. Synchronous. |
-| `rename-at` (directory) | Recursive: paginates `ListObjectsV2` over the source prefix, copies + deletes each key, rewires the inode tree. Empty destination is replaced; non-empty → `not-empty`; rename-into-self → `invalid`. |
+| `rename-at` (file or symlink) | **Async.** Returns as soon as the inode tree is rewired; `CopyObject` + `DeleteObject` runs on a background worker. During the in-flight window, reads/writes against the new path resolve to the OLD S3 key so the object never disappears. Worker errors surface on the next `sync` of the renamed inode. |
+| `rename-at` (directory) | **Async.** Returns immediately after the inode tree is rewired. The worker paginates `ListObjectsV2` over the source prefix and copies + deletes each key in the background. Empty destination is replaced; non-empty → `not-empty`; rename-into-self → `invalid`. |
 | `set-size` | **Shrink:** flush pending writes, GET `[0..new_size)`, single `PutObject`. **Grow:** zero-fill via buffer pool (capped at 100 MiB to avoid OOM). |
 | `set-times{,-at}` | Persists as `x-amz-meta-s3wasifs-{atime,mtime}` via `CopyObject` self-copy with `MetadataDirective=REPLACE`. Read back into `DescriptorStat` on next lookup. |
-| `sync`, `sync-data` | Drain dirty parts → `copy_unmodified_parts` → `CompleteMultipartUpload`, OR single `PutObject` for sub-part / small-file paths. Durable when the call returns. |
+| `sync`, `sync-data` | Drains any in-flight eager `UploadPart`s parked on parts, then for remaining dirty parts: `copy_unmodified_parts` → `CompleteMultipartUpload`. Falls back to single `PutObject` for sub-part / small-file paths. Durable when the call returns. Serialized against an in-flight rename worker via a per-inode async lock. |
 | `preopens.get-directories` | Single entry: `(root_descriptor, mount_path)` where `mount_path` defaults to `/`. |
 
 ## ⚠️ Weakened semantics — guests will mostly not notice, but the gap is real
 
 | WASI op | Gap | Mitigation / contract |
 |---|---|---|
-| `rename-at` | **Not POSIX-atomic.** `CopyObject` + `DeleteObject` is two calls; both keys briefly exist; a host crash leaves both. | Synchronous from caller's perspective. Errors surface from the rename call itself rather than later. |
+| `rename-at` | **Not POSIX-atomic.** Async `CopyObject` + `DeleteObject` is two calls; both keys briefly exist; a host crash mid-window leaves both. A second `rename` on the same inode while one is in flight returns `WouldBlock`. | Caller can `Fs::wait_for_rename` to drain. Errors stash on the inode and surface on the next `sync` / `rename`. Pre-flush of any open writable handle for the source happens before enqueue, so the worker copies a fully-committed object. |
 | `unlink-file-at` while fd is open | **No POSIX "invisible deleted file" semantics.** Further ops on stale handles return `bad-descriptor`/`no-entry`. | Documented; matches GeeseFS. |
 | Two writers to same key | **No fencing.** Last `MultipartUpload` committed wins; no torn data but no single-writer guarantee. | Inside an enclave there's typically one writer. If you need single-writer-per-key semantics, layer it above (DynamoDB CAS, lease service, etc.). |
 | `is-same-object` across mounts | Inode IDs are per-process. Two mounts of the same bucket disagree on identity. | Within-mount works. |
@@ -54,7 +54,7 @@ S3 is an object store, not a filesystem. Some POSIX semantics map cleanly, some 
 
 ## Test coverage
 
-- **162 unit tests** in `s3fs-core` and `s3fs-wasmtime` against the in-memory backend.
+- **171 unit tests** in `s3fs-core` and `s3fs-wasmtime` against the in-memory backend.
 - **10 integration tests** in `s3fs-core/tests/minio_integration.rs` against MinIO via testcontainers (run with `--features aws --test minio_integration -- --ignored`).
 - **End-to-end SQLite test**: `examples/guest-fsdemo` runs a real SQLite database on top of the S3-backed filesystem (CREATE TABLE, INSERT, COMMIT, re-open, SELECT, verify) and prints `OK`.
 

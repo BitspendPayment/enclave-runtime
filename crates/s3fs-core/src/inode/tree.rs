@@ -52,6 +52,8 @@ impl InodeTree {
             state: RwLock::new(InodeState::Cached),
             parent: None,
             children: RwLock::new(Children::default()),
+            rename_state: RwLock::new(None),
+            rename_lock: tokio::sync::Mutex::new(()),
         });
         tree.by_id.write().insert(InodeId::ROOT, root);
         tree
@@ -99,6 +101,17 @@ impl InodeTree {
     /// configured `bucket_prefix`.
     pub fn s3_key(&self, inode: &Inode) -> String {
         path::join_prefix(&self.config.bucket_prefix, &self.full_key(inode))
+    }
+
+    /// Wire key honoring an in-flight async rename: returns the OLD key
+    /// while the rename worker is still propagating bytes from old → new in
+    /// S3, so reads/writes resolve to the object that actually exists.
+    /// Once the worker clears `rename_state`, falls back to `s3_key`.
+    pub fn current_s3_key(&self, inode: &Inode) -> String {
+        if let Some(s) = inode.rename_state() {
+            return s.old_key.clone();
+        }
+        self.s3_key(inode)
     }
 
     /// The directory-marker form (`s3_key(inode) + "/"`) for use with

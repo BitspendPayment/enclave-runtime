@@ -63,6 +63,12 @@ pub struct PartBuf {
     /// ETag from the last successful upload of this part. `None` until the
     /// first successful flush.
     pub etag: Option<String>,
+    /// In-flight background `UploadPart` job, if any. Set by `pwrite` when
+    /// it makes the part fully dirty and submits it eagerly to the
+    /// flusher; awaited by the next `sync()` for this file. The `Mutex`
+    /// is `tokio` (not `parking_lot`) because we need to await it.
+    pub upload_in_flight:
+        std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<crate::flusher::PartResult>>>,
 }
 
 impl PartBuf {
@@ -84,6 +90,7 @@ impl PartBuf {
             state: PartState::Clean,
             dirty: RangeSet::new(),
             etag: None,
+            upload_in_flight: std::sync::Mutex::new(None),
         }
     }
 
@@ -101,6 +108,22 @@ impl PartBuf {
             state: PartState::Dirty,
             dirty: RangeSet::new(),
             etag: None,
+            upload_in_flight: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Take any in-flight upload receiver out of the part. Used by `sync`
+    /// to await the result of an eager `pwrite`-triggered upload.
+    pub fn take_inflight(
+        &self,
+    ) -> Option<tokio::sync::oneshot::Receiver<crate::flusher::PartResult>> {
+        self.upload_in_flight.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Park an in-flight upload receiver on the part.
+    pub fn park_inflight(&self, rx: tokio::sync::oneshot::Receiver<crate::flusher::PartResult>) {
+        if let Ok(mut g) = self.upload_in_flight.lock() {
+            *g = Some(rx);
         }
     }
 

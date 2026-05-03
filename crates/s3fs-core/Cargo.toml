@@ -14,6 +14,7 @@ aws = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-runtime-api", "dep:aw
 
 [dependencies]
 tokio       = { workspace = true, features = ["sync", "rt", "macros", "io-util", "time"] }
+tokio-util  = { version = "0.7", features = ["rt"] }
 bytes       = { workspace = true }
 tracing     = { workspace = true }
 thiserror   = { workspace = true }

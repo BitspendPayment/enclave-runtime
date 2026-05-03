@@ -15,7 +15,7 @@ Pre-1.0. Three workspace crates plus an example guest:
 | [`s3fs-runner`](crates/s3fs-runner/) | CLI binary that loads a `.wasm` component and runs it against a configured S3 bucket. |
 | [`examples/guest-fsdemo`](examples/guest-fsdemo/) | Example Wasm component. Exercises mkdir / write / sync / read / rename / SQLite end-to-end. |
 
-**Test coverage:** 162 unit tests + 10 MinIO integration tests. End-to-end SQLite-on-S3 demo works.
+**Test coverage:** 171 unit tests + 10 MinIO integration tests. End-to-end SQLite-on-S3 demo works.
 
 ## Quick start: run a Wasm guest against MinIO
 
@@ -107,7 +107,7 @@ The full matrix — what's POSIX-equivalent, what's weakened, what's unsupported
 git clone <this repo>
 cd s3-wasi-fs
 cargo build --release --workspace --features aws  # AWS feature builds AwsS3Backend
-cargo test  --workspace --features aws --lib       # 162 unit tests
+cargo test  --workspace --features aws --lib       # 171 unit tests
 cargo clippy --workspace --features aws --all-targets -- -D warnings
 ```
 

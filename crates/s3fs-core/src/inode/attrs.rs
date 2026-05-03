@@ -114,6 +114,33 @@ pub struct Children {
     pub listing_fetched_at: Option<Instant>,
 }
 
+/// Tracks an async rename that has rewired the inode tree but whose
+/// background copy+delete in S3 has not yet completed.
+///
+/// While set, `InodeTree::current_s3_key` returns `old_key` (so reads and
+/// writes still resolve to the existing object). Once the worker finishes
+/// the copy + delete, it clears this state and signals `done`.
+///
+/// On worker error, `error` is populated and `state` is left set so the
+/// next `Fs::sync` / `Fs::rename` for the inode can surface it.
+#[derive(Debug)]
+pub struct RenameState {
+    pub old_key: String,
+    /// `Some(_)` after a worker error.
+    pub error: RwLock<Option<crate::errors::FsError>>,
+    pub done: Arc<tokio::sync::Notify>,
+}
+
+impl RenameState {
+    pub fn new(old_key: String) -> Arc<Self> {
+        Arc::new(Self {
+            old_key,
+            error: RwLock::new(None),
+            done: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+}
+
 /// In-memory inode. Cheap to clone (`Arc<Inode>`).
 #[derive(Debug)]
 pub struct Inode {
@@ -125,6 +152,14 @@ pub struct Inode {
     pub state: RwLock<InodeState>,
     pub parent: Option<Weak<Inode>>,
     pub children: RwLock<Children>,
+    /// Set on the *destination* inode of an async rename — the in-memory
+    /// rewire happened but the underlying S3 copy+delete is still in
+    /// flight. Cleared by the rename worker on success.
+    pub rename_state: RwLock<Option<Arc<RenameState>>>,
+    /// Per-inode async lock that serialises a rename worker against any
+    /// sync/pwrite-commit on the same inode. Held by the worker for the
+    /// entire copy+delete; held by sync around its commit.
+    pub rename_lock: tokio::sync::Mutex<()>,
 }
 
 impl Inode {
@@ -144,6 +179,8 @@ impl Inode {
             state: RwLock::new(InodeState::Cached),
             parent,
             children: RwLock::new(Children::default()),
+            rename_state: RwLock::new(None),
+            rename_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -162,6 +199,8 @@ impl Inode {
             state: RwLock::new(InodeState::Cached),
             parent: Some(parent),
             children: RwLock::new(Children::default()),
+            rename_state: RwLock::new(None),
+            rename_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -183,7 +222,14 @@ impl Inode {
             state: RwLock::new(InodeState::Cached),
             parent: Some(parent),
             children: RwLock::new(Children::default()),
+            rename_state: RwLock::new(None),
+            rename_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Snapshot of the inode's current rename state (None if not in flight).
+    pub fn rename_state(&self) -> Option<Arc<RenameState>> {
+        self.rename_state.read().clone()
     }
 
     pub fn state(&self) -> InodeState {

@@ -12,6 +12,7 @@ pub mod fs;
 pub mod inode;
 pub mod mpu;
 pub mod path;
+pub mod rename;
 
 pub use buffer::{BufferPool, PartBuf, PartKey, PartState, RangeSet};
 pub use config::Config;

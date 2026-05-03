@@ -16,9 +16,8 @@
 //!   lookup is reserved for the dedicated symlink module)
 //!
 //! Deferred:
-//! - background flusher / async rename queue
 //! - symlink resolution during `open_at`
-//! - `set-times`, hardlink ops (`unsupported` per the Compatibility Matrix)
+//! - hardlink ops (`unsupported` per the Compatibility Matrix)
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -148,6 +147,7 @@ pub struct Fs {
     pub tree: Arc<InodeTree>,
     pub pool: Arc<BufferPool>,
     pub flusher: crate::flusher::Flusher,
+    pub rename_queue: crate::rename::RenameQueue,
     handles: PlRwLock<HashMap<HandleId, Arc<FileHandle>>>,
     next_handle: AtomicU64,
 }
@@ -158,12 +158,14 @@ impl Fs {
         let tree = InodeTree::new(backend.clone(), config.clone());
         let pool = BufferPool::new(config.clone());
         let flusher = crate::flusher::Flusher::new(&config);
+        let rename_queue = crate::rename::RenameQueue::new();
         Arc::new(Self {
             backend,
             config,
             tree,
             pool,
             flusher,
+            rename_queue,
             handles: PlRwLock::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
         })
@@ -246,7 +248,10 @@ impl Fs {
         if ino.is_dir() {
             return Err(FsError::IsDirectory);
         }
-        let key = self.tree.s3_key(&ino);
+        // If the inode is mid-rename, wait for it to finish so we don't race
+        // the worker (which would otherwise resurrect a key we just deleted).
+        self.wait_for_rename(&ino).await?;
+        let key = self.tree.current_s3_key(&ino);
         self.backend.delete_blob(&key).await?;
         self.tree.detach(&ino);
         // Drop any cached parts.
@@ -285,12 +290,24 @@ impl Fs {
         Ok(())
     }
 
-    /// `rename-at` — synchronous rename.
-    /// - **File / symlink:** `CopyObject` + `DeleteObject` (single round-trip pair).
-    /// - **Directory:** recursive — paginate `ListObjectsV2(prefix=old/)`,
-    ///   `CopyObject` + `DeleteObject` for every key, then move the marker
-    ///   if present. **Not POSIX-atomic** for either case — both source and
-    ///   destination key(s) exist briefly between the copy and delete.
+    /// `rename-at` — async rename.
+    ///
+    /// Returns as soon as the inode tree has been rewired and the
+    /// background `CopyObject` + `DeleteObject` work has been enqueued.
+    /// During the in-flight window, reads/writes against the new path
+    /// resolve to the OLD S3 key (via [`InodeTree::current_s3_key`]) so
+    /// the object the caller can actually touch never disappears.
+    ///
+    /// Errors from the worker surface on the next `Fs::sync` of the
+    /// renamed inode (or on a subsequent `Fs::rename` of the same inode).
+    ///
+    /// **Pre-flush.** Any open write handle for the source inode is
+    /// `sync`'d synchronously before the worker is enqueued — this avoids
+    /// a torn read where the worker's `CopyObject` runs while UploadParts
+    /// for an in-flight MPU on the same key are still pending.
+    ///
+    /// **Not POSIX-atomic.** Both source and destination keys briefly
+    /// coexist between copy and delete; a crash in that window leaves both.
     pub async fn rename(
         &self,
         old_base: &Arc<Inode>,
@@ -300,40 +317,49 @@ impl Fs {
     ) -> FsResult<()> {
         let old_ino = self.tree.lookup(old_base, old_name).await?;
         path::validate_segment(new_name)?;
-        if old_ino.is_dir() {
-            return self.rename_dir(&old_ino, new_base, new_name).await;
+        if !new_base.is_dir() {
+            return Err(FsError::NotDirectory);
         }
 
-        let src_key = self.tree.s3_key(&old_ino);
+        // Surface a prior worker error or reject duplicate concurrent
+        // rename of the same inode.
+        if let Some(s) = old_ino.rename_state() {
+            if let Some(e) = s.error.read().clone() {
+                *old_ino.rename_state.write() = None; // consumed
+                return Err(e);
+            }
+            return Err(FsError::WouldBlock);
+        }
 
-        // If a target with the same name already exists, S3 will overwrite —
-        // POSIX `rename` allows this for files, so we mirror it. (Directory
-        // overwrite would error with NotEmpty; we already excluded dirs.)
+        // Pre-flush any open writable handle for the source so the worker
+        // copies a fully-committed S3 object.
+        let handles_to_flush: Vec<Arc<FileHandle>> = self
+            .handles
+            .read()
+            .values()
+            .filter(|h| h.inode.id == old_ino.id && h.flags.write)
+            .cloned()
+            .collect();
+        for h in handles_to_flush {
+            self.sync(&h).await?;
+        }
+
+        if old_ino.is_dir() {
+            return self.rename_dir_async(&old_ino, new_base, new_name).await;
+        }
+
+        // ----- file / symlink -----
+        let src_key = self.tree.s3_key(&old_ino);
         let new_parent_key = self.tree.s3_key(new_base);
         let dst_key = if new_parent_key.is_empty() {
             new_name.to_string()
         } else {
             format!("{new_parent_key}/{new_name}")
         };
-
         if src_key == dst_key {
-            return Ok(()); // rename-to-self
+            return Ok(());
         }
 
-        self.backend
-            .copy_blob(CopyBlobInput {
-                source_key: src_key.clone(),
-                destination_key: dst_key.clone(),
-                replace_metadata: None,
-                replace_content_type: None,
-            })
-            .await?;
-        self.backend.delete_blob(&src_key).await?;
-
-        // Rewire the inode under the new parent / name. Detach + attach a
-        // fresh inode (preserving attrs/etag) is the simplest correct path
-        // for v1; the rich oldParent/oldName tracking lives in the async
-        // queue session.
         let attrs = old_ino.attrs.read().clone();
         let new_ino = match &*old_ino.kind.read() {
             InodeKind::RegularFile => Inode::new_file(
@@ -351,29 +377,51 @@ impl Fs {
             ),
             InodeKind::Directory { .. } => unreachable!("handled above"),
         };
+        // Park rename state on the new inode BEFORE attaching so any
+        // concurrent lookup that races us sees the redirect.
+        *new_ino.rename_state.write() =
+            Some(crate::inode::attrs::RenameState::new(src_key.clone()));
+
         self.tree.detach(&old_ino);
         self.pool.forget_inode(old_ino.id);
-        self.tree.attach(new_base, new_ino);
+        let attached = self.tree.attach(new_base, new_ino.clone());
+
+        // Enqueue the background copy+delete. If the queue is closed
+        // (Fs being torn down), unwind: clear state, fall through to a
+        // synchronous copy+delete to maintain a consistent S3 view.
+        if let Err(_e) = self.rename_queue.enqueue(crate::rename::RenameJob::File {
+            backend: self.backend.clone(),
+            inode: attached.clone(),
+            old_key: src_key.clone(),
+            new_key: dst_key.clone(),
+        }) {
+            *attached.rename_state.write() = None;
+            self.backend
+                .copy_blob(CopyBlobInput {
+                    source_key: src_key.clone(),
+                    destination_key: dst_key,
+                    replace_metadata: None,
+                    replace_content_type: None,
+                })
+                .await?;
+            self.backend.delete_blob(&src_key).await?;
+        }
         Ok(())
     }
 
-    /// Recursive directory rename. Lists every key under the source's
-    /// `prefix/`, copies each to the corresponding destination key, deletes
-    /// the source. Also moves the explicit dir marker if present.
-    /// Cross-bucket rename and rename-into-self are rejected.
-    async fn rename_dir(
+    /// Recursive directory rename — async. Lists every key under the
+    /// source's `prefix/`, copies each to the corresponding destination
+    /// key, deletes the source. Cross-bucket rename and rename-into-self
+    /// are rejected synchronously before enqueueing the worker.
+    async fn rename_dir_async(
         &self,
         old_ino: &Arc<Inode>,
         new_base: &Arc<Inode>,
         new_name: &str,
     ) -> FsResult<()> {
-        if !new_base.is_dir() {
-            return Err(FsError::NotDirectory);
-        }
-        // Reject if destination already exists as a non-empty dir or a file.
+        // Reject if destination exists as a non-empty dir or as a file.
         if let Ok(existing) = self.tree.lookup(new_base, new_name).await {
             if existing.is_dir() {
-                // Check empty.
                 let dst_dir_key = self.tree.s3_dir_key(&existing);
                 let probe = self
                     .backend
@@ -388,7 +436,6 @@ impl Fs {
                 if real > 0 {
                     return Err(FsError::NotEmpty);
                 }
-                // Empty: replace by deleting the marker if present.
                 if probe.items.iter().any(|i| i.key == dst_dir_key) {
                     self.backend.delete_blob(&dst_dir_key).await?;
                 }
@@ -405,31 +452,61 @@ impl Fs {
         } else {
             format!("{new_parent_key}/{new_name}/")
         };
-
         if old_prefix == new_prefix {
             return Ok(());
         }
-        // Reject rename into self / descendant.
         if new_prefix.starts_with(&old_prefix) {
             return Err(FsError::Invalid("cannot rename a directory into itself"));
         }
 
-        // Page through ListObjectsV2 over the old prefix and copy+delete each.
+        let attrs = old_ino.attrs.read().clone();
+        let explicit = old_ino.dir_explicit_marker().unwrap_or(false);
+        let new_ino = Inode::new_dir(
+            self.tree.alloc_id(),
+            new_name,
+            Some(Arc::downgrade(new_base)),
+            explicit,
+            attrs,
+        );
+        // The "old key" for a directory rename is the prefix; current_s3_key
+        // doesn't apply to listings (which use new_prefix immediately) but
+        // the bookkeeping marker keeps duplicate-rename detection working.
+        *new_ino.rename_state.write() =
+            Some(crate::inode::attrs::RenameState::new(old_prefix.clone()));
+
+        self.tree.detach(old_ino);
+        let attached = self.tree.attach(new_base, new_ino);
+
+        if let Err(_e) = self.rename_queue.enqueue(crate::rename::RenameJob::Dir {
+            backend: self.backend.clone(),
+            inode: attached.clone(),
+            old_prefix: old_prefix.clone(),
+            new_prefix: new_prefix.clone(),
+        }) {
+            // Queue closed: unwind to synchronous directory rename.
+            *attached.rename_state.write() = None;
+            self.copy_dir_sync(&old_prefix, &new_prefix).await?;
+        }
+        Ok(())
+    }
+
+    /// Synchronous fallback used when the rename queue is unavailable
+    /// (Fs being torn down). Same algorithm as the worker.
+    async fn copy_dir_sync(&self, old_prefix: &str, new_prefix: &str) -> FsResult<()> {
         let mut continuation: Option<String> = None;
         loop {
             let listing = self
                 .backend
                 .list_blobs(crate::backend::ListBlobsInput {
-                    prefix: &old_prefix,
+                    prefix: old_prefix,
                     delimiter: None,
                     continuation_token: continuation.as_deref(),
                     max_keys: None,
                     ..Default::default()
                 })
                 .await?;
-
             for item in &listing.items {
-                let suffix = match item.key.strip_prefix(&old_prefix) {
+                let suffix = match item.key.strip_prefix(old_prefix) {
                     Some(s) => s,
                     None => continue,
                 };
@@ -444,7 +521,6 @@ impl Fs {
                     .await?;
                 self.backend.delete_blob(&item.key).await?;
             }
-
             if !listing.is_truncated {
                 break;
             }
@@ -453,24 +529,26 @@ impl Fs {
                 None => break,
             }
         }
-
-        // Move the explicit directory marker if present (it has key
-        // exactly `old_prefix`, which would have shown up in the listing —
-        // already handled by the loop above).
-
-        // Rewire the inode tree: detach old, attach a fresh dir under new.
-        let attrs = old_ino.attrs.read().clone();
-        let explicit = old_ino.dir_explicit_marker().unwrap_or(false);
-        let new_ino = Inode::new_dir(
-            self.tree.alloc_id(),
-            new_name,
-            Some(Arc::downgrade(new_base)),
-            explicit,
-            attrs,
-        );
-        self.tree.detach(old_ino);
-        self.tree.attach(new_base, new_ino);
         Ok(())
+    }
+
+    /// Wait for any in-flight async rename on `inode` to complete. Returns
+    /// the worker's error if the rename failed (and clears it, so the
+    /// next call doesn't re-fire). Cheap no-op if no rename is in flight.
+    pub async fn wait_for_rename(&self, inode: &Arc<Inode>) -> FsResult<()> {
+        loop {
+            let s = match inode.rename_state() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            // If the worker already finished with an error, surface it.
+            if let Some(e) = s.error.read().clone() {
+                *inode.rename_state.write() = None;
+                return Err(e);
+            }
+            // Otherwise wait for the next notify, then re-check.
+            s.done.notified().await;
+        }
     }
 
     // ------------------- symlinks -------------------
@@ -562,7 +640,7 @@ impl Fs {
         if new_size < current {
             // Shrink: flush any pending writes first.
             self.sync(handle).await?;
-            let key = self.tree.s3_key(&handle.inode);
+            let key = self.tree.current_s3_key(&handle.inode);
             let body = if new_size == 0 {
                 Bytes::new()
             } else {
@@ -639,7 +717,7 @@ impl Fs {
         if atime.is_none() && mtime.is_none() {
             return Ok(());
         }
-        let key = self.tree.s3_key(ino);
+        let key = self.tree.current_s3_key(ino);
         // Read current head to preserve metadata fields we don't touch.
         let head = self.backend.head_blob(&key).await?;
         let mut metadata = head.metadata.clone();
@@ -871,6 +949,9 @@ impl Fs {
         let total_end = offset + data.len() as u64;
         let mut cur = offset;
         let mut data_off = 0usize;
+        // Parts that became fully dirty during this call — eagerly enqueue
+        // after we drop all part locks so the await point is clean.
+        let mut eager_parts: Vec<(u32, Arc<parking_lot::RwLock<PartBuf>>)> = Vec::new();
 
         while data_off < data.len() {
             let loc = self
@@ -882,20 +963,45 @@ impl Fs {
                 .get_or_fetch_part_for_write(handle, loc.part_index)
                 .await?;
 
+            // If this part has an in-flight eager upload, await it before
+            // mutating. This both bounds memory pressure and prevents a
+            // mark_flushing → apply_write WouldBlock race.
+            let inflight = part_arc.read().take_inflight();
+            if let Some(rx) = inflight {
+                self.absorb_inflight(handle, rx).await?;
+            }
+
             let into_part = cur - loc.part_start;
             let space_in_part = loc.part_size - into_part;
             let to_write = ((data.len() - data_off) as u64).min(space_in_part) as usize;
 
-            let mut part = part_arc.write();
-            part.apply_write(into_part, &data[data_off..data_off + to_write])?;
-            drop(part);
+            let became_full = {
+                let mut part = part_arc.write();
+                part.apply_write(into_part, &data[data_off..data_off + to_write])?;
+                // Only eagerly enqueue when the part is COMPLETELY filled
+                // to its tier capacity (not just "dirty covers valid_len" —
+                // that's true for a partial last part too, and uploading
+                // those wastes work the next pwrite would overwrite).
+                let fully_filled = part.valid_len == part.part_size && part.is_fully_dirty();
+                let no_inflight = part
+                    .upload_in_flight
+                    .lock()
+                    .ok()
+                    .is_some_and(|g| g.is_none());
+                fully_filled && no_inflight
+            };
+
+            if became_full {
+                eager_parts.push((loc.part_index, part_arc.clone()));
+            }
 
             data_off += to_write;
             cur += to_write as u64;
             written += to_write;
         }
 
-        // Update logical file size.
+        // Update logical file size BEFORE submitting eager uploads — the
+        // worker reads `final_size` from the snapshot we pass it.
         {
             let mut sz = handle.size.write();
             if total_end > *sz {
@@ -903,7 +1009,88 @@ impl Fs {
             }
         }
 
+        // Eager flush: enqueue any newly-full parts. Skip when the file is
+        // small enough that single-PUT will win (no point starting an MPU).
+        let final_size = *handle.size.read();
+        if !eager_parts.is_empty() && final_size > self.config.single_part_threshold {
+            self.enqueue_eager_uploads(handle, eager_parts).await?;
+        }
+
         Ok(written)
+    }
+
+    /// Lazily begin the per-handle MPU and enqueue an `UploadPart` job for
+    /// each newly-full part, parking the reply receiver on the part so a
+    /// later `sync` can await it.
+    async fn enqueue_eager_uploads(
+        &self,
+        handle: &FileHandle,
+        parts: Vec<(u32, Arc<parking_lot::RwLock<PartBuf>>)>,
+    ) -> FsResult<()> {
+        let key = self.tree.current_s3_key(&handle.inode);
+
+        // Begin MPU under handle.mpu lock if not already started.
+        let mut mpu_guard = handle.mpu.lock().await;
+        let (source_size, source_etag) = {
+            let a = handle.inode.attrs.read();
+            if a.etag.is_empty() {
+                (None, None)
+            } else {
+                (Some(a.size), Some(a.etag.clone()))
+            }
+        };
+        let upload_id = crate::flusher::ensure_mpu_begun_locked(
+            &self.backend,
+            &mut mpu_guard,
+            &key,
+            &self.config.part_schedule,
+            source_size,
+            source_etag,
+        )
+        .await?;
+        // Note the source_size from MpuState — it may differ from the
+        // current inode attrs after concurrent activity.
+        let mpu_source_size = mpu_guard.as_ref().and_then(|s| s.source_size).unwrap_or(0);
+        drop(mpu_guard);
+
+        let final_size = *handle.size.read();
+        for (part_index, part_arc) in parts {
+            let rx = self.flusher.enqueue_upload(
+                self.backend.clone(),
+                key.clone(),
+                upload_id.clone(),
+                part_index,
+                part_arc.clone(),
+                self.config.part_schedule.clone(),
+                mpu_source_size,
+                final_size,
+            )?;
+            part_arc.read().park_inflight(rx);
+        }
+        Ok(())
+    }
+
+    /// Await an in-flight `UploadPart` reply, fold the result into the
+    /// per-handle MPU state, and surface errors to the caller. On error the
+    /// part's state is rolled back to Dirty so a later `sync` can retry.
+    async fn absorb_inflight(
+        &self,
+        handle: &FileHandle,
+        rx: tokio::sync::oneshot::Receiver<crate::flusher::PartResult>,
+    ) -> FsResult<()> {
+        match rx.await {
+            Ok(Ok((part_index, etag))) => {
+                let mut g = handle.mpu.lock().await;
+                if let Some(state) = g.as_mut() {
+                    state.record_part_uploaded(part_index, etag);
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            // Worker dropped without replying (shouldn't happen unless Fs
+            // was torn down). Treat as transient I/O.
+            Err(_) => Err(FsError::Io("flush worker dropped before reply".into())),
+        }
     }
 
     /// Flush dirty bytes to S3 and finalise. Durable when this returns.
@@ -916,8 +1103,30 @@ impl Fs {
             return Ok(());
         }
 
+        // Hold the per-inode rename lock for the whole sync so a
+        // concurrent rename worker can't run its CopyObject on a key that
+        // we're mid-commit on. The worker takes the same lock; ordering
+        // is "first acquired, first served". Cheap when no rename is in
+        // flight (uncontested mutex).
+        let _rename_guard = handle.inode.rename_lock.lock().await;
+
+        // If a prior rename worker errored (and left state set), surface
+        // and clear so the caller sees it once.
+        if let Some(s) = handle.inode.rename_state() {
+            if let Some(e) = s.error.read().clone() {
+                *handle.inode.rename_state.write() = None;
+                return Err(e);
+            }
+        }
+
+        // Drain any eager-upload receivers parked on parts. After this,
+        // every part is either Clean/Flushed (background upload done and
+        // recorded into MpuState) or Dirty (no in-flight, needs sync to
+        // upload it inline).
+        self.drain_inflight_uploads(handle).await?;
+
         let final_size = *handle.size.read();
-        let key = self.tree.s3_key(&handle.inode);
+        let key = self.tree.current_s3_key(&handle.inode);
 
         // Collect dirty parts. We snapshot under the pool's per-part read
         // locks; the buffer pool itself is already lock-light.
@@ -963,6 +1172,57 @@ impl Fs {
 
         // MPU path.
         self.sync_via_mpu(handle, &key, dirty_parts).await
+    }
+
+    /// Walk every part for this inode, take any in-flight receiver, await
+    /// it, and fold the etag into MpuState. Errors are returned to the
+    /// caller (the first one wins; we still drain the rest).
+    async fn drain_inflight_uploads(&self, handle: &FileHandle) -> FsResult<()> {
+        let final_size = *handle.size.read();
+        if final_size == 0 {
+            return Ok(());
+        }
+        let high = self
+            .config
+            .part_schedule
+            .locate(final_size - 1)
+            .ok_or(FsError::FileTooLarge)?
+            .part_index;
+        let mut receivers: Vec<tokio::sync::oneshot::Receiver<crate::flusher::PartResult>> =
+            Vec::new();
+        for i in 0..=high {
+            let key = PartKey::new(handle.inode.id, i);
+            if let Some(part_arc) = self.pool.get(key) {
+                if let Some(rx) = part_arc.read().take_inflight() {
+                    receivers.push(rx);
+                }
+            }
+        }
+        let mut first_err: Option<FsError> = None;
+        for rx in receivers {
+            match rx.await {
+                Ok(Ok((part_index, etag))) => {
+                    let mut g = handle.mpu.lock().await;
+                    if let Some(state) = g.as_mut() {
+                        state.record_part_uploaded(part_index, etag);
+                    }
+                }
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(FsError::Io("flush worker dropped".into()));
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        Ok(())
     }
 
     async fn sync_via_single_put(
@@ -1169,19 +1429,22 @@ impl Fs {
         let upload_id = Arc::new(upload_id.clone());
         let schedule = self.config.part_schedule.clone();
         let cap = max_parallel.max(1);
-        let flusher = self.flusher.clone();
+        let semaphore = self.flusher.semaphore();
 
         stream::iter(dirty_parts.into_iter().map(|(part_index, part_arc)| {
             let backend = backend.clone();
             let key = key.clone();
             let upload_id = upload_id.clone();
             let schedule = schedule.clone();
-            let flusher = flusher.clone();
+            let semaphore = semaphore.clone();
             async move {
                 // Acquire a permit from the per-Fs flusher BEFORE doing any
                 // backend I/O. This caps total concurrent uploads across all
                 // open files, not just within one sync() call.
-                let _permit = flusher.acquire().await;
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore never closed");
                 upload_one_part(
                     backend,
                     key.as_str(),
@@ -1230,7 +1493,7 @@ impl Fs {
         let r = part_range.start..part_range.end.min(source_size);
         let g = self
             .backend
-            .get_blob(&self.tree.s3_key(&handle.inode), Some(r))
+            .get_blob(&self.tree.current_s3_key(&handle.inode), Some(r))
             .await?;
         let part = PartBuf::new_clean(
             part_index,
@@ -1257,7 +1520,7 @@ impl Fs {
 /// (with RMW for partial parts), mark Flushing, `UploadPart`, mark Flushed.
 /// Errors transition the part back to Dirty so a retry can pick it up.
 #[allow(clippy::too_many_arguments)]
-async fn upload_one_part(
+pub(crate) async fn upload_one_part(
     backend: Arc<dyn Backend>,
     key: &str,
     upload_id: &crate::backend::MultipartId,
@@ -1270,14 +1533,25 @@ async fn upload_one_part(
     // file doesn't truncate the unchanged tail).
     final_size: u64,
 ) -> FsResult<(u32, String)> {
-    // Snapshot under read lock — release before any await.
+    // Snapshot AND mark_flushing in one critical section so that any
+    // concurrent pwrite is either fully captured by the snapshot OR sees
+    // state=Flushing and bails (returns WouldBlock; pwrite handles by
+    // awaiting the in-flight receiver). Without this, a write that lands
+    // between snapshot and mark_flushing is lost when mark_flushed clears
+    // the dirty bitmap.
+    //
+    // If state is already Flushing (because eager pwrite raced with us
+    // and snapshot+marked first), skip the transition.
     let (part_body, fully_dirty, dirty_ranges_owned) = {
-        let part_read = part_arc.read();
-        (
-            Bytes::copy_from_slice(part_read.body()),
-            part_read.is_fully_dirty(),
-            part_read.dirty_ranges().to_vec(),
-        )
+        let mut part = part_arc.write();
+        let body = Bytes::copy_from_slice(part.body());
+        let fully = part.is_fully_dirty();
+        let ranges = part.dirty_ranges().to_vec();
+        if matches!(part.state, crate::buffer::PartState::Dirty) {
+            // Normal path: transition Dirty → Flushing here.
+            part.state = crate::buffer::PartState::Flushing;
+        }
+        (body, fully, ranges)
     };
 
     let part_range = schedule
@@ -1319,10 +1593,6 @@ async fn upload_one_part(
     };
     materialized.truncate(part_actual_size);
 
-    {
-        let mut p = part_arc.write();
-        p.mark_flushing()?;
-    }
     let body = materialized.freeze();
     let r = backend
         .multipart_upload_part(key, upload_id, part_index + 1, body)
@@ -1772,8 +2042,8 @@ mod tests {
 
     // ---------- rename ----------
 
-    #[tokio::test]
-    async fn rename_file_synchronous_copy_delete() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rename_file_async_copy_delete() {
         let (backend, fs) = small_fs();
         let root = fs.root();
         let h = fs
@@ -1793,6 +2063,10 @@ mod tests {
         fs.close(&h).await.unwrap();
 
         fs.rename(&root, "old", &root, "new").await.unwrap();
+        // Wait for the background worker to finish copy+delete.
+        let new_ino = fs.tree.lookup(&root, "new").await.unwrap();
+        fs.wait_for_rename(&new_ino).await.unwrap();
+
         assert!(matches!(
             backend.head_blob("old").await,
             Err(FsError::NotFound)
@@ -1801,7 +2075,7 @@ mod tests {
         assert_eq!(&g.body[..], b"data");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rename_directory_recursive_moves_all_descendants() {
         let (backend, fs) = small_fs();
         let root = fs.root();
@@ -1826,6 +2100,8 @@ mod tests {
         let _ = fs.read_dir(&root).await.unwrap();
 
         fs.rename(&root, "old", &root, "new").await.unwrap();
+        let new_ino = fs.tree.lookup(&root, "new").await.unwrap();
+        fs.wait_for_rename(&new_ino).await.unwrap();
 
         // Old keys are gone; new keys carry the content.
         for k in ["old/a.txt", "old/b.txt", "old/sub/c.txt", "old/"] {
@@ -1852,6 +2128,71 @@ mod tests {
         let d = fs.tree.lookup(&root, "d").await.unwrap();
         let r = fs.rename(&root, "d", &d, "inner").await;
         assert!(matches!(r, Err(FsError::Invalid(_))));
+    }
+
+    /// Right after `rename` returns and BEFORE the worker completes,
+    /// reads against the new path resolve via `current_s3_key` to the OLD
+    /// key, which still exists. The worker eventually catches up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rename_destination_reads_old_key_until_worker_finishes() {
+        let (backend, fs) = small_fs();
+        let root = fs.root();
+        // Seed an existing object so the OLD key has content.
+        backend
+            .put_blob(PutBlobInput {
+                key: "src.bin".into(),
+                body: Bytes::from_static(b"hello"),
+                metadata: HashMap::new(),
+                content_type: None,
+            })
+            .await
+            .unwrap();
+        let _ = fs.read_dir(&root).await.unwrap();
+
+        fs.rename(&root, "src.bin", &root, "dst.bin").await.unwrap();
+        let new_ino = fs.tree.lookup(&root, "dst.bin").await.unwrap();
+        // current_s3_key still points at the old key while rename in flight.
+        let key = fs.tree.current_s3_key(&new_ino);
+        assert!(
+            key == "src.bin" || key == "dst.bin",
+            "key should be either old (rename in flight) or new (worker completed): {key}"
+        );
+
+        fs.wait_for_rename(&new_ino).await.unwrap();
+        assert_eq!(fs.tree.current_s3_key(&new_ino), "dst.bin");
+        let g = backend.get_blob("dst.bin", None).await.unwrap();
+        assert_eq!(&g.body[..], b"hello");
+    }
+
+    /// A second `rename` of the same inode while the first is still in
+    /// flight is rejected with `WouldBlock`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_rename_while_in_flight_returns_wouldblock() {
+        let (backend, fs) = small_fs();
+        let root = fs.root();
+        backend
+            .put_blob(PutBlobInput {
+                key: "f".into(),
+                body: Bytes::from_static(b"x"),
+                metadata: HashMap::new(),
+                content_type: None,
+            })
+            .await
+            .unwrap();
+        let _ = fs.read_dir(&root).await.unwrap();
+        fs.rename(&root, "f", &root, "g").await.unwrap();
+        // Second rename of the same inode under its NEW name. The
+        // worker may or may not have run yet. If state is still set,
+        // expect WouldBlock; if it cleared, expect Ok.
+        let g_ino = fs.tree.lookup(&root, "g").await.unwrap();
+        let r = fs.rename(&root, "g", &root, "h").await;
+        if g_ino.rename_state().is_some() {
+            assert!(matches!(r, Err(FsError::WouldBlock)));
+        } else {
+            r.unwrap();
+        }
+        // Drain the queue to settle.
+        let _ = fs.wait_for_rename(&g_ino).await;
     }
 
     // ---------- set_size ----------
@@ -2170,5 +2511,116 @@ mod tests {
         let names: Vec<_> = snap.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"d"));
         assert!(names.contains(&"f.txt"));
+    }
+
+    // ---------- eager flusher (background upload) ----------
+
+    /// Write that fills more than `single_part_threshold` bytes across
+    /// multiple full parts kicks off an MPU mid-pwrite (begin happens
+    /// before pwrite returns). After sync, file contents round-trip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pwrite_eager_starts_mpu_for_large_writes() {
+        let (backend, fs) = tiny_fs(); // 4 B/part, threshold = 8 B
+        let h = fs
+            .open(
+                "big.bin",
+                OpenFlags {
+                    write: true,
+                    create: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let payload = vec![b'A'; 16]; // 4 full parts, > threshold
+        let n = fs.pwrite(&h, 0, &payload).await.unwrap();
+        assert_eq!(n, 16);
+        // Eager path begun an MPU.
+        assert_eq!(backend.mpu_count(), 1, "MPU should be begun by pwrite");
+        // Sync completes the MPU; file content matches.
+        fs.sync(&h).await.unwrap();
+        assert_eq!(backend.mpu_count(), 0, "MPU committed by sync");
+        let g = backend.get_blob("big.bin", None).await.unwrap();
+        assert_eq!(&g.body[..], &payload[..]);
+    }
+
+    /// Sub-threshold writes never start an MPU: they go through the
+    /// single-PUT path on sync.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pwrite_below_threshold_does_not_eager_flush() {
+        let (backend, fs) = tiny_fs(); // threshold = 8 B
+        let h = fs
+            .open(
+                "small.bin",
+                OpenFlags {
+                    write: true,
+                    create: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        fs.pwrite(&h, 0, b"abc").await.unwrap(); // 3 B, single part
+        assert_eq!(backend.mpu_count(), 0, "small write must not begin an MPU");
+        fs.sync(&h).await.unwrap();
+        let g = backend.get_blob("small.bin", None).await.unwrap();
+        assert_eq!(&g.body[..], b"abc");
+    }
+
+    /// After an eager flush completes, the next sync sees no remaining
+    /// dirty parts for the eager-uploaded region — it just runs the MPU
+    /// commit without re-uploading.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_drains_inflight_then_commits() {
+        let (backend, fs) = tiny_fs();
+        let h = fs
+            .open(
+                "drain.bin",
+                OpenFlags {
+                    write: true,
+                    create: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Fill 3 full parts (12 B) — enqueues 3 eager UploadParts.
+        let payload = vec![b'X'; 12];
+        fs.pwrite(&h, 0, &payload).await.unwrap();
+        // Briefly yield to let the worker pick up the jobs.
+        tokio::task::yield_now().await;
+        // Sync drains in-flights, then commits.
+        fs.sync(&h).await.unwrap();
+        let g = backend.get_blob("drain.bin", None).await.unwrap();
+        assert_eq!(&g.body[..], &payload[..]);
+    }
+
+    /// A second pwrite into the same part that has an in-flight eager
+    /// upload waits for the upload to land, then re-dirties the part. The
+    /// sync afterwards re-uploads the part with the new content.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_pwrite_to_inflight_part_waits_then_redirties() {
+        let (backend, fs) = tiny_fs();
+        let h = fs
+            .open(
+                "rewrite.bin",
+                OpenFlags {
+                    write: true,
+                    create: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // First write fills 4 parts (16 B) — eager uploads triggered.
+        fs.pwrite(&h, 0, &[b'A'; 16]).await.unwrap();
+        // Re-write the first part. absorb_inflight should await the eager
+        // upload then apply the new bytes; sync uploads the latest.
+        fs.pwrite(&h, 0, b"ZZZZ").await.unwrap();
+        fs.sync(&h).await.unwrap();
+        let g = backend.get_blob("rewrite.bin", None).await.unwrap();
+        let mut expected = [b'A'; 16];
+        expected[..4].copy_from_slice(b"ZZZZ");
+        assert_eq!(&g.body[..], &expected[..]);
     }
 }

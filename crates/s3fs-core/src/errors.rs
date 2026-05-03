@@ -9,7 +9,7 @@ use thiserror::Error;
 /// Filesystem-engine error. Variants are picked to map cleanly onto
 /// `wasi:filesystem/types::error-code` while staying intelligible inside the
 /// engine itself.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum FsError {
     #[error("not found")]
     NotFound,
