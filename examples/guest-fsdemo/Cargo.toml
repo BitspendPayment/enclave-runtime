@@ -8,6 +8,9 @@ publish = false
 # build it for the host platform on `cargo build --workspace`.
 [workspace]
 
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 [[bin]]
 name = "guest-fsdemo"
 path = "src/main.rs"

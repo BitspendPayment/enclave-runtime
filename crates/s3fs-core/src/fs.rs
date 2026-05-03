@@ -260,9 +260,12 @@ impl Fs {
         Ok(())
     }
 
-    /// `rename-at` — synchronous file rename via `CopyObject` + `DeleteObject`.
-    /// **Not POSIX-atomic** — both keys exist briefly between the two calls.
-    /// Directory rename is not yet supported; returns `NotSupported`.
+    /// `rename-at` — synchronous rename.
+    /// - **File / symlink:** `CopyObject` + `DeleteObject` (single round-trip pair).
+    /// - **Directory:** recursive — paginate `ListObjectsV2(prefix=old/)`,
+    ///   `CopyObject` + `DeleteObject` for every key, then move the marker
+    ///   if present. **Not POSIX-atomic** for either case — both source and
+    ///   destination key(s) exist briefly between the copy and delete.
     pub async fn rename(
         &self,
         old_base: &Arc<Inode>,
@@ -271,12 +274,10 @@ impl Fs {
         new_name: &str,
     ) -> FsResult<()> {
         let old_ino = self.tree.lookup(old_base, old_name).await?;
-        if old_ino.is_dir() {
-            // Recursive directory rename is reserved for the async-queue
-            // session. Fail explicitly so callers see the gap.
-            return Err(FsError::NotSupported);
-        }
         path::validate_segment(new_name)?;
+        if old_ino.is_dir() {
+            return self.rename_dir(&old_ino, new_base, new_name).await;
+        }
 
         let src_key = self.tree.s3_key(&old_ino);
 
@@ -327,6 +328,124 @@ impl Fs {
         };
         self.tree.detach(&old_ino);
         self.pool.forget_inode(old_ino.id);
+        self.tree.attach(new_base, new_ino);
+        Ok(())
+    }
+
+    /// Recursive directory rename. Lists every key under the source's
+    /// `prefix/`, copies each to the corresponding destination key, deletes
+    /// the source. Also moves the explicit dir marker if present.
+    /// Cross-bucket rename and rename-into-self are rejected.
+    async fn rename_dir(
+        &self,
+        old_ino: &Arc<Inode>,
+        new_base: &Arc<Inode>,
+        new_name: &str,
+    ) -> FsResult<()> {
+        if !new_base.is_dir() {
+            return Err(FsError::NotDirectory);
+        }
+        // Reject if destination already exists as a non-empty dir or a file.
+        if let Ok(existing) = self.tree.lookup(new_base, new_name).await {
+            if existing.is_dir() {
+                // Check empty.
+                let dst_dir_key = self.tree.s3_dir_key(&existing);
+                let probe = self
+                    .backend
+                    .list_blobs(crate::backend::ListBlobsInput {
+                        prefix: &dst_dir_key,
+                        delimiter: None,
+                        max_keys: Some(2),
+                        ..Default::default()
+                    })
+                    .await?;
+                let real = probe.items.iter().filter(|i| i.key != dst_dir_key).count();
+                if real > 0 {
+                    return Err(FsError::NotEmpty);
+                }
+                // Empty: replace by deleting the marker if present.
+                if probe.items.iter().any(|i| i.key == dst_dir_key) {
+                    self.backend.delete_blob(&dst_dir_key).await?;
+                }
+                self.tree.detach(&existing);
+            } else {
+                return Err(FsError::NotDirectory);
+            }
+        }
+
+        let old_prefix = format!("{}/", self.tree.s3_key(old_ino));
+        let new_parent_key = self.tree.s3_key(new_base);
+        let new_prefix = if new_parent_key.is_empty() {
+            format!("{new_name}/")
+        } else {
+            format!("{new_parent_key}/{new_name}/")
+        };
+
+        if old_prefix == new_prefix {
+            return Ok(());
+        }
+        // Reject rename into self / descendant.
+        if new_prefix.starts_with(&old_prefix) {
+            return Err(FsError::Invalid("cannot rename a directory into itself"));
+        }
+
+        // Page through ListObjectsV2 over the old prefix and copy+delete each.
+        let mut continuation: Option<String> = None;
+        loop {
+            let listing = self
+                .backend
+                .list_blobs(crate::backend::ListBlobsInput {
+                    prefix: &old_prefix,
+                    delimiter: None,
+                    continuation_token: continuation.as_deref(),
+                    max_keys: None,
+                    ..Default::default()
+                })
+                .await?;
+
+            for item in &listing.items {
+                let suffix = match item.key.strip_prefix(&old_prefix) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let dst_key = format!("{new_prefix}{suffix}");
+                self.backend
+                    .copy_blob(CopyBlobInput {
+                        source_key: item.key.clone(),
+                        destination_key: dst_key,
+                        replace_metadata: None,
+                        replace_content_type: None,
+                    })
+                    .await?;
+                self.backend.delete_blob(&item.key).await?;
+            }
+
+            if !listing.is_truncated {
+                break;
+            }
+            match listing.next_continuation_token {
+                Some(t) => continuation = Some(t),
+                None => break,
+            }
+        }
+
+        // Move the explicit directory marker if present (it has key
+        // exactly `old_prefix`, which would have shown up in the listing —
+        // already handled by the loop above).
+
+        // Rewire the inode tree: detach old, attach a fresh dir under new.
+        let attrs = old_ino.attrs.read().clone();
+        let explicit = old_ino
+            .dir_explicit_marker()
+            .unwrap_or(false);
+        let new_ino = Inode::new_dir(
+            self.tree.alloc_id(),
+            new_name,
+            Some(Arc::downgrade(new_base)),
+            explicit,
+            attrs,
+        );
+        self.tree.detach(old_ino);
         self.tree.attach(new_base, new_ino);
         Ok(())
     }
@@ -716,16 +835,21 @@ impl Fs {
         debug_assert!(dirty_parts.len() <= 1, "small-file path implies ≤1 dirty part");
 
         // Snapshot everything we need from the dirty part before any await.
-        let part_snapshot: Option<(Bytes, u64, bool)> = dirty_parts.first().map(|(_, part_arc)| {
-            let part = part_arc.read();
-            let body = Bytes::copy_from_slice(part.body());
-            let valid_len = part.valid_len;
-            let needs_source_load = !part.is_fully_dirty();
-            (body, valid_len, needs_source_load)
-        });
+        // We capture the *dirty ranges* explicitly so we only overlay bytes
+        // the user actually wrote — `body[0..valid_len]` includes zero-fill
+        // bytes from `apply_write` extending past previous EOF, which would
+        // wrongly overwrite source bytes.
+        let part_snapshot: Option<(Bytes, bool, Vec<std::ops::Range<u64>>)> =
+            dirty_parts.first().map(|(_, part_arc)| {
+                let part = part_arc.read();
+                let body = Bytes::copy_from_slice(part.body());
+                let needs_source_load = !part.is_fully_dirty();
+                let dirty_ranges = part.dirty_ranges().to_vec();
+                (body, needs_source_load, dirty_ranges)
+            });
         let source_size = handle.inode.attrs.read().size;
 
-        let body = if let Some((part_body, valid_len, needs_source_load)) = part_snapshot {
+        let body = if let Some((part_body, needs_source_load, dirty_ranges)) = part_snapshot {
             let mut canvas = if needs_source_load && source_size > 0 {
                 let g = self.backend.get_blob(key, None).await?;
                 let mut buf = BytesMut::from(&g.body[..]);
@@ -736,8 +860,16 @@ impl Fs {
             } else {
                 BytesMut::from(vec![0u8; final_size as usize].as_slice())
             };
-            let valid_in_canvas = valid_len.min(final_size) as usize;
-            canvas[..valid_in_canvas].copy_from_slice(&part_body[..valid_in_canvas]);
+            // Overlay only the dirty byte ranges from the buffer into the canvas.
+            for r in &dirty_ranges {
+                let start = r.start as usize;
+                let end = (r.end as usize).min(canvas.len());
+                if start >= end {
+                    continue;
+                }
+                canvas[start..end].copy_from_slice(&part_body[start..end]);
+            }
+            canvas.truncate(final_size as usize);
             canvas.freeze()
         } else {
             let src = self.backend.get_blob(key, None).await?;
@@ -805,12 +937,15 @@ impl Fs {
         };
         drop(mpu_guard);
 
-        // Parallel UploadPart pass.
+        // Parallel UploadPart pass. Capture final_size *before* the await so
+        // each task can clamp its part length correctly.
+        let final_size_for_upload = *handle.size.read();
         let upload_results = self
             .upload_parts_concurrent(
                 key,
                 &upload_id,
                 source_size,
+                final_size_for_upload,
                 dirty_parts,
                 self.config.max_parallel_parts,
             )
@@ -880,6 +1015,7 @@ impl Fs {
         key: &str,
         upload_id: &crate::backend::MultipartId,
         source_size: u64,
+        final_size: u64,
         dirty_parts: Vec<(u32, Arc<parking_lot::RwLock<PartBuf>>)>,
         max_parallel: usize,
     ) -> Vec<FsResult<(u32, String)>> {
@@ -905,6 +1041,7 @@ impl Fs {
                     part_arc,
                     &schedule,
                     source_size,
+                    final_size,
                 )
                 .await
             }
@@ -963,6 +1100,7 @@ impl Fs {
 /// One-shot helper for `upload_parts_concurrent`: snapshot, materialize
 /// (with RMW for partial parts), mark Flushing, `UploadPart`, mark Flushed.
 /// Errors transition the part back to Dirty so a retry can pick it up.
+#[allow(clippy::too_many_arguments)]
 async fn upload_one_part(
     backend: Arc<dyn Backend>,
     key: &str,
@@ -971,24 +1109,34 @@ async fn upload_one_part(
     part_arc: Arc<parking_lot::RwLock<PartBuf>>,
     schedule: &crate::config::PartSchedule,
     source_size: u64,
+    // `final_size`: file size *after* this sync — used to compute the part's
+    // actual byte length (so a sub-part dirty write to the middle of a large
+    // file doesn't truncate the unchanged tail).
+    final_size: u64,
 ) -> FsResult<(u32, String)> {
     // Snapshot under read lock — release before any await.
-    let (part_body, valid_len, fully_dirty, dirty_ranges_owned) = {
+    let (part_body, fully_dirty, dirty_ranges_owned) = {
         let part_read = part_arc.read();
         (
             Bytes::copy_from_slice(part_read.body()),
-            part_read.valid_len,
             part_read.is_fully_dirty(),
             part_read.dirty_ranges().to_vec(),
         )
     };
 
-    let mut materialized = if fully_dirty {
+    let part_range = schedule
+        .part_range(part_index)
+        .ok_or(FsError::FileTooLarge)?;
+    // The part's actual size in the destination file: full part_size, except
+    // possibly clipped if this is the last part.
+    let part_actual_size = (final_size.saturating_sub(part_range.start))
+        .min(part_range.end - part_range.start) as usize;
+
+    let mut materialized = if fully_dirty && part_body.len() == part_actual_size {
         BytesMut::from(&part_body[..])
     } else {
-        let part_range = schedule
-            .part_range(part_index)
-            .ok_or(FsError::FileTooLarge)?;
+        // RMW: load source bytes for this part's range, then overlay only
+        // the dirty subranges from the buffer.
         let source_end = part_range.end.min(source_size);
         let source_start = part_range.start;
         let loaded = if source_end > source_start {
@@ -998,18 +1146,20 @@ async fn upload_one_part(
             Bytes::new()
         };
         let mut canvas = BytesMut::from(&loaded[..]);
-        let needed = valid_len as usize;
-        if canvas.len() < needed {
-            canvas.resize(needed, 0);
+        if canvas.len() < part_actual_size {
+            canvas.resize(part_actual_size, 0);
         }
         for r in &dirty_ranges_owned {
             let start = r.start as usize;
-            let end = r.end as usize;
+            let end = (r.end as usize).min(canvas.len());
+            if start >= end {
+                continue;
+            }
             canvas[start..end].copy_from_slice(&part_body[start..end]);
         }
         canvas
     };
-    materialized.truncate(valid_len as usize);
+    materialized.truncate(part_actual_size);
 
     {
         let mut p = part_arc.write();
@@ -1310,6 +1460,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn small_file_inplace_edit_preserves_unchanged_source_bytes() {
+        // Regression: the small-file `sync_via_single_put` used to overlay
+        // `body[0..valid_len]` onto the canvas, which included zero-fill bytes
+        // from `apply_write` extending past previous EOF — wrongly clobbering
+        // source bytes. SQLite blocker.
+        let (backend, fs) = small_fs();
+        backend
+            .put_blob(PutBlobInput {
+                key: "db".into(),
+                body: Bytes::from_static(b"AAAABBBBCCCCDDDD"), // 16 bytes
+                metadata: HashMap::new(),
+                content_type: None,
+            })
+            .await
+            .unwrap();
+        let h = fs
+            .open("db", OpenFlags { read: true, write: true, ..Default::default() })
+            .await
+            .unwrap();
+        // Modify only bytes 8..10. Bytes 0..8 must come from source, not zeros.
+        fs.pwrite(&h, 8, b"ZZ").await.unwrap();
+        fs.sync(&h).await.unwrap();
+        fs.close(&h).await.unwrap();
+
+        let g = backend.get_blob("db", None).await.unwrap();
+        assert_eq!(&g.body[..], b"AAAABBBBZZCCDDDD");
+    }
+
+    #[tokio::test]
+    async fn large_file_subpart_edit_preserves_unchanged_part_tail() {
+        // Regression: in `upload_one_part`, materialized was truncated to
+        // `valid_len` instead of `min(part_size, file_size - part_start)`.
+        // For a file > threshold with sub-part dirty content in a non-last
+        // part, this shrank the part body and corrupted the file. SQLite
+        // blocker for any DB > 5 MiB.
+        let backend = Arc::new(MemoryBackend::new());
+        let cfg = Config::builder()
+            .part_schedule(crate::config::PartSchedule { tiers: vec![(8, 100)] })
+            .single_part_threshold(8) // anything above 8 bytes uses MPU
+            .max_parallel_parts(2)
+            .max_parallel_copy(2)
+            .max_merge_copy_bytes(1024)
+            .memory_limit_bytes(1024 * 1024)
+            .build();
+        let fs = Fs::new(backend.clone() as Arc<dyn Backend>, Arc::new(cfg));
+
+        // Source: 24 bytes = 3 parts of 8 bytes.
+        backend
+            .put_blob(PutBlobInput {
+                key: "k".into(),
+                body: Bytes::from_static(b"AAAAAAAABBBBBBBBCCCCCCCC"),
+                metadata: HashMap::new(),
+                content_type: None,
+            })
+            .await
+            .unwrap();
+
+        let h = fs
+            .open("k", OpenFlags { read: true, write: true, ..Default::default() })
+            .await
+            .unwrap();
+        // Write 2 bytes at offset 8 (part 1, offset 0): modifies first 2
+        // bytes of "BBBBBBBB". The rest of part 1 ("BBBBBB") must survive.
+        fs.pwrite(&h, 8, b"ZZ").await.unwrap();
+        fs.sync(&h).await.unwrap();
+        fs.close(&h).await.unwrap();
+
+        let g = backend.get_blob("k", None).await.unwrap();
+        assert_eq!(g.body.len(), 24, "file size unchanged");
+        assert_eq!(&g.body[..], b"AAAAAAAAZZBBBBBBCCCCCCCC");
+        assert_eq!(backend.mpu_count(), 0);
+    }
+
+    #[tokio::test]
     async fn close_without_sync_aborts_in_flight_mpu() {
         let (backend, fs) = tiny_fs();
         backend
@@ -1371,12 +1595,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_directory_unsupported_for_now() {
+    async fn rename_directory_recursive_moves_all_descendants() {
+        let (backend, fs) = small_fs();
+        let root = fs.root();
+        // Build /old/{a.txt, b.txt, sub/c.txt}
+        fs.mkdir(&root, "old").await.unwrap();
+        for (path, body) in [
+            ("old/a.txt", b"AAA" as &[u8]),
+            ("old/b.txt", b"BBB"),
+            ("old/sub/c.txt", b"CCC"),
+        ] {
+            backend
+                .put_blob(PutBlobInput {
+                    key: path.into(),
+                    body: Bytes::copy_from_slice(body),
+                    metadata: HashMap::new(),
+                    content_type: None,
+                })
+                .await
+                .unwrap();
+        }
+        // Force the inode tree to know about /old.
+        let _ = fs.read_dir(&root).await.unwrap();
+
+        fs.rename(&root, "old", &root, "new").await.unwrap();
+
+        // Old keys are gone; new keys carry the content.
+        for k in ["old/a.txt", "old/b.txt", "old/sub/c.txt", "old/"] {
+            assert!(
+                matches!(backend.head_blob(k).await, Err(FsError::NotFound)),
+                "leftover {k}"
+            );
+        }
+        for (k, expected) in [
+            ("new/a.txt", b"AAA" as &[u8]),
+            ("new/b.txt", b"BBB"),
+            ("new/sub/c.txt", b"CCC"),
+        ] {
+            let g = backend.get_blob(k, None).await.unwrap();
+            assert_eq!(&g.body[..], expected, "key {k}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_directory_into_self_rejected() {
         let (_b, fs) = small_fs();
         let root = fs.root();
         fs.mkdir(&root, "d").await.unwrap();
-        let r = fs.rename(&root, "d", &root, "d2").await;
-        assert!(matches!(r, Err(FsError::NotSupported)));
+        let d = fs.tree.lookup(&root, "d").await.unwrap();
+        let r = fs.rename(&root, "d", &d, "inner").await;
+        assert!(matches!(r, Err(FsError::Invalid(_))));
     }
 
     // ---------- symlinks ----------

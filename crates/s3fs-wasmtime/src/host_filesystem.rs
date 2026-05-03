@@ -302,17 +302,17 @@ impl HostDescriptor for S3FsCtxView<'_> {
     async fn stat_at(
         &mut self,
         fd: Resource<WitDescriptor>,
-        _path_flags: PathFlags,
+        path_flags: PathFlags,
         path: String,
     ) -> S3WasiFsResult<DescriptorStat> {
         let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
-        let target = self
-            .fs
-            .tree
-            .lookup_at(&base, &path)
-            .await
-            .map_err(|e| S3WasiFsError::from(from_fs(e)))?;
+        let target = if path_flags.contains(PathFlags::SYMLINK_FOLLOW) {
+            self.fs.tree.lookup_at(&base, &path).await
+        } else {
+            self.fs.tree.lookup_at_no_follow(&base, &path).await
+        }
+        .map_err(|e| S3WasiFsError::from(from_fs(e)))?;
         let kind = target.kind.read().clone();
         let attrs = target.attrs.read().clone();
         Ok(DescriptorStat {
@@ -351,7 +351,7 @@ impl HostDescriptor for S3FsCtxView<'_> {
     async fn open_at(
         &mut self,
         fd: Resource<WitDescriptor>,
-        _path_flags: PathFlags,
+        path_flags: PathFlags,
         path: String,
         open_flags: WitOpenFlags,
         descriptor_flags: DescriptorFlags,
@@ -364,6 +364,19 @@ impl HostDescriptor for S3FsCtxView<'_> {
         flags.write = descriptor_flags.contains(DescriptorFlags::WRITE);
 
         let want_dir = open_flags.contains(WitOpenFlags::DIRECTORY);
+
+        // O_NOFOLLOW (path-flags::symlink-follow cleared): if the leaf is a
+        // symlink, return Loop per WASI spec rather than following.
+        if !path_flags.contains(PathFlags::SYMLINK_FOLLOW) {
+            // Probe the leaf without following. NotFound is fine — open_at
+            // may be creating. Actual symlink → Loop.
+            match self.fs.tree.lookup_at_no_follow(&base, &path).await {
+                Ok(probe) if probe.is_symlink() => {
+                    return Err(S3WasiFsError::from(ErrorCode::Loop));
+                }
+                _ => {}
+            }
+        }
 
         let handle = self
             .fs

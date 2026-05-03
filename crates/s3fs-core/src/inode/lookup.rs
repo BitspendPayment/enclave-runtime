@@ -164,24 +164,63 @@ impl InodeTree {
     /// component. `.` is skipped; `..` pops the current node, but cannot
     /// escape the tree root (which is the preopen root).
     ///
-    /// Returns the resolved inode. Symlink resolution is **not** performed
-    /// here — that's the symlink module's responsibility. Callers that want
-    /// `path-flags::symlink-follow` semantics should layer it on top.
+    /// Symlinks are followed transparently for **intermediate** components.
+    /// The final named component is also followed (POSIX default). To
+    /// suppress follow on the final component (POSIX `O_NOFOLLOW` /
+    /// WASI `path-flags::symlink-follow` cleared), use [`Self::lookup_at_no_follow`].
     pub async fn lookup_at(
         &self,
         start: &Arc<Inode>,
         rel_path: &str,
     ) -> FsResult<Arc<Inode>> {
+        self.lookup_at_inner(start, rel_path, /* follow_last */ true, 0)
+            .await
+    }
+
+    /// Like `lookup_at` but does NOT follow a symlink at the final named
+    /// component. Returns the symlink inode itself if the leaf is a symlink.
+    /// Used by `readlink_at` and by `open_at` when `path-flags::symlink-follow`
+    /// is cleared (the latter then maps to `error-code::loop`).
+    pub async fn lookup_at_no_follow(
+        &self,
+        start: &Arc<Inode>,
+        rel_path: &str,
+    ) -> FsResult<Arc<Inode>> {
+        self.lookup_at_inner(start, rel_path, /* follow_last */ false, 0)
+            .await
+    }
+
+    /// Internal recursive implementation. Tracks `depth` to enforce
+    /// `Config::max_symlink_depth` (default 40, matching Linux's `MAXSYMLINKS`).
+    async fn lookup_at_inner(
+        &self,
+        start: &Arc<Inode>,
+        rel_path: &str,
+        follow_last: bool,
+        depth: u32,
+    ) -> FsResult<Arc<Inode>> {
         if rel_path.starts_with('/') {
             return Err(FsError::NotPermitted);
         }
+        if depth > self.config.max_symlink_depth {
+            return Err(FsError::Loop);
+        }
         let mut current = start.clone();
         let root = self.root();
-        for seg in rel_path.split('/') {
-            if seg.is_empty() || seg == "." {
+
+        let segments: Vec<&str> = rel_path.split('/').collect();
+        // Index of the rightmost "named" segment (not "", ".", or ".."). The
+        // `follow_last` flag only governs that one — all earlier symlinks are
+        // always followed.
+        let last_named = segments
+            .iter()
+            .rposition(|s| !s.is_empty() && *s != "." && *s != "..");
+
+        for (i, seg) in segments.iter().enumerate() {
+            if seg.is_empty() || *seg == "." {
                 continue;
             }
-            if seg == ".." {
+            if *seg == ".." {
                 if Arc::ptr_eq(&current, &root) {
                     return Err(FsError::NotPermitted);
                 }
@@ -197,6 +236,37 @@ impl InodeTree {
                 return Err(FsError::NotDirectory);
             }
             current = self.lookup(&current, seg).await?;
+
+            // Symlink follow: always for intermediate components, and for
+            // the final named component iff `follow_last`.
+            let is_last_named = Some(i) == last_named;
+            let should_follow = !is_last_named || follow_last;
+            if should_follow {
+                if let Some(target) = current.symlink_target() {
+                    // Resolve relative to the symlink's parent (or root for
+                    // absolute targets). Recurse with depth + 1 (Box::pin so
+                    // the future has a known size).
+                    let (resolution_base, target_relative) = if let Some(stripped) =
+                        target.strip_prefix('/')
+                    {
+                        (root.clone(), stripped.to_string())
+                    } else {
+                        let parent = current
+                            .parent
+                            .as_ref()
+                            .and_then(Weak::upgrade)
+                            .unwrap_or_else(|| root.clone());
+                        (parent, target)
+                    };
+                    current = Box::pin(self.lookup_at_inner(
+                        &resolution_base,
+                        &target_relative,
+                        /* follow_last */ true,
+                        depth + 1,
+                    ))
+                    .await?;
+                }
+            }
         }
         Ok(current)
     }
@@ -424,6 +494,97 @@ mod tests {
         let root = tree.root();
         let r = tree.lookup_at(&root, "").await.unwrap();
         assert!(Arc::ptr_eq(&r, &root));
+    }
+
+    #[tokio::test]
+    async fn lookup_at_follows_symlink_intermediate_component() {
+        let (backend, tree) = fresh();
+        // /target/file.txt
+        put(&backend, "target/file.txt", b"hello").await;
+        // /link → "target"  (a symlink to a dir)
+        let mut meta = HashMap::new();
+        meta.insert(SYMLINK_METADATA_KEY.into(), SYMLINK_METADATA_VALUE.into());
+        put_with_meta(&backend, "link", b"target", meta).await;
+
+        // lookup "link/file.txt" — intermediate "link" is followed.
+        let resolved = tree
+            .lookup_at(&tree.root(), "link/file.txt")
+            .await
+            .unwrap();
+        assert!(resolved.is_regular_file());
+        assert_eq!(tree.full_key(&resolved), "target/file.txt");
+    }
+
+    #[tokio::test]
+    async fn lookup_at_follows_symlink_at_leaf_by_default() {
+        let (backend, tree) = fresh();
+        put(&backend, "target.txt", b"yo").await;
+        let mut meta = HashMap::new();
+        meta.insert(SYMLINK_METADATA_KEY.into(), SYMLINK_METADATA_VALUE.into());
+        put_with_meta(&backend, "link.txt", b"target.txt", meta).await;
+
+        let resolved = tree.lookup_at(&tree.root(), "link.txt").await.unwrap();
+        assert!(resolved.is_regular_file());
+        assert_eq!(tree.full_key(&resolved), "target.txt");
+    }
+
+    #[tokio::test]
+    async fn lookup_at_no_follow_returns_symlink_at_leaf() {
+        let (backend, tree) = fresh();
+        put(&backend, "target.txt", b"yo").await;
+        let mut meta = HashMap::new();
+        meta.insert(SYMLINK_METADATA_KEY.into(), SYMLINK_METADATA_VALUE.into());
+        put_with_meta(&backend, "link.txt", b"target.txt", meta).await;
+
+        let resolved = tree
+            .lookup_at_no_follow(&tree.root(), "link.txt")
+            .await
+            .unwrap();
+        assert!(resolved.is_symlink());
+        assert_eq!(resolved.symlink_target().as_deref(), Some("target.txt"));
+    }
+
+    #[tokio::test]
+    async fn lookup_at_symlink_cycle_returns_loop() {
+        let (backend, tree) = fresh();
+        let meta = || {
+            let mut m = HashMap::new();
+            m.insert(SYMLINK_METADATA_KEY.into(), SYMLINK_METADATA_VALUE.into());
+            m
+        };
+        // a → b, b → a (mutual cycle)
+        put_with_meta(&backend, "a", b"b", meta()).await;
+        put_with_meta(&backend, "b", b"a", meta()).await;
+
+        let r = tree.lookup_at(&tree.root(), "a").await;
+        assert!(matches!(r, Err(FsError::Loop)), "expected Loop, got {r:?}");
+    }
+
+    #[tokio::test]
+    async fn lookup_at_symlink_to_absolute_path_resolves_from_root() {
+        let (backend, tree) = fresh();
+        put(&backend, "deep/target.txt", b"x").await;
+        let mut meta = HashMap::new();
+        meta.insert(SYMLINK_METADATA_KEY.into(), SYMLINK_METADATA_VALUE.into());
+        put_with_meta(&backend, "shortcut", b"/deep/target.txt", meta).await;
+
+        let r = tree.lookup_at(&tree.root(), "shortcut").await.unwrap();
+        assert!(r.is_regular_file());
+        assert_eq!(tree.full_key(&r), "deep/target.txt");
+    }
+
+    #[tokio::test]
+    async fn lookup_at_symlink_target_escape_rejected() {
+        let (backend, tree) = fresh();
+        let mut meta = HashMap::new();
+        meta.insert(SYMLINK_METADATA_KEY.into(), SYMLINK_METADATA_VALUE.into());
+        put_with_meta(&backend, "evil", b"../../etc/passwd", meta).await;
+
+        let r = tree.lookup_at(&tree.root(), "evil").await;
+        assert!(
+            matches!(r, Err(FsError::NotPermitted)),
+            "expected NotPermitted, got {r:?}"
+        );
     }
 
     #[tokio::test]
