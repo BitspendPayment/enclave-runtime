@@ -29,9 +29,9 @@ impl Default for PartSchedule {
     fn default() -> Self {
         Self {
             tiers: vec![
-                (5 * 1024 * 1024, 1000),         // 5 MiB × 1000  →    5 GiB
-                (25 * 1024 * 1024, 1000),        // 25 MiB × 1000  →   25 GiB
-                (125 * 1024 * 1024, 8000),       // 125 MiB × 8000 → 1000 GiB
+                (5 * 1024 * 1024, 1000),   // 5 MiB × 1000  →    5 GiB
+                (25 * 1024 * 1024, 1000),  // 25 MiB × 1000  →   25 GiB
+                (125 * 1024 * 1024, 8000), // 125 MiB × 8000 → 1000 GiB
             ],
         }
     }
@@ -148,11 +148,11 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             part_schedule: PartSchedule::default(),
-            single_part_threshold: 5 * 1024 * 1024,        // 5 MiB
+            single_part_threshold: 5 * 1024 * 1024, // 5 MiB
             max_parallel_parts: 8,
             max_parallel_copy: 8,
-            max_merge_copy_bytes: 128 * 1024 * 1024,       // 128 MiB
-            memory_limit_bytes: 64 * 1024 * 1024,          // 64 MiB
+            max_merge_copy_bytes: 128 * 1024 * 1024, // 128 MiB
+            memory_limit_bytes: 64 * 1024 * 1024,    // 64 MiB
             disk_overflow_dir: None,
             read_ahead_chunks: 2,
             max_symlink_depth: 40,
@@ -167,7 +167,9 @@ impl Default for Config {
 impl Config {
     /// Start from defaults; mutate via the returned builder.
     pub fn builder() -> ConfigBuilder {
-        ConfigBuilder { inner: Self::default() }
+        ConfigBuilder {
+            inner: Self::default(),
+        }
     }
 }
 
@@ -224,9 +226,7 @@ mod tests {
         // 5 GiB + 25 GiB + 1000 GiB = 1030 GiB ≈ 1.006 TiB
         assert_eq!(
             s.max_file_size(),
-            5u64 * 1024 * 1024 * 1000
-                + 25u64 * 1024 * 1024 * 1000
-                + 125u64 * 1024 * 1024 * 8000
+            5u64 * 1024 * 1024 * 1000 + 25u64 * 1024 * 1024 * 1000 + 125u64 * 1024 * 1024 * 8000
         );
         assert_eq!(s.total_parts(), 10_000);
     }

@@ -1,7 +1,7 @@
 //! `wasi:filesystem/preopens::Host` — exposes the single root descriptor.
 
-use wasmtime::Result;
 use wasmtime::component::Resource;
+use wasmtime::Result;
 
 use crate::bindings::wasi::filesystem::preopens::Host;
 use crate::bindings::wasi::filesystem::types::Descriptor as WitDescriptor;

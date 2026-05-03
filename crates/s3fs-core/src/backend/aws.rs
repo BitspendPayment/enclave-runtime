@@ -151,7 +151,9 @@ impl Backend for AwsS3Backend {
             .send()
             .await
             .map_err(|e| match &e {
-                SdkError::ServiceError(svc) if matches!(svc.err(), HeadObjectError::NotFound(_)) => {
+                SdkError::ServiceError(svc)
+                    if matches!(svc.err(), HeadObjectError::NotFound(_)) =>
+                {
                     FsError::NotFound
                 }
                 _ => map_sdk_error("HeadObject", e),
@@ -475,8 +477,7 @@ impl Backend for AwsS3Backend {
     ) -> FsResult<PartUploadOutput> {
         let copy_source = format!("{}/{}", self.bucket, source_key);
         // Inclusive end per S3.
-        let copy_source_range =
-            format!("bytes={}-{}", source_range.start, source_range.end - 1);
+        let copy_source_range = format!("bytes={}-{}", source_range.start, source_range.end - 1);
         let resp = self
             .client
             .upload_part_copy()

@@ -21,8 +21,8 @@ pub mod view;
 pub use descriptors::{Descriptor, DirectoryEntryStream};
 pub use view::{S3FsCtxView, S3WasiView};
 
-use wasmtime::Result;
 use wasmtime::component::{HasData, Linker};
+use wasmtime::Result;
 
 /// `HasData` marker so bindgen knows the trait impls live on
 /// [`S3FsCtxView<'_>`].

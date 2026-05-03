@@ -233,9 +233,21 @@ mod tests {
             metadata: HashMap::new(),
             fetched_at: std::time::Instant::now(),
         };
-        let dir = Inode::new_dir(t.alloc_id(), "dir", Some(Arc::downgrade(&root)), false, attrs());
+        let dir = Inode::new_dir(
+            t.alloc_id(),
+            "dir",
+            Some(Arc::downgrade(&root)),
+            false,
+            attrs(),
+        );
         t.attach(&root, dir.clone());
-        let sub = Inode::new_dir(t.alloc_id(), "sub", Some(Arc::downgrade(&dir)), false, attrs());
+        let sub = Inode::new_dir(
+            t.alloc_id(),
+            "sub",
+            Some(Arc::downgrade(&dir)),
+            false,
+            attrs(),
+        );
         t.attach(&dir, sub.clone());
         let file = Inode::new_file(t.alloc_id(), "file.txt", Arc::downgrade(&sub), attrs());
         t.attach(&sub, file.clone());

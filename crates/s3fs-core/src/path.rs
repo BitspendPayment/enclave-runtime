@@ -238,7 +238,10 @@ mod tests {
 
     #[test]
     fn resolve_pops_on_dotdot() {
-        assert_eq!(resolve_at("", "dir/sub", "../sibling").unwrap(), "dir/sibling");
+        assert_eq!(
+            resolve_at("", "dir/sub", "../sibling").unwrap(),
+            "dir/sibling"
+        );
         assert_eq!(resolve_at("", "a/b/c", "../../x").unwrap(), "a/x");
     }
 
@@ -269,10 +272,7 @@ mod tests {
             Err(FsError::NotPermitted)
         ));
         // But popping just back to the preopen root is fine:
-        assert_eq!(
-            resolve_at("data", "data/foo", "..").unwrap(),
-            "data"
-        );
+        assert_eq!(resolve_at("data", "data/foo", "..").unwrap(), "data");
         // And popping to a sibling within the preopen is fine:
         assert_eq!(
             resolve_at("data", "data/foo/bar", "../sib").unwrap(),

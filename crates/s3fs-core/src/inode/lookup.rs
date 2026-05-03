@@ -31,10 +31,17 @@ fn meta_indicates_symlink(meta: &HashMap<String, String>) -> bool {
 }
 
 fn attrs_from_head(head: &BlobMeta) -> Attrs {
+    // If we previously persisted an mtime via `set_times`, prefer that over
+    // S3's `LastModified` so guests see the time they explicitly set.
+    let last_modified = head
+        .metadata
+        .get(crate::fs::METADATA_MTIME_KEY)
+        .and_then(|s| crate::fs::meta_to_systemtime(s))
+        .unwrap_or(head.last_modified);
     Attrs {
         size: head.size,
         etag: head.e_tag.clone(),
-        last_modified: head.last_modified,
+        last_modified,
         content_type: head.content_type.clone(),
         metadata: head.metadata.clone(),
         fetched_at: Instant::now(),
@@ -117,13 +124,9 @@ impl InodeTree {
             };
             let id = self.alloc_id();
             let child = match kind {
-                InodeKind::Symlink { target } => Inode::new_symlink(
-                    id,
-                    name,
-                    Arc::downgrade(parent),
-                    target,
-                    attrs,
-                ),
+                InodeKind::Symlink { target } => {
+                    Inode::new_symlink(id, name, Arc::downgrade(parent), target, attrs)
+                }
                 _ => Inode::new_file(id, name, Arc::downgrade(parent), attrs),
             };
             return Ok(self.attach(parent, child));
@@ -168,11 +171,7 @@ impl InodeTree {
     /// The final named component is also followed (POSIX default). To
     /// suppress follow on the final component (POSIX `O_NOFOLLOW` /
     /// WASI `path-flags::symlink-follow` cleared), use [`Self::lookup_at_no_follow`].
-    pub async fn lookup_at(
-        &self,
-        start: &Arc<Inode>,
-        rel_path: &str,
-    ) -> FsResult<Arc<Inode>> {
+    pub async fn lookup_at(&self, start: &Arc<Inode>, rel_path: &str) -> FsResult<Arc<Inode>> {
         self.lookup_at_inner(start, rel_path, /* follow_last */ true, 0)
             .await
     }
@@ -246,18 +245,17 @@ impl InodeTree {
                     // Resolve relative to the symlink's parent (or root for
                     // absolute targets). Recurse with depth + 1 (Box::pin so
                     // the future has a known size).
-                    let (resolution_base, target_relative) = if let Some(stripped) =
-                        target.strip_prefix('/')
-                    {
-                        (root.clone(), stripped.to_string())
-                    } else {
-                        let parent = current
-                            .parent
-                            .as_ref()
-                            .and_then(Weak::upgrade)
-                            .unwrap_or_else(|| root.clone());
-                        (parent, target)
-                    };
+                    let (resolution_base, target_relative) =
+                        if let Some(stripped) = target.strip_prefix('/') {
+                            (root.clone(), stripped.to_string())
+                        } else {
+                            let parent = current
+                                .parent
+                                .as_ref()
+                                .and_then(Weak::upgrade)
+                                .unwrap_or_else(|| root.clone());
+                            (parent, target)
+                        };
                     current = Box::pin(self.lookup_at_inner(
                         &resolution_base,
                         &target_relative,
@@ -283,8 +281,10 @@ mod tests {
 
     fn fresh() -> (Arc<MemoryBackend>, Arc<InodeTree>) {
         let backend = Arc::new(MemoryBackend::new());
-        let tree =
-            InodeTree::new(backend.clone() as Arc<dyn Backend>, Arc::new(Config::default()));
+        let tree = InodeTree::new(
+            backend.clone() as Arc<dyn Backend>,
+            Arc::new(Config::default()),
+        );
         (backend, tree)
     }
 
@@ -507,10 +507,7 @@ mod tests {
         put_with_meta(&backend, "link", b"target", meta).await;
 
         // lookup "link/file.txt" — intermediate "link" is followed.
-        let resolved = tree
-            .lookup_at(&tree.root(), "link/file.txt")
-            .await
-            .unwrap();
+        let resolved = tree.lookup_at(&tree.root(), "link/file.txt").await.unwrap();
         assert!(resolved.is_regular_file());
         assert_eq!(tree.full_key(&resolved), "target/file.txt");
     }

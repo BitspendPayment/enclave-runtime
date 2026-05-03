@@ -16,12 +16,8 @@ use s3fs_core::{FileHandle, Inode};
 /// descriptor we resolve relative to its parent.
 #[derive(Debug)]
 pub enum Descriptor {
-    File {
-        handle: Arc<FileHandle>,
-    },
-    Dir {
-        inode: Arc<Inode>,
-    },
+    File { handle: Arc<FileHandle> },
+    Dir { inode: Arc<Inode> },
 }
 
 impl Descriptor {

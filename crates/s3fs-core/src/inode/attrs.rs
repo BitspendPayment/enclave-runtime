@@ -41,10 +41,14 @@ pub enum InodeKind {
     /// Directory. `explicit_marker` records whether a zero-byte `dir/`
     /// object exists in S3 (set on `mkdir`) or whether the directory is
     /// implicit-from-prefix only.
-    Directory { explicit_marker: bool },
+    Directory {
+        explicit_marker: bool,
+    },
     /// Symlink. `target` is the literal stored target path string. Resolution
     /// happens at follow-time; at attr-cache level we just remember the body.
-    Symlink { target: String },
+    Symlink {
+        target: String,
+    },
 }
 
 impl InodeKind {

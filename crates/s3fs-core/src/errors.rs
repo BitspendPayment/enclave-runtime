@@ -100,7 +100,10 @@ mod tests {
     #[test]
     fn display_is_stable() {
         assert_eq!(FsError::NotFound.to_string(), "not found");
-        assert_eq!(FsError::Loop.to_string(), "symlink loop or recursion limit exceeded");
+        assert_eq!(
+            FsError::Loop.to_string(),
+            "symlink loop or recursion limit exceeded"
+        );
         assert_eq!(
             FsError::Invalid("bad part number").to_string(),
             "invalid argument: bad part number"

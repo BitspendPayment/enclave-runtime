@@ -44,6 +44,22 @@ use crate::path;
 /// console viewers get a hint about what they are.
 pub const SYMLINK_CONTENT_TYPE: &str = "application/x-s3wasifs-symlink";
 
+/// User-metadata keys we use for `set-times`. Stored as RFC-3339-ish nanos.
+pub const METADATA_ATIME_KEY: &str = "s3wasifs-atime";
+pub const METADATA_MTIME_KEY: &str = "s3wasifs-mtime";
+
+fn systemtime_to_meta(t: std::time::SystemTime) -> String {
+    let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    format!("{}.{:09}", d.as_secs(), d.subsec_nanos())
+}
+
+pub(crate) fn meta_to_systemtime(s: &str) -> Option<std::time::SystemTime> {
+    let (sec_str, nanos_str) = s.split_once('.').unwrap_or((s, "0"));
+    let secs: u64 = sec_str.parse().ok()?;
+    let nanos: u32 = nanos_str.parse().ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+}
+
 /// Stable handle ID for an open file. Allocated by the `Fs` instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HandleId(pub NonZeroU64);
@@ -67,13 +83,23 @@ pub struct OpenFlags {
 
 impl OpenFlags {
     pub fn read_only() -> Self {
-        Self { read: true, ..Self::default() }
+        Self {
+            read: true,
+            ..Self::default()
+        }
     }
     pub fn write_only() -> Self {
-        Self { write: true, ..Self::default() }
+        Self {
+            write: true,
+            ..Self::default()
+        }
     }
     pub fn read_write() -> Self {
-        Self { read: true, write: true, ..Self::default() }
+        Self {
+            read: true,
+            write: true,
+            ..Self::default()
+        }
     }
     pub fn create_new() -> Self {
         Self {
@@ -121,6 +147,7 @@ pub struct Fs {
     pub config: Arc<Config>,
     pub tree: Arc<InodeTree>,
     pub pool: Arc<BufferPool>,
+    pub flusher: crate::flusher::Flusher,
     handles: PlRwLock<HashMap<HandleId, Arc<FileHandle>>>,
     next_handle: AtomicU64,
 }
@@ -130,11 +157,13 @@ impl Fs {
     pub fn new(backend: Arc<dyn Backend>, config: Arc<Config>) -> Arc<Self> {
         let tree = InodeTree::new(backend.clone(), config.clone());
         let pool = BufferPool::new(config.clone());
+        let flusher = crate::flusher::Flusher::new(&config);
         Arc::new(Self {
             backend,
             config,
             tree,
             pool,
+            flusher,
             handles: PlRwLock::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
         })
@@ -244,11 +273,7 @@ impl Fs {
             })
             .await?;
         // Filter out the dir's own marker (key == dir_key) — that's not "content".
-        let real_children = listing
-            .items
-            .iter()
-            .filter(|i| i.key != dir_key)
-            .count();
+        let real_children = listing.items.iter().filter(|i| i.key != dir_key).count();
         if real_children > 0 {
             return Err(FsError::NotEmpty);
         }
@@ -435,9 +460,7 @@ impl Fs {
 
         // Rewire the inode tree: detach old, attach a fresh dir under new.
         let attrs = old_ino.attrs.read().clone();
-        let explicit = old_ino
-            .dir_explicit_marker()
-            .unwrap_or(false);
+        let explicit = old_ino.dir_explicit_marker().unwrap_or(false);
         let new_ino = Inode::new_dir(
             self.tree.alloc_id(),
             new_name,
@@ -495,8 +518,7 @@ impl Fs {
 
         let attrs = attrs_from_meta(&meta);
         let id = self.tree.alloc_id();
-        let inode =
-            Inode::new_symlink(id, name, Arc::downgrade(base), target.to_string(), attrs);
+        let inode = Inode::new_symlink(id, name, Arc::downgrade(base), target.to_string(), attrs);
         Ok(self.tree.attach(base, inode))
     }
 
@@ -508,6 +530,137 @@ impl Fs {
             Some(t) => Ok(t),
             None => Err(FsError::Invalid("readlink_at: not a symlink")),
         }
+    }
+
+    // ------------------- set_size / set_times -------------------
+
+    /// `set-size` — truncate or grow a file to exactly `new_size` bytes.
+    ///
+    /// **Shrink:** any pending writes are first synced to S3 (so we don't
+    /// lose them by truncating mid-buffer); then we issue a ranged `GET`
+    /// for `[0, new_size)` and re-`PUT` the result. Simple and correct for
+    /// any size, but downloads + re-uploads the surviving prefix.
+    /// Acceptable for typical truncate workloads (`> file`, log rotation,
+    /// SQLite VACUUM); large in-place shrinks would benefit from an MPU
+    /// rewrite path which we can layer on later.
+    ///
+    /// **Grow:** zero-fills the gap by issuing a normal `pwrite` of zeros at
+    /// the previous EOF. Capped at 100 MiB to avoid blowing up memory; for
+    /// larger growths use direct `pwrite` of your real bytes.
+    pub async fn set_size(&self, handle: &FileHandle, new_size: u64) -> FsResult<()> {
+        if !handle.flags.write {
+            return Err(FsError::AccessDenied);
+        }
+        if handle.inode.is_deleted() {
+            return Err(FsError::NotFound);
+        }
+        let current = *handle.size.read();
+        if new_size == current {
+            return Ok(());
+        }
+
+        if new_size < current {
+            // Shrink: flush any pending writes first.
+            self.sync(handle).await?;
+            let key = self.tree.s3_key(&handle.inode);
+            let body = if new_size == 0 {
+                Bytes::new()
+            } else {
+                self.backend.get_blob(&key, Some(0..new_size)).await?.body
+            };
+            let meta = self
+                .backend
+                .put_blob(PutBlobInput {
+                    key,
+                    body,
+                    metadata: HashMap::new(),
+                    content_type: None,
+                })
+                .await?;
+            *handle.inode.attrs.write() = attrs_from_meta(&meta);
+            *handle.size.write() = new_size;
+            self.pool.forget_inode(handle.inode.id);
+            Ok(())
+        } else {
+            // Grow: zero-fill via the buffer pool. Cap to avoid OOM.
+            let extra = new_size - current;
+            const MAX_GROW_BYTES: u64 = 100 * 1024 * 1024;
+            if extra > MAX_GROW_BYTES {
+                return Err(FsError::Invalid(
+                    "set_size grow exceeds 100 MiB cap; use pwrite of real bytes",
+                ));
+            }
+            let zeros = vec![0u8; extra as usize];
+            self.pwrite(handle, current, &zeros).await?;
+            Ok(())
+        }
+    }
+
+    /// `set-times-at` — persist atime/mtime as user metadata via a
+    /// `CopyObject` self-copy with `MetadataDirective=REPLACE`. The values
+    /// land in `x-amz-meta-s3wasifs-{atime,mtime}` as RFC-3339 nanos.
+    ///
+    /// `None` means "don't change"; `Some(t)` sets the field. The cached
+    /// inode attrs are updated so subsequent `stat` calls see the new
+    /// times within the same process — across mounts, the times are
+    /// readable on next `lookup` (which fetches metadata via `HeadObject`).
+    pub async fn set_times_at(
+        &self,
+        base: &Arc<Inode>,
+        path: &str,
+        follow_symlinks: bool,
+        atime: Option<std::time::SystemTime>,
+        mtime: Option<std::time::SystemTime>,
+    ) -> FsResult<()> {
+        let ino = if follow_symlinks {
+            self.tree.lookup_at(base, path).await?
+        } else {
+            self.tree.lookup_at_no_follow(base, path).await?
+        };
+        self.set_times_inode(&ino, atime, mtime).await
+    }
+
+    /// Like `set_times_at` but on an already-resolved file handle.
+    pub async fn set_times(
+        &self,
+        handle: &FileHandle,
+        atime: Option<std::time::SystemTime>,
+        mtime: Option<std::time::SystemTime>,
+    ) -> FsResult<()> {
+        self.set_times_inode(&handle.inode, atime, mtime).await
+    }
+
+    async fn set_times_inode(
+        &self,
+        ino: &Arc<Inode>,
+        atime: Option<std::time::SystemTime>,
+        mtime: Option<std::time::SystemTime>,
+    ) -> FsResult<()> {
+        if atime.is_none() && mtime.is_none() {
+            return Ok(());
+        }
+        let key = self.tree.s3_key(ino);
+        // Read current head to preserve metadata fields we don't touch.
+        let head = self.backend.head_blob(&key).await?;
+        let mut metadata = head.metadata.clone();
+        let mut new_attrs = ino.attrs.read().clone();
+        if let Some(t) = atime {
+            metadata.insert(METADATA_ATIME_KEY.to_string(), systemtime_to_meta(t));
+        }
+        if let Some(t) = mtime {
+            metadata.insert(METADATA_MTIME_KEY.to_string(), systemtime_to_meta(t));
+            new_attrs.last_modified = t;
+        }
+        self.backend
+            .copy_blob(CopyBlobInput {
+                source_key: key.clone(),
+                destination_key: key,
+                replace_metadata: Some(metadata),
+                replace_content_type: head.content_type,
+            })
+            .await?;
+        *ino.attrs.write() = new_attrs;
+        Ok(())
     }
 
     // ------------------- open / close -------------------
@@ -541,9 +694,7 @@ impl Fs {
                 }
                 i
             }
-            Err(FsError::NotFound) if flags.create => {
-                self.create_file_at(base, path).await?
-            }
+            Err(FsError::NotFound) if flags.create => self.create_file_at(base, path).await?,
             Err(e) => return Err(e),
         };
 
@@ -571,11 +722,7 @@ impl Fs {
     }
 
     /// Convenience: `open_at(root, path, flags)`.
-    pub async fn open(
-        &self,
-        path: &str,
-        flags: OpenFlags,
-    ) -> FsResult<Arc<FileHandle>> {
+    pub async fn open(&self, path: &str, flags: OpenFlags) -> FsResult<Arc<FileHandle>> {
         let root = self.root();
         self.open_at(&root, path, flags).await
     }
@@ -596,11 +743,7 @@ impl Fs {
     /// Internal: create a new empty file at `path` under `base`. Used by
     /// the `O_CREAT` path of `open_at`. Atomic via `put_blob_if_not_exists`
     /// when `O_EXCL` is also set; otherwise falls back to plain `put_blob`.
-    async fn create_file_at(
-        &self,
-        base: &Arc<Inode>,
-        path: &str,
-    ) -> FsResult<Arc<Inode>> {
+    async fn create_file_at(&self, base: &Arc<Inode>, path: &str) -> FsResult<Arc<Inode>> {
         // Resolve parent + final segment. We re-walk one shy of the leaf so
         // we have the final basename to attach in the inode tree.
         let (parent_dir, basename) = self.resolve_parent_and_basename(base, path).await?;
@@ -672,12 +815,7 @@ impl Fs {
 
     /// Read `len` bytes from the file at `offset`. Returns up to `len` bytes;
     /// short reads at EOF return fewer.
-    pub async fn pread(
-        &self,
-        handle: &FileHandle,
-        offset: u64,
-        len: usize,
-    ) -> FsResult<Bytes> {
+    pub async fn pread(&self, handle: &FileHandle, offset: u64, len: usize) -> FsResult<Bytes> {
         if !handle.flags.read {
             return Err(FsError::AccessDenied);
         }
@@ -718,12 +856,7 @@ impl Fs {
     /// (always `data.len()` on success). Marks affected parts dirty and
     /// updates the handle's logical file size if the write extends past EOF.
     /// Does NOT call S3 — `sync` does the actual upload.
-    pub async fn pwrite(
-        &self,
-        handle: &FileHandle,
-        offset: u64,
-        data: &[u8],
-    ) -> FsResult<usize> {
+    pub async fn pwrite(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> FsResult<usize> {
         if !handle.flags.write {
             return Err(FsError::AccessDenied);
         }
@@ -745,7 +878,9 @@ impl Fs {
                 .part_schedule
                 .locate(cur)
                 .ok_or(FsError::FileTooLarge)?;
-            let part_arc = self.get_or_fetch_part_for_write(handle, loc.part_index).await?;
+            let part_arc = self
+                .get_or_fetch_part_for_write(handle, loc.part_index)
+                .await?;
 
             let into_part = cur - loc.part_start;
             let space_in_part = loc.part_size - into_part;
@@ -808,7 +943,12 @@ impl Fs {
         }
 
         // No dirty bytes and no in-flight MPU → nothing to do.
-        let mpu_in_flight = handle.mpu.lock().await.as_ref().is_some_and(|s| s.has_upload());
+        let mpu_in_flight = handle
+            .mpu
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|s| s.has_upload());
         if dirty_parts.is_empty() && !mpu_in_flight {
             return Ok(());
         }
@@ -832,7 +972,10 @@ impl Fs {
         final_size: u64,
         dirty_parts: Vec<(u32, Arc<parking_lot::RwLock<PartBuf>>)>,
     ) -> FsResult<()> {
-        debug_assert!(dirty_parts.len() <= 1, "small-file path implies ≤1 dirty part");
+        debug_assert!(
+            dirty_parts.len() <= 1,
+            "small-file path implies ≤1 dirty part"
+        );
 
         // Snapshot everything we need from the dirty part before any await.
         // We capture the *dirty ranges* explicitly so we only overlay bytes
@@ -1026,13 +1169,19 @@ impl Fs {
         let upload_id = Arc::new(upload_id.clone());
         let schedule = self.config.part_schedule.clone();
         let cap = max_parallel.max(1);
+        let flusher = self.flusher.clone();
 
         stream::iter(dirty_parts.into_iter().map(|(part_index, part_arc)| {
             let backend = backend.clone();
             let key = key.clone();
             let upload_id = upload_id.clone();
             let schedule = schedule.clone();
+            let flusher = flusher.clone();
             async move {
+                // Acquire a permit from the per-Fs flusher BEFORE doing any
+                // backend I/O. This caps total concurrent uploads across all
+                // open files, not just within one sync() call.
+                let _permit = flusher.acquire().await;
                 upload_one_part(
                     backend,
                     key.as_str(),
@@ -1071,11 +1220,18 @@ impl Fs {
         let source_size = handle.inode.attrs.read().size;
         if part_range.start >= source_size {
             // Empty part past EOF.
-            let part = PartBuf::new_empty_dirty(part_index, part_range.end - part_range.start, part_range.start);
+            let part = PartBuf::new_empty_dirty(
+                part_index,
+                part_range.end - part_range.start,
+                part_range.start,
+            );
             return Ok(self.pool.insert(key, part));
         }
         let r = part_range.start..part_range.end.min(source_size);
-        let g = self.backend.get_blob(&self.tree.s3_key(&handle.inode), Some(r)).await?;
+        let g = self
+            .backend
+            .get_blob(&self.tree.s3_key(&handle.inode), Some(r))
+            .await?;
         let part = PartBuf::new_clean(
             part_index,
             part_range.end - part_range.start,
@@ -1140,7 +1296,9 @@ async fn upload_one_part(
         let source_end = part_range.end.min(source_size);
         let source_start = part_range.start;
         let loaded = if source_end > source_start {
-            let g = backend.get_blob(key, Some(source_start..source_end)).await?;
+            let g = backend
+                .get_blob(key, Some(source_start..source_end))
+                .await?;
             g.body
         } else {
             Bytes::new()
@@ -1319,10 +1477,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(
-            fs.rmdir(&root, "d").await,
-            Err(FsError::NotEmpty)
-        ));
+        assert!(matches!(fs.rmdir(&root, "d").await, Err(FsError::NotEmpty)));
     }
 
     // ---------- open / O_CREAT / O_EXCL / O_TRUNC ----------
@@ -1331,7 +1486,14 @@ mod tests {
     async fn open_create_writes_empty_file() {
         let (backend, fs) = small_fs();
         let h = fs
-            .open("hello.txt", OpenFlags { write: true, create: true, ..Default::default() })
+            .open(
+                "hello.txt",
+                OpenFlags {
+                    write: true,
+                    create: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(*h.size.read(), 0);
@@ -1360,7 +1522,15 @@ mod tests {
             .await
             .unwrap();
         let h = fs
-            .open("k", OpenFlags { read: true, write: true, truncate: true, ..Default::default() })
+            .open(
+                "k",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    truncate: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(*h.size.read(), 0);
@@ -1421,7 +1591,14 @@ mod tests {
             .await
             .unwrap();
         let h = fs
-            .open("big", OpenFlags { read: true, write: true, ..Default::default() })
+            .open(
+                "big",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         // Modify part 1 (bytes 4..8): "BBBB" → "ZZZZ".
@@ -1449,7 +1626,14 @@ mod tests {
             .await
             .unwrap();
         let h = fs
-            .open("k", OpenFlags { read: true, write: true, ..Default::default() })
+            .open(
+                "k",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         fs.pwrite(&h, 5, b"XX").await.unwrap();
@@ -1476,7 +1660,14 @@ mod tests {
             .await
             .unwrap();
         let h = fs
-            .open("db", OpenFlags { read: true, write: true, ..Default::default() })
+            .open(
+                "db",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         // Modify only bytes 8..10. Bytes 0..8 must come from source, not zeros.
@@ -1497,7 +1688,9 @@ mod tests {
         // blocker for any DB > 5 MiB.
         let backend = Arc::new(MemoryBackend::new());
         let cfg = Config::builder()
-            .part_schedule(crate::config::PartSchedule { tiers: vec![(8, 100)] })
+            .part_schedule(crate::config::PartSchedule {
+                tiers: vec![(8, 100)],
+            })
             .single_part_threshold(8) // anything above 8 bytes uses MPU
             .max_parallel_parts(2)
             .max_parallel_copy(2)
@@ -1518,7 +1711,14 @@ mod tests {
             .unwrap();
 
         let h = fs
-            .open("k", OpenFlags { read: true, write: true, ..Default::default() })
+            .open(
+                "k",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         // Write 2 bytes at offset 8 (part 1, offset 0): modifies first 2
@@ -1546,7 +1746,14 @@ mod tests {
             .await
             .unwrap();
         let h = fs
-            .open("k", OpenFlags { read: true, write: true, ..Default::default() })
+            .open(
+                "k",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         // Trigger MPU lazily by writing across part boundaries.
@@ -1645,6 +1852,156 @@ mod tests {
         let d = fs.tree.lookup(&root, "d").await.unwrap();
         let r = fs.rename(&root, "d", &d, "inner").await;
         assert!(matches!(r, Err(FsError::Invalid(_))));
+    }
+
+    // ---------- set_size ----------
+
+    #[tokio::test]
+    async fn set_size_truncate_to_zero() {
+        let (backend, fs) = small_fs();
+        backend
+            .put_blob(PutBlobInput {
+                key: "k".into(),
+                body: Bytes::from_static(b"some content"),
+                metadata: HashMap::new(),
+                content_type: None,
+            })
+            .await
+            .unwrap();
+        let h = fs
+            .open(
+                "k",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        fs.set_size(&h, 0).await.unwrap();
+        assert_eq!(*h.size.read(), 0);
+        let g = backend.get_blob("k", None).await.unwrap();
+        assert!(g.body.is_empty());
+        fs.close(&h).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_size_shrink_partial_keeps_prefix() {
+        let (backend, fs) = small_fs();
+        backend
+            .put_blob(PutBlobInput {
+                key: "k".into(),
+                body: Bytes::from_static(b"abcdefghij"),
+                metadata: HashMap::new(),
+                content_type: None,
+            })
+            .await
+            .unwrap();
+        let h = fs
+            .open(
+                "k",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        fs.set_size(&h, 4).await.unwrap();
+        let g = backend.get_blob("k", None).await.unwrap();
+        assert_eq!(&g.body[..], b"abcd");
+    }
+
+    #[tokio::test]
+    async fn set_size_grow_zero_fills_via_pwrite() {
+        let (backend, fs) = small_fs();
+        let h = fs
+            .open(
+                "k",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    create: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        fs.pwrite(&h, 0, b"abc").await.unwrap();
+        fs.set_size(&h, 10).await.unwrap();
+        fs.sync(&h).await.unwrap();
+        let g = backend.get_blob("k", None).await.unwrap();
+        assert_eq!(&g.body[..], b"abc\0\0\0\0\0\0\0");
+    }
+
+    #[tokio::test]
+    async fn set_size_grow_too_large_rejected() {
+        let (_b, fs) = small_fs();
+        let h = fs
+            .open(
+                "k",
+                OpenFlags {
+                    write: true,
+                    create: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let r = fs.set_size(&h, 200 * 1024 * 1024).await;
+        assert!(matches!(r, Err(FsError::Invalid(_))));
+    }
+
+    // ---------- set_times ----------
+
+    #[tokio::test]
+    async fn set_times_persists_mtime_to_metadata() {
+        let (backend, fs) = small_fs();
+        backend
+            .put_blob(PutBlobInput {
+                key: "k".into(),
+                body: Bytes::from_static(b"x"),
+                metadata: HashMap::new(),
+                content_type: None,
+            })
+            .await
+            .unwrap();
+        let h = fs.open("k", OpenFlags::write_only()).await.unwrap();
+        let target_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        fs.set_times(&h, None, Some(target_mtime)).await.unwrap();
+        // Wire-level: object metadata now carries our mtime key.
+        let head = backend.head_blob("k").await.unwrap();
+        assert!(head
+            .metadata
+            .get(METADATA_MTIME_KEY)
+            .is_some_and(|v| v.starts_with("1700000000")));
+    }
+
+    #[tokio::test]
+    async fn set_times_at_with_no_follow_targets_symlink_itself() {
+        let (backend, fs) = small_fs();
+        backend
+            .put_blob(PutBlobInput {
+                key: "target".into(),
+                body: Bytes::from_static(b"data"),
+                metadata: HashMap::new(),
+                content_type: None,
+            })
+            .await
+            .unwrap();
+        fs.symlink_at(&fs.root(), "link", "target").await.unwrap();
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+
+        // follow=false: writes mtime to the SYMLINK object, not the target.
+        fs.set_times_at(&fs.root(), "link", false, None, Some(mtime))
+            .await
+            .unwrap();
+        let link_head = backend.head_blob("link").await.unwrap();
+        assert!(link_head.metadata.contains_key(METADATA_MTIME_KEY));
+        let target_head = backend.head_blob("target").await.unwrap();
+        assert!(!target_head.metadata.contains_key(METADATA_MTIME_KEY));
     }
 
     // ---------- symlinks ----------
@@ -1757,13 +2114,19 @@ mod tests {
         let h = fs
             .open(
                 "k",
-                OpenFlags { read: true, write: true, ..Default::default() },
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
 
         // Modify these part indices (non-contiguous, includes boundaries).
-        let modified_parts = [0u32, 1, 5, 7, 11, 12, 13, 19, 23, 27, 31, 35, 41, 42, 43, 47, 49];
+        let modified_parts = [
+            0u32, 1, 5, 7, 11, 12, 13, 19, 23, 27, 31, 35, 41, 42, 43, 47, 49,
+        ];
         for &p in &modified_parts {
             let off = (p * 4) as u64;
             // Write distinctive 4-byte sequence "Z<idx>" packed; just use 'Z'.

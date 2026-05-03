@@ -208,7 +208,9 @@ impl PartBuf {
     /// are preserved so the flusher can retry.
     pub fn mark_flush_failed(&mut self) -> FsResult<()> {
         if !matches!(self.state, PartState::Flushing) {
-            return Err(FsError::Invalid("mark_flush_failed requires Flushing state"));
+            return Err(FsError::Invalid(
+                "mark_flush_failed requires Flushing state",
+            ));
         }
         self.state = PartState::Dirty;
         Ok(())
@@ -364,7 +366,7 @@ mod tests {
         // Can't mark_flushing from Dirty-but-empty? Actually we can — Dirty
         // state allows flushing; let's test something that's truly invalid.
         assert!(p.mark_flushed("nope".into()).is_err()); // Dirty → not allowed
-        assert!(p.mark_clean().is_err());                // Dirty → not allowed
+        assert!(p.mark_clean().is_err()); // Dirty → not allowed
     }
 
     #[test]

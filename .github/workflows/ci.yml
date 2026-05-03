@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build + test (default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build --workspace --all-targets
+      - name: cargo test (lib)
+        run: cargo test --workspace --lib
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build-aws:
+    name: build + test (aws feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --features aws
+        run: cargo build --workspace --features aws --all-targets
+      - name: cargo test --features aws (lib)
+        run: cargo test --workspace --features aws --lib
+      - name: cargo clippy --features aws
+        run: cargo clippy --workspace --features aws --all-targets -- -D warnings
+
+  minio-integration:
+    name: MinIO integration tests
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/ready"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+          ENTRYPOINT /usr/bin/docker-entrypoint.sh server /data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (minio integration)
+        run: cargo test -p s3fs-core --features aws --test minio_integration -- --ignored --test-threads=1
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  guest-build:
+    name: example guest builds for wasm32-wasip2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasi-sdk
+        run: |
+          curl -sLO https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
+          mkdir -p $HOME/wasi-sdk
+          tar xf wasi-sdk-25.0-x86_64-linux.tar.gz -C $HOME/wasi-sdk --strip-components=1
+      - name: build guest-fsdemo (with bundled SQLite)
+        env:
+          CC_wasm32_wasip2: ${{ github.workspace }}/../wasi-sdk/bin/clang
+          AR_wasm32_wasip2: ${{ github.workspace }}/../wasi-sdk/bin/ar
+        run: |
+          export CC_wasm32_wasip2=$HOME/wasi-sdk/bin/clang
+          export AR_wasm32_wasip2=$HOME/wasi-sdk/bin/ar
+          export CFLAGS_wasm32_wasip2="--sysroot=$HOME/wasi-sdk/share/wasi-sysroot -DSQLITE_THREADSAFE=0 -DHAVE_USLEEP=1"
+          cd examples/guest-fsdemo
+          cargo build --release --target wasm32-wasip2

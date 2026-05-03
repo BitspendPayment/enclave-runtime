@@ -51,7 +51,11 @@ impl InodeTree {
             // s3_key(root) is just the bucket_prefix; we want it slash-terminated
             // unless empty.
             let p = self.s3_key(dir);
-            if p.is_empty() { String::new() } else { format!("{p}/") }
+            if p.is_empty() {
+                String::new()
+            } else {
+                format!("{p}/")
+            }
         } else {
             self.s3_dir_key(dir)
         };
@@ -134,23 +138,13 @@ impl InodeTree {
                 _ => {
                     let id = self.alloc_id();
                     let new_inode = match src {
-                        EntrySrc::File => {
-                            Inode::new_file(id, &name, Arc::downgrade(dir), attrs)
+                        EntrySrc::File => Inode::new_file(id, &name, Arc::downgrade(dir), attrs),
+                        EntrySrc::ExplicitDir => {
+                            Inode::new_dir(id, &name, Some(Arc::downgrade(dir)), true, attrs)
                         }
-                        EntrySrc::ExplicitDir => Inode::new_dir(
-                            id,
-                            &name,
-                            Some(Arc::downgrade(dir)),
-                            true,
-                            attrs,
-                        ),
-                        EntrySrc::ImplicitDir => Inode::new_dir(
-                            id,
-                            &name,
-                            Some(Arc::downgrade(dir)),
-                            false,
-                            attrs,
-                        ),
+                        EntrySrc::ImplicitDir => {
+                            Inode::new_dir(id, &name, Some(Arc::downgrade(dir)), false, attrs)
+                        }
                     };
                     self.attach(dir, new_inode)
                 }
@@ -183,8 +177,10 @@ mod tests {
 
     fn fresh() -> (Arc<MemoryBackend>, Arc<InodeTree>) {
         let backend = Arc::new(MemoryBackend::new());
-        let tree =
-            InodeTree::new(backend.clone() as Arc<dyn Backend>, Arc::new(Config::default()));
+        let tree = InodeTree::new(
+            backend.clone() as Arc<dyn Backend>,
+            Arc::new(Config::default()),
+        );
         (backend, tree)
     }
 
@@ -227,14 +223,17 @@ mod tests {
         let (backend, tree) = fresh();
         put(&backend, "file1.txt", b"x").await;
         put(&backend, "subdir/inner.txt", b"y").await; // implicit dir
-        put(&backend, "explicit/", b"").await;          // explicit dir marker
+        put(&backend, "explicit/", b"").await; // explicit dir marker
         put(&backend, "explicit/inner.txt", b"z").await;
 
         let snap = tree.snapshot_directory(&tree.root()).await.unwrap();
         let names: Vec<_> = snap.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["explicit", "file1.txt", "subdir"]);
 
-        let by_name: HashMap<_, _> = snap.iter().map(|e| (e.name.clone(), e.inode.clone())).collect();
+        let by_name: HashMap<_, _> = snap
+            .iter()
+            .map(|e| (e.name.clone(), e.inode.clone()))
+            .collect();
         assert!(by_name["file1.txt"].is_regular_file());
         assert!(by_name["explicit"].is_dir());
         assert!(by_name["subdir"].is_dir());

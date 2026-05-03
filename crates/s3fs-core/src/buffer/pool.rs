@@ -31,7 +31,10 @@ pub struct PartKey {
 
 impl PartKey {
     pub fn new(inode_id: InodeId, part_index: u32) -> Self {
-        Self { inode_id, part_index }
+        Self {
+            inode_id,
+            part_index,
+        }
     }
 }
 
@@ -106,10 +109,7 @@ impl BufferPool {
 
         // Evict clean parts until we'd fit, or we run out of evictable parts.
         if g.used + new_cost > self.config.memory_limit_bytes {
-            let target = self
-                .config
-                .memory_limit_bytes
-                .saturating_sub(new_cost);
+            let target = self.config.memory_limit_bytes.saturating_sub(new_cost);
             self.evict_clean_locked(&mut g, target);
         }
 

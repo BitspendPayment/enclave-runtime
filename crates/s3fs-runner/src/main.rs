@@ -24,7 +24,10 @@ use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Run a Wasm component with wasi:filesystem backed by S3")]
+#[command(
+    version,
+    about = "Run a Wasm component with wasi:filesystem backed by S3"
+)]
 struct Cli {
     /// S3 bucket name.
     #[arg(long, env = "S3FS_BUCKET")]

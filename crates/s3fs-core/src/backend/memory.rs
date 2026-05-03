@@ -252,7 +252,11 @@ impl Backend for MemoryBackend {
         }
 
         let is_truncated = idx < keys.len();
-        let next_continuation_token = if is_truncated { last_consumed_key } else { None };
+        let next_continuation_token = if is_truncated {
+            last_consumed_key
+        } else {
+            None
+        };
 
         Ok(ListBlobsOutput {
             items,
@@ -280,7 +284,8 @@ impl Backend for MemoryBackend {
             content_type,
             metadata,
         };
-        g.objects.insert(input.destination_key.clone(), stored.clone());
+        g.objects
+            .insert(input.destination_key.clone(), stored.clone());
         Ok(self.meta_from_stored(&input.destination_key, &stored))
     }
 
@@ -631,21 +636,11 @@ mod tests {
             .await
             .unwrap();
         let p1 = b
-            .multipart_upload_part(
-                "big",
-                &id,
-                1,
-                Bytes::from_static(b"hello "),
-            )
+            .multipart_upload_part("big", &id, 1, Bytes::from_static(b"hello "))
             .await
             .unwrap();
         let p2 = b
-            .multipart_upload_part(
-                "big",
-                &id,
-                2,
-                Bytes::from_static(b"world"),
-            )
+            .multipart_upload_part("big", &id, 2, Bytes::from_static(b"world"))
             .await
             .unwrap();
         b.multipart_complete(

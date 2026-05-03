@@ -36,3 +36,8 @@ tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros
 anyhow = { workspace = true }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["minio"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "fs_hot_paths"
+harness = false

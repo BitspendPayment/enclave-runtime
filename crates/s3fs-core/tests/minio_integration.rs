@@ -201,13 +201,7 @@ async fn multipart_lifecycle_with_upload_part_copy() {
 
     // Part 1 = first 5 MiB of src (copied), Part 2 = a fresh 5 MiB upload.
     let p1 = backend
-        .multipart_upload_part_copy(
-            "dst",
-            &upload_id,
-            1,
-            "src",
-            0..(part_size as u64),
-        )
+        .multipart_upload_part_copy("dst", &upload_id, 1, "src", 0..(part_size as u64))
         .await
         .unwrap();
     let p2_body = vec![0xAB; part_size];
@@ -394,10 +388,7 @@ async fn fs_symlink_round_trip() {
 
     let root = fs.root();
     fs.symlink_at(&root, "link", "target.txt").await.unwrap();
-    assert_eq!(
-        fs.readlink_at(&root, "link").await.unwrap(),
-        "target.txt"
-    );
+    assert_eq!(fs.readlink_at(&root, "link").await.unwrap(), "target.txt");
     // Re-creating the same symlink should fail with AlreadyExists.
     let r = fs.symlink_at(&root, "link", "other.txt").await;
     assert!(matches!(r, Err(FsError::AlreadyExists)));

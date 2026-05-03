@@ -7,6 +7,7 @@ pub mod backend;
 pub mod buffer;
 pub mod config;
 pub mod errors;
+pub mod flusher;
 pub mod fs;
 pub mod inode;
 pub mod mpu;

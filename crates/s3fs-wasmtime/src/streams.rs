@@ -53,10 +53,7 @@ impl Pollable for S3OutputStream {
                     self.position += written as u64;
                 }
                 Err(e) => {
-                    self.last_error = Some(wasmtime::Error::msg(format!(
-                        "{:?}",
-                        from_fs(e)
-                    )));
+                    self.last_error = Some(wasmtime::Error::msg(format!("{:?}", from_fs(e))));
                 }
             }
         }

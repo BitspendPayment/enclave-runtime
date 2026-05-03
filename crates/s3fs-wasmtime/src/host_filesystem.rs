@@ -7,9 +7,9 @@
 //! them through `wasmtime-wasi`'s stream machinery is reserved for a follow-
 //! up.
 
-use wasmtime::Result;
 use s3fs_core::{InodeKind, OpenFlags};
 use wasmtime::component::Resource;
+use wasmtime::Result;
 use wasmtime_wasi::p2::bindings::io::streams::{InputStream, OutputStream};
 
 use crate::bindings::wasi::filesystem::types::{
@@ -28,7 +28,8 @@ use crate::view::S3FsCtxView;
 
 impl wit::Host for S3FsCtxView<'_> {
     fn convert_error_code(&mut self, err: S3WasiFsError) -> Result<ErrorCode> {
-        err.downcast()}
+        err.downcast()
+    }
 
     async fn filesystem_error_code(
         &mut self,
@@ -64,6 +65,43 @@ fn descriptor_type_for(kind: &InodeKind) -> DescriptorType {
         InodeKind::RegularFile => DescriptorType::RegularFile,
         InodeKind::Directory { .. } => DescriptorType::Directory,
         InodeKind::Symlink { .. } => DescriptorType::SymbolicLink,
+    }
+}
+
+fn stat_from_attrs(attrs: &s3fs_core::inode::Attrs, kind: &InodeKind) -> DescriptorStat {
+    let dt = systemtime_to_wit(attrs.last_modified);
+    DescriptorStat {
+        type_: descriptor_type_for(kind),
+        link_count: 1,
+        size: attrs.size,
+        // Without a separate atime field in our cache, fall back to mtime.
+        data_access_timestamp: Some(dt),
+        data_modification_timestamp: Some(dt),
+        status_change_timestamp: Some(dt),
+    }
+}
+
+fn systemtime_to_wit(
+    t: std::time::SystemTime,
+) -> wasmtime_wasi::p2::bindings::clocks::wall_clock::Datetime {
+    let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    wasmtime_wasi::p2::bindings::clocks::wall_clock::Datetime {
+        seconds: d.as_secs(),
+        nanoseconds: d.subsec_nanos(),
+    }
+}
+
+/// Convert a WIT `new-timestamp` to `Option<SystemTime>` per WASI semantics:
+/// - `NoChange` → `None` (don't update this field)
+/// - `Now` → `Some(now)`
+/// - `Timestamp(dt)` → `Some(epoch + dt.seconds + dt.nanoseconds)`
+fn wit_timestamp_to_systemtime(ts: NewTimestamp) -> Option<std::time::SystemTime> {
+    match ts {
+        NewTimestamp::NoChange => None,
+        NewTimestamp::Now => Some(std::time::SystemTime::now()),
+        NewTimestamp::Timestamp(dt) => {
+            Some(std::time::UNIX_EPOCH + std::time::Duration::new(dt.seconds, dt.nanoseconds))
+        }
     }
 }
 
@@ -117,8 +155,9 @@ impl HostDescriptor for S3FsCtxView<'_> {
             Descriptor::File { handle } => handle,
             Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
         };
-        let s: wasmtime_wasi::p2::DynInputStream =
-            Box::new(crate::streams::S3InputStream::read_at(self.fs.clone(), handle, offset));
+        let s: wasmtime_wasi::p2::DynInputStream = Box::new(
+            crate::streams::S3InputStream::read_at(self.fs.clone(), handle, offset),
+        );
         let res = self
             .table
             .push(s)
@@ -136,8 +175,9 @@ impl HostDescriptor for S3FsCtxView<'_> {
             Descriptor::File { handle } => handle,
             Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
         };
-        let s: wasmtime_wasi::p2::DynOutputStream =
-            Box::new(crate::streams::S3OutputStream::write_at(self.fs.clone(), handle, offset));
+        let s: wasmtime_wasi::p2::DynOutputStream = Box::new(
+            crate::streams::S3OutputStream::write_at(self.fs.clone(), handle, offset),
+        );
         let res = self
             .table
             .push(s)
@@ -155,8 +195,9 @@ impl HostDescriptor for S3FsCtxView<'_> {
             Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
         };
         let offset = *handle.size.read();
-        let s: wasmtime_wasi::p2::DynOutputStream =
-            Box::new(crate::streams::S3OutputStream::write_at(self.fs.clone(), handle, offset));
+        let s: wasmtime_wasi::p2::DynOutputStream = Box::new(
+            crate::streams::S3OutputStream::write_at(self.fs.clone(), handle, offset),
+        );
         let res = self
             .table
             .push(s)
@@ -187,26 +228,41 @@ impl HostDescriptor for S3FsCtxView<'_> {
     }
 
     async fn get_type(&mut self, fd: Resource<WitDescriptor>) -> S3WasiFsResult<DescriptorType> {
-        let d = self.table.get(&fd).map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
+        let d = self
+            .table
+            .get(&fd)
+            .map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
         let kind = d.inode().kind.read().clone();
         Ok(descriptor_type_for(&kind))
     }
 
     async fn set_size(
         &mut self,
-        _fd: Resource<WitDescriptor>,
-        _size: Filesize,
+        fd: Resource<WitDescriptor>,
+        size: Filesize,
     ) -> S3WasiFsResult<()> {
-        Err(S3WasiFsError::from(ErrorCode::Unsupported))
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
+        let handle = match d {
+            Descriptor::File { handle } => handle,
+            Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
+        };
+        self.fs.set_size(&handle, size).await.into_wasi()
     }
 
     async fn set_times(
         &mut self,
-        _fd: Resource<WitDescriptor>,
-        _data_access_timestamp: NewTimestamp,
-        _data_modification_timestamp: NewTimestamp,
+        fd: Resource<WitDescriptor>,
+        data_access_timestamp: NewTimestamp,
+        data_modification_timestamp: NewTimestamp,
     ) -> S3WasiFsResult<()> {
-        Err(S3WasiFsError::from(ErrorCode::Unsupported))
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
+        let handle = match d {
+            Descriptor::File { handle } => handle,
+            Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
+        };
+        let atime = wit_timestamp_to_systemtime(data_access_timestamp);
+        let mtime = wit_timestamp_to_systemtime(data_modification_timestamp);
+        self.fs.set_times(&handle, atime, mtime).await.into_wasi()
     }
 
     async fn read(
@@ -286,17 +342,13 @@ impl HostDescriptor for S3FsCtxView<'_> {
     }
 
     async fn stat(&mut self, fd: Resource<WitDescriptor>) -> S3WasiFsResult<DescriptorStat> {
-        let d = self.table.get(&fd).map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
+        let d = self
+            .table
+            .get(&fd)
+            .map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
         let kind = d.inode().kind.read().clone();
         let attrs = d.inode().attrs.read().clone();
-        Ok(DescriptorStat {
-            type_: descriptor_type_for(&kind),
-            link_count: 1,
-            size: attrs.size,
-            data_access_timestamp: None,
-            data_modification_timestamp: None,
-            status_change_timestamp: None,
-        })
+        Ok(stat_from_attrs(&attrs, &kind))
     }
 
     async fn stat_at(
@@ -315,25 +367,26 @@ impl HostDescriptor for S3FsCtxView<'_> {
         .map_err(|e| S3WasiFsError::from(from_fs(e)))?;
         let kind = target.kind.read().clone();
         let attrs = target.attrs.read().clone();
-        Ok(DescriptorStat {
-            type_: descriptor_type_for(&kind),
-            link_count: 1,
-            size: attrs.size,
-            data_access_timestamp: None,
-            data_modification_timestamp: None,
-            status_change_timestamp: None,
-        })
+        Ok(stat_from_attrs(&attrs, &kind))
     }
 
     async fn set_times_at(
         &mut self,
-        _fd: Resource<WitDescriptor>,
-        _path_flags: PathFlags,
-        _path: String,
-        _data_access_timestamp: NewTimestamp,
-        _data_modification_timestamp: NewTimestamp,
+        fd: Resource<WitDescriptor>,
+        path_flags: PathFlags,
+        path: String,
+        data_access_timestamp: NewTimestamp,
+        data_modification_timestamp: NewTimestamp,
     ) -> S3WasiFsResult<()> {
-        Err(S3WasiFsError::from(ErrorCode::Unsupported))
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
+        let base = d.at_base();
+        let follow = path_flags.contains(PathFlags::SYMLINK_FOLLOW);
+        let atime = wit_timestamp_to_systemtime(data_access_timestamp);
+        let mtime = wit_timestamp_to_systemtime(data_modification_timestamp);
+        self.fs
+            .set_times_at(&base, &path, follow, atime, mtime)
+            .await
+            .into_wasi()
     }
 
     async fn link_at(
@@ -443,7 +496,8 @@ impl HostDescriptor for S3FsCtxView<'_> {
         new_path: String,
     ) -> S3WasiFsResult<()> {
         let old_d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
-        let new_d = get_descriptor_owned(self.table, &new_descriptor).map_err(S3WasiFsError::trap)?;
+        let new_d =
+            get_descriptor_owned(self.table, &new_descriptor).map_err(S3WasiFsError::trap)?;
         let old_base = old_d.at_base();
         let new_base = new_d.at_base();
         let (op, oname) = split_at_path(&old_path);
@@ -499,7 +553,10 @@ impl HostDescriptor for S3FsCtxView<'_> {
         &mut self,
         fd: Resource<WitDescriptor>,
     ) -> S3WasiFsResult<MetadataHashValue> {
-        let d = self.table.get(&fd).map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
+        let d = self
+            .table
+            .get(&fd)
+            .map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
         Ok(metadata_hash_for(d))
     }
 
