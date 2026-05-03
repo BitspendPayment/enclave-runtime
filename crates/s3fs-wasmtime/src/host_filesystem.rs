@@ -7,10 +7,10 @@
 //! them through `wasmtime-wasi`'s stream machinery is reserved for a follow-
 //! up.
 
-use anyhow::Result;
+use wasmtime::Result;
 use s3fs_core::{InodeKind, OpenFlags};
 use wasmtime::component::Resource;
-use wasmtime_wasi::bindings::io::streams::{InputStream, OutputStream};
+use wasmtime_wasi::p2::bindings::io::streams::{InputStream, OutputStream};
 
 use crate::bindings::wasi::filesystem::types::{
     self as wit, Descriptor as WitDescriptor, DescriptorFlags, DescriptorStat, DescriptorType,
@@ -20,20 +20,19 @@ use crate::bindings::wasi::filesystem::types::{
 };
 use crate::descriptors::{Descriptor, DirectoryEntryStream};
 use crate::error_map::{from_fs, IntoS3WasiResult, S3WasiFsError, S3WasiFsResult};
-use crate::view::S3FsHostState;
+use crate::view::S3FsCtxView;
 
 // ---------------------------------------------------------------------------
 // types::Host
 // ---------------------------------------------------------------------------
 
-impl wit::Host for S3FsHostState {
+impl wit::Host for S3FsCtxView<'_> {
     fn convert_error_code(&mut self, err: S3WasiFsError) -> Result<ErrorCode> {
-        err.downcast()
-    }
+        err.downcast()}
 
     async fn filesystem_error_code(
         &mut self,
-        _err: Resource<wasmtime_wasi::bindings::io::error::Error>,
+        _err: Resource<wasmtime_wasi::p2::bindings::io::error::Error>,
     ) -> Result<Option<ErrorCode>> {
         // Streams are not yet wired up; nothing to inspect.
         Ok(None)
@@ -45,11 +44,11 @@ impl wit::Host for S3FsHostState {
 // ---------------------------------------------------------------------------
 
 fn get_descriptor_owned(
-    state: &mut S3FsHostState,
+    table: &mut wasmtime::component::ResourceTable,
     fd: &Resource<WitDescriptor>,
 ) -> Result<Descriptor> {
     // Clone via match — both variants are cheap (Arc clones).
-    let d = state.table.get(fd).map_err(anyhow::Error::from)?;
+    let d = table.get(fd).map_err(wasmtime::Error::from)?;
     Ok(match d {
         Descriptor::File { handle } => Descriptor::File {
             handle: handle.clone(),
@@ -107,28 +106,62 @@ async fn resolve_parent(
 // HostDescriptor — every method in the WIT
 // ---------------------------------------------------------------------------
 
-impl HostDescriptor for S3FsHostState {
+impl HostDescriptor for S3FsCtxView<'_> {
     async fn read_via_stream(
         &mut self,
-        _fd: Resource<WitDescriptor>,
-        _offset: Filesize,
+        fd: Resource<WitDescriptor>,
+        offset: Filesize,
     ) -> Result<Resource<InputStream>, S3WasiFsError> {
-        Err(S3WasiFsError::from(ErrorCode::Unsupported))
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
+        let handle = match d {
+            Descriptor::File { handle } => handle,
+            Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
+        };
+        let s: wasmtime_wasi::p2::DynInputStream =
+            Box::new(crate::streams::S3InputStream::read_at(self.fs.clone(), handle, offset));
+        let res = self
+            .table
+            .push(s)
+            .map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
+        Ok(res)
     }
 
     async fn write_via_stream(
         &mut self,
-        _fd: Resource<WitDescriptor>,
-        _offset: Filesize,
+        fd: Resource<WitDescriptor>,
+        offset: Filesize,
     ) -> Result<Resource<OutputStream>, S3WasiFsError> {
-        Err(S3WasiFsError::from(ErrorCode::Unsupported))
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
+        let handle = match d {
+            Descriptor::File { handle } => handle,
+            Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
+        };
+        let s: wasmtime_wasi::p2::DynOutputStream =
+            Box::new(crate::streams::S3OutputStream::write_at(self.fs.clone(), handle, offset));
+        let res = self
+            .table
+            .push(s)
+            .map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
+        Ok(res)
     }
 
     async fn append_via_stream(
         &mut self,
-        _fd: Resource<WitDescriptor>,
+        fd: Resource<WitDescriptor>,
     ) -> Result<Resource<OutputStream>, S3WasiFsError> {
-        Err(S3WasiFsError::from(ErrorCode::Unsupported))
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
+        let handle = match d {
+            Descriptor::File { handle } => handle,
+            Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
+        };
+        let offset = *handle.size.read();
+        let s: wasmtime_wasi::p2::DynOutputStream =
+            Box::new(crate::streams::S3OutputStream::write_at(self.fs.clone(), handle, offset));
+        let res = self
+            .table
+            .push(s)
+            .map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
+        Ok(res)
     }
 
     async fn advise(
@@ -142,7 +175,7 @@ impl HostDescriptor for S3FsHostState {
     }
 
     async fn sync_data(&mut self, fd: Resource<WitDescriptor>) -> S3WasiFsResult<()> {
-        let d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         match d {
             Descriptor::File { handle } => self.fs.sync(&handle).await.into_wasi(),
             Descriptor::Dir { .. } => Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
@@ -154,7 +187,7 @@ impl HostDescriptor for S3FsHostState {
     }
 
     async fn get_type(&mut self, fd: Resource<WitDescriptor>) -> S3WasiFsResult<DescriptorType> {
-        let d = self.table.get(&fd).map_err(|e| S3WasiFsError::trap(anyhow::Error::from(e)))?;
+        let d = self.table.get(&fd).map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
         let kind = d.inode().kind.read().clone();
         Ok(descriptor_type_for(&kind))
     }
@@ -182,7 +215,7 @@ impl HostDescriptor for S3FsHostState {
         length: Filesize,
         offset: Filesize,
     ) -> S3WasiFsResult<(Vec<u8>, bool)> {
-        let d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let handle = match d {
             Descriptor::File { handle } => handle,
             Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
@@ -202,7 +235,7 @@ impl HostDescriptor for S3FsHostState {
         buffer: Vec<u8>,
         offset: Filesize,
     ) -> S3WasiFsResult<Filesize> {
-        let d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let handle = match d {
             Descriptor::File { handle } => handle,
             Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
@@ -219,7 +252,7 @@ impl HostDescriptor for S3FsHostState {
         &mut self,
         fd: Resource<WitDescriptor>,
     ) -> S3WasiFsResult<Resource<WitDirectoryEntryStream>> {
-        let d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let dir = match d {
             Descriptor::Dir { inode } => inode,
             Descriptor::File { .. } => return Err(S3WasiFsError::from(ErrorCode::NotDirectory)),
@@ -232,7 +265,7 @@ impl HostDescriptor for S3FsHostState {
         let res = self
             .table
             .push(DirectoryEntryStream::new(entries))
-            .map_err(|e| S3WasiFsError::trap(anyhow::Error::from(e)))?;
+            .map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
         Ok(res)
     }
 
@@ -245,15 +278,15 @@ impl HostDescriptor for S3FsHostState {
         fd: Resource<WitDescriptor>,
         path: String,
     ) -> S3WasiFsResult<()> {
-        let d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let (parent_path, name) = split_at_path(&path);
-        let parent = resolve_parent(&self.fs, &base, parent_path).await?;
+        let parent = resolve_parent(self.fs, &base, parent_path).await?;
         self.fs.mkdir(&parent, name).await.map(|_| ()).into_wasi()
     }
 
     async fn stat(&mut self, fd: Resource<WitDescriptor>) -> S3WasiFsResult<DescriptorStat> {
-        let d = self.table.get(&fd).map_err(|e| S3WasiFsError::trap(anyhow::Error::from(e)))?;
+        let d = self.table.get(&fd).map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
         let kind = d.inode().kind.read().clone();
         let attrs = d.inode().attrs.read().clone();
         Ok(DescriptorStat {
@@ -272,7 +305,7 @@ impl HostDescriptor for S3FsHostState {
         _path_flags: PathFlags,
         path: String,
     ) -> S3WasiFsResult<DescriptorStat> {
-        let d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let target = self
             .fs
@@ -323,7 +356,7 @@ impl HostDescriptor for S3FsHostState {
         open_flags: WitOpenFlags,
         descriptor_flags: DescriptorFlags,
     ) -> S3WasiFsResult<Resource<WitDescriptor>> {
-        let d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
 
         let mut flags = open_flags_from_wit(open_flags);
@@ -361,7 +394,7 @@ impl HostDescriptor for S3FsHostState {
         let res = self
             .table
             .push(descriptor)
-            .map_err(|e| S3WasiFsError::trap(anyhow::Error::from(e)))?;
+            .map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
         Ok(res)
     }
 
@@ -370,10 +403,10 @@ impl HostDescriptor for S3FsHostState {
         fd: Resource<WitDescriptor>,
         path: String,
     ) -> S3WasiFsResult<String> {
-        let d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let (parent_path, name) = split_at_path(&path);
-        let parent = resolve_parent(&self.fs, &base, parent_path).await?;
+        let parent = resolve_parent(self.fs, &base, parent_path).await?;
         self.fs.readlink_at(&parent, name).await.into_wasi()
     }
 
@@ -382,10 +415,10 @@ impl HostDescriptor for S3FsHostState {
         fd: Resource<WitDescriptor>,
         path: String,
     ) -> S3WasiFsResult<()> {
-        let d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let (parent_path, name) = split_at_path(&path);
-        let parent = resolve_parent(&self.fs, &base, parent_path).await?;
+        let parent = resolve_parent(self.fs, &base, parent_path).await?;
         self.fs.rmdir(&parent, name).await.into_wasi()
     }
 
@@ -396,14 +429,14 @@ impl HostDescriptor for S3FsHostState {
         new_descriptor: Resource<WitDescriptor>,
         new_path: String,
     ) -> S3WasiFsResult<()> {
-        let old_d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
-        let new_d = get_descriptor_owned(self, &new_descriptor).map_err(S3WasiFsError::trap)?;
+        let old_d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
+        let new_d = get_descriptor_owned(self.table, &new_descriptor).map_err(S3WasiFsError::trap)?;
         let old_base = old_d.at_base();
         let new_base = new_d.at_base();
         let (op, oname) = split_at_path(&old_path);
         let (np, nname) = split_at_path(&new_path);
-        let old_parent = resolve_parent(&self.fs, &old_base, op).await?;
-        let new_parent = resolve_parent(&self.fs, &new_base, np).await?;
+        let old_parent = resolve_parent(self.fs, &old_base, op).await?;
+        let new_parent = resolve_parent(self.fs, &new_base, np).await?;
         self.fs
             .rename(&old_parent, oname, &new_parent, nname)
             .await
@@ -416,10 +449,10 @@ impl HostDescriptor for S3FsHostState {
         old_path: String,
         new_path: String,
     ) -> S3WasiFsResult<()> {
-        let d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let (parent_path, name) = split_at_path(&new_path);
-        let parent = resolve_parent(&self.fs, &base, parent_path).await?;
+        let parent = resolve_parent(self.fs, &base, parent_path).await?;
         self.fs
             .symlink_at(&parent, name, &old_path)
             .await
@@ -432,10 +465,10 @@ impl HostDescriptor for S3FsHostState {
         fd: Resource<WitDescriptor>,
         path: String,
     ) -> S3WasiFsResult<()> {
-        let d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let (parent_path, name) = split_at_path(&path);
-        let parent = resolve_parent(&self.fs, &base, parent_path).await?;
+        let parent = resolve_parent(self.fs, &base, parent_path).await?;
         self.fs.unlink(&parent, name).await.into_wasi()
     }
 
@@ -453,7 +486,7 @@ impl HostDescriptor for S3FsHostState {
         &mut self,
         fd: Resource<WitDescriptor>,
     ) -> S3WasiFsResult<MetadataHashValue> {
-        let d = self.table.get(&fd).map_err(|e| S3WasiFsError::trap(anyhow::Error::from(e)))?;
+        let d = self.table.get(&fd).map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
         Ok(metadata_hash_for(d))
     }
 
@@ -463,7 +496,7 @@ impl HostDescriptor for S3FsHostState {
         _path_flags: PathFlags,
         path: String,
     ) -> S3WasiFsResult<MetadataHashValue> {
-        let d = get_descriptor_owned(self, &fd).map_err(S3WasiFsError::trap)?;
+        let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let target = self
             .fs
@@ -508,7 +541,7 @@ fn simple_hash(etag: &str, size: u64) -> u64 {
 // HostDirectoryEntryStream
 // ---------------------------------------------------------------------------
 
-impl HostDirectoryEntryStream for S3FsHostState {
+impl HostDirectoryEntryStream for S3FsCtxView<'_> {
     async fn read_directory_entry(
         &mut self,
         stream: Resource<WitDirectoryEntryStream>,
@@ -516,7 +549,7 @@ impl HostDirectoryEntryStream for S3FsHostState {
         let s = self
             .table
             .get_mut(&stream)
-            .map_err(|e| S3WasiFsError::trap(anyhow::Error::from(e)))?;
+            .map_err(|e| S3WasiFsError::trap(wasmtime::Error::from(e)))?;
         if s.cursor >= s.entries.len() {
             return Ok(None);
         }

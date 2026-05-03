@@ -1,0 +1,28 @@
+[package]
+name = "s3fs-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wasmtime runner that loads a Wasm component and exposes wasi:filesystem backed by S3"
+
+[[bin]]
+name = "s3fs-runner"
+path = "src/main.rs"
+
+[dependencies]
+s3fs-core     = { path = "../s3fs-core", features = ["aws"] }
+s3fs-wasmtime = { path = "../s3fs-wasmtime" }
+
+# Runner needs the compiler (cranelift) plus runtime; the workspace base dep
+# is runtime-only so the library crate stays light.
+wasmtime         = { version = "=44.0.0", features = ["component-model", "async", "runtime", "cranelift", "std"] }
+wasmtime-wasi    = { workspace = true }
+wasmtime-wasi-io = "=44.0.0"
+
+clap    = { version = "4", features = ["derive", "env"] }
+tokio   = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+anyhow  = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

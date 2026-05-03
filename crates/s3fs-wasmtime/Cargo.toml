@@ -9,8 +9,9 @@ description = "Wasmtime host bindings that expose `s3fs-core` as wasi:filesystem
 
 [dependencies]
 s3fs-core     = { path = "../s3fs-core" }
-wasmtime      = { workspace = true }
-wasmtime-wasi = { workspace = true }
+wasmtime         = { workspace = true }
+wasmtime-wasi    = { workspace = true }
+wasmtime-wasi-io = "=44.0.0"
 async-trait   = { workspace = true }
 anyhow        = { workspace = true }
 bytes         = { workspace = true }

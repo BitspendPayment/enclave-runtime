@@ -1,0 +1,19 @@
+[package]
+name = "guest-fsdemo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone — not part of the host workspace, so cargo doesn't try to
+# build it for the host platform on `cargo build --workspace`.
+[workspace]
+
+[[bin]]
+name = "guest-fsdemo"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

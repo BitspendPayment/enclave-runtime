@@ -1,4 +1,4 @@
-//! `wasmtime::component::bindgen!` invocation against the vendored WASI 0.2.3
+//! `wasmtime::component::bindgen!` invocation against the vendored WASI 0.2.6
 //! WIT. Generates the host traits we then implement in `host_*.rs`.
 //!
 //! `with:` reuses `wasmtime-wasi`'s pre-generated bindings for `wasi:io` and
@@ -9,15 +9,16 @@
 wasmtime::component::bindgen!({
     path: "../../wit",
     world: "s3fs-host",
-    async: true,
-    trappable_imports: true,
+    imports: { default: async | trappable },
     trappable_error_type: {
-        "wasi:filesystem/types/error-code" => crate::error_map::S3WasiFsError,
+        "wasi:filesystem/types.error-code" => crate::error_map::S3WasiFsError,
     },
     with: {
-        "wasi:io":     wasmtime_wasi::bindings::io,
-        "wasi:clocks": wasmtime_wasi::bindings::clocks,
-        "wasi:filesystem/types/descriptor":             crate::descriptors::Descriptor,
-        "wasi:filesystem/types/directory-entry-stream": crate::descriptors::DirectoryEntryStream,
+        "wasi:io/poll":     wasmtime_wasi::p2::bindings::io::poll,
+        "wasi:io/streams":  wasmtime_wasi::p2::bindings::io::streams,
+        "wasi:io/error":    wasmtime_wasi::p2::bindings::io::error,
+        "wasi:clocks/wall-clock": wasmtime_wasi::p2::bindings::clocks::wall_clock,
+        "wasi:filesystem/types.descriptor":             crate::descriptors::Descriptor,
+        "wasi:filesystem/types.directory-entry-stream": crate::descriptors::DirectoryEntryStream,
     },
 });

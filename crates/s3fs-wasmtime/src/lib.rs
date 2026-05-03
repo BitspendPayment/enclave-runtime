@@ -15,25 +15,32 @@ pub mod descriptors;
 pub mod error_map;
 pub mod host_filesystem;
 pub mod host_preopens;
+pub mod streams;
 pub mod view;
 
 pub use descriptors::{Descriptor, DirectoryEntryStream};
-pub use view::{S3FsHostState, S3WasiView};
+pub use view::{S3FsCtxView, S3WasiView};
 
-use anyhow::Result;
-use wasmtime::component::Linker;
+use wasmtime::Result;
+use wasmtime::component::{HasData, Linker};
+
+/// `HasData` marker so bindgen knows the trait impls live on
+/// [`S3FsCtxView<'_>`].
+pub struct HasS3Fs;
+impl HasData for HasS3Fs {
+    type Data<'a> = S3FsCtxView<'a>;
+}
 
 /// Add the `wasi:filesystem/{types,preopens}` interfaces to `linker`, backed
 /// by an `s3fs-core::Fs` retrieved from the store via the [`S3WasiView`] trait.
 ///
 /// The caller is responsible for adding the rest of WASI (i/o, clocks, cli,
-/// …) via the standard `wasmtime_wasi::add_to_linker_async` machinery before
-/// or after this call.
+/// …) before or after this call. See `s3fs-runner` for a worked example.
 pub fn add_to_linker<T: S3WasiView + 'static>(linker: &mut Linker<T>) -> Result<()> {
-    fn getter<T: S3WasiView>(t: &mut T) -> &mut S3FsHostState {
-        t.s3fs_state()
+    fn getter<T: S3WasiView>(t: &mut T) -> S3FsCtxView<'_> {
+        t.s3fs_view()
     }
-    bindings::wasi::filesystem::types::add_to_linker_get_host(linker, getter::<T>)?;
-    bindings::wasi::filesystem::preopens::add_to_linker_get_host(linker, getter::<T>)?;
+    bindings::wasi::filesystem::types::add_to_linker::<T, HasS3Fs>(linker, getter::<T>)?;
+    bindings::wasi::filesystem::preopens::add_to_linker::<T, HasS3Fs>(linker, getter::<T>)?;
     Ok(())
 }

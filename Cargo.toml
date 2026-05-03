@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/s3fs-core",
     "crates/s3fs-wasmtime",
+    "crates/s3fs-runner",
 ]
 
 [workspace.package]
@@ -32,8 +33,8 @@ aws-sdk-s3             = { version = "1", default-features = false }
 aws-smithy-runtime-api = "1"
 aws-smithy-types       = "1"
 
-wasmtime      = { version = "29", default-features = false, features = ["component-model", "async", "runtime"] }
-wasmtime-wasi = "29"
+wasmtime      = { version = "=44.0.0", default-features = false, features = ["component-model", "async", "runtime"] }
+wasmtime-wasi = "=44.0.0"
 
 [profile.release]
 lto = "thin"
