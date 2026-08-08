@@ -10,7 +10,12 @@ Designed for [AWS Nitro Enclaves](https://aws.amazon.com/ec2/nitro/nitro-enclave
 
 ## Status
 
-Pre-1.0. Three workspace crates plus an example guest:
+Pre-1.0. The storage engine is complete; the enclave integration is not.
+[`docs/ROADMAP.md`](docs/ROADMAP.md) covers what remains: NSM attestation and
+KMS key release (M8), garbage collection (M9), and the `enclave-runtime` crate
+that runs a guest inside a Nitro Enclave (M10).
+
+Three workspace crates plus an example guest:
 
 | Crate | Purpose |
 |---|---|
