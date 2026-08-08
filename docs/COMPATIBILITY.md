@@ -1,64 +1,71 @@
 # Compatibility Matrix
 
-The user-facing semantic contract: what `wasi:filesystem@0.2.x` ops do behind our implementation, and where they deviate from POSIX.
+What a Wasm guest gets from `wasi:filesystem@0.2.6`, and where it differs from a local filesystem.
 
-S3 is an object store, not a filesystem. Some POSIX semantics map cleanly, some require workarounds, some are fundamentally incompatible. This document is honest about all three categories.
+The storage engine is a ZFS-style copy-on-write block store: content is held in immutable, AEAD-encrypted blocks packed into slab objects, and the whole filesystem hangs off one signed, hash-chained root record. Every mutation is a single transaction group and therefore a single root record, which is where most of the guarantees below come from.
 
----
-
-## ✅ Fully POSIX-equivalent
+## ✅ POSIX-equivalent
 
 | WASI op | Notes |
 |---|---|
-| `read`, `read-via-stream` | Ranged `GetObject` with buffer-pool cache. Streams are non-blocking; `Pollable::ready()` does the actual fetch. |
-| `write`, `write-via-stream`, `append-via-stream` | `MultipartUpload` + `UploadPartCopy` for in-place updates of large files (GeeseFS-parity); single `PutObject` for small files. Streams queue + drain via `Pollable::ready()`. |
-| `stat`, `stat-at` | Race-three lookup on cache miss (parallel HEAD + HEAD-with-slash + LIST). `DescriptorStat` returns mtime from `x-amz-meta-s3wasifs-mtime` if set, else S3's `LastModified`. |
-| `read-directory` | Snapshot at iterator open via paginated `ListObjectsV2(prefix, delim='/')`. Per WASI semantics, entries added/removed mid-iteration may be missed (POSIX-allowed). |
-| `create-directory-at` | Zero-byte `dir/` marker object. |
-| `is-same-object` | Inode-ID comparison; correct **within one mount**. |
-| `get-flags`, `get-type` | Trivial. `get-type` returns `regular-file` / `directory` / `symbolic-link`. |
-| `metadata-hash{,-at}` | `siphash24(etag ‖ size)` for files; siphash of sorted child entries for directories. Changes when content / membership changes. |
-| `advise` (`will-need`, `sequential`) | Honoured as buffer-pool prefetch hints. Other variants are no-ops (allowed by WASI). |
-| `open-at` with `create-flags::create \| exclusive` (`O_EXCL`) | Atomic via S3 `PutObject` with `If-None-Match: *`. Conflict → `error-code::exist`. |
-| `open-at` with `open-flags::truncate` | Synchronous zero-byte `PutObject` on open, regardless of whether the guest later writes. |
-| `open-at` with `path-flags::symlink-follow` set | Recursive resolution, max-depth 40 (Linux `MAXSYMLINKS`). Cycles → `error-code::loop`. |
-| `open-at` with `path-flags::symlink-follow` cleared on a symlink | Returns `error-code::loop` per WASI spec (POSIX `O_NOFOLLOW`). |
-| `symlink-at` | Atomic via `If-None-Match: *`; conflict → `error-code::exist`. Stored as a small object with body = target string and `x-amz-meta-s3wasifs-type=symlink`. |
-| `readlink-at` | Single `GetObject`; non-symlink target → `error-code::invalid` per POSIX. |
-| `unlink-file-at` | `DeleteObject`. Inode marked `Deleted`; further ops on stale handles return `bad-descriptor`/`no-entry`. |
-| `remove-directory-at` | List with `MaxKeys=2` for emptiness check, then `DeleteObject` of marker if present. Non-empty → `error-code::not-empty` (POSIX). |
-| `rename-at` (file or symlink) | **Async.** Returns as soon as the inode tree is rewired; `CopyObject` + `DeleteObject` runs on a background worker. During the in-flight window, reads/writes against the new path resolve to the OLD S3 key so the object never disappears. Worker errors surface on the next `sync` of the renamed inode. |
-| `rename-at` (directory) | **Async.** Returns immediately after the inode tree is rewired. The worker paginates `ListObjectsV2` over the source prefix and copies + deletes each key in the background. Empty destination is replaced; non-empty → `not-empty`; rename-into-self → `invalid`. |
-| `set-size` | **Shrink:** flush pending writes, GET `[0..new_size)`, single `PutObject`. **Grow:** zero-fill via buffer pool (capped at 100 MiB to avoid OOM). |
-| `set-times{,-at}` | Persists as `x-amz-meta-s3wasifs-{atime,mtime}` via `CopyObject` self-copy with `MetadataDirective=REPLACE`. Read back into `DescriptorStat` on next lookup. |
-| `sync`, `sync-data` | Drains any in-flight eager `UploadPart`s parked on parts, then for remaining dirty parts: `copy_unmodified_parts` → `CompleteMultipartUpload`. Falls back to single `PutObject` for sub-part / small-file paths. Durable when the call returns. Serialized against an in-flight rename worker via a per-inode async lock. |
-| `preopens.get-directories` | Single entry: `(root_descriptor, mount_path)` where `mount_path` defaults to `/`. |
+| `read`, `write`, `read-via-stream`, `write-via-stream`, `append-via-stream` | Buffered per handle at record granularity. |
+| `sync`, `sync-data` | Commits a transaction group and publishes a new signed root. |
+| `stat`, `stat-at` | Read from the dnode on every call, so they cannot go stale. `link-count` and all three timestamps are real values, not placeholders. |
+| `set-times`, `set-times-at` | A field write in the dnode. No `CopyObject`, and nothing else to disagree with. |
+| `set-size` | Truncate or grow, at any size. Growth is a hole and costs nothing. |
+| `create-directory-at`, `remove-directory-at`, `unlink-file-at` | One commit each. |
+| **`rename-at`** | **Atomic.** One directory-entry move inside one commit. A directory rename costs the same as a file rename. |
+| `read-directory` | Name-ordered, straight from the directory's leaves — no sort step. |
+| `symlink-at`, `readlink-at` | Targets up to 294 bytes live in the dnode; longer ones spill to data blocks. Cycle detection at depth 40. |
+| `open-at` with `CREATE` / `EXCLUSIVE` / `TRUNCATE` | Create is atomic inside its transaction. |
+| **`link-at`** | **Hard links.** A directory entry is an object id, so a link is one more entry and an increment of `nlink`. Files and symlinks only. |
+| **`unlink-file-at` while an fd is open** | **POSIX behaviour.** The object stays readable and writable through existing handles until the last one closes. |
+| `is-same-object`, `metadata-hash`, `metadata-hash-at` | Exact. Identity is `(object id, generation)`, which is stable across mounts because object ids are never reused. |
 
-## ⚠️ Weakened semantics — guests will mostly not notice, but the gap is real
+**Crash consistency.** The visible state is always a Merkle-verified snapshot, never a torn one. Slabs written by a commit that died before publishing its root are orphans: unreferenced, unreachable, harmless. There is no journal and no fsck.
 
-| WASI op | Gap | Mitigation / contract |
+**Integrity.** Every block read verifies a BLAKE3 checksum against its parent's block pointer and then opens an AEAD whose additional data binds the block to its exact position in the tree. A block cannot be corrupted, forged, substituted, or relocated without the read failing.
+
+**Rollback.** Root records are written with `If-None-Match: *` into a bucket under Object Lock COMPLIANCE retention, and each carries the hash of its predecessor. An adversary with full write access to the buckets can make the filesystem unreadable, but cannot make it read *wrong* and cannot make it read *old*.
+
+## ⚠️ Weakened semantics
+
+| WASI op | Gap | Contract |
 |---|---|---|
-| `rename-at` | **Not POSIX-atomic.** Async `CopyObject` + `DeleteObject` is two calls; both keys briefly exist; a host crash mid-window leaves both. A second `rename` on the same inode while one is in flight returns `WouldBlock`. | Caller can `Fs::wait_for_rename` to drain. Errors stash on the inode and surface on the next `sync` / `rename`. Pre-flush of any open writable handle for the source happens before enqueue, so the worker copies a fully-committed object. |
-| `unlink-file-at` while fd is open | **No POSIX "invisible deleted file" semantics.** Further ops on stale handles return `bad-descriptor`/`no-entry`. | Documented; matches GeeseFS. |
-| Two writers to same key | **No fencing.** Last `MultipartUpload` committed wins; no torn data but no single-writer guarantee. | Inside an enclave there's typically one writer. If you need single-writer-per-key semantics, layer it above (DynamoDB CAS, lease service, etc.). |
-| `is-same-object` across mounts | Inode IDs are per-process. Two mounts of the same bucket disagree on identity. | Within-mount works. |
-| `set-times` and `LastModified` | We persist the user-set mtime as metadata, but every successful `CompleteMultipartUpload` / `PutObject` also bumps S3's own `LastModified`. The metadata mtime is what we report from `DescriptorStat`. | Acceptable for nearly all guests. |
-| `set-size` grow > 100 MiB | Returns `error-code::invalid`. | Use `pwrite` of real bytes for genuine large grows. |
-| `sync` of a sub-part write after MPU started | Currently triggers an MPU+`UploadPartCopy` rewrite path. Correct but slow when the dirty content is far smaller than `single_part_threshold`. | Performance gap, not correctness. |
+| Crash while a file is unlinked-but-open | The dnode leaks: allocated, nameless, unreachable. | Garbage, not corruption — the same trade a real filesystem makes with its orphan inode list. Reclaimed by the garbage collector when that lands. |
+| Two writers to the same file | Each handle buffers independently; whichever syncs last wins. | Within one mount, use one handle per file. |
+| Two mounts of the same buckets | Exactly one can win a given root sequence. The loser is **poisoned**: every subsequent operation fails, including reads. | Deliberate. Retrying would reuse a transaction group and repeat every AEAD nonce in it. Single writer per filesystem. |
+| Unsynced writes on a crash | Lost. | The transaction-group model: durability is at `sync` / `close`, and what survives is always consistent. |
+| Cold-mount freshness | A store that *hides* roots newer than the one it serves is not cryptographically excluded. Object Lock means those roots cannot be deleted, so this requires S3 itself to lie. | Pass `--min-root-seq` to set a floor from outside the store. Within a session the gap does not exist: the accepted sequence only ever rises. |
+| `atime` | Only updated when a handle is synced. | No read-time metadata writes; a commit per read would be absurd. |
 
-## ❌ Cannot map — always returns `error-code::unsupported`
+A hard link to a *directory* returns `not-permitted`, as on Linux: it would make the namespace a graph rather than a tree, and the dnode's parent link has room for exactly one answer.
 
-| WASI op | Why |
-|---|---|
-| `link-at` (hardlinks) | POSIX requires shared mutability across link members; S3 has no shared-identity-across-keys. The implementable approaches (indirection layer with refcount sidecar, or fan-out copy on every write) all impose either an extra GET per read, O(N) PUTs per write, or fragile crash-recovery state. **Permanent gap by design.** |
+## ❌ Not implemented
+
+Nothing in `wasi:filesystem@0.2.6` is unsupported.
+
+## Snapshots
+
+Every root record is a complete, self-verifying snapshot. Copy-on-write means the blocks an older root names were never overwritten, so taking one costs nothing and keeping one costs only the storage its blocks already occupy.
+
+```rust
+let snaps = fs.snapshots(10).await?;              // newest first
+let snap  = fs.open_snapshot(snaps[3].seq).await?;
+let ino   = snap.lookup(&snap.root(), "deleted-file").await?;
+let bytes = snap.read(&ino, 0, 4096).await?;
+```
+
+Reads through a snapshot verify exactly as the live mount does — same checksums, same position binding — because a snapshot is not a copy of anything. It is the same blocks, reached through an older root.
+
+Opening one does not lower the live mount's rollback floor. Reading history must never become a way to make the store rewind.
+
+## Operational notes
+
+- **The bucket is not browsable.** Contents are opaque, encrypted, content-independent blocks. `aws s3 ls` shows slabs and roots, nothing resembling a path.
+- **No garbage collection yet.** Copy-on-write means superseded blocks accumulate. Roots are ~700 bytes each and locked for the full retention term; slabs are the cost driver and live in an unlocked bucket precisely so they can be reclaimed later.
+- **Keys are supplied, not discovered.** The master secret and the filesystem id are inputs. The keys that verify a root record derive from them, so reading either out of the store would mean trusting the store to say which key checks its own signature.
 
 ## Test coverage
 
-- **171 unit tests** in `s3fs-core` and `s3fs-wasmtime` against the in-memory backend.
-- **10 integration tests** in `s3fs-core/tests/minio_integration.rs` against MinIO via testcontainers (run with `--features aws --test minio_integration -- --ignored`).
-- **End-to-end SQLite test**: `examples/guest-fsdemo` runs a real SQLite database on top of the S3-backed filesystem (CREATE TABLE, INSERT, COMMIT, re-open, SELECT, verify) and prints `OK`.
-
-## Design references
-
-- The race-three lookup, MPU `copyUnmodifiedParts` strategy, and tiered part schedule are direct ports of [GeeseFS](https://github.com/yandex-cloud/geesefs)'s patterns. See [its `core/` directory](https://github.com/yandex-cloud/geesefs/tree/master/core) for the original Go implementation.
-- The `wasi:filesystem` WIT lives at [`wit/deps/filesystem.wit`](../wit/deps/filesystem.wit) (vendored from `wasmtime-wasi 44`'s `wasi@0.2.6`).
+333 unit tests plus a MinIO integration suite covering the real S3 wire protocol, Object Lock retention, end-to-end write/read/remount, slab packing economics, tamper detection, and mount-floor enforcement. Design lineage: ZFS for the storage model, [GeeseFS](https://github.com/yandex-cloud/geesefs) for the original path-mapping engine this replaced.

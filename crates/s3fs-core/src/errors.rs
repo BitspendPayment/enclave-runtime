@@ -68,6 +68,24 @@ pub enum FsError {
     #[error("precondition / CAS conflict")]
     Conflict,
 
+    /// A block, dnode, or root record failed verification: checksum mismatch
+    /// against the parent block pointer, AEAD authentication failure, a bad
+    /// root signature, or a broken `prev_root_hash` chain link.
+    ///
+    /// This is never transient and must never be retried or degraded around.
+    /// Producing it poisons the mount: the store is either lying or corrupt,
+    /// and in both cases the only safe response is to stop serving bytes.
+    #[error("integrity check failed: {0}")]
+    Integrity(&'static str),
+
+    /// The store offered a root record older than one we have already
+    /// accepted, or older than the configured floor. Distinct from
+    /// [`FsError::Integrity`] because the data is *valid* — correctly signed
+    /// and internally consistent — just stale. That is the signature of a
+    /// rollback attempt rather than corruption.
+    #[error("rollback detected: root seq {found} is not newer than {expected}")]
+    Rollback { expected: u64, found: u64 },
+
     #[error("i/o timeout")]
     IoTimeout,
 
@@ -108,6 +126,30 @@ mod tests {
             FsError::Invalid("bad part number").to_string(),
             "invalid argument: bad part number"
         );
+        assert_eq!(
+            FsError::Integrity("blkptr checksum").to_string(),
+            "integrity check failed: blkptr checksum"
+        );
+        assert_eq!(
+            FsError::Rollback {
+                expected: 42,
+                found: 41
+            }
+            .to_string(),
+            "rollback detected: root seq 41 is not newer than 42"
+        );
+    }
+
+    /// Integrity and rollback failures are adversarial signals, not blips.
+    /// Retrying them would turn a detected attack into a spin loop.
+    #[test]
+    fn verification_failures_are_never_transient() {
+        assert!(!FsError::Integrity("root signature").is_transient());
+        assert!(!FsError::Rollback {
+            expected: 2,
+            found: 1
+        }
+        .is_transient());
     }
 
     #[test]

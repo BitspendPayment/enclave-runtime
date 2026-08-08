@@ -18,7 +18,7 @@ use std::hash::Hasher;
 
 use super::{
     Backend, BlobItem, BlobMeta, Capabilities, CompletedPart, CopyBlobInput, GetBlobOutput,
-    ListBlobsInput, ListBlobsOutput, MultipartId, PartUploadOutput, PutBlobInput,
+    ListBlobsInput, ListBlobsOutput, MultipartId, ObjectLock, PartUploadOutput, PutBlobInput,
 };
 use crate::errors::{FsError, FsResult};
 
@@ -29,6 +29,20 @@ struct StoredBlob {
     last_modified: SystemTime,
     content_type: Option<String>,
     metadata: HashMap<String, String>,
+    /// Retention stamped at PUT time, if any.
+    object_lock: Option<ObjectLock>,
+}
+
+impl StoredBlob {
+    /// `true` if retention is still in force, i.e. S3 would refuse to delete
+    /// or overwrite this object.
+    ///
+    /// Governance mode is modelled as equally binding: this fake has no notion
+    /// of IAM principals, so there is nobody here who could hold
+    /// `s3:BypassGovernanceRetention`.
+    fn is_retained(&self, now: SystemTime) -> bool {
+        self.object_lock.is_some_and(|lock| now < lock.retain_until)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +50,7 @@ struct ActiveMpu {
     key: String,
     metadata: HashMap<String, String>,
     content_type: Option<String>,
+    object_lock: Option<ObjectLock>,
     parts: HashMap<u32, MpuPart>,
 }
 
@@ -122,6 +137,7 @@ impl Backend for MemoryBackend {
             upload_part_copy: true,
             batch_delete: true,
             metadata_in_listings: false, // mirror standard S3
+            object_lock: true,
         }
     }
 
@@ -158,9 +174,15 @@ impl Backend for MemoryBackend {
             last_modified: now,
             content_type: input.content_type,
             metadata: input.metadata,
+            object_lock: input.object_lock,
         };
         let key = input.key;
         let mut g = self.state.write();
+        // This fake models a non-versioned bucket, so an overwrite replaces
+        // the retained version rather than adding a new one. Refuse it.
+        if g.objects.get(&key).is_some_and(|b| b.is_retained(now)) {
+            return Err(FsError::AccessDenied);
+        }
         g.objects.insert(key.clone(), stored.clone());
         Ok(self.meta_from_stored(&key, &stored))
     }
@@ -178,6 +200,7 @@ impl Backend for MemoryBackend {
             last_modified: now,
             content_type: input.content_type,
             metadata: input.metadata,
+            object_lock: input.object_lock,
         };
         let key = input.key;
         g.objects.insert(key.clone(), stored.clone());
@@ -185,14 +208,23 @@ impl Backend for MemoryBackend {
     }
 
     async fn delete_blob(&self, key: &str) -> FsResult<()> {
+        let now = SystemTime::now();
+        let mut g = self.state.write();
+        if g.objects.get(key).is_some_and(|b| b.is_retained(now)) {
+            return Err(FsError::AccessDenied);
+        }
         // S3 `DeleteObject` is idempotent — non-existent key returns success.
-        self.state.write().objects.remove(key);
+        g.objects.remove(key);
         Ok(())
     }
 
     async fn delete_blobs(&self, keys: &[String]) -> FsResult<()> {
+        let now = SystemTime::now();
         let mut g = self.state.write();
         for k in keys {
+            if g.objects.get(k).is_some_and(|b| b.is_retained(now)) {
+                return Err(FsError::AccessDenied);
+            }
             g.objects.remove(k);
         }
         Ok(())
@@ -274,15 +306,26 @@ impl Backend for MemoryBackend {
             .ok_or(FsError::NotFound)?
             .clone();
 
+        let now = SystemTime::now();
+        if g.objects
+            .get(&input.destination_key)
+            .is_some_and(|b| b.is_retained(now))
+        {
+            return Err(FsError::AccessDenied);
+        }
+
         let metadata = input.replace_metadata.unwrap_or(src.metadata);
         let content_type = input.replace_content_type.or(src.content_type);
         let e_tag = self.make_etag(&src.body);
         let stored = StoredBlob {
             body: src.body,
             e_tag,
-            last_modified: SystemTime::now(),
+            last_modified: now,
             content_type,
             metadata,
+            // S3 does not carry retention across a copy unless the request
+            // asks for it, and `CopyBlobInput` has no way to ask.
+            object_lock: None,
         };
         g.objects
             .insert(input.destination_key.clone(), stored.clone());
@@ -292,7 +335,9 @@ impl Backend for MemoryBackend {
     async fn multipart_begin(&self, input: PutBlobInput) -> FsResult<MultipartId> {
         let n = self.next_mpu_id.fetch_add(1, Ordering::Relaxed);
         let id = MultipartId(format!("mpu-{n}"));
+        let object_lock = input.object_lock;
         let mpu = ActiveMpu {
+            object_lock,
             key: input.key,
             metadata: input.metadata,
             content_type: input.content_type,
@@ -402,12 +447,17 @@ impl Backend for MemoryBackend {
 
         let body = Bytes::from(body_acc);
         let e_tag = self.make_etag(&body);
+        let now = SystemTime::now();
+        if g.objects.get(key).is_some_and(|b| b.is_retained(now)) {
+            return Err(FsError::AccessDenied);
+        }
         let stored = StoredBlob {
             body,
             e_tag,
-            last_modified: SystemTime::now(),
+            last_modified: now,
             content_type: mpu.content_type,
             metadata: mpu.metadata,
+            object_lock: mpu.object_lock,
         };
         g.objects.insert(key.to_string(), stored.clone());
         Ok(self.meta_from_stored(key, &stored))
@@ -439,6 +489,7 @@ mod tests {
                 body: Bytes::from_static(b"hello"),
                 metadata: Default::default(),
                 content_type: Some("text/plain".into()),
+                object_lock: None,
             })
             .await
             .unwrap();
@@ -466,6 +517,7 @@ mod tests {
             body: Bytes::from_static(b"abcdef"),
             metadata: Default::default(),
             content_type: None,
+            object_lock: None,
         })
         .await
         .unwrap();
@@ -481,6 +533,7 @@ mod tests {
             body: Bytes::from_static(b"v"),
             metadata: Default::default(),
             content_type: None,
+            object_lock: None,
         };
         b.put_blob_if_not_exists(body()).await.unwrap();
         assert!(matches!(
@@ -504,6 +557,7 @@ mod tests {
                 body: Bytes::from_static(b""),
                 metadata: Default::default(),
                 content_type: None,
+                object_lock: None,
             })
             .await
             .unwrap();
@@ -530,6 +584,7 @@ mod tests {
                 body: Bytes::from_static(b""),
                 metadata: Default::default(),
                 content_type: None,
+                object_lock: None,
             })
             .await
             .unwrap();
@@ -556,6 +611,7 @@ mod tests {
                 body: Bytes::from_static(b""),
                 metadata: Default::default(),
                 content_type: None,
+                object_lock: None,
             })
             .await
             .unwrap();
@@ -608,6 +664,7 @@ mod tests {
             body: Bytes::from_static(b"data"),
             metadata: Default::default(),
             content_type: None,
+            object_lock: None,
         })
         .await
         .unwrap();
@@ -632,6 +689,7 @@ mod tests {
                 body: Bytes::new(),
                 metadata: Default::default(),
                 content_type: None,
+                object_lock: None,
             })
             .await
             .unwrap();
@@ -673,6 +731,7 @@ mod tests {
             body: Bytes::from_static(b"0123456789"),
             metadata: Default::default(),
             content_type: None,
+            object_lock: None,
         })
         .await
         .unwrap();
@@ -683,6 +742,7 @@ mod tests {
                 body: Bytes::new(),
                 metadata: Default::default(),
                 content_type: None,
+                object_lock: None,
             })
             .await
             .unwrap();
@@ -724,6 +784,7 @@ mod tests {
                 body: Bytes::new(),
                 metadata: Default::default(),
                 content_type: None,
+                object_lock: None,
             })
             .await
             .unwrap();
@@ -745,5 +806,110 @@ mod tests {
         assert!(c.upload_part_copy);
         assert!(c.batch_delete);
         assert!(!c.metadata_in_listings); // mirror standard S3
+        assert!(c.object_lock);
+    }
+
+    // ---- Object Lock -------------------------------------------------------
+    //
+    // These matter because the whole rollback story rests on a committed root
+    // record being undeletable. If the fake let a retained object be removed
+    // or rewritten, every rollback test built on it would pass vacuously.
+
+    fn locked(key: &str, body: &'static [u8], secs: u64) -> PutBlobInput {
+        PutBlobInput::new(key, Bytes::from_static(body)).with_object_lock(ObjectLock {
+            mode: super::super::ObjectLockMode::Compliance,
+            retain_until: SystemTime::now() + std::time::Duration::from_secs(secs),
+        })
+    }
+
+    #[tokio::test]
+    async fn retained_object_cannot_be_deleted() {
+        let b = MemoryBackend::new();
+        b.put_blob(locked("roots/0001", b"root", 3600))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            b.delete_blob("roots/0001").await,
+            Err(FsError::AccessDenied)
+        ));
+        assert!(matches!(
+            b.delete_blobs(&["roots/0001".to_string()]).await,
+            Err(FsError::AccessDenied)
+        ));
+        // Still there, still the original bytes.
+        assert_eq!(
+            b.get_blob("roots/0001", None).await.unwrap().body,
+            Bytes::from_static(b"root")
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_object_cannot_be_overwritten() {
+        let b = MemoryBackend::new();
+        b.put_blob(locked("roots/0001", b"root", 3600))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            b.put_blob(PutBlobInput::new(
+                "roots/0001",
+                Bytes::from_static(b"forged")
+            ))
+            .await,
+            Err(FsError::AccessDenied)
+        ));
+        assert!(matches!(
+            b.copy_blob(CopyBlobInput {
+                source_key: "roots/0001".into(),
+                destination_key: "roots/0001".into(),
+                replace_metadata: None,
+                replace_content_type: None,
+            })
+            .await,
+            Err(FsError::AccessDenied)
+        ));
+        assert_eq!(
+            b.get_blob("roots/0001", None).await.unwrap().body,
+            Bytes::from_static(b"root")
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_retention_stops_binding() {
+        let b = MemoryBackend::new();
+        // Retention already in the past — S3 would allow the delete.
+        b.put_blob(
+            PutBlobInput::new("roots/0001", Bytes::from_static(b"root")).with_object_lock(
+                ObjectLock {
+                    mode: super::super::ObjectLockMode::Compliance,
+                    retain_until: SystemTime::now() - std::time::Duration::from_secs(1),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        b.delete_blob("roots/0001").await.unwrap();
+        assert!(matches!(
+            b.head_blob("roots/0001").await,
+            Err(FsError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unlocked_objects_are_unaffected() {
+        let b = MemoryBackend::new();
+        b.put_blob(PutBlobInput::new("slabs/0001", Bytes::from_static(b"data")))
+            .await
+            .unwrap();
+        b.put_blob(PutBlobInput::new(
+            "slabs/0001",
+            Bytes::from_static(b"data2"),
+        ))
+        .await
+        .unwrap();
+        b.delete_blob("slabs/0001").await.unwrap();
+        assert_eq!(b.object_count(), 0);
     }
 }

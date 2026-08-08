@@ -25,10 +25,10 @@ use testcontainers_modules::minio::MinIO;
 use s3fs_core::backend::{
     AwsS3Backend, AwsS3BackendConfig, Backend, CompletedPart, ListBlobsInput, PutBlobInput,
 };
-use s3fs_core::config::PartSchedule;
+use s3fs_core::backend::{ObjectLock, ObjectLockMode};
 use s3fs_core::errors::FsError;
 use s3fs_core::fs::OpenFlags;
-use s3fs_core::{Config, Fs};
+use s3fs_core::{Config, Fs, MasterSecret};
 
 /// Start a MinIO container, build an `AwsS3Backend` pointed at it, and create
 /// the bucket. The returned `ContainerAsync` MUST stay in scope for the
@@ -69,6 +69,21 @@ async fn fresh_minio_with_bucket(bucket: &str) -> (ContainerAsync<MinIO>, AwsS3B
     (container, backend)
 }
 
+/// A second backend against the same container, for the roots bucket.
+async fn extra_bucket(backend: &AwsS3Backend, bucket: &str, object_lock: bool) -> AwsS3Backend {
+    let mut req = backend.client().create_bucket().bucket(bucket);
+    if object_lock {
+        req = req.object_lock_enabled_for_bucket(true);
+    }
+    req.send().await.expect("create bucket");
+
+    let mut cfg = backend.config().clone();
+    cfg.bucket = bucket.to_string();
+    AwsS3Backend::connect_unchecked(cfg)
+        .await
+        .expect("connect to second bucket")
+}
+
 // ---------- Backend-level tests ----------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -84,6 +99,7 @@ async fn put_head_get_delete_round_trip() {
             body: Bytes::from_static(b"hello"),
             metadata: metadata.clone(),
             content_type: Some("text/plain".into()),
+            object_lock: None,
         })
         .await
         .unwrap();
@@ -113,6 +129,7 @@ async fn get_with_byte_range() {
             body: Bytes::from_static(b"0123456789"),
             metadata: HashMap::new(),
             content_type: None,
+            object_lock: None,
         })
         .await
         .unwrap();
@@ -129,6 +146,7 @@ async fn put_blob_if_not_exists_returns_already_exists_on_collision() {
         body: Bytes::from_static(b"v"),
         metadata: HashMap::new(),
         content_type: None,
+        object_lock: None,
     };
     backend.put_blob_if_not_exists(mk()).await.unwrap();
     assert!(matches!(
@@ -148,6 +166,7 @@ async fn list_with_delimiter_separates_items_and_prefixes() {
                 body: Bytes::from_static(b""),
                 metadata: HashMap::new(),
                 content_type: None,
+                object_lock: None,
             })
             .await
             .unwrap();
@@ -184,6 +203,7 @@ async fn multipart_lifecycle_with_upload_part_copy() {
             body: Bytes::from(src_body.clone()),
             metadata: HashMap::new(),
             content_type: None,
+            object_lock: None,
         })
         .await
         .unwrap();
@@ -195,6 +215,7 @@ async fn multipart_lifecycle_with_upload_part_copy() {
             body: Bytes::new(),
             metadata: HashMap::new(),
             content_type: None,
+            object_lock: None,
         })
         .await
         .unwrap();
@@ -238,158 +259,201 @@ async fn multipart_lifecycle_with_upload_part_copy() {
 
 // ---------- Fs end-to-end tests ----------
 
+// ---------- Object Lock ----------
+
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Docker"]
-async fn fs_small_file_round_trip() {
-    let (_c, backend) = fresh_minio_with_bucket("fs-small").await;
-    let cfg = Config::builder()
-        .single_part_threshold(5 * 1024 * 1024)
-        .build();
-    let fs = Fs::new(Arc::new(backend) as Arc<dyn Backend>, Arc::new(cfg));
+#[ignore = "requires Docker; run with --features aws -- --ignored"]
+async fn object_lock_makes_a_root_record_undeletable() {
+    let (_c, data) = fresh_minio_with_bucket("data-lock").await;
+    let roots = extra_bucket(&data, "roots-lock", true).await;
 
-    let h = fs
-        .open(
-            "hello.txt",
-            OpenFlags {
-                read: true,
-                write: true,
-                create: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    fs.pwrite(&h, 0, b"hello, minio").await.unwrap();
-    fs.sync(&h).await.unwrap();
-    fs.close(&h).await.unwrap();
+    // A minute, not a decade: the container is thrown away, but a real
+    // COMPLIANCE retention would make the bucket itself undeletable for the
+    // full term, which is not something a test should create.
+    let lock = ObjectLock {
+        mode: ObjectLockMode::Compliance,
+        retain_until: std::time::SystemTime::now() + Duration::from_secs(60),
+    };
+    let input = PutBlobInput::new("roots/0000000000000000", Bytes::from_static(b"anchor"))
+        .with_object_lock(lock);
+    roots.put_blob_if_not_exists(input).await.unwrap();
 
-    // Re-open and read back.
-    let h2 = fs.open("hello.txt", OpenFlags::read_only()).await.unwrap();
-    let body = fs.pread(&h2, 0, 100).await.unwrap();
-    assert_eq!(&body[..], b"hello, minio");
-    fs.close(&h2).await.unwrap();
+    // The rollback guarantee, checked against a real S3 implementation rather
+    // than the in-memory fake: neither delete nor overwrite is permitted.
+    let err = roots.delete_blob("roots/0000000000000000").await;
+    assert!(err.is_err(), "a retained root must not be deletable");
+
+    assert_eq!(
+        roots
+            .get_blob("roots/0000000000000000", None)
+            .await
+            .unwrap()
+            .body,
+        Bytes::from_static(b"anchor")
+    );
+}
+
+// ---------- Engine-level tests ----------
+
+const TEST_MASTER: [u8; 32] = [0x42; 32];
+const TEST_FS_ID: [u8; 16] = [0x11; 16];
+
+fn engine_config() -> Config {
+    Config::builder()
+        .record_size(64 * 1024)
+        // Retention is exercised separately; leaving it off keeps these tests
+        // able to tear their buckets down.
+        .root_retention(None)
+        .build()
+}
+
+async fn mount(data: &AwsS3Backend, roots: &AwsS3Backend) -> Arc<Fs> {
+    Fs::mount(
+        Arc::new(data.clone()) as Arc<dyn Backend>,
+        Arc::new(roots.clone()) as Arc<dyn Backend>,
+        &MasterSecret::from_bytes(TEST_MASTER),
+        TEST_FS_ID,
+        Arc::new(engine_config()),
+        None,
+    )
+    .await
+    .expect("mount")
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Docker"]
-async fn fs_in_place_update_uses_copy_for_unchanged_parts() {
-    // The load-bearing claim end-to-end: a 15 MiB file (3 parts of 5 MiB),
-    // modify only part 1 (bytes 5MiB..10MiB), sync, verify content. The Fs
-    // commit path should issue UploadPartCopy for parts 0 and 2 — no full
-    // re-upload of unchanged data.
-    let (_c, backend) = fresh_minio_with_bucket("fs-rmw").await;
-    let cfg = Config::builder()
-        .part_schedule(PartSchedule {
-            tiers: vec![(5 * 1024 * 1024, 1000)],
-        })
-        .single_part_threshold(5 * 1024 * 1024)
-        .max_parallel_parts(4)
-        .max_parallel_copy(4)
-        .max_merge_copy_bytes(128 * 1024 * 1024)
-        .memory_limit_bytes(64 * 1024 * 1024)
-        .build();
-    let backend_arc = Arc::new(backend);
-    let fs = Fs::new(backend_arc.clone() as Arc<dyn Backend>, Arc::new(cfg));
+#[ignore = "requires Docker; run with --features aws -- --ignored"]
+async fn end_to_end_write_read_and_remount() {
+    let (_c, data) = fresh_minio_with_bucket("data-e2e").await;
+    let roots = extra_bucket(&data, "roots-e2e", false).await;
 
-    // Pre-populate "big" with 15 MiB of recognisable bytes.
-    let total: usize = 15 * 1024 * 1024;
-    let mut src = vec![0u8; total];
-    for (i, b) in src.iter_mut().enumerate() {
-        *b = (i % 251) as u8;
+    let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    {
+        let fs = mount(&data, &roots).await;
+        let root = fs.root();
+        fs.mkdir(&root, "dir").await.unwrap();
+        let h = fs.open("/dir/file", OpenFlags::create_new()).await.unwrap();
+        fs.pwrite(&h, 0, &payload).await.unwrap();
+        fs.close(&h).await.unwrap();
     }
-    backend_arc
-        .put_blob(PutBlobInput {
-            key: "big".into(),
-            body: Bytes::from(src.clone()),
-            metadata: HashMap::new(),
-            content_type: None,
-        })
-        .await
-        .unwrap();
 
-    // Open and overwrite part 1 (bytes 5MiB..10MiB).
-    let h = fs
-        .open(
-            "big",
-            OpenFlags {
-                read: true,
-                write: true,
-                ..Default::default()
-            },
-        )
+    // A separate mount, reading only what the anchored root records commit.
+    let fs = mount(&data, &roots).await;
+    let h = fs.open("/dir/file", OpenFlags::read_only()).await.unwrap();
+    let got = fs.pread(&h, 0, payload.len()).await.unwrap();
+    assert_eq!(got.len(), payload.len());
+    assert_eq!(got.as_ref(), payload.as_slice());
+
+    let names: Vec<_> = fs
+        .read_dir(&fs.root())
         .await
-        .unwrap();
-    let new_chunk = vec![0xAB; 5 * 1024 * 1024];
-    fs.pwrite(&h, 5 * 1024 * 1024, &new_chunk).await.unwrap();
-    fs.sync(&h).await.unwrap();
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, vec!["dir"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker; run with --features aws -- --ignored"]
+async fn a_commit_costs_a_handful_of_objects() {
+    let (_c, data) = fresh_minio_with_bucket("data-cost").await;
+    let roots = extra_bucket(&data, "roots-cost", false).await;
+    let fs = mount(&data, &roots).await;
+
+    let before = count_keys(&data, "slabs/").await;
+    let h = fs.open("/big", OpenFlags::create_new()).await.unwrap();
+    // 64 records at the configured record size, committed as one group.
+    fs.pwrite(&h, 0, &vec![7u8; 64 * 64 * 1024]).await.unwrap();
     fs.close(&h).await.unwrap();
+    let after = count_keys(&data, "slabs/").await;
 
-    // Verify the resulting object byte-for-byte.
-    let g = backend_arc.get_blob("big", None).await.unwrap();
-    assert_eq!(g.body.len(), total);
-    for i in 0..total {
-        let expected = if (5 * 1024 * 1024..10 * 1024 * 1024).contains(&i) {
-            0xAB
-        } else {
-            (i % 251) as u8
-        };
-        assert_eq!(g.body[i], expected, "byte {i}");
+    // The point of packing blocks into slabs: many dirty blocks, few PUTs.
+    // Addressing blocks by content hash would have cost 64 objects here.
+    assert!(
+        after - before <= 4,
+        "expected a handful of slab objects, got {}",
+        after - before
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker; run with --features aws -- --ignored"]
+async fn tampering_with_a_slab_is_detected() {
+    let (_c, data) = fresh_minio_with_bucket("data-tamper").await;
+    let roots = extra_bucket(&data, "roots-tamper", false).await;
+
+    {
+        let fs = mount(&data, &roots).await;
+        let h = fs.open("/f", OpenFlags::create_new()).await.unwrap();
+        fs.pwrite(&h, 0, &vec![0x5au8; 100_000]).await.unwrap();
+        fs.close(&h).await.unwrap();
     }
+
+    // Rewrite every slab with a flipped byte, as a bucket operator could.
+    for key in list_keys(&data, "slabs/").await {
+        let body = data.get_blob(&key, None).await.unwrap().body;
+        let mut body = body.to_vec();
+        body[0] ^= 0xff;
+        data.put_blob(PutBlobInput::new(key, Bytes::from(body)))
+            .await
+            .unwrap();
+    }
+
+    let fs = mount(&data, &roots).await;
+    let result = async {
+        let h = fs.open("/f", OpenFlags::read_only()).await?;
+        fs.pread(&h, 0, 100_000).await
+    }
+    .await;
+    assert!(
+        matches!(result, Err(FsError::Integrity(_))),
+        "expected an integrity failure, got {result:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Docker"]
-async fn fs_mkdir_and_listing() {
-    let (_c, backend) = fresh_minio_with_bucket("fs-mkdir").await;
-    let cfg = Config::default();
-    let fs = Fs::new(Arc::new(backend) as Arc<dyn Backend>, Arc::new(cfg));
+#[ignore = "requires Docker; run with --features aws -- --ignored"]
+async fn a_mount_floor_above_the_tip_is_refused() {
+    let (_c, data) = fresh_minio_with_bucket("data-floor").await;
+    let roots = extra_bucket(&data, "roots-floor", false).await;
+    {
+        let fs = mount(&data, &roots).await;
+        fs.mkdir(&fs.root(), "a").await.unwrap();
+    }
 
-    let root = fs.root();
-    fs.mkdir(&root, "subdir").await.unwrap();
-    let h = fs
-        .open(
-            "f.txt",
-            OpenFlags {
-                write: true,
-                create: true,
+    let result = Fs::mount(
+        Arc::new(data.clone()) as Arc<dyn Backend>,
+        Arc::new(roots.clone()) as Arc<dyn Backend>,
+        &MasterSecret::from_bytes(TEST_MASTER),
+        TEST_FS_ID,
+        Arc::new(engine_config()),
+        Some(9999),
+    )
+    .await;
+    assert!(matches!(result, Err(FsError::Rollback { .. })));
+}
+
+async fn list_keys(backend: &AwsS3Backend, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let page = backend
+            .list_blobs(ListBlobsInput {
+                prefix,
+                continuation_token: token.as_deref(),
                 ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    fs.pwrite(&h, 0, b"x").await.unwrap();
-    fs.sync(&h).await.unwrap();
-    fs.close(&h).await.unwrap();
-
-    let snap = fs.read_dir(&root).await.unwrap();
-    let names: Vec<_> = snap.iter().map(|e| e.name.as_str()).collect();
-    assert!(names.contains(&"subdir"));
-    assert!(names.contains(&"f.txt"));
+            })
+            .await
+            .unwrap();
+        out.extend(page.items.into_iter().map(|i| i.key));
+        match page.next_continuation_token {
+            Some(t) if page.is_truncated => token = Some(t),
+            _ => break,
+        }
+    }
+    out
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Docker"]
-async fn fs_o_excl_collision_returns_already_exists() {
-    let (_c, backend) = fresh_minio_with_bucket("fs-excl").await;
-    let cfg = Config::default();
-    let fs = Fs::new(Arc::new(backend) as Arc<dyn Backend>, Arc::new(cfg));
-
-    let _h1 = fs.open("k", OpenFlags::create_new()).await.unwrap();
-    let r = fs.open("k", OpenFlags::create_new()).await;
-    assert!(matches!(r, Err(FsError::AlreadyExists)));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Docker"]
-async fn fs_symlink_round_trip() {
-    let (_c, backend) = fresh_minio_with_bucket("fs-sym").await;
-    let cfg = Config::default();
-    let fs = Fs::new(Arc::new(backend) as Arc<dyn Backend>, Arc::new(cfg));
-
-    let root = fs.root();
-    fs.symlink_at(&root, "link", "target.txt").await.unwrap();
-    assert_eq!(fs.readlink_at(&root, "link").await.unwrap(), "target.txt");
-    // Re-creating the same symlink should fail with AlreadyExists.
-    let r = fs.symlink_at(&root, "link", "other.txt").await;
-    assert!(matches!(r, Err(FsError::AlreadyExists)));
+async fn count_keys(backend: &AwsS3Backend, prefix: &str) -> usize {
+    list_keys(backend, prefix).await.len()
 }

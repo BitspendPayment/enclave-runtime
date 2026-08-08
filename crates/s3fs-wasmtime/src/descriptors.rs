@@ -7,17 +7,24 @@ use s3fs_core::{FileHandle, Inode};
 /// Wasmtime resource handle for `wasi:filesystem/types/descriptor`.
 ///
 /// A descriptor is one of two flavours:
-/// - **File descriptor**: holds an `Arc<FileHandle>` plus its parent inode
-///   (so paths used in `_at` operations resolve relative to the right place).
-/// - **Directory descriptor**: holds the directory inode directly. Reads /
-///   writes against a dir-descriptor return `is-directory`.
+/// - **File descriptor**: an `Arc<FileHandle>` plus the directory it was
+///   opened under, so paths used in `*-at` operations resolve relative to the
+///   right place.
+/// - **Directory descriptor**: the directory inode itself. Reads and writes
+///   against one return `is-directory`.
 ///
-/// Both flavours can be used as the `base` for `*-at` operations; for a file
-/// descriptor we resolve relative to its parent.
+/// The parent is captured at open time rather than walked back to on demand:
+/// `at_base` is synchronous, and the parent link now lives in the dnode, which
+/// would make resolving it an I/O operation.
 #[derive(Debug)]
 pub enum Descriptor {
-    File { handle: Arc<FileHandle> },
-    Dir { inode: Arc<Inode> },
+    File {
+        handle: Arc<FileHandle>,
+        parent: Arc<Inode>,
+    },
+    Dir {
+        inode: Arc<Inode>,
+    },
 }
 
 impl Descriptor {
@@ -25,28 +32,16 @@ impl Descriptor {
     /// file's own inode; for dirs, the directory inode itself.
     pub fn inode(&self) -> &Arc<Inode> {
         match self {
-            Descriptor::File { handle } => &handle.inode,
+            Descriptor::File { handle, .. } => &handle.inode,
             Descriptor::Dir { inode } => inode,
         }
     }
 
-    /// The directory inode to use as the base for `*-at` path resolution.
-    /// For a file descriptor, that's the file's parent (or the file itself
-    /// if it has no parent — which would be an open of the root, an
-    /// invalid case for files).
+    /// The directory to use as the base for `*-at` path resolution.
     pub fn at_base(&self) -> Arc<Inode> {
         match self {
             Descriptor::Dir { inode } => inode.clone(),
-            Descriptor::File { handle } => {
-                // For an open file the parent should always exist; fall back
-                // to the file inode itself in the degenerate case.
-                handle
-                    .inode
-                    .parent
-                    .as_ref()
-                    .and_then(|w| w.upgrade())
-                    .unwrap_or_else(|| handle.inode.clone())
-            }
+            Descriptor::File { parent, .. } => parent.clone(),
         }
     }
 }

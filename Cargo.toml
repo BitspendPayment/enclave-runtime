@@ -28,6 +28,16 @@ hashlink    = "0.9"
 bitvec      = "1"
 percent-encoding = "2"
 
+# Scrubs key material on drop. Enclave memory is unreadable from outside, but
+# key bytes should not outlive their use inside it either.
+zeroize     = { version = "1", features = ["zeroize_derive"] }
+# Merkle-tree block checksums and the root-record hash chain. BLAKE3 is the
+# hot path (every block read verifies one), so its SIMD backends matter.
+blake3      = "1"
+# AEAD (AES-256-GCM), Ed25519 root signatures, HKDF key derivation. aws-lc-rs
+# is the AWS-native, FIPS-capable stack — the same primitives KMS speaks.
+aws-lc-rs   = { version = "1", default-features = false, features = ["aws-lc-sys"] }
+
 aws-config             = { version = "1", default-features = false }
 aws-sdk-s3             = { version = "1", default-features = false }
 aws-smithy-runtime-api = "1"

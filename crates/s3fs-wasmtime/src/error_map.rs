@@ -41,6 +41,10 @@ pub fn from_fs(e: FsError) -> ErrorCode {
         // style failures; callers that want different semantics can re-map
         // before this point.
         FsError::Conflict => ErrorCode::Exist,
+        // Verification failures. WASI has no "the storage lied to us" code, so
+        // these surface as `Io` — the guest sees an unreadable filesystem
+        // rather than plausible-looking wrong bytes, which is the whole point.
+        FsError::Integrity(_) | FsError::Rollback { .. } => ErrorCode::Io,
         FsError::IoTimeout => ErrorCode::Io,
         FsError::Io(_) | FsError::Network(_) => ErrorCode::Io,
     }

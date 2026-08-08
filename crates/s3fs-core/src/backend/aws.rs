@@ -19,7 +19,7 @@ use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart as SdkCompletedPart, Delete, MetadataDirective,
-    ObjectIdentifier,
+    ObjectIdentifier, ObjectLockMode as SdkObjectLockMode,
 };
 use aws_sdk_s3::Client;
 use aws_smithy_runtime_api::client::result::SdkError;
@@ -28,9 +28,29 @@ use bytes::Bytes;
 
 use super::{
     Backend, BlobItem, BlobMeta, Capabilities, CompletedPart, CopyBlobInput, GetBlobOutput,
-    ListBlobsInput, ListBlobsOutput, MultipartId, PartUploadOutput, PutBlobInput,
+    ListBlobsInput, ListBlobsOutput, MultipartId, ObjectLock, ObjectLockMode, PartUploadOutput,
+    PutBlobInput,
 };
 use crate::errors::{FsError, FsResult};
+
+/// Apply Object Lock retention headers to a `PutObject` request.
+///
+/// Note the bucket must have been created with Object Lock enabled
+/// (`ObjectLockEnabledForBucket`); S3 rejects these headers otherwise. That
+/// failure surfaces as `InvalidRequest` from `send()` rather than being
+/// swallowed here, which is the behaviour we want — a retention we asked for
+/// and didn't get must be loud.
+fn apply_object_lock(
+    req: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    lock: &ObjectLock,
+) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
+    let mode = match lock.mode {
+        ObjectLockMode::Governance => SdkObjectLockMode::Governance,
+        ObjectLockMode::Compliance => SdkObjectLockMode::Compliance,
+    };
+    req.object_lock_mode(mode)
+        .object_lock_retain_until_date(aws_smithy_types::DateTime::from(lock.retain_until))
+}
 
 /// Construction parameters for [`AwsS3Backend`].
 #[derive(Debug, Clone)]
@@ -73,6 +93,7 @@ impl AwsS3BackendConfig {
 pub struct AwsS3Backend {
     bucket: String,
     client: Client,
+    config: AwsS3BackendConfig,
 }
 
 impl AwsS3Backend {
@@ -117,13 +138,20 @@ impl AwsS3Backend {
         }
         let client = Client::from_conf(conf_builder.build());
         Ok(Self {
-            bucket: config.bucket,
+            bucket: config.bucket.clone(),
             client,
+            config,
         })
     }
 
     pub fn bucket(&self) -> &str {
         &self.bucket
+    }
+
+    /// The configuration this backend was built from, so a caller can derive
+    /// a second backend against another bucket on the same endpoint.
+    pub fn config(&self) -> &AwsS3BackendConfig {
+        &self.config
     }
 
     pub fn client(&self) -> &Client {
@@ -139,6 +167,7 @@ impl Backend for AwsS3Backend {
             upload_part_copy: true,
             batch_delete: true,
             metadata_in_listings: false,
+            object_lock: true,
         }
     }
 
@@ -234,6 +263,9 @@ impl Backend for AwsS3Backend {
         if let Some(ct) = &input.content_type {
             req = req.content_type(ct);
         }
+        if let Some(lock) = &input.object_lock {
+            req = apply_object_lock(req, lock);
+        }
         let resp = req
             .send()
             .await
@@ -266,6 +298,9 @@ impl Backend for AwsS3Backend {
         }
         if let Some(ct) = &input.content_type {
             req = req.content_type(ct);
+        }
+        if let Some(lock) = &input.object_lock {
+            req = apply_object_lock(req, lock);
         }
         let resp = req.send().await.map_err(|e| {
             // S3 returns 412 PreconditionFailed when If-None-Match: * fires.
@@ -387,7 +422,7 @@ impl Backend for AwsS3Backend {
         let copy_source = format!("{}/{}", self.bucket, input.source_key);
         let mut req = self
             .client
-            .copy_object()
+            .copy_object()AwsS3Backend
             .bucket(&self.bucket)
             .key(&input.destination_key)
             .copy_source(copy_source);
@@ -433,6 +468,15 @@ impl Backend for AwsS3Backend {
         }
         if let Some(ct) = &input.content_type {
             req = req.content_type(ct);
+        }
+        if let Some(lock) = &input.object_lock {
+            let mode = match lock.mode {
+                ObjectLockMode::Governance => SdkObjectLockMode::Governance,
+                ObjectLockMode::Compliance => SdkObjectLockMode::Compliance,
+            };
+            req = req
+                .object_lock_mode(mode)
+                .object_lock_retain_until_date(aws_smithy_types::DateTime::from(lock.retain_until));
         }
         let resp = req
             .send()
