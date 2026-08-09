@@ -11,6 +11,8 @@ use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::clock::{TrustedClock, WallClockAdapter};
 use crate::linker::build_linker;
+use crate::nsm::Nsm;
+use crate::random::GuestRandom;
 use crate::state::State;
 
 /// Exit code for a guest that trapped.
@@ -66,9 +68,15 @@ pub fn read_component(path: &Path) -> Result<Vec<u8>> {
 /// clock is left on `wasmtime-wasi`'s default: it backs timer subscriptions, so
 /// it must be cheap, and it must never step backwards — which a clock
 /// disciplined by an external source can.
+///
+/// `entropy` backs `wasi:random/random`. `wasi:random/insecure` keeps
+/// `wasmtime-wasi`'s generator — it is explicitly not cryptographic, and making
+/// it cost a device round trip would be perverse — but its seed is drawn from
+/// `entropy` once so it is not deterministic across runs.
 pub async fn run_component(
     fs: Arc<Fs>,
     clock: Box<dyn TrustedClock>,
+    entropy: Arc<dyn Nsm>,
     component_bytes: &[u8],
     env: &[(String, String)],
     args: &[String],
@@ -91,6 +99,10 @@ pub async fn run_component(
     wasi.envs(env);
     wasi.args(args);
     wasi.wall_clock(SharedWallClock(wall_clock.clone()));
+
+    let random = GuestRandom::new(entropy.clone());
+    wasi.insecure_random_seed(random.insecure_seed()?);
+    wasi.secure_random(random);
 
     let mut store = Store::new(&engine, State::new(wasi.build(), fs, wall_clock));
 

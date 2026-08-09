@@ -15,8 +15,9 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use s3fs_host::{
-    mount, open_clock, read_component, run_component, ClockSource, GuestEnvPolicy, MasterKeySource,
-    MountConfig, StaticKey, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
+    mount, open_clock, open_entropy, read_component, run_component, ClockSource, GuestEnvPolicy,
+    MasterKeySource, MountConfig, RandomSource, StaticKey, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE,
+    EXIT_RUNTIME_FAILURE,
 };
 
 #[derive(Parser, Debug)]
@@ -104,6 +105,22 @@ struct Cli {
     #[arg(long, env = "S3FS_PTP_DEVICE", default_value = DEFAULT_PTP_DEVICE)]
     ptp_device: PathBuf,
 
+    /// Where the guest's random bytes come from.
+    ///
+    /// `nsm` reads the Nitro Security Module and refuses to start without it.
+    /// `host` uses the kernel, which inside an enclave is NSM-seeded but says
+    /// nothing about it. `auto` prefers NSM and reports a fallback as an error,
+    /// because every key the guest generates afterwards rests on the answer.
+    ///
+    /// An enclave image should set this to `nsm`.
+    #[arg(long, env = "S3FS_RANDOM_SOURCE", default_value = "auto",
+          value_parser = RandomSource::parse)]
+    random_source: RandomSource,
+
+    /// NSM character device to read.
+    #[arg(long, env = "S3FS_NSM_DEVICE", default_value = DEFAULT_NSM_DEVICE)]
+    nsm_device: PathBuf,
+
     /// Path to the `.wasm` component file.
     #[arg(long, short = 'c')]
     component: PathBuf,
@@ -186,11 +203,12 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
     );
 
     let clock = open_clock(cli.clock_source, &cli.ptp_device)?;
+    let entropy = open_entropy(cli.random_source, &cli.nsm_device)?;
     let fs = mount(&cli.mount_config()?, &keys).await?;
     let component = read_component(&cli.component)?;
     let env = cli.env_policy().build()?;
 
-    run_component(fs, clock, &component, &env, &cli.guest_args).await
+    run_component(fs, clock, entropy, &component, &env, &cli.guest_args).await
 }
 
 #[cfg(test)]

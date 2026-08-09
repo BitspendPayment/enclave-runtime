@@ -212,7 +212,9 @@ they share one commit, which is why 20 000 batched inserts land in less time
 than 25 unbatched ones.
 
 
-## Time
+## Time and entropy
+
+### Time
 
 An enclave's system clock is not its own. It is seeded by the hypervisor at
 boot, has no NTP, and drifts — and the party that sets it is the parent
@@ -268,6 +270,57 @@ Verify on any machine with a PHC:
 Neither emulates Nitro; they exercise the same device interface. Full fidelity
 needs QEMU ≥ 9.1's `nitro-enclave` machine and an EIF, which belongs with
 attestation in [the roadmap](docs/ROADMAP.md).
+
+
+### Entropy
+
+`wasi:random/random` is what a guest builds keys, nonces and session
+identifiers from. By default `wasmtime-wasi` serves it from the kernel's
+`getrandom(2)`. Inside an enclave that pool *is* seeded by the Nitro Security
+Module — but nothing in the path says so, and nothing fails if it isn't.
+
+`enclave-runtime` reads the NSM directly, through `/dev/nsm`: the same device
+that signs attestation documents, reached with the same ioctl. Bytes come
+**straight from the device on every call** — there is no software generator in
+between, so the claim is "the NSM produced these" with nothing else to trust.
+
+| `--random-source` | Behaviour |
+|---|---|
+| `nsm` | Read `/dev/nsm`; refuse to start without it. **An enclave image should set this.** |
+| `host` | Kernel `getrandom(2)`, with a warning. Development and CI. |
+| `auto` *(default)* | NSM if the device opens, kernel otherwise. |
+
+A fallback here is logged at **error**, not warning. A clock that falls back is
+degraded; entropy that falls back means every key the guest generates afterwards
+rests on a source nobody chose.
+
+Two things to know if you ever debug this. The raw NSM ioctl requires
+**`CAP_SYS_ADMIN`**, so an unprivileged process gets `EPERM` from a device that
+exists and is readable. And the device answers **256 bytes per call**, so a
+larger request is a loop of ioctls — direct-from-device is deliberately not the
+fast option.
+
+`wasi:random/insecure` keeps `wasmtime-wasi`'s generator; making a
+deliberately-not-cryptographic interface cost a device round trip would be
+perverse. Its seed is drawn from the NSM once at startup so it is not
+deterministic across runs.
+
+`--self-check` reports both clock and entropy and exits without mounting
+anything:
+
+```console
+$ enclave-runtime --self-check --clock-source ptp --random-source nsm
+clock source: PTP hardware clock (/dev/ptp0)
+  ...
+entropy source: Nitro Security Module (/dev/nsm)
+  sample:      b00c80e8c01f4edfd2af255037a94c16
+  histogram:   peak 27, 0 of 256 values unseen (mean 16)
+  read cost:   5.7 us for 64 bytes, 8.5 us for 4096
+```
+
+The histogram is not a randomness test — no cheap check is. It catches the
+failures that actually happen: a stub returning zeros, a buffer never written,
+a device answering the same block every time.
 
 
 ## Building from source

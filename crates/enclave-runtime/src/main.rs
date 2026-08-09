@@ -27,8 +27,9 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use s3fs_host::{
-    mount, open_clock, read_component, run_component, ClockSource, GuestEnvPolicy, MasterKeySource,
-    MountConfig, StaticKey, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
+    mount, open_clock, open_entropy, read_component, run_component, ClockSource, GuestEnvPolicy,
+    MasterKeySource, MountConfig, RandomSource, StaticKey, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE,
+    EXIT_RUNTIME_FAILURE,
 };
 
 /// Where the guest lives inside the enclave image.
@@ -146,10 +147,27 @@ struct Cli {
     #[arg(long, env = "S3FS_PTP_DEVICE", default_value = DEFAULT_PTP_DEVICE)]
     ptp_device: PathBuf,
 
-    /// Report on the configured clock and exit, without mounting or running
-    /// anything. For diagnosing a deployment.
-    #[arg(long)]
-    clock_check: bool,
+    /// Where the guest's random bytes come from.
+    ///
+    /// `nsm` reads the Nitro Security Module and refuses to start without it.
+    /// `host` uses the kernel, which inside an enclave is NSM-seeded but says
+    /// nothing about it. `auto` prefers NSM and reports a fallback as an error,
+    /// because every key the guest generates afterwards rests on the answer.
+    ///
+    /// An enclave image should set this to `nsm`.
+    #[arg(long, env = "S3FS_RANDOM_SOURCE", default_value = "auto",
+          value_parser = RandomSource::parse)]
+    random_source: RandomSource,
+
+    /// NSM character device to read.
+    #[arg(long, env = "S3FS_NSM_DEVICE", default_value = DEFAULT_NSM_DEVICE)]
+    nsm_device: PathBuf,
+
+    /// Report on the configured clock and entropy source and exit, without
+    /// mounting or running anything. For diagnosing a deployment, and the only
+    /// thing the emulator harness needs — it touches no storage.
+    #[arg(long, alias = "clock-check")]
+    self_check: bool,
 
     /// Arguments passed to the guest.
     #[arg(last = true)]
@@ -220,8 +238,11 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
     let cli = Cli::parse();
 
     let clock = open_clock(cli.clock_source, &cli.ptp_device)?;
-    if cli.clock_check {
+    let entropy = open_entropy(cli.random_source, &cli.nsm_device)?;
+    if cli.self_check {
         clock_check(clock.as_ref())?;
+        println!();
+        entropy_check(entropy.as_ref())?;
         return Ok(s3fs_host::GuestOutcome::Success);
     }
 
@@ -246,7 +267,7 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
         "running guest"
     );
 
-    run_component(fs, clock, &component, &env, &cli.guest_args).await
+    run_component(fs, clock, entropy, &component, &env, &cli.guest_args).await
 }
 
 /// Print what the configured clock actually reports.
@@ -314,6 +335,73 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .init();
+}
+
+/// Report on the entropy source, and apply the crude checks that catch a
+/// device returning constants.
+///
+/// These prove nothing about randomness quality — no cheap test can — but they
+/// do catch the failure modes that actually occur: a stub that returns zeros, a
+/// buffer never written, a device answering the same block every time. That is
+/// exactly how an emulator or a misconfigured driver misbehaves.
+fn entropy_check(source: &dyn s3fs_host::Nsm) -> Result<()> {
+    use std::time::Instant;
+
+    println!("entropy source: {}", source.describe());
+
+    let mut first = [0u8; 64];
+    let started = Instant::now();
+    source.get_random(&mut first)?;
+    let first_read = started.elapsed();
+
+    let mut second = [0u8; 64];
+    source.get_random(&mut second)?;
+
+    if first.iter().all(|&b| b == 0) {
+        anyhow::bail!("entropy source returned all zeros");
+    }
+    if first.iter().all(|&b| b == first[0]) {
+        anyhow::bail!("entropy source returned a constant byte {:#04x}", first[0]);
+    }
+    if first == second {
+        anyhow::bail!("two draws returned identical bytes; the source is not advancing");
+    }
+
+    // A byte histogram over a larger sample. Not a randomness test — with 4096
+    // samples over 256 buckets the mean is 16, and anything above ~80 in one
+    // bucket is a stuck source rather than bad luck.
+    let mut bulk = vec![0u8; 4096];
+    let bulk_started = Instant::now();
+    source.get_random(&mut bulk)?;
+    let bulk_read = bulk_started.elapsed();
+
+    let mut histogram = [0u32; 256];
+    for &b in &bulk {
+        histogram[b as usize] += 1;
+    }
+    let peak = histogram.iter().copied().max().unwrap_or(0);
+    let empty = histogram.iter().filter(|&&c| c == 0).count();
+    if peak > 80 {
+        anyhow::bail!("byte histogram peaks at {peak} of 4096; the source looks stuck");
+    }
+
+    println!(
+        "  sample:      {}",
+        first[..16]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join("")
+    );
+    println!("  histogram:   peak {peak}, {empty} of 256 values unseen (mean 16)");
+    println!(
+        "  read cost:   {:.1} us for 64 bytes, {:.1} us for 4096",
+        first_read.as_secs_f64() * 1e6,
+        bulk_read.as_secs_f64() * 1e6
+    );
+    println!();
+    println!("entropy source produced varying, non-constant bytes");
+    Ok(())
 }
 
 #[cfg(test)]

@@ -51,6 +51,10 @@ ENV S3FS_GUEST_PATH=/enclave/guest.wasm
 # alternative is running on a clock the parent instance sets, which is the
 # party this whole design excludes.
 ENV S3FS_CLOCK_SOURCE=ptp
+# Take entropy from the Nitro Security Module and refuse to start without it.
+# The alternative is a kernel pool that is NSM-seeded in an enclave but says
+# nothing about it, and the guest builds keys from these bytes.
+ENV S3FS_RANDOM_SOURCE=nsm
 # ENV S3FS_BUCKET=prod-data
 # ENV S3FS_ROOTS_BUCKET=prod-roots        # Object Lock COMPLIANCE lives here
 # ENV AWS_REGION=eu-west-2

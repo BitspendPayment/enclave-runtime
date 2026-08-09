@@ -26,8 +26,12 @@ in M1.
 
 ### What has to be built
 
-**1. NSM attestation documents.** `aws-nitro-enclaves-nsm-api` to request one
-from `/dev/nsm`, carrying a public key the enclave generates at boot.
+**1. NSM attestation documents.** The device layer already exists —
+[`s3fs-host/src/nsm.rs`](../crates/s3fs-host/src/nsm.rs) opens `/dev/nsm` and
+does the raw CBOR ioctl for `GetRandom`. Attestation is the same call with a
+different payload, so what remains is encoding the `Attestation` request with a
+public key the enclave generates at boot, and parsing the COSE_Sign1 document
+that comes back.
 
 **2. KMS `Decrypt` with `Recipient`.** The attestation document goes in the
 `Recipient` field; KMS returns the plaintext encrypted to the enclave's public

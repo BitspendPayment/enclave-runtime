@@ -24,6 +24,27 @@ fn main() {
     }
 }
 
+/// `wasi:random` reaches a wasip2 guest as the standard library's entropy
+/// source, so this needs no bindings of its own.
+fn getrandom(buf: &mut [u8]) -> Result<(), String> {
+    // `std` has no public entropy API, but `RandomState` is seeded from the
+    // same place, and hashing gives us bytes derived from it. Simpler: read
+    // from the wasi-libc `getrandom` shim via std's `HashMap` seed is fragile,
+    // so go through the raw preview2 import that wasi-libc exposes as
+    // `getentropy`.
+    extern "C" {
+        fn getentropy(buf: *mut u8, len: usize) -> i32;
+    }
+    // getentropy is capped at 256 bytes per call by POSIX.
+    for chunk in buf.chunks_mut(256) {
+        let rc = unsafe { getentropy(chunk.as_mut_ptr(), chunk.len()) };
+        if rc != 0 {
+            return Err(format!("getentropy failed with {rc}"));
+        }
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     // The environment is the reason this guest exists as much as the
     // filesystem is: an enclave guest is configured entirely through it.
@@ -48,6 +69,24 @@ fn run() -> Result<(), String> {
     if now.as_secs() < 1_577_836_800 {
         return Err(format!("wall clock reads {}, before 2020", now.as_secs()));
     }
+
+    // wasi:random/random, which inside an enclave is the Nitro Security
+    // Module. Two draws that differ and are not all-zero is the guest-side
+    // proof the interface is wired to something live.
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    getrandom(&mut a)?;
+    getrandom(&mut b)?;
+    if a == b {
+        return Err("two random draws returned identical bytes".to_string());
+    }
+    if a.iter().all(|&x| x == 0) {
+        return Err("random draw returned all zeros".to_string());
+    }
+    println!(
+        "random {}",
+        a[..8].iter().map(|x| format!("{x:02x}")).collect::<String>()
+    );
 
     let dir = "/smoke";
     if fs::metadata(dir).is_err() {

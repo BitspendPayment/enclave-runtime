@@ -25,6 +25,13 @@ wasmtime-wasi-io = "=44.0.0"
 # already compiled into the tree via wasmtime, so this adds no build cost and
 # avoids a direct libc dependency.
 rustix      = { version = "1", features = ["time", "fs"] }
+# NSM speaks CBOR. Already in the lock file transitively; attestation (M8)
+# will need it for far less trivial payloads than GetRandom.
+ciborium    = "0.2"
+# Pinned to whatever `wasmtime-wasi` accepts for `secure_random`, which is
+# cap-rand's re-export of rand 0.8 — not a version to guess at.
+cap-rand    = "3"
+getrandom   = "0.3"
 
 anyhow      = { workspace = true }
 async-trait = { workspace = true }
