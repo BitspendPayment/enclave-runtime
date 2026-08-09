@@ -11,9 +11,9 @@ use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::clock::{TrustedClock, WallClockAdapter};
 use crate::linker::build_linker;
-use nitro_nsm::Nsm;
 use crate::random::GuestRandom;
 use crate::state::State;
+use nitro_nsm::Nsm;
 
 /// Exit code for a guest that trapped.
 pub const EXIT_GUEST_TRAPPED: i32 = 70;
@@ -62,6 +62,74 @@ pub fn read_component(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("reading guest component at {}", path.display()))
 }
 
+/// Everything a guest instance is built from, in a form that can be used more
+/// than once.
+///
+/// A `wasi:cli/command` guest needs one instance and one [`State`]. A
+/// `wasi:http/proxy` guest needs a fresh `State` per request — a `Store` cannot
+/// be reused across requests, and reusing one would leak a guest's resource
+/// table into the next caller's request. Both must produce *identical*
+/// environments, so both go through here rather than each building a
+/// `WasiCtxBuilder` and drifting.
+///
+/// The filesystem is shared, deliberately: `Arc<Fs>` is one mounted
+/// filesystem with one transaction stream, so writes from separate requests
+/// land in the same store rather than racing two views of it.
+pub struct GuestEnvironment {
+    fs: Arc<Fs>,
+    clock: Arc<WallClockAdapter>,
+    entropy: Arc<dyn Nsm>,
+    env: Vec<(String, String)>,
+    args: Vec<String>,
+}
+
+impl GuestEnvironment {
+    pub fn new(
+        fs: Arc<Fs>,
+        clock: Box<dyn TrustedClock>,
+        entropy: Arc<dyn Nsm>,
+        env: &[(String, String)],
+        args: &[String],
+    ) -> Result<Self> {
+        Ok(GuestEnvironment {
+            fs,
+            // One adapter shared by the guest's clock interface and the
+            // filesystem's "now", so `set-times` cannot disagree with
+            // `wall-clock`.
+            clock: Arc::new(WallClockAdapter::new(clock)?),
+            entropy,
+            env: env.to_vec(),
+            args: args.to_vec(),
+        })
+    }
+
+    pub fn fs(&self) -> &Arc<Fs> {
+        &self.fs
+    }
+
+    /// Build a fresh [`State`] with this environment's capabilities.
+    ///
+    /// Each call draws a new insecure-random seed from the entropy source, so
+    /// two guest instances do not share a hash seed.
+    pub fn new_state(&self) -> Result<State> {
+        let mut wasi = WasiCtxBuilder::new();
+        wasi.inherit_stdio();
+        wasi.envs(&self.env);
+        wasi.args(&self.args);
+        wasi.wall_clock(SharedWallClock(self.clock.clone()));
+
+        let random = GuestRandom::new(self.entropy.clone());
+        wasi.insecure_random_seed(random.insecure_seed()?);
+        wasi.secure_random(random);
+
+        Ok(State::new(
+            wasi.build(),
+            self.fs.clone(),
+            self.clock.clone(),
+        ))
+    }
+}
+
 /// Compile and run a `wasi:cli/command` component against `fs`.
 ///
 /// `clock` backs `wasi:clocks/wall-clock` and `set-times`' "now". The monotonic
@@ -90,21 +158,8 @@ pub async fn run_component(
         .map_err(|e| anyhow::anyhow!(e.to_string()))
         .context("compiling guest component")?;
 
-    // One adapter shared by the guest's clock interface and the filesystem's
-    // "now", so `set-times` cannot disagree with `wall-clock`.
-    let wall_clock = Arc::new(WallClockAdapter::new(clock)?);
-
-    let mut wasi = WasiCtxBuilder::new();
-    wasi.inherit_stdio();
-    wasi.envs(env);
-    wasi.args(args);
-    wasi.wall_clock(SharedWallClock(wall_clock.clone()));
-
-    let random = GuestRandom::new(entropy.clone());
-    wasi.insecure_random_seed(random.insecure_seed()?);
-    wasi.secure_random(random);
-
-    let mut store = Store::new(&engine, State::new(wasi.build(), fs, wall_clock));
+    let guest = GuestEnvironment::new(fs, clock, entropy, env, args)?;
+    let mut store = Store::new(&engine, guest.new_state()?);
 
     let command =
         wasmtime_wasi::p2::bindings::Command::instantiate_async(&mut store, &component, &linker)

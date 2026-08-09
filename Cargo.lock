@@ -3381,6 +3381,9 @@ dependencies = [
  "bytes",
  "cap-rand",
  "getrandom 0.3.4",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper 1.9.0",
  "nitro-nsm",
  "rustix 1.1.4",
  "s3fs-core",
@@ -3388,6 +3391,7 @@ dependencies = [
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
+ "wasmtime-wasi-http",
  "wasmtime-wasi-io",
 ]
 
@@ -4814,6 +4818,26 @@ dependencies = [
  "wasmtime-wasi-io",
  "wiggle",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "wasmtime-wasi-http"
+version = "44.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5798e6e48005406983ba6a7b27f3832f1571e53f1401ef2d60111c96eab534b4"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.9.0",
+ "tokio",
+ "tracing",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wasmtime-wasi-io",
 ]
 
 [[package]]

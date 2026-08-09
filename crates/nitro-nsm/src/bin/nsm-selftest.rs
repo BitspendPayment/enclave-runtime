@@ -13,7 +13,9 @@ use std::time::Instant;
 use nitro_nsm::{Nsm, NsmDevice, DEFAULT_NSM_DEVICE};
 
 fn main() {
-    let device = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_NSM_DEVICE.to_string());
+    let device = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_NSM_DEVICE.to_string());
     match run(&device) {
         Ok(()) => println!("NSM-SELFTEST-OK"),
         Err(e) => {
@@ -64,7 +66,10 @@ fn run(device: &str) -> anyhow::Result<()> {
 
     println!(
         "sample     {}",
-        first[..16].iter().map(|b| format!("{b:02x}")).collect::<String>()
+        first[..16]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     );
     println!("histogram  peak {peak} of 4096 (mean 16)");
     println!(

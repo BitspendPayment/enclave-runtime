@@ -12,6 +12,17 @@ default = []
 # Mounting an S3-backed filesystem. Off by default so the wasi:filesystem
 # bindings stay usable over any Backend without pulling in the AWS SDK.
 aws = ["s3fs-core/aws"]
+# Serving a `wasi:http/proxy` guest. Off by default because it drags in hyper
+# and a second copy of the HTTP machinery, which a host embedding only
+# `wasi:filesystem` has no use for.
+serve = [
+    "dep:wasmtime-wasi-http",
+    "dep:hyper",
+    "dep:http",
+    "dep:http-body-util",
+    "tokio/net",
+    "tokio/io-util",
+]
 
 [dependencies]
 s3fs-core  = { path = "../s3fs-core" }
@@ -21,6 +32,18 @@ nitro-nsm  = { path = "../nitro-nsm" }
 wasmtime         = { version = "=44.0.0", features = ["component-model", "async", "runtime", "cranelift", "std"] }
 wasmtime-wasi    = { workspace = true }
 wasmtime-wasi-io = "=44.0.0"
+
+# `default-send-request` is deliberately OFF. With it on, `wasi:http`'s
+# outgoing-handler quietly gains a working implementation — a guest could make
+# arbitrary outbound requests, through a second rustls and its own root store,
+# neither of which anything here configures. With it off, `send_request`
+# becomes a trait method we are *required* to write, so refusing egress is a
+# visible decision rather than a feature flag nobody looked at. See
+# `serve::EgressPolicy`.
+wasmtime-wasi-http = { version = "=44.0.0", default-features = false, features = ["p2"], optional = true }
+hyper          = { version = "1", features = ["http1", "server"], optional = true }
+http           = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
 
 # The PTP clock is read through the POSIX dynamic-clock mechanism. rustix is
 # already compiled into the tree via wasmtime, so this adds no build cost and

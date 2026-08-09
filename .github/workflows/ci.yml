@@ -44,6 +44,31 @@ jobs:
       - name: cargo clippy --features aws
         run: cargo clippy --workspace --features s3fs-host/aws --all-targets -- -D warnings
 
+  serve-http:
+    name: Serving a wasi:http guest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+
+      # Needs no C toolchain and no Docker: the tests run the real component
+      # through the real linker over the in-memory backend, so the whole
+      # dispatch path is covered on every push rather than only where MinIO is
+      # available.
+      - name: build the HTTP guest
+        working-directory: examples/guest-http
+        run: cargo build --release --target wasm32-wasip2
+
+      - name: cargo clippy --features serve
+        run: cargo clippy --workspace --features s3fs-host/serve --all-targets -- -D warnings
+
+      - name: serve integration tests
+        run: cargo test -p s3fs-host --features serve --test serve_guest -- --include-ignored
+
   minio-integration:
     name: MinIO integration tests
     runs-on: ubuntu-latest

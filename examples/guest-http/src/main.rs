@@ -1,0 +1,169 @@
+//! A guest that answers HTTP requests out of the Merkle-anchored filesystem.
+//!
+//! This is the end-to-end signal for the serving path, and it is deliberately
+//! stateful: `/counter` reads a file, increments it and writes it back, so a
+//! second request proves the runtime carried a *committed* filesystem across
+//! requests rather than handing each instance a fresh view. A stateless
+//! handler would pass even if every request got its own empty store.
+//!
+//! What it never does is as informative as what it does. There is no listener,
+//! no socket, no certificate and no outbound request anywhere in this file —
+//! the runtime terminates TLS and hands over a parsed request. The guest's
+//! entire view of the network is the `Request` argument.
+//!
+//! ```console
+//! $ curl localhost:8080/           # what this guest is
+//! $ curl localhost:8080/counter    # increments, persists
+//! $ curl localhost:8080/env        # what the environment policy let through
+//! $ curl -X POST --data-binary @f localhost:8080/files/notes.txt
+//! $ curl localhost:8080/files/notes.txt
+//! ```
+
+use std::fmt::Write as _;
+use std::fs;
+use std::io::Write as _;
+use std::path::{Component, Path, PathBuf};
+
+use wstd::http::{Body, Error, Request, Response, StatusCode};
+
+/// Where this guest keeps its state. A directory rather than the root, so it
+/// is obvious in a bucket listing which objects came from the example.
+const STATE_DIR: &str = "/http-example";
+
+#[wstd::http_server]
+async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+
+    let result = match (method.as_str(), path.as_str()) {
+        ("GET", "/") => Ok(text(StatusCode::OK, banner())),
+        ("GET", "/counter") => counter().map(|n| text(StatusCode::OK, format!("{n}\n"))),
+        ("GET", "/env") => Ok(text(StatusCode::OK, environment())),
+        ("POST", p) | ("PUT", p) if p.starts_with("/files/") => {
+            let body = req.body_mut().bytes_contents().await?;
+            write_file(&p["/files/".len()..], &body)
+        }
+        ("GET", p) if p.starts_with("/files/") => read_file(&p["/files/".len()..]),
+        _ => Ok(text(
+            StatusCode::NOT_FOUND,
+            format!("no route for {method} {path}\n"),
+        )),
+    };
+
+    // A guest failure is a 500 with the reason, not a trap. Trapping would
+    // take down the instance and tell the client nothing, and inside an
+    // enclave the console is the only other place the reason could go.
+    Ok(result.unwrap_or_else(|e| text(StatusCode::INTERNAL_SERVER_ERROR, format!("error: {e}\n"))))
+}
+
+fn text(status: StatusCode, body: String) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(body.into())
+        .expect("response is well formed")
+}
+
+fn banner() -> String {
+    let mut out = String::from("guest-http on a Merkle-anchored filesystem\n\n");
+    out.push_str("GET  /counter          increment and return a persisted counter\n");
+    out.push_str("GET  /env              environment the runtime policy allowed\n");
+    out.push_str("POST /files/<name>     write a file\n");
+    out.push_str("GET  /files/<name>     read it back\n\n");
+    match fs::read_dir(STATE_DIR) {
+        Ok(entries) => {
+            let _ = writeln!(out, "files: {}", entries.count());
+        }
+        Err(_) => out.push_str("files: none yet\n"),
+    }
+    out
+}
+
+/// Read-modify-write against the block store.
+///
+/// The proof that matters: run it twice and the number goes up. That can only
+/// happen if the first request's write was committed and the second request's
+/// fresh instance read the committed state.
+fn counter() -> Result<u64, String> {
+    fs::create_dir_all(STATE_DIR).map_err(|e| format!("creating {STATE_DIR}: {e}"))?;
+    let path = format!("{STATE_DIR}/counter");
+
+    let current: u64 = match fs::read_to_string(&path) {
+        Ok(s) => s.trim().parse().unwrap_or(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(format!("reading {path}: {e}")),
+    };
+    let next = current + 1;
+
+    // `sync_all` rather than relying on drop: the runtime commits a
+    // transaction on flush, and a response that reports a number the store has
+    // not accepted yet would be a lie the next request exposes.
+    let mut f = fs::File::create(&path).map_err(|e| format!("creating {path}: {e}"))?;
+    f.write_all(format!("{next}\n").as_bytes())
+        .map_err(|e| format!("writing {path}: {e}"))?;
+    f.sync_all().map_err(|e| format!("syncing {path}: {e}"))?;
+    Ok(next)
+}
+
+fn environment() -> String {
+    let mut vars: Vec<_> = std::env::vars().collect();
+    vars.sort();
+    if vars.is_empty() {
+        return "(the runtime passed no variables)\n".to_string();
+    }
+    let mut out = String::new();
+    for (k, v) in vars {
+        let _ = writeln!(out, "{k}={v}");
+    }
+    out
+}
+
+fn write_file(name: &str, body: &[u8]) -> Result<Response<Body>, String> {
+    let path = safe_path(name)?;
+    fs::create_dir_all(STATE_DIR).map_err(|e| format!("creating {STATE_DIR}: {e}"))?;
+    let mut f = fs::File::create(&path).map_err(|e| format!("creating {}: {e}", path.display()))?;
+    f.write_all(body)
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    f.sync_all()
+        .map_err(|e| format!("syncing {}: {e}", path.display()))?;
+    Ok(text(
+        StatusCode::CREATED,
+        format!("wrote {} bytes to {}\n", body.len(), path.display()),
+    ))
+}
+
+fn read_file(name: &str) -> Result<Response<Body>, String> {
+    let path = safe_path(name)?;
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/octet-stream")
+            .body(bytes.into())
+            .expect("response is well formed")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(text(
+            StatusCode::NOT_FOUND,
+            format!("no such file: {name}\n"),
+        )),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
+}
+
+/// Keep a request-supplied name inside [`STATE_DIR`].
+///
+/// The preopen the runtime grants is the filesystem *root*, so `..` in a path
+/// from a client would escape this guest's directory and reach anything else
+/// stored in the same filesystem. WASI's capability model stops a guest
+/// leaving its preopen; it does not stop a guest wandering around inside it.
+fn safe_path(name: &str) -> Result<PathBuf, String> {
+    if name.is_empty() {
+        return Err("empty file name".into());
+    }
+    let candidate = Path::new(name);
+    if candidate
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(format!("rejected path {name:?}: must be a plain file name"));
+    }
+    Ok(Path::new(STATE_DIR).join(candidate))
+}

@@ -33,6 +33,8 @@ pub mod linker;
 pub mod mount;
 pub mod random;
 pub mod run;
+#[cfg(feature = "serve")]
+pub mod serve;
 pub mod state;
 pub mod wasi;
 
@@ -46,7 +48,10 @@ pub use mount::{mount, parse_fs_id, MountConfig};
 pub use nitro_nsm::{Nsm, NsmDevice, DEFAULT_NSM_DEVICE};
 pub use random::{open_entropy, GuestRandom, HostEntropy, RandomSource};
 pub use run::{
-    read_component, run_component, GuestOutcome, EXIT_GUEST_TRAPPED, EXIT_RUNTIME_FAILURE,
+    read_component, run_component, GuestEnvironment, GuestOutcome, EXIT_GUEST_TRAPPED,
+    EXIT_RUNTIME_FAILURE,
 };
+#[cfg(feature = "serve")]
+pub use serve::{serve_component, EgressPolicy, ServeConfig, ServeHandle};
 pub use state::State;
 pub use wasi::{add_filesystem_to_linker, S3FsCtxView, S3WasiView};

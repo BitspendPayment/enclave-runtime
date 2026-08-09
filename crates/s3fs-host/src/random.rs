@@ -175,8 +175,8 @@ impl cap_rand::CryptoRng for GuestRandom {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nitro_nsm::fake::FakeNsm;
     use cap_rand::RngCore;
+    use nitro_nsm::fake::FakeNsm;
     use std::sync::atomic::Ordering;
 
     fn fake() -> Arc<FakeNsm> {

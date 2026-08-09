@@ -21,19 +21,35 @@
 //! parent instance, exactly the party an enclave exists to exclude. Replacing
 //! it is a new [`s3fs_host::MasterKeySource`] implementation and nothing else.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
 use s3fs_host::{
-    mount, open_clock, open_entropy, read_component, run_component, ClockSource, GuestEnvPolicy,
-    MasterKeySource, MountConfig, RandomSource, StaticKey, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE,
-    EXIT_RUNTIME_FAILURE,
+    mount, open_clock, open_entropy, read_component, run_component, serve_component, ClockSource,
+    GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, RandomSource, ServeConfig,
+    StaticKey, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
 /// Where the guest lives inside the enclave image.
 const DEFAULT_GUEST_PATH: &str = "/enclave/guest.wasm";
+
+/// Whether the guest is run to completion or serves requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Command,
+    Serve,
+}
+
+fn parse_mode(s: &str) -> Result<Mode, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "command" | "run" => Ok(Mode::Command),
+        "serve" | "http" => Ok(Mode::Serve),
+        other => Err(format!("unknown mode {other:?}; expected command or serve")),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -169,6 +185,33 @@ struct Cli {
     #[arg(long, alias = "clock-check")]
     self_check: bool,
 
+    /// What kind of guest this is.
+    ///
+    /// `command` runs a `wasi:cli/command` guest once and exits with its code.
+    /// `serve` expects a `wasi:http/proxy` guest and answers HTTP until
+    /// stopped. The two are different component worlds, so a guest built for
+    /// one will not instantiate under the other.
+    #[arg(long, env = "S3FS_MODE", default_value = "command",
+          value_parser = parse_mode)]
+    mode: Mode,
+
+    /// Address to serve on in `serve` mode.
+    ///
+    /// Binds every interface by default because inside an enclave the only
+    /// interface is the one the parent's proxy reaches, and binding loopback
+    /// there would answer nobody.
+    #[arg(long, env = "S3FS_HTTP_LISTEN", default_value = "0.0.0.0:8080")]
+    http_listen: SocketAddr,
+
+    /// Requests allowed inside the guest at once.
+    ///
+    /// One by default. The filesystem is safe to share, but a guest is not
+    /// necessarily safe to run twice over the same data — SQLite on WASI has
+    /// to hold `locking_mode=EXCLUSIVE`, because WASI has no `fcntl` and so no
+    /// file locking. Raise it for a guest that keeps no cross-request state.
+    #[arg(long, env = "S3FS_HTTP_CONCURRENCY", default_value_t = 1)]
+    http_concurrency: usize,
+
     /// Arguments passed to the guest.
     #[arg(last = true)]
     guest_args: Vec<String>,
@@ -261,13 +304,37 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
     let component = read_component(&cli.guest_path)?;
 
     let env = cli.env_policy().build()?;
-    tracing::info!(
-        variables = env.len(),
-        args = cli.guest_args.len(),
-        "running guest"
-    );
 
-    run_component(fs, clock, entropy, &component, &env, &cli.guest_args).await
+    match cli.mode {
+        Mode::Command => {
+            tracing::info!(
+                variables = env.len(),
+                args = cli.guest_args.len(),
+                "running guest"
+            );
+            run_component(fs, clock, entropy, &component, &env, &cli.guest_args).await
+        }
+        Mode::Serve => {
+            tracing::info!(
+                variables = env.len(),
+                listen = %cli.http_listen,
+                "serving guest"
+            );
+            let guest = GuestEnvironment::new(fs, clock, entropy, &env, &cli.guest_args)?;
+            serve_component(
+                &component,
+                guest,
+                ServeConfig {
+                    addr: cli.http_listen,
+                    concurrency: cli.http_concurrency,
+                },
+            )
+            .await?;
+            // `serve_component` only returns on error; reaching here means the
+            // accept loop stopped, which is not a guest exit.
+            Ok(s3fs_host::GuestOutcome::Failed)
+        }
+    }
 }
 
 /// Print what the configured clock actually reports.

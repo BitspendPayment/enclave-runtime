@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "guest-http"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "wasm32-wasip2 guest serving wasi:http/incoming-handler over the block store"
+
+[[bin]]
+name = "guest-http"
+path = "src/main.rs"
+
+[dependencies]
+# `wstd` supplies the `http_server` attribute, which is what turns this binary
+# into a component exporting `wasi:http/incoming-handler`. Everything else is
+# `std`: file access goes through `wasi:filesystem`, which the runtime backs
+# with the block store.
+wstd = "0.6"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
