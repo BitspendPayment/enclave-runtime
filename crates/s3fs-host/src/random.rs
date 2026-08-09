@@ -63,6 +63,21 @@ impl Nsm for HostEntropy {
         getrandom::fill(buf).map_err(|e| anyhow::anyhow!("kernel getrandom(2): {e}"))
     }
 
+    /// There is no attestation without an NSM, and no substitute worth
+    /// inventing.
+    ///
+    /// A document is a signature by AWS over what this enclave is running. On
+    /// a developer's machine there is nothing to sign it with and nothing true
+    /// to say, so this fails rather than returning a plausible-looking
+    /// structure — a caller that got one would be building the very confusion
+    /// attestation exists to prevent.
+    fn attest(&self, _request: &nitro_nsm::AttestationRequest) -> Result<Vec<u8>> {
+        anyhow::bail!(
+            "no attestation available: entropy is coming from the kernel, not an NSM. \
+             Attestation needs a real enclave (or the QEMU nitro-enclave harness)."
+        )
+    }
+
     fn describe(&self) -> String {
         "kernel getrandom(2) (not NSM)".to_string()
     }

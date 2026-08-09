@@ -60,10 +60,54 @@ struct NsmRaw {
 /// `_IOWR(NSM_MAGIC, 0x0, struct nsm_raw)`.
 const NSM_IOCTL_RAW: ioctl::Opcode = ioctl::opcode::read_write::<NsmRaw>(0x0A, 0x0);
 
+/// What goes into an attestation document, beyond what the NSM puts there
+/// itself (the PCRs, the module id, the timestamp, the signing certificate).
+///
+/// All three fields are optional and all three are attacker-visible; none is a
+/// secret. Their value is that the NSM copies them verbatim into a document it
+/// signs, so a verifier who trusts the signature can trust that *this enclave*
+/// asserted them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AttestationRequest {
+    /// Application-chosen bytes. This is where a TLS certificate hash goes, so
+    /// a client can tie the connection it holds to the code it attested.
+    pub user_data: Option<Vec<u8>>,
+    /// Caller-chosen bytes, echoed back. A verifier supplies a fresh one so a
+    /// replayed document from an earlier boot cannot be passed off as current.
+    pub nonce: Option<Vec<u8>>,
+    /// A public key the enclave generated, for a verifier to encrypt to. Used
+    /// by KMS `Decrypt` with `Recipient`; unused here.
+    pub public_key: Option<Vec<u8>>,
+}
+
+impl AttestationRequest {
+    /// An attestation binding `user_data`, with a caller-supplied `nonce`.
+    pub fn with_user_data(user_data: Vec<u8>) -> Self {
+        AttestationRequest {
+            user_data: Some(user_data),
+            ..Default::default()
+        }
+    }
+
+    pub fn nonce(mut self, nonce: Vec<u8>) -> Self {
+        self.nonce = Some(nonce);
+        self
+    }
+}
+
 /// What an NSM can do, so tests can substitute a fake.
 pub trait Nsm: Send + Sync + fmt::Debug {
     /// Fill `buf` with random bytes.
     fn get_random(&self, buf: &mut [u8]) -> Result<()>;
+
+    /// Ask for an attestation document.
+    ///
+    /// Returns the raw COSE_Sign1 bytes, unparsed and unverified. Parsing
+    /// belongs to `nitro-attestation`, which a *client* needs without this
+    /// crate's Linux device layer — the whole point of a document is that it
+    /// is checked somewhere else.
+    fn attest(&self, request: &AttestationRequest) -> Result<Vec<u8>>;
+
     /// Short description for logs.
     fn describe(&self) -> String;
 }
@@ -176,9 +220,79 @@ impl Nsm for NsmDevice {
         Ok(())
     }
 
+    fn attest(&self, request: &AttestationRequest) -> Result<Vec<u8>> {
+        let response = self.request(&encode_attestation(request))?;
+        decode_attestation(&response)
+    }
+
     fn describe(&self) -> String {
         format!("Nitro Security Module ({})", self.device.display())
     }
+}
+
+/// `{"Attestation": {"user_data": <bytes>, ...}}`, with absent fields
+/// **omitted rather than set to null**.
+///
+/// This is not a style choice. The device parses each present key by pulling a
+/// byte string out of it; a CBOR `null` is not a byte string, so a request
+/// carrying `"nonce": null` is rejected outright — and the rejection arrives
+/// as `InvalidOperation` for the whole request, naming nothing. Omitting the
+/// key leaves the field at its default, which is null anyway.
+fn encode_attestation(request: &AttestationRequest) -> Vec<u8> {
+    let mut fields = Vec::new();
+    let mut push = |name: &str, value: &Option<Vec<u8>>| {
+        if let Some(bytes) = value {
+            fields.push((
+                ciborium::Value::Text(name.to_string()),
+                ciborium::Value::Bytes(bytes.clone()),
+            ));
+        }
+    };
+    push("user_data", &request.user_data);
+    push("nonce", &request.nonce);
+    push("public_key", &request.public_key);
+
+    let value = ciborium::Value::Map(vec![(
+        ciborium::Value::Text("Attestation".into()),
+        ciborium::Value::Map(fields),
+    )]);
+    let mut out = Vec::new();
+    ciborium::into_writer(&value, &mut out).expect("writing to a Vec cannot fail");
+    out
+}
+
+/// Pull the COSE_Sign1 out of `{"Attestation": {"document": <bytes>}}`.
+fn decode_attestation(cbor: &[u8]) -> Result<Vec<u8>> {
+    let value: ciborium::Value =
+        ciborium::from_reader(cbor).context("decoding the NSM Attestation response")?;
+
+    let outer = value
+        .as_map()
+        .with_context(|| format!("NSM response is not a map: {value:?}"))?;
+    let (key, inner) = outer.first().context("NSM response map is empty")?;
+    let key = key.as_text().unwrap_or("<non-text>");
+    if key != "Attestation" {
+        // The device reports its own failures as {"Error": "..."} rather than
+        // by failing the ioctl, so the real text matters here.
+        bail!("NSM answered {key:?} instead of Attestation: {inner:?}");
+    }
+
+    let inner = inner
+        .as_map()
+        .with_context(|| format!("Attestation value is not a map: {inner:?}"))?;
+    for (k, v) in inner {
+        if k.as_text() == Some("document") {
+            let doc = v
+                .as_bytes()
+                .cloned()
+                .context("Attestation 'document' field is not a byte string")?;
+            if doc.is_empty() {
+                bail!("NSM returned an empty attestation document");
+            }
+            return Ok(doc);
+        }
+    }
+    bail!("Attestation response has no 'document' field")
 }
 
 /// The `GetRandom` request: a bare CBOR text string.
@@ -225,6 +339,7 @@ fn decode_get_random(cbor: &[u8]) -> Result<Vec<u8>> {
 pub mod fake {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     /// Encodes a GetRandom response the way the device does, so the decoder is
     /// tested against the real wire shape rather than against itself.
@@ -241,6 +356,20 @@ pub mod fake {
         out
     }
 
+    /// Encodes an Attestation response the way the device does.
+    pub fn encode_attestation_response(document: &[u8]) -> Vec<u8> {
+        let value = ciborium::Value::Map(vec![(
+            ciborium::Value::Text("Attestation".into()),
+            ciborium::Value::Map(vec![(
+                ciborium::Value::Text("document".into()),
+                ciborium::Value::Bytes(document.to_vec()),
+            )]),
+        )]);
+        let mut out = Vec::new();
+        ciborium::into_writer(&value, &mut out).unwrap();
+        out
+    }
+
     /// A stand-in device: counts calls, and can be made to return nothing.
     #[derive(Debug)]
     pub struct FakeNsm {
@@ -248,6 +377,15 @@ pub mod fake {
         pub empty: AtomicBool,
         /// Bytes returned per call, mirroring the device's 256-byte chunk.
         pub chunk: usize,
+        /// Document [`Nsm::attest`] hands back, and the last request that
+        /// asked for one.
+        ///
+        /// It is *not* a signed COSE_Sign1 by default — this crate has no
+        /// signing stack and should not grow one. Tests that need a verifiable
+        /// document build it in `nitro-attestation` and set it here, so a fake
+        /// can never accidentally satisfy a real verifier.
+        pub attestation: Mutex<Vec<u8>>,
+        pub last_attestation_request: Mutex<Option<AttestationRequest>>,
     }
 
     impl Default for FakeNsm {
@@ -256,6 +394,8 @@ pub mod fake {
                 calls: AtomicU64::new(0),
                 empty: AtomicBool::new(false),
                 chunk: 256,
+                attestation: Mutex::new(b"not-a-signed-attestation-document".to_vec()),
+                last_attestation_request: Mutex::new(None),
             }
         }
     }
@@ -286,9 +426,94 @@ pub mod fake {
             }
             Ok(())
         }
+        fn attest(&self, request: &AttestationRequest) -> Result<Vec<u8>> {
+            if self.empty.load(Ordering::SeqCst) {
+                bail!("NSM returned an empty attestation document");
+            }
+            *self.last_attestation_request.lock().unwrap() = Some(request.clone());
+            Ok(self.attestation.lock().unwrap().clone())
+        }
+
         fn describe(&self) -> String {
             "fake NSM".into()
         }
+    }
+
+    /// The device rejects a `null` field outright — `fill_attestation_property`
+    /// wants a byte string — and answers `InvalidOperation` for the whole
+    /// request without naming which field was at fault. Omitting absent fields
+    /// is what keeps that from happening, so it is worth a test.
+    #[test]
+    fn absent_attestation_fields_are_omitted_not_nulled() {
+        let encoded = encode_attestation(&AttestationRequest::with_user_data(vec![1, 2, 3]));
+        let value: ciborium::Value = ciborium::from_reader(&encoded[..]).unwrap();
+        let inner = value.as_map().unwrap()[0].1.as_map().unwrap();
+
+        let names: Vec<&str> = inner.iter().filter_map(|(k, _)| k.as_text()).collect();
+        assert_eq!(names, ["user_data"], "only the supplied field may appear");
+        assert!(
+            !inner
+                .iter()
+                .any(|(_, v)| matches!(v, ciborium::Value::Null)),
+            "a null field makes the device reject the whole request"
+        );
+    }
+
+    #[test]
+    fn every_supplied_attestation_field_is_carried() {
+        let request = AttestationRequest {
+            user_data: Some(vec![0xaa]),
+            nonce: Some(vec![0xbb]),
+            public_key: Some(vec![0xcc]),
+        };
+        let value: ciborium::Value =
+            ciborium::from_reader(&encode_attestation(&request)[..]).unwrap();
+        let outer = value.as_map().unwrap();
+        assert_eq!(outer[0].0.as_text(), Some("Attestation"));
+
+        let inner = outer[0].1.as_map().unwrap();
+        let get = |name: &str| {
+            inner
+                .iter()
+                .find(|(k, _)| k.as_text() == Some(name))
+                .map(|(_, v)| v.as_bytes().unwrap().clone())
+        };
+        assert_eq!(get("user_data"), Some(vec![0xaa]));
+        assert_eq!(get("nonce"), Some(vec![0xbb]));
+        assert_eq!(get("public_key"), Some(vec![0xcc]));
+    }
+
+    #[test]
+    fn an_attestation_document_round_trips() {
+        let doc = b"\x84pretend COSE_Sign1".to_vec();
+        assert_eq!(
+            decode_attestation(&encode_attestation_response(&doc)).unwrap(),
+            doc
+        );
+    }
+
+    /// An empty document is a failure, not an empty success: everything
+    /// downstream would otherwise try to parse zero bytes and report a
+    /// confusing parse error instead of "the device gave us nothing".
+    #[test]
+    fn an_empty_attestation_document_is_an_error() {
+        let err = decode_attestation(&encode_attestation_response(&[])).unwrap_err();
+        assert!(format!("{err:#}").contains("empty"), "{err:#}");
+    }
+
+    #[test]
+    fn an_error_response_to_attestation_names_what_came_back() {
+        let value = ciborium::Value::Map(vec![(
+            ciborium::Value::Text("Error".into()),
+            ciborium::Value::Text("InvalidOperation".into()),
+        )]);
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&value, &mut cbor).unwrap();
+
+        let err = decode_attestation(&cbor).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("Error"), "{text}");
+        assert!(text.contains("InvalidOperation"), "{text}");
     }
 
     #[test]
