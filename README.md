@@ -378,6 +378,175 @@ This needs `/dev/kvm` and so does not run on GitHub-hosted runners, the same
 limitation the PTP harness has.
 
 
+## Serving HTTP
+
+The runtime terminates HTTPS itself and hands the guest plaintext. This follows
+[nitriding](https://github.com/brave/nitriding-daemon), as does
+[ArkLabsHQ/enclave](https://github.com/ArkLabsHQ/enclave), and the reason is
+the whole point of the exercise: a reverse proxy on the parent instance would
+read every request in the clear, and the parent is precisely the party an
+enclave exists to exclude.
+
+```text
+     internet
+        │  HTTPS :443
+        ▼
+┌──────────────────────────────────────────┐   EC2 parent instance
+│  gvproxy   --listen vsock://:1024        │   (untrusted)
+│            expose :443 → 192.168.127.2   │
+└──────────────────────────────────────────┘
+        │  AF_VSOCK CID 3, port 1024  (ethernet frames)
+        ▼
+┌──────────────────────────────────────────┐   enclave (attested)
+│  gvforwarder → tap0  192.168.127.2       │
+│                                          │
+│  enclave-runtime                         │
+│    rustls  :443  ← key born here         │
+│      ├─ /enclave/*  → runtime            │
+│      └─ everything else                  │
+│           ▼  plaintext HTTP              │
+│    wasmtime-wasi-http                    │
+│           ▼                              │
+│    guest.wasm  wasi:http/incoming-handler│
+│      imports wasi:filesystem (s3fs)      │
+│      imports NO sockets                  │
+└──────────────────────────────────────────┘
+```
+
+### What the guest gets, and does not
+
+It exports `wasi:http/incoming-handler` and receives a **parsed request**. It
+never sees a socket, a connection, a certificate or a TLS record. It cannot
+open one either: the linker grants no `wasi:sockets` permission, and
+`wasi:http/outgoing-handler` is wired to an [`EgressPolicy`](crates/s3fs-host/src/serve/mod.rs)
+that refuses every request.
+
+That refusal is explicit rather than incidental. `wasmtime-wasi-http`'s
+`default-send-request` feature is off, which turns `send_request` from a
+defaulted method into one this crate must write — so the answer is a decision
+with a test, not a consequence of which crate features happened to be on.
+
+`examples/guest-http` is the worked example.
+
+```console
+$ (cd examples/guest-http && cargo build --release --target wasm32-wasip2)
+$ S3FS_MODE=serve S3FS_TLS=off S3FS_HTTP_LISTEN=127.0.0.1:8080 \
+  S3FS_GUEST_PATH=examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm \
+  ./target/release/enclave-runtime
+$ curl localhost:8080/counter    # 1
+$ curl localhost:8080/counter    # 2 — committed to the block store
+```
+
+### Requests run one at a time by default
+
+`Fs` is safe to share: handles under a `parking_lot::Mutex`, transaction state
+under a `tokio::Mutex`. The *guest* may not be. As the compatibility matrix
+above records, SQLite on WASI has to hold `locking_mode=EXCLUSIVE`, because
+WASI has no `fcntl` and therefore no file locking — two instances over one
+database would each believe they had it alone, and fail in a way that looks
+like corruption rather than contention.
+
+So `--http-concurrency` defaults to `1`. Raise it for a guest that keeps no
+cross-request state in the filesystem.
+
+### The attestation binding
+
+The TLS key is generated inside the enclave and never leaves it. Its
+certificate's hash goes into the attestation document, so a client can tie the
+connection it holds to the code it attested:
+
+| Endpoint | |
+|---|---|
+| `GET /enclave/attestation?nonce=<hex>` | base64 COSE_Sign1, `no-store` |
+| `GET /enclave/config` | PCR0 and the two hashes, nothing secret |
+
+`user_data` follows nitriding's layout — two multihash-prefixed SHA-256
+digests, 68 bytes:
+
+```text
+  0x12 0x20 ‖ sha256(TLS leaf DER) ‖ 0x12 0x20 ‖ sha256(guest component)
+```
+
+The certificate hash ties the TLS session to the document; the guest hash says
+which application was behind it. `/enclave/` is reserved and checked before the
+guest sees a request — a guest that could answer there could serve any
+attestation it liked. The nonce is **required**: a document without one cannot
+be shown to be fresh, and serving one on demand invites exactly the replay the
+nonce exists to prevent.
+
+Verify an endpoint with one command:
+
+```console
+$ nitro-attest --url https://enclave.example/enclave/attestation \
+      --pcr0 8cac35ce… --guest ./guest.wasm
+module     i-0abc…-enc0123…
+PCR0       8cac35ce…
+chain      verified to the AWS Nitro root
+tls hash   3aa2e103…
+guest hash 7ee636bc…
+binding    the attested certificate is the one serving this connection
+OK
+```
+
+That last line is the one that matters. Without it a valid attestation
+document proves only that *an* enclave exists somewhere — a proxy could fetch a
+genuine one and serve it over its own TLS session. With it, the only party who
+could have produced the document is the one holding the private key for the
+connection in hand.
+
+### Certificates: self-signed or Let's Encrypt
+
+| `--tls` | |
+|---|---|
+| `self-signed` *(default)* | Generated at startup. Browsers refuse it; attestation-verifying clients do not care, because the binding proves more than a CA signature does. |
+| `acme` | Let's Encrypt over **TLS-ALPN-01**, on the same :443 already forwarded. Needs `--tls-domain` and outbound network. |
+| `off` | Plaintext. Inside an enclave this hands every request to the parent. |
+
+Let's Encrypt buys browser compatibility, not trust. The operator controls the
+domain and could obtain their own certificate for it and terminate TLS
+themselves; the attestation binding is what closes that, because a client
+checking it will not accept a certificate the enclave did not attest.
+
+The ACME account key and the certificate's private key are sealed with
+AES-256-GCM under a key derived from the master secret and written as ordinary
+objects — the parent stores ciphertext. They are deliberately not in the
+filesystem, because the guest's preopen is its **root**, and a guest holding
+the TLS private key could impersonate the enclave. Caching is not optional:
+Let's Encrypt allows five duplicate certificates per week, so an enclave
+re-issuing on every boot would exhaust that and be unable to serve.
+
+### The parent instance
+
+An enclave has no NIC. Nothing above works until the parent turns vsock into an
+interface, and an enclave that boots and then answers nothing is almost always
+this:
+
+```console
+$ ./deploy/parent/run-parent.sh          # gvproxy + inbound :443 forwarding
+$ nitro-cli run-enclave --eif-path s3fs.eif --cpu-count 2 --memory 2048
+```
+
+The parent carries ciphertext it cannot read — TLS to S3 and KMS is
+established inside the enclave, and inbound HTTPS is terminated inside it. What
+it does learn is metadata, and it can of course refuse to carry anything;
+neither is new, since it already decides whether the enclave runs. What is not
+safe is trusting its DNS, which is why every outbound connection validates
+certificates.
+
+### What is verified, and what is not
+
+Covered on every push: the dispatch path against a real component over the
+in-memory backend, and a real TLS connection whose attestation document is
+checked to bind the certificate from the handshake — including the failures,
+where a substituted certificate breaks the binding and an earlier document does
+not satisfy a later nonce.
+
+**Not covered:** a successful ACME issuance. That needs a CA and a domain it can
+reach; the path from a signed order to a served certificate is written and
+unexercised. Chain validation to the AWS Nitro root is likewise hardware-only,
+since QEMU signs with a key it generates.
+
+
 ## Building from source
 
 ```bash

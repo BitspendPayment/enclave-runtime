@@ -26,16 +26,15 @@ in M1.
 
 ### What has to be built
 
-**1. NSM attestation documents.** The device layer already exists —
-[`nitro-nsm`](../crates/nitro-nsm/src/lib.rs) opens `/dev/nsm` and does the raw
-CBOR ioctl for `GetRandom`. Attestation is the same call with a different
-payload, so what remains is encoding the `Attestation` request with a public key
-the enclave generates at boot, and parsing the COSE_Sign1 document that comes
-back.
+**1. NSM attestation documents — done.** [`nitro-nsm`](../crates/nitro-nsm/src/lib.rs)
+issues the `Attestation` request and [`nitro-attestation`](../crates/nitro-attestation/src/lib.rs)
+parses and verifies the COSE_Sign1 that comes back, against the AWS Nitro root.
+The runtime already binds its TLS certificate and the guest into `user_data`
+and serves documents at `/enclave/attestation`.
 
-It is a separate crate rather than a module of `s3fs-host` so it can be linked
-into a small static musl binary for an enclave image — which is how the device
-layer is verified today, in the QEMU harness described below.
+What M8 still needs from this layer is the `public_key` field, which is
+currently always absent: KMS `Decrypt` with `Recipient` returns the plaintext
+encrypted to a key the enclave generates at boot, and that key goes there.
 
 **2. KMS `Decrypt` with `Recipient`.** The attestation document goes in the
 `Recipient` field; KMS returns the plaintext encrypted to the enclave's public
