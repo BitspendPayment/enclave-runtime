@@ -221,14 +221,14 @@ fn decode_get_random(cbor: &[u8]) -> Result<Vec<u8>> {
     bail!("GetRandom response has no 'random' field")
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "testing"))]
+pub mod fake {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// Encodes a GetRandom response the way the device does, so the decoder is
     /// tested against the real wire shape rather than against itself.
-    pub(crate) fn encode_response(bytes: &[u8]) -> Vec<u8> {
+    pub fn encode_response(bytes: &[u8]) -> Vec<u8> {
         let value = ciborium::Value::Map(vec![(
             ciborium::Value::Text("GetRandom".into()),
             ciborium::Value::Map(vec![(
@@ -243,20 +243,26 @@ pub(crate) mod tests {
 
     /// A stand-in device: counts calls, and can be made to return nothing.
     #[derive(Debug)]
-    pub(crate) struct FakeNsm {
+    pub struct FakeNsm {
         pub calls: AtomicU64,
         pub empty: AtomicBool,
         /// Bytes returned per call, mirroring the device's 256-byte chunk.
         pub chunk: usize,
     }
 
-    impl FakeNsm {
-        pub(crate) fn new() -> Self {
+    impl Default for FakeNsm {
+        fn default() -> Self {
             FakeNsm {
                 calls: AtomicU64::new(0),
                 empty: AtomicBool::new(false),
                 chunk: 256,
             }
+        }
+    }
+
+    impl FakeNsm {
+        pub fn new() -> Self {
+            Self::default()
         }
     }
 

@@ -11,7 +11,7 @@ use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::clock::{TrustedClock, WallClockAdapter};
 use crate::linker::build_linker;
-use crate::nsm::Nsm;
+use nitro_nsm::Nsm;
 use crate::random::GuestRandom;
 use crate::state::State;
 

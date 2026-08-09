@@ -14,7 +14,8 @@ default = []
 aws = ["s3fs-core/aws"]
 
 [dependencies]
-s3fs-core = { path = "../s3fs-core" }
+s3fs-core  = { path = "../s3fs-core" }
+nitro-nsm  = { path = "../nitro-nsm" }
 
 # The host compiles components, so it needs cranelift on top of the runtime.
 wasmtime         = { version = "=44.0.0", features = ["component-model", "async", "runtime", "cranelift", "std"] }
@@ -25,9 +26,6 @@ wasmtime-wasi-io = "=44.0.0"
 # already compiled into the tree via wasmtime, so this adds no build cost and
 # avoids a direct libc dependency.
 rustix      = { version = "1", features = ["time", "fs"] }
-# NSM speaks CBOR. Already in the lock file transitively; attestation (M8)
-# will need it for far less trivial payloads than GetRandom.
-ciborium    = "0.2"
 # Pinned to whatever `wasmtime-wasi` accepts for `secure_random`, which is
 # cap-rand's re-export of rand 0.8 — not a version to guess at.
 cap-rand    = "3"
@@ -41,3 +39,4 @@ tracing     = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros"] }
+nitro-nsm = { path = "../nitro-nsm", features = ["testing"] }

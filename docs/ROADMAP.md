@@ -27,11 +27,15 @@ in M1.
 ### What has to be built
 
 **1. NSM attestation documents.** The device layer already exists —
-[`s3fs-host/src/nsm.rs`](../crates/s3fs-host/src/nsm.rs) opens `/dev/nsm` and
-does the raw CBOR ioctl for `GetRandom`. Attestation is the same call with a
-different payload, so what remains is encoding the `Attestation` request with a
-public key the enclave generates at boot, and parsing the COSE_Sign1 document
-that comes back.
+[`nitro-nsm`](../crates/nitro-nsm/src/lib.rs) opens `/dev/nsm` and does the raw
+CBOR ioctl for `GetRandom`. Attestation is the same call with a different
+payload, so what remains is encoding the `Attestation` request with a public key
+the enclave generates at boot, and parsing the COSE_Sign1 document that comes
+back.
+
+It is a separate crate rather than a module of `s3fs-host` so it can be linked
+into a small static musl binary for an enclave image — which is how the device
+layer is verified today, in the QEMU harness described below.
 
 **2. KMS `Decrypt` with `Recipient`.** The attestation document goes in the
 `Recipient` field; KMS returns the plaintext encrypted to the enclave's public
@@ -90,9 +94,17 @@ the one thing that closes the residual risk documented in
 ### Testing
 
 Everything except the NSM calls can be tested without hardware: the vsock
-client against a local listener, the credential refresh against MinIO, the
-key-source abstraction with a fake that returns fixed bytes. The attestation
-path needs a real `nitro-cli run-enclave`, and CI cannot cover it.
+client against a local listener, the credential refresh against MinIO, and the
+key-source abstraction with a fake that returns fixed bytes.
+
+The NSM calls themselves now have a home too. [`deploy/qemu-nitro/`](../deploy/qemu-nitro/)
+builds an EIF and boots it on QEMU's `nitro-enclave` machine, where
+`GetRandom` against the emulated device already passes. Attestation should
+extend that harness rather than wait for hardware: `eif_build` produces genuine
+PCR0/1/2, so the measurements an `Attestation` response must quote are already
+known values. What the emulator cannot give is a document signed by the real
+AWS Nitro root, so certificate-chain validation and the KMS `Recipient` round
+trip still need `nitro-cli run-enclave`, and CI cannot cover either.
 
 ---
 

@@ -322,6 +322,61 @@ The histogram is not a randomness test — no cheap check is. It catches the
 failures that actually happen: a stub returning zeros, a buffer never written,
 a device answering the same block every time.
 
+### Verifying it in an emulated enclave
+
+`/dev/nsm` exists nowhere but an enclave, so unit tests use a fake and CI runs
+`--random-source host`. Neither proves the device layer talks to a real NSM.
+QEMU's `nitro-enclave` machine does, and [`deploy/qemu-nitro/`](deploy/qemu-nitro/)
+builds an image and boots it:
+
+```bash
+./deploy/qemu-nitro/build-eif.sh     # static musl self-test → ramdisk → EIF
+./deploy/qemu-nitro/run-selftest.sh  # boot it, check the console
+```
+
+The result, from the guest running inside the emulated enclave:
+
+```
+opening /dev/nsm
+Nitro Security Module (/dev/nsm)
+sample     3aa2e10393116ee4f9e7d71dfb2ff5b3
+histogram  peak 28 of 4096 (mean 16)
+read cost  0.0 us for 64 bytes, 4000.3 us for 4096
+NSM-SELFTEST-OK
+```
+
+Roughly **62 µs per device call** — 4096 bytes is 64 round trips, since the NSM
+answers 64 bytes at a time. The 64-byte figure reads as zero because the
+enclave kernel's clock cannot resolve a single call. Direct-from-device is
+deliberately not fast; there is no DRBG in front of it, so a guest drawing
+kilobytes should draw them once and expand with its own KDF.
+
+Four things have to line up, and each fails in a way that does not name itself:
+
+- **QEMU built with `virtio-nsm`.** Only compiled when libcbor and gnutls are
+  present at configure time, so distro packages do not have it even at version
+  11. [`deploy/qemu-nitro/Dockerfile`](deploy/qemu-nitro/Dockerfile) builds 9.2
+  from source and fails the *build* if the device is missing.
+- **A vsock backend** on QEMU's chardev — the machine has no built-in one.
+- **A heartbeat answer.** Enclave `init` writes `0xB7` to the parent on vsock
+  port 9000 and waits for it back, with no timeout. Unanswered, the kernel
+  boots and then nothing happens, which looks exactly like a broken image.
+  Worse, `vhost-device-vsock`'s Unix-socket backend silently drops it: init
+  dials **CID 3**, the Nitro parent convention, and that backend only serves
+  the host CID. Hence `--forward-cid 1` and a real AF_VSOCK listener, which
+  needs `vsock_loopback` loaded on the host (`sudo modprobe vsock_loopback`).
+- **Mountpoints inside `rootfs/`.** init binds `/rootfs` onto itself and mounts
+  the pseudo-filesystems inside it. Missing ones abort with
+  `mount: /dev: No such file or directory`, which reads like a bootstrap fault
+  and is not.
+
+The EIF is built with `eif_build`, so it carries genuine PCR0/1/2
+measurements — the same values a real enclave would attest to. That is the
+groundwork for M8.
+
+This needs `/dev/kvm` and so does not run on GitHub-hosted runners, the same
+limitation the PTP harness has.
+
 
 ## Building from source
 

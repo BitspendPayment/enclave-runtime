@@ -31,7 +31,6 @@ pub mod keys;
 pub mod linker;
 #[cfg(feature = "aws")]
 pub mod mount;
-pub mod nsm;
 pub mod random;
 pub mod run;
 pub mod state;
@@ -44,7 +43,7 @@ pub use keys::{MasterKeySource, StaticKey};
 pub use linker::build_linker;
 #[cfg(feature = "aws")]
 pub use mount::{mount, parse_fs_id, MountConfig};
-pub use nsm::{Nsm, NsmDevice, DEFAULT_NSM_DEVICE};
+pub use nitro_nsm::{Nsm, NsmDevice, DEFAULT_NSM_DEVICE};
 pub use random::{open_entropy, GuestRandom, HostEntropy, RandomSource};
 pub use run::{
     read_component, run_component, GuestOutcome, EXIT_GUEST_TRAPPED, EXIT_RUNTIME_FAILURE,

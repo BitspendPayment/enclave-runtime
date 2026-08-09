@@ -72,12 +72,10 @@ fn now_nanos() -> u64 {
 /// already have a slab — the remains of a commit that died after writing its
 /// data but before publishing a root.
 pub async fn next_safe_txg(blocks: &BlockStore, tip_txg: u64) -> FsResult<u64> {
-    let mut txg = tip_txg + 1;
-    for _ in 0..MAX_ORPHAN_PROBE {
+    for txg in (tip_txg + 1..).take(MAX_ORPHAN_PROBE as usize) {
         if !blocks.slab_exists(txg, 0).await? {
             return Ok(txg);
         }
-        txg += 1;
     }
     Err(FsError::Integrity(
         "txg: too many orphaned transaction groups to skip",

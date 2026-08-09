@@ -1,0 +1,25 @@
+[package]
+name = "nitro-nsm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The AWS Nitro Security Module through /dev/nsm: raw CBOR ioctl, GetRandom"
+
+[features]
+default = []
+# Exposes the in-memory fake so dependents can test against it.
+testing = []
+
+[[bin]]
+name = "nsm-selftest"
+path = "src/bin/nsm-selftest.rs"
+
+# Pure Rust on purpose. This crate goes into an enclave ramdisk as a
+# statically linked musl binary, so a C dependency anywhere here would mean
+# a cross-compiling toolchain for something that needs two syscalls.
+[dependencies]
+anyhow   = { workspace = true }
+ciborium = "0.2"
+rustix   = { version = "1", features = ["fs"] }

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::nsm::{Nsm, NsmDevice};
+use nitro_nsm::{Nsm, NsmDevice};
 
 /// Which entropy source to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -175,7 +175,7 @@ impl cap_rand::CryptoRng for GuestRandom {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nsm::tests::FakeNsm;
+    use nitro_nsm::fake::FakeNsm;
     use cap_rand::RngCore;
     use std::sync::atomic::Ordering;
 
