@@ -326,16 +326,46 @@ fn split_response(response: &[u8]) -> Result<(u16, Vec<u8>)> {
         .context("response has no status code")?;
 
     let body = &response[split + 4..];
-    // `Connection: close` normally avoids chunking, but a server may chunk
-    // anyway, and silently verifying a chunk header would be worse than
-    // saying so.
-    if head
+    let body = if head
         .to_ascii_lowercase()
         .contains("transfer-encoding: chunked")
     {
-        bail!("endpoint used chunked transfer encoding, which this client does not decode");
+        dechunk(body)?
+    } else {
+        body.to_vec()
+    };
+    Ok((status, body))
+}
+
+/// Decode `Transfer-Encoding: chunked`.
+///
+/// Not optional. A guest response has no `content-length` — the body streams
+/// out of the component as it is produced — so hyper chunks it, and an
+/// attestation endpoint sitting on the same server may be reached the same
+/// way. A client that ignored this would read chunk framing as content.
+fn dechunk(body: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    loop {
+        let end = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .context("chunked body ended without a chunk header")?;
+        let header = std::str::from_utf8(&rest[..end]).context("chunk header is not UTF-8")?;
+        let size = usize::from_str_radix(header.split(';').next().unwrap_or("").trim(), 16)
+            .context("chunk size is not hex")?;
+        rest = &rest[end + 2..];
+        if size == 0 {
+            break;
+        }
+        if rest.len() < size {
+            bail!("chunked body is truncated");
+        }
+        out.extend_from_slice(&rest[..size]);
+        // Skip the chunk's trailing CRLF.
+        rest = rest.get(size + 2..).unwrap_or(&[]);
     }
-    Ok((status, body.to_vec()))
+    Ok(out)
 }
 
 mod danger {

@@ -52,6 +52,9 @@ pub use run::{
     EXIT_RUNTIME_FAILURE,
 };
 #[cfg(feature = "serve")]
-pub use serve::{serve_component, EgressPolicy, ServeConfig, ServeHandle};
+pub use serve::{
+    serve_component, EgressPolicy, EnclaveEndpoints, ServeConfig, ServeHandle, Server, TlsIdentity,
+    TlsMode,
+};
 pub use state::State;
 pub use wasi::{add_filesystem_to_linker, S3FsCtxView, S3WasiView};

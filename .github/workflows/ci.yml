@@ -69,6 +69,14 @@ jobs:
       - name: serve integration tests
         run: cargo test -p s3fs-host --features serve --test serve_guest -- --include-ignored
 
+      # The milestone's central claim: a client opens a real TLS connection and
+      # checks that the attestation document binds the certificate it just saw.
+      - name: TLS termination and the attestation binding
+        run: cargo test -p s3fs-host --features serve --test serve_tls -- --include-ignored
+
+      - name: build the verifier CLI
+        run: cargo build -p nitro-attestation --features cli
+
   minio-integration:
     name: MinIO integration tests
     runs-on: ubuntu-latest

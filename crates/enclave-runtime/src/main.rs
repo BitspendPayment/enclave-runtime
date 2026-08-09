@@ -30,7 +30,7 @@ use clap::Parser;
 use s3fs_host::{
     mount, open_clock, open_entropy, read_component, run_component, serve_component, ClockSource,
     GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, RandomSource, ServeConfig,
-    StaticKey, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
+    StaticKey, TlsIdentity, TlsMode, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
 /// Where the guest lives inside the enclave image.
@@ -212,6 +212,36 @@ struct Cli {
     #[arg(long, env = "S3FS_HTTP_CONCURRENCY", default_value_t = 1)]
     http_concurrency: usize,
 
+    /// Where the serving certificate comes from.
+    ///
+    /// `self-signed` generates one at startup, inside the enclave. Browsers
+    /// reject it; a client verifying attestation does not care, because the
+    /// document binds the certificate to a specific enclave image — a stronger
+    /// statement than any CA makes.
+    ///
+    /// `acme` obtains a browser-trusted certificate from Let's Encrypt over
+    /// TLS-ALPN-01, on the same port. It needs `--acme-domain` and outbound
+    /// network.
+    ///
+    /// `off` serves plaintext. Inside an enclave that hands every request to
+    /// the parent instance, which is the party this design excludes.
+    #[arg(long, env = "S3FS_TLS", default_value = "self-signed",
+          value_parser = TlsMode::parse)]
+    tls: TlsMode,
+
+    /// Domain to put in the certificate. Repeatable; required for `--tls acme`.
+    #[arg(long = "tls-domain", env = "S3FS_TLS_DOMAINS", value_delimiter = ',')]
+    tls_domains: Vec<String>,
+
+    /// Serve `/enclave/attestation` and `/enclave/config`.
+    ///
+    /// On by default: an enclave nobody can verify is an enclave for nothing.
+    /// Turning it off is for running the same image outside one, where the NSM
+    /// is absent and startup would otherwise fail.
+    #[arg(long, env = "S3FS_ATTESTATION", value_parser = s3fs_host::parse_bool_flag,
+          num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
+    attestation: bool,
+
     /// Arguments passed to the guest.
     #[arg(last = true)]
     guest_args: Vec<String>,
@@ -315,11 +345,22 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
             run_component(fs, clock, entropy, &component, &env, &cli.guest_args).await
         }
         Mode::Serve => {
+            let tls = match cli.tls {
+                TlsMode::Off => None,
+                TlsMode::SelfSigned => Some(TlsIdentity::self_signed(&cli.tls_domains)?),
+                TlsMode::Acme => anyhow::bail!(
+                    "--tls acme is not implemented yet; use self-signed, which \
+                     attestation-verifying clients accept"
+                ),
+            };
             tracing::info!(
                 variables = env.len(),
                 listen = %cli.http_listen,
+                tls = ?cli.tls,
                 "serving guest"
             );
+
+            let attestation = cli.attestation.then(|| entropy.clone());
             let guest = GuestEnvironment::new(fs, clock, entropy, &env, &cli.guest_args)?;
             serve_component(
                 &component,
@@ -327,6 +368,8 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
                 ServeConfig {
                     addr: cli.http_listen,
                     concurrency: cli.http_concurrency,
+                    tls,
+                    attestation,
                 },
             )
             .await?;

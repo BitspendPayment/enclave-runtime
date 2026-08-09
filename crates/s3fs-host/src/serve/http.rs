@@ -17,15 +17,27 @@ use wasmtime_wasi_http::p2::WasiHttpView;
 
 use crate::linker::build_linker;
 use crate::run::GuestEnvironment;
+use crate::serve::endpoints::EnclaveEndpoints;
+use crate::serve::tls::TlsIdentity;
 use crate::state::State;
+use nitro_nsm::Nsm;
 
 /// How the guest is served.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ServeConfig {
-    /// Address to accept plaintext HTTP on.
+    /// Address to accept on.
     pub addr: SocketAddr,
     /// Requests allowed inside the guest at once. See [`ServeConfig::default`].
     pub concurrency: usize,
+    /// Certificate to terminate TLS with. `None` serves plaintext.
+    pub tls: Option<TlsIdentity>,
+    /// NSM to answer `/enclave/attestation` from.
+    ///
+    /// Only useful alongside `tls`: the document binds the serving
+    /// certificate, and without one there is nothing to bind. Supplying it
+    /// without TLS is refused rather than silently serving documents that
+    /// promise a binding they do not have.
+    pub attestation: Option<Arc<dyn Nsm>>,
 }
 
 impl Default for ServeConfig {
@@ -46,6 +58,8 @@ impl Default for ServeConfig {
         ServeConfig {
             addr: ([0, 0, 0, 0], 8080).into(),
             concurrency: 1,
+            tls: None,
+            attestation: None,
         }
     }
 }
@@ -154,11 +168,127 @@ impl ServeHandle {
     }
 }
 
-/// Serve a guest over plaintext HTTP until the process is stopped.
+/// The accept loop: TLS if configured, `/enclave/*` to the runtime, the rest
+/// to the guest.
 ///
-/// This is the development and inside-the-image path. In an enclave the same
-/// [`ServeHandle`] sits behind TLS; nothing about the guest changes, which is
-/// the reason the dispatch lives here rather than inside the TLS listener.
+/// Nothing about the guest changes between the plaintext and TLS paths, which
+/// is why dispatch lives in [`ServeHandle`] and this only decides what wraps
+/// it.
+pub struct Server {
+    guest: Arc<ServeHandle>,
+    endpoints: Option<Arc<EnclaveEndpoints>>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    addr: SocketAddr,
+}
+
+impl Server {
+    pub fn new(guest: ServeHandle, addr: SocketAddr) -> Self {
+        Server {
+            guest: Arc::new(guest),
+            endpoints: None,
+            tls: None,
+            addr,
+        }
+    }
+
+    pub fn with_endpoints(mut self, endpoints: Arc<EnclaveEndpoints>) -> Self {
+        self.endpoints = Some(endpoints);
+        self
+    }
+
+    pub fn with_tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
+        self.tls = Some(config);
+        self
+    }
+
+    /// Accept connections until the process is stopped.
+    pub async fn run(self) -> Result<()> {
+        let listener = TcpListener::bind(self.addr)
+            .await
+            .with_context(|| format!("binding {}", self.addr))?;
+        tracing::info!(
+            addr = %listener.local_addr()?,
+            tls = self.tls.is_some(),
+            attestation = self.endpoints.is_some(),
+            "serving"
+        );
+
+        let acceptor = self.tls.clone().map(tokio_rustls::TlsAcceptor::from);
+        // What the *client* used. With TLS terminated here the guest is still
+        // told `https`, or it would build wrong absolute URLs and set wrong
+        // cookie flags.
+        let scheme = if acceptor.is_some() {
+            Scheme::Https
+        } else {
+            Scheme::Http
+        };
+
+        loop {
+            let (client, peer) = listener.accept().await.context("accepting connection")?;
+            let guest = self.guest.clone();
+            let endpoints = self.endpoints.clone();
+            let acceptor = acceptor.clone();
+            // `Scheme` is not `Copy`, and the service closure is `Fn` — it may
+            // run per request on a kept-alive connection, so it needs its own.
+            let scheme = scheme.clone();
+
+            tokio::task::spawn(async move {
+                let service = hyper::service::service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| {
+                        let guest = guest.clone();
+                        let endpoints = endpoints.clone();
+                        let scheme = scheme.clone();
+                        async move {
+                            // The runtime's own paths are checked first and are
+                            // not forwardable: a guest able to answer under
+                            // `/enclave/` could serve any attestation it liked.
+                            if let Some(endpoints) = &endpoints {
+                                let path = req.uri().path().to_string();
+                                let query = req.uri().query().map(str::to_string);
+                                if let Some(response) =
+                                    endpoints.handle(&path, query.as_deref()).await
+                                {
+                                    return Ok::<_, anyhow::Error>(response);
+                                }
+                            }
+                            guest.handle(scheme, req).await
+                        }
+                    },
+                );
+
+                let result = match acceptor {
+                    Some(acceptor) => match acceptor.accept(client).await {
+                        Ok(stream) => {
+                            http1::Builder::new()
+                                .keep_alive(true)
+                                .serve_connection(TokioIo::new(stream), service)
+                                .await
+                        }
+                        Err(e) => {
+                            // Routine: scanners, health checks and clients
+                            // that reject a self-signed certificate all land
+                            // here. Not worth a warning each time.
+                            tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                            return;
+                        }
+                    },
+                    None => {
+                        http1::Builder::new()
+                            .keep_alive(true)
+                            .serve_connection(TokioIo::new(client), service)
+                            .await
+                    }
+                };
+                if let Err(e) = result {
+                    tracing::debug!(%peer, error = %e, "connection ended");
+                }
+            });
+        }
+    }
+}
+
+/// Compile the guest, build the server described by `config`, and serve until
+/// the process is stopped.
 pub async fn serve_component(
     component_bytes: &[u8],
     guest: GuestEnvironment,
@@ -167,37 +297,33 @@ pub async fn serve_component(
     // wasmtime 44 enables async at the engine level when the `async` feature
     // is on; `Config::async_support` is a no-op. Same as `run_component`.
     let engine = Engine::new(&wasmtime::Config::new())?;
-    let handle = Arc::new(ServeHandle::new(
-        &engine,
-        component_bytes,
-        guest,
-        config.concurrency,
-    )?);
+    let handle = ServeHandle::new(&engine, component_bytes, guest, config.concurrency)?;
+    let mut server = Server::new(handle, config.addr);
 
-    let listener = TcpListener::bind(config.addr)
-        .await
-        .with_context(|| format!("binding {}", config.addr))?;
-    tracing::info!(
-        addr = %listener.local_addr()?,
-        concurrency = config.concurrency,
-        "serving guest over plaintext HTTP"
-    );
-
-    loop {
-        let (client, peer) = listener.accept().await.context("accepting connection")?;
-        let handle = handle.clone();
-        tokio::task::spawn(async move {
-            let service = hyper::service::service_fn(move |req| {
-                let handle = handle.clone();
-                async move { handle.handle(Scheme::Http, req).await }
-            });
-            if let Err(e) = http1::Builder::new()
-                .keep_alive(true)
-                .serve_connection(TokioIo::new(client), service)
-                .await
-            {
-                tracing::debug!(%peer, error = %e, "connection ended");
+    match (&config.tls, &config.attestation) {
+        (Some(tls), attestation) => {
+            if let Some(nsm) = attestation {
+                // Binds this certificate and this guest, and fails here if the
+                // device will not attest — before a single request is served.
+                let endpoints =
+                    EnclaveEndpoints::new(nsm.clone(), &tls.certificate_der, component_bytes)?;
+                server = server.with_endpoints(Arc::new(endpoints));
             }
-        });
+            server = server.with_tls(tls.config.clone());
+        }
+        (None, Some(_)) => {
+            anyhow::bail!(
+                "attestation was requested without TLS. A document binds the serving \
+                 certificate, so without one it would promise a binding it does not have."
+            );
+        }
+        (None, None) => {
+            tracing::warn!(
+                "serving plaintext HTTP with no attestation; \
+                 inside an enclave this exposes every request to the parent instance"
+            );
+        }
     }
+
+    server.run().await
 }

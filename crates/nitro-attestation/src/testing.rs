@@ -27,6 +27,7 @@ use rcgen::{
 use crate::AttestationDocument;
 
 /// A certificate chain plus the leaf's signing key.
+#[derive(Debug)]
 pub struct TestChain {
     /// DER, root first — the `cabundle` layout.
     pub cabundle: Vec<Vec<u8>>,

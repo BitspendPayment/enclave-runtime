@@ -16,9 +16,13 @@
 //!                       └──▶ everything else ──▶ guest
 //! ```
 
+pub mod endpoints;
 mod http;
+pub mod tls;
 
-pub use http::{serve_component, ServeConfig, ServeHandle};
+pub use endpoints::{EnclaveEndpoints, ENCLAVE_PREFIX};
+pub use http::{serve_component, ServeConfig, ServeHandle, Server};
+pub use tls::{TlsIdentity, TlsMode};
 
 use wasmtime_wasi_http::p2::{
     bindings::http::types::ErrorCode, body::HyperOutgoingBody, types::HostFutureIncomingResponse,
