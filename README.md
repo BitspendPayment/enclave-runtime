@@ -134,6 +134,84 @@ The full matrix — what's POSIX-equivalent, what's weakened, what's unsupported
 - ✅ **`unlink` while an fd is open** keeps the file readable and writable until the last handle closes.
 - ✅ **Snapshots** — every root record is one, and reading an old one costs nothing to have kept.
 
+## Running SQLite
+
+SQLite works, and is the main conformance test: a real C database doing
+page-granular random I/O, rewriting a rollback journal every transaction, and
+then telling us via `PRAGMA integrity_check` whether the bytes came back
+correct. [`examples/guest-sqlite`](examples/guest-sqlite/) exercises it and
+prints the table below.
+
+### Two pragmas you must set
+
+```rust
+conn.pragma_update(None, "temp_store",   "MEMORY")?;     // no access(2) under WASI
+conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;  // no fcntl under WASI
+```
+
+**`temp_store=MEMORY`** is the non-obvious one, and getting it wrong costs an
+afternoon. SQLite locates a directory for temporary databases by probing
+candidates (`SQLITE_TMPDIR`, `TMPDIR`, `/var/tmp`, `/tmp`) with `access(2)`.
+WASI has no such call, so every candidate is rejected and `VACUUM` fails with a
+bare `disk I/O error` that says nothing about a missing syscall. Setting
+`temp_store_directory` instead does not help — that pragma validates the path
+the same way and reports `not a writable directory`.
+
+**`locking_mode=EXCLUSIVE`** because WASI provides no `fcntl` advisory locking.
+
+### What cannot work
+
+| | Why |
+|---|---|
+| **WAL journal mode** | WAL coordinates readers and writers through a shared-memory index (`-shm`). WASI has no shared memory and no `mmap`, so there is nothing to build it on. Use `journal_mode=DELETE` — the default — which is a real sidecar file and works fine. |
+| **Concurrent connections** | No `fcntl` locking means SQLite cannot arbitrate between processes, hence `locking_mode=EXCLUSIVE`. This is not a real restriction here: the store is single-writer by design, and a second mount racing the same root sequence is poisoned rather than allowed to diverge. |
+
+Neither is a limitation of this filesystem — both are consequences of WASI's
+syscall surface, and both would apply to any WASI filesystem.
+
+### Optional modules
+
+All three are compiled into the bundled SQLite and **all three work**, verified
+against the store rather than assumed:
+
+| Module | Status |
+|---|---|
+| **JSON** | `json_extract`, and an index over a JSON expression. Built into SQLite from 3.38. |
+| **FTS5** | 2 000 documents indexed, `MATCH` queried, then `rebuild` to regenerate every shadow table. The heaviest filesystem workload of the three. |
+| **R-Tree** | 1 000 bounding boxes, range-queried. |
+
+Availability depends on how the bundled SQLite was configured, so the guest
+probes for each and reports what it found rather than assuming.
+
+### Benchmark
+
+20 000 accounts and 40 000 entries, against MinIO on localhost. Absolute
+numbers will be worse against real S3 — the round trips get longer — but the
+*shape* is the point.
+
+| phase | elapsed | rate |
+|---|---|---|
+| bulk insert (20 000 rows, one txn) | 142 ms | 140 884 rows/s |
+| point select by rowid | 2.5 ms | 405 948 queries/s |
+| indexed select by name | 1.3 ms | 785 850 queries/s |
+| update (500 rows, one txn) | 63 ms | 7 963 rows/s |
+| blob write | 128 ms | 18.5 MB/s |
+| blob read + verify | 41 ms | 57.8 MB/s |
+| incremental blob I/O (512 KiB, scattered) | 242 ms | 2.2 MB/s |
+| VACUUM | 471 ms | |
+| `PRAGMA integrity_check` | 136 ms | |
+| **25 inserts, autocommit** | **1 796 ms** | **14 rows/s** |
+| **25 inserts, one transaction** | **69 ms** | **364 rows/s** |
+
+**Batch your writes.** Those last two rows are the same 25 inserts, 26× apart.
+Every statement outside an explicit transaction is its own commit, and a commit
+is a transaction group: slab PUTs plus a signed root record published with a
+conditional PUT. That is two or more round trips to object storage that no
+local caching can avoid — durability is the whole point. Inside a transaction
+they share one commit, which is why 20 000 batched inserts land in less time
+than 25 unbatched ones.
+
+
 ## Building from source
 
 ```bash

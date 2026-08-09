@@ -82,9 +82,21 @@ fn run() -> Result<(), String> {
     joins_and_aggregates(&conn)?;
     ctes_and_windows(&conn)?;
     blobs(&conn)?;
+    incremental_blob_io(&conn)?;
     text_and_collation(&conn)?;
     triggers_and_views(&conn)?;
     alter_and_indexes(&conn)?;
+    attach_database(&conn)?;
+    advanced_tables(&conn)?;
+    insert_variants(&conn)?;
+    transaction_modes(&conn)?;
+    datetime_and_scalars(&conn)?;
+    temp_tables(&conn)?;
+    commit_cost(&conn)?;
+    extensions(&conn)?;
+    // Drops come last so VACUUM has freed pages to reclaim, which is the case
+    // that actually shrinks the file.
+    drops(&conn)?;
     maintenance(&conn)?;
     integrity(&conn)?;
 
@@ -680,6 +692,482 @@ fn integrity(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("foreign_key_check: {e}"))?;
         if let Some(violation) = fk {
             return Err(format!("foreign_key_check found a violation in {violation}"));
+        }
+        Ok::<_, String>(())
+    })
+}
+
+/// Incremental blob I/O: `sqlite3_blob_open` reads and writes *within* an
+/// existing blob without materialising it. That is a partial-page update
+/// pattern nothing else in this workload produces.
+fn incremental_blob_io(conn: &Connection) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    const SIZE: usize = 512 * 1024;
+    phase("incremental blob I/O", Some(("bytes", SIZE as u64)), || {
+        conn.execute_batch("CREATE TABLE incremental (id INTEGER PRIMARY KEY, payload BLOB);")
+            .map_err(|e| format!("create: {e}"))?;
+        // Reserve the space, then fill it in place.
+        conn.execute(
+            "INSERT INTO incremental (id, payload) VALUES (1, zeroblob(?1))",
+            [SIZE as i64],
+        )
+        .map_err(|e| format!("zeroblob: {e}"))?;
+
+        let mut blob = conn
+            .blob_open(rusqlite::DatabaseName::Main, "incremental", "payload", 1, false)
+            .map_err(|e| format!("blob_open: {e}"))?;
+        if blob.len() != SIZE {
+            return Err(format!("blob is {} bytes, expected {SIZE}", blob.len()));
+        }
+
+        // Scattered writes rather than one sweep, so pages are dirtied out of
+        // order the way a real workload would.
+        for chunk in (0..SIZE / 4096).rev() {
+            let offset = chunk * 4096;
+            let bytes: Vec<u8> = (0..4096).map(|b| ((offset + b) % 251) as u8).collect();
+            blob.seek(SeekFrom::Start(offset as u64))
+                .map_err(|e| format!("seek {offset}: {e}"))?;
+            blob.write_all(&bytes)
+                .map_err(|e| format!("write {offset}: {e}"))?;
+        }
+        drop(blob);
+
+        let mut blob = conn
+            .blob_open(rusqlite::DatabaseName::Main, "incremental", "payload", 1, true)
+            .map_err(|e| format!("blob_open read: {e}"))?;
+        let mut got = vec![0u8; SIZE];
+        blob.read_exact(&mut got).map_err(|e| format!("read: {e}"))?;
+        if let Some(bad) = (0..SIZE).find(|b| got[*b] != (b % 251) as u8) {
+            return Err(format!("incremental blob corrupt at offset {bad}"));
+        }
+        Ok::<_, String>(())
+    })
+}
+
+/// A second database file, open at the same time as the first. Two journals,
+/// two sets of page writes, and a query spanning both.
+fn attach_database(conn: &Connection) -> Result<(), String> {
+    phase("ATTACH + cross-database join", None, || {
+        for suffix in ["", "-journal"] {
+            let _ = std::fs::remove_file(format!("/sqlite/aux.db{suffix}"));
+        }
+        conn.execute_batch("ATTACH DATABASE '/sqlite/aux.db' AS aux;")
+            .map_err(|e| format!("attach: {e}"))?;
+
+        conn.execute_batch(
+            "CREATE TABLE aux.labels (account_id INTEGER PRIMARY KEY, label TEXT NOT NULL);
+             INSERT INTO aux.labels (account_id, label)
+                 SELECT id, 'label-' || id FROM main.accounts WHERE id < 100;",
+        )
+        .map_err(|e| format!("populate attached: {e}"))?;
+
+        // A join across the two files: both must be readable in one statement.
+        let joined: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM main.accounts a JOIN aux.labels l ON l.account_id = a.id",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("cross-database join: {e}"))?;
+        if joined == 0 {
+            return Err("cross-database join returned nothing".to_string());
+        }
+
+        // Each attached database has its own integrity.
+        let aux_ok: String = conn
+            .query_row("PRAGMA aux.integrity_check", [], |r| r.get(0))
+            .map_err(|e| format!("aux integrity: {e}"))?;
+        if aux_ok != "ok" {
+            return Err(format!("attached database integrity: {aux_ok}"));
+        }
+
+        conn.execute_batch("DETACH DATABASE aux;")
+            .map_err(|e| format!("detach: {e}"))?;
+        if std::fs::metadata("/sqlite/aux.db").is_err() {
+            return Err("attached database file is missing after detach".to_string());
+        }
+        Ok::<_, String>(())
+    })
+}
+
+/// Table shapes with different on-disk representations: no rowid, stored
+/// generated columns, and indexes that are not a plain column list.
+fn advanced_tables(conn: &Connection) -> Result<(), String> {
+    phase("WITHOUT ROWID + generated cols", None, || {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;
+
+            CREATE TABLE computed (
+                a INTEGER NOT NULL,
+                b INTEGER NOT NULL,
+                virt  INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL,
+                store INTEGER GENERATED ALWAYS AS (a * b) STORED
+            );
+
+            -- Neither of these is a plain column list, so both take a
+            -- different path through the index machinery.
+            CREATE INDEX idx_partial ON accounts(balance) WHERE balance > 100.0;
+            CREATE INDEX idx_expr    ON accounts(lower(name));
+            "#,
+        )
+        .map_err(|e| format!("create: {e}"))?;
+
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        {
+            let mut stmt = conn
+                .prepare("INSERT INTO kv (k, v) VALUES (?1, ?2)")
+                .map_err(|e| e.to_string())?;
+            for i in 0..500 {
+                stmt.execute(params![format!("key-{i:05}"), format!("value-{i}")])
+                    .map_err(|e| format!("kv insert {i}: {e}"))?;
+            }
+        }
+        conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        let v: String = conn
+            .query_row("SELECT v FROM kv WHERE k = 'key-00042'", [], |r| r.get(0))
+            .map_err(|e| format!("without-rowid lookup: {e}"))?;
+        if v != "value-42" {
+            return Err(format!("WITHOUT ROWID returned {v}"));
+        }
+
+        conn.execute("INSERT INTO computed (a, b) VALUES (6, 7)", [])
+            .map_err(|e| format!("generated insert: {e}"))?;
+        let (virt, store): (i64, i64) = conn
+            .query_row("SELECT virt, store FROM computed", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(|e| format!("generated read: {e}"))?;
+        if virt != 13 || store != 42 {
+            return Err(format!("generated columns wrong: {virt} {store}"));
+        }
+
+        // The expression index has to actually be usable.
+        let found: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM accounts WHERE lower(name) = 'account-0000005'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("expression index query: {e}"))?;
+        if found != 1 {
+            return Err(format!("expression index returned {found} rows"));
+        }
+        Ok::<_, String>(())
+    })
+}
+
+fn insert_variants(conn: &Connection) -> Result<(), String> {
+    phase("INSERT OR REPLACE / IGNORE", None, || {
+        conn.execute(
+            "INSERT OR IGNORE INTO accounts (id, name, balance, created) VALUES (0, 'ignored', 1.0, 0)",
+            [],
+        )
+        .map_err(|e| format!("or ignore: {e}"))?;
+        let name: String = conn
+            .query_row("SELECT name FROM accounts WHERE id = 0", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if name == "ignored" {
+            return Err("INSERT OR IGNORE overwrote an existing row".to_string());
+        }
+
+        conn.execute(
+            "INSERT OR REPLACE INTO accounts (id, name, balance, created) VALUES (0, 'replaced', 5.0, 0)",
+            [],
+        )
+        .map_err(|e| format!("or replace: {e}"))?;
+        let name: String = conn
+            .query_row("SELECT name FROM accounts WHERE id = 0", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if name != "replaced" {
+            return Err(format!("INSERT OR REPLACE left {name}"));
+        }
+        Ok::<_, String>(())
+    })
+}
+
+fn transaction_modes(conn: &Connection) -> Result<(), String> {
+    phase("BEGIN IMMEDIATE / EXCLUSIVE", None, || {
+        // Both take the write lock up front rather than on first write, which
+        // is a different ordering of journal creation.
+        for mode in ["IMMEDIATE", "EXCLUSIVE"] {
+            conn.execute_batch(&format!(
+                "BEGIN {mode};
+                 INSERT INTO audit (action, subject) VALUES ('{mode}', 1);
+                 COMMIT;"
+            ))
+            .map_err(|e| format!("BEGIN {mode}: {e}"))?;
+        }
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM audit WHERE action IN ('IMMEDIATE', 'EXCLUSIVE')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if n != 2 {
+            return Err(format!("expected 2 rows from explicit modes, got {n}"));
+        }
+        Ok::<_, String>(())
+    })
+}
+
+fn datetime_and_scalars(conn: &Connection) -> Result<(), String> {
+    phase("date/time + scalar functions", None, || {
+        // `now` reaches the host clock through wasi:clocks, so this quietly
+        // checks that too.
+        let today: String = conn
+            .query_row("SELECT date('now')", [], |r| r.get(0))
+            .map_err(|e| format!("date('now'): {e}"))?;
+        if today.len() != 10 || !today.starts_with("20") {
+            return Err(format!("date('now') returned {today:?}"));
+        }
+
+        let converted: String = conn
+            .query_row("SELECT datetime(1700000000, 'unixepoch')", [], |r| r.get(0))
+            .map_err(|e| format!("datetime: {e}"))?;
+        if !converted.starts_with("2023-11-14") {
+            return Err(format!("unixepoch conversion returned {converted}"));
+        }
+
+        let (upper, sub, replaced, padded): (String, String, String, String) = conn
+            .query_row(
+                "SELECT upper('abc'), substr('abcdef', 2, 3), replace('a-b-c', '-', '+'), printf('%05d', 42)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(|e| format!("scalar functions: {e}"))?;
+        if (upper.as_str(), sub.as_str(), replaced.as_str(), padded.as_str())
+            != ("ABC", "bcd", "a+b+c", "00042")
+        {
+            return Err(format!("scalars wrong: {upper} {sub} {replaced} {padded}"));
+        }
+        Ok::<_, String>(())
+    })
+}
+
+fn temp_tables(conn: &Connection) -> Result<(), String> {
+    phase("TEMP tables", None, || {
+        // With temp_store=MEMORY these never touch the filesystem, which is
+        // the point — the check is that they still work.
+        conn.execute_batch(
+            "CREATE TEMP TABLE scratch AS SELECT id, balance FROM accounts WHERE id < 200;
+             CREATE INDEX temp.idx_scratch ON scratch(balance);",
+        )
+        .map_err(|e| format!("temp table: {e}"))?;
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM scratch", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("temp table is empty".to_string());
+        }
+        conn.execute_batch("DROP TABLE scratch;")
+            .map_err(|e| format!("drop temp: {e}"))
+    })
+}
+
+/// The cost of a commit, measured on purpose.
+///
+/// This is the number that matters most for anyone sizing a workload. Every
+/// statement outside an explicit transaction is its own commit, and a commit
+/// here is a transaction group: slab PUTs plus a signed root record, published
+/// with a conditional PUT. That is two or more round trips to object storage,
+/// and no amount of local caching can avoid them — durability is the point.
+///
+/// Inside a transaction the same statements share one commit, which is why the
+/// bulk phases above run three orders of magnitude faster per row.
+fn commit_cost(conn: &Connection) -> Result<(), String> {
+    const N: usize = 25;
+
+    conn.execute_batch("CREATE TABLE commit_cost (id INTEGER PRIMARY KEY, v TEXT);")
+        .map_err(|e| format!("create: {e}"))?;
+
+    phase("  25 inserts, autocommit", Some(("rows", N as u64)), || {
+        for i in 0..N {
+            conn.execute(
+                "INSERT INTO commit_cost (id, v) VALUES (?1, ?2)",
+                params![i as i64, "x"],
+            )
+            .map_err(|e| format!("autocommit insert {i}: {e}"))?;
+        }
+        Ok::<_, String>(())
+    })?;
+
+    phase("  25 inserts, one txn", Some(("rows", N as u64)), || {
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        for i in 0..N {
+            conn.execute(
+                "INSERT INTO commit_cost (id, v) VALUES (?1, ?2)",
+                params![(1_000 + i) as i64, "x"],
+            )
+            .map_err(|e| format!("txn insert {i}: {e}"))?;
+        }
+        conn.execute_batch("COMMIT").map_err(|e| e.to_string())
+    })?;
+
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM commit_cost", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if n != (N * 2) as i64 {
+        return Err(format!("expected {} rows, got {n}", N * 2));
+    }
+    Ok(())
+}
+
+/// Optional modules. Whether these are compiled in depends on how the bundled
+/// SQLite was configured, so absence is reported rather than failed — but
+/// anything present is exercised, because FTS5 in particular creates several
+/// shadow tables and is a heavy filesystem workload.
+fn extensions(conn: &Connection) -> Result<(), String> {
+    phase("optional modules", None, || {
+        let mut available = Vec::new();
+
+        // JSON is built into SQLite from 3.38 onwards.
+        match conn.query_row("SELECT json_extract('{\"a\":[1,2,3]}', '$.a[1]')", [], |r| {
+            r.get::<_, i64>(0)
+        }) {
+            Ok(2) => {
+                available.push("JSON");
+                conn.execute_batch(
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, doc TEXT);
+                     INSERT INTO docs (id, doc) VALUES (1, '{\"name\":\"x\",\"tags\":[\"a\",\"b\"]}');
+                     CREATE INDEX idx_docs_name ON docs(json_extract(doc, '$.name'));",
+                )
+                .map_err(|e| format!("json table: {e}"))?;
+                let name: String = conn
+                    .query_row(
+                        "SELECT json_extract(doc, '$.name') FROM docs WHERE id = 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| format!("json query: {e}"))?;
+                if name != "x" {
+                    return Err(format!("json_extract returned {name}"));
+                }
+            }
+            Ok(other) => return Err(format!("json_extract returned {other}, expected 2")),
+            Err(_) => {}
+        }
+
+        if conn
+            .execute_batch("CREATE VIRTUAL TABLE ft USING fts5(body);")
+            .is_ok()
+        {
+            available.push("FTS5");
+            conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+            {
+                let mut stmt = conn
+                    .prepare("INSERT INTO ft (body) VALUES (?1)")
+                    .map_err(|e| e.to_string())?;
+                for i in 0..2_000 {
+                    stmt.execute([format!("document {i} about storage and enclaves")])
+                        .map_err(|e| format!("fts insert {i}: {e}"))?;
+                }
+            }
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+
+            let hits: i64 = conn
+                .query_row("SELECT count(*) FROM ft WHERE ft MATCH 'enclaves'", [], |r| r.get(0))
+                .map_err(|e| format!("fts match: {e}"))?;
+            if hits != 2_000 {
+                return Err(format!("FTS5 matched {hits} of 2000"));
+            }
+            // Rebuilds every shadow table from the content table.
+            conn.execute_batch("INSERT INTO ft(ft) VALUES('rebuild');")
+                .map_err(|e| format!("fts rebuild: {e}"))?;
+        }
+
+        if conn
+            .execute_batch("CREATE VIRTUAL TABLE geo USING rtree(id, minX, maxX, minY, maxY);")
+            .is_ok()
+        {
+            available.push("R-Tree");
+            conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+            {
+                let mut stmt = conn
+                    .prepare("INSERT INTO geo VALUES (?1, ?2, ?3, ?4, ?5)")
+                    .map_err(|e| e.to_string())?;
+                for i in 0..1_000i64 {
+                    let x = i as f64;
+                    stmt.execute(params![i, x, x + 1.0, x, x + 1.0])
+                        .map_err(|e| format!("rtree insert {i}: {e}"))?;
+                }
+            }
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+
+            let inside: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM geo WHERE minX >= 10 AND maxX <= 21",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("rtree query: {e}"))?;
+            if inside == 0 {
+                return Err("R-Tree range query matched nothing".to_string());
+            }
+        }
+
+        println!(
+            "    modules present: {}",
+            if available.is_empty() {
+                "none".to_string()
+            } else {
+                available.join(", ")
+            }
+        );
+        Ok::<_, String>(())
+    })
+}
+
+/// Dropping is what frees pages, and freeing is what VACUUM then reclaims.
+fn drops(conn: &Connection) -> Result<(), String> {
+    phase("DROP index/view/trigger/table", None, || {
+        conn.execute_batch(
+            "DROP INDEX idx_accounts_nickname;
+             DROP INDEX idx_expr;
+             DROP VIEW premium_totals;
+             DROP TRIGGER audit_delete;
+             DROP TABLE kv;
+             DROP TABLE computed;
+             DROP TABLE incremental;",
+        )
+        .map_err(|e| format!("drop: {e}"))?;
+
+        // Gone from the schema, not merely inaccessible.
+        for (kind, name) in [
+            ("index", "idx_accounts_nickname"),
+            ("view", "premium_totals"),
+            ("trigger", "audit_delete"),
+            ("table", "kv"),
+            ("table", "incremental"),
+        ] {
+            let present: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    params![kind, name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if present.is_some() {
+                return Err(format!("{kind} {name} survived DROP"));
+            }
+        }
+
+        // And the dropped trigger must no longer fire.
+        conn.execute(
+            "INSERT INTO accounts (id, name, balance, created) VALUES (700002, 'no-trigger', 1.0, 0)",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM accounts WHERE id = 700002", [])
+            .map_err(|e| e.to_string())?;
+        let audited: i64 = conn
+            .query_row("SELECT count(*) FROM audit WHERE subject = 700002", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if audited != 0 {
+            return Err("dropped trigger still fired".to_string());
         }
         Ok::<_, String>(())
     })

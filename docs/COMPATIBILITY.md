@@ -89,9 +89,18 @@ journal is a real sidecar file, created, extended, truncated and unlinked on
 every transaction. WAL is not usable — it needs shared memory that WASI has no
 way to provide.
 
-[`examples/guest-sqlite`](../examples/guest-sqlite/) runs this workload and
-prints a benchmark table. At 20 000 accounts and 40 000 entries against local
-MinIO, `PRAGMA integrity_check` passes both before and after a reopen.
+WAL is not usable — it coordinates through a shared-memory index that WASI has
+no way to provide — and concurrent connections are out for the same reason
+`locking_mode=EXCLUSIVE` is needed. Neither restricts anything real here: the
+store is single-writer by design.
+
+JSON, FTS5 and R-Tree are all present in the bundled build and all verified
+working. [`examples/guest-sqlite`](../examples/guest-sqlite/) covers DDL,
+transactions, savepoints, every constraint kind, joins, CTEs, window functions,
+blobs including incremental `sqlite3_blob_open` I/O, `ATTACH`, `WITHOUT ROWID`,
+generated columns, partial and expression indexes, `DROP`, `VACUUM`, and
+`integrity_check` before and after a reopen. The README has the full notes and
+the benchmark table.
 
 ## Test coverage
 
