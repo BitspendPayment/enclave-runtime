@@ -66,8 +66,8 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  guest-build:
-    name: example guest builds for wasm32-wasip2
+  guest-sqlite:
+    name: SQLite conformance + benchmark
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,21 +75,64 @@ jobs:
         with:
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
-      - name: Install wasi-sdk
+
+      - name: install wasi-sdk
         run: |
-          curl -sLO https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
-          mkdir -p $HOME/wasi-sdk
-          tar xf wasi-sdk-25.0-x86_64-linux.tar.gz -C $HOME/wasi-sdk --strip-components=1
-      - name: build guest-fsdemo (with bundled SQLite)
+          curl -sSL -o wasi-sdk.tar.gz \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
+          mkdir -p "$HOME/wasi-sdk"
+          tar xf wasi-sdk.tar.gz -C "$HOME/wasi-sdk" --strip-components=1
+
+      - name: build the SQLite guest
+        working-directory: examples/guest-sqlite
         env:
-          CC_wasm32_wasip2: ${{ github.workspace }}/../wasi-sdk/bin/clang
-          AR_wasm32_wasip2: ${{ github.workspace }}/../wasi-sdk/bin/ar
+          CC_wasm32_wasip2: /home/runner/wasi-sdk/bin/clang
+          AR_wasm32_wasip2: /home/runner/wasi-sdk/bin/ar
+          CFLAGS_wasm32_wasip2: "--sysroot=/home/runner/wasi-sdk/share/wasi-sysroot -DSQLITE_THREADSAFE=0 -DHAVE_USLEEP=1"
+        run: cargo build --release --target wasm32-wasip2
+
+      - name: build enclave-runtime
+        run: cargo build --release -p enclave-runtime
+
+      - name: start MinIO
         run: |
-          export CC_wasm32_wasip2=$HOME/wasi-sdk/bin/clang
-          export AR_wasm32_wasip2=$HOME/wasi-sdk/bin/ar
-          export CFLAGS_wasm32_wasip2="--sysroot=$HOME/wasi-sdk/share/wasi-sysroot -DSQLITE_THREADSAFE=0 -DHAVE_USLEEP=1"
-          cd examples/guest-fsdemo
-          cargo build --release --target wasm32-wasip2
+          docker run -d --rm --name ci-minio-sql -p 9002:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:9002/minio/health/ready && break
+            sleep 1
+          done
+          docker run --rm --network host --entrypoint sh minio/mc -c "
+            mc alias set m http://127.0.0.1:9002 minioadmin minioadmin
+            mc mb m/sql-data
+            mc mb --with-lock m/sql-roots"
+
+      # A real C database driving the filesystem: page-granular random I/O, a
+      # rollback journal created and unlinked per transaction, VACUUM rewriting
+      # the whole file, and PRAGMA integrity_check to say whether the bytes came
+      # back correct. Also prints the benchmark table.
+      - name: run the SQLite workload
+        env:
+          SQLITE_SCALE: "20000"
+          S3FS_MASTER_KEY: "00000000000000000000000000000000000000000000000000000000000000ef"
+          S3FS_BUCKET: sql-data
+          S3FS_ROOTS_BUCKET: sql-roots
+          S3FS_ENDPOINT: http://127.0.0.1:9002
+          S3FS_FORCE_PATH_STYLE: "1"
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+          S3FS_GUEST_PATH: examples/guest-sqlite/target/wasm32-wasip2/release/guest-sqlite.wasm
+        run: |
+          set -euo pipefail
+          out=$(./target/release/enclave-runtime)
+          echo "$out"
+          echo "$out" | grep -qx OK
+
+      - name: stop MinIO
+        if: always()
+        run: docker rm -f ci-minio-sql || true
 
   guest-e2e:
     name: End-to-end (guest + MinIO)

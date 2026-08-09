@@ -24,7 +24,8 @@ Three workspace crates plus an example guest:
 | [`s3fs-runner`](crates/s3fs-runner/) | Development CLI. Explicit flags; the guest gets no environment unless asked. |
 | [`enclave-runtime`](crates/enclave-runtime/) | Deployment target. Configured by environment, guest loaded from a known path inside the enclave image. |
 | [`examples/guest-smoke`](examples/guest-smoke/) | Minimal guest, no C toolchain needed. Exercises write / patch / rename / read_dir and the environment policy; run twice it proves durability. |
-| [`examples/guest-fsdemo`](examples/guest-fsdemo/) | Heavier guest: a real bundled SQLite database over `wasi:filesystem`. Needs wasi-sdk. |
+| [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Needs wasi-sdk. |
+| [`examples/guest-fsdemo`](examples/guest-fsdemo/) | The original smaller SQLite demo. |
 
 **Test coverage:** 333 unit tests plus a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor). End-to-end SQLite-on-S3 demo works.
 

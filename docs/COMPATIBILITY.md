@@ -66,6 +66,33 @@ Opening one does not lower the live mount's rollback floor. Reading history must
 - **No garbage collection yet.** Copy-on-write means superseded blocks accumulate. Roots are ~700 bytes each and locked for the full retention term; slabs are the cost driver and live in an unlocked bucket precisely so they can be reclaimed later.
 - **Keys are supplied, not discovered.** The master secret and the filesystem id are inputs. The keys that verify a root record derive from them, so reading either out of the store would mean trusting the store to say which key checks its own signature.
 
+## Running SQLite
+
+SQLite works, including `VACUUM`, triggers, foreign-key cascades, recursive
+CTEs, window functions, and `PRAGMA integrity_check`. Two settings are needed,
+and neither is a limitation of this filesystem:
+
+```rust
+conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;  // no fcntl under WASI
+conn.pragma_update(None, "temp_store",   "MEMORY")?;     // no access(2) under WASI
+```
+
+`temp_store=MEMORY` is the non-obvious one. SQLite locates a directory for
+temporary databases by probing candidates with `access(2)`, which WASI does not
+provide — so every candidate is rejected, and `VACUUM` fails with a bare
+`disk I/O error` that says nothing about a missing syscall. Setting
+`temp_store_directory` does not help: that pragma validates the path the same
+way and reports `not a writable directory`.
+
+`journal_mode=DELETE` (the default) is fine and worth keeping: the rollback
+journal is a real sidecar file, created, extended, truncated and unlinked on
+every transaction. WAL is not usable — it needs shared memory that WASI has no
+way to provide.
+
+[`examples/guest-sqlite`](../examples/guest-sqlite/) runs this workload and
+prints a benchmark table. At 20 000 accounts and 40 000 entries against local
+MinIO, `PRAGMA integrity_check` passes both before and after a reopen.
+
 ## Test coverage
 
 333 unit tests plus a MinIO integration suite covering the real S3 wire protocol, Object Lock retention, end-to-end write/read/remount, slab packing economics, tamper detection, and mount-floor enforcement. Design lineage: ZFS for the storage model, [GeeseFS](https://github.com/yandex-cloud/geesefs) for the original path-mapping engine this replaced.

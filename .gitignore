@@ -1,4 +1,6 @@
-/target
+# Any crate's build directory, not only the workspace root: the example
+# guests are separate workspaces with their own target/.
+target/
 **/*.rs.bk
 Cargo.lock.bak
 .env

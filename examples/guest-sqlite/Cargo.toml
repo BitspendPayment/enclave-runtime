@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "guest-sqlite"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "SQLite conformance and benchmark workload over wasi:filesystem"
+
+[[bin]]
+name = "guest-sqlite"
+path = "src/main.rs"
+
+[dependencies]
+# Bundled SQLite: a real C database driving the filesystem through WASI, which
+# is a far harsher test than any hand-written workload. Building it needs
+# wasi-sdk — see the README.
+rusqlite = { version = "0.32", features = ["bundled", "blob"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
