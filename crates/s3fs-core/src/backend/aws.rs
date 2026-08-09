@@ -422,7 +422,7 @@ impl Backend for AwsS3Backend {
         let copy_source = format!("{}/{}", self.bucket, input.source_key);
         let mut req = self
             .client
-            .copy_object()AwsS3Backend
+            .copy_object()
             .bucket(&self.bucket)
             .key(&input.destination_key)
             .copy_source(copy_source);

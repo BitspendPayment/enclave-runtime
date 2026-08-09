@@ -3,10 +3,10 @@
 use wasmtime::component::Resource;
 use wasmtime::Result;
 
-use crate::bindings::wasi::filesystem::preopens::Host;
-use crate::bindings::wasi::filesystem::types::Descriptor as WitDescriptor;
-use crate::descriptors::Descriptor;
-use crate::view::S3FsCtxView;
+use crate::wasi::bindings::wasi::filesystem::preopens::Host;
+use crate::wasi::bindings::wasi::filesystem::types::Descriptor as WitDescriptor;
+use crate::wasi::descriptors::Descriptor;
+use crate::wasi::view::S3FsCtxView;
 
 impl Host for S3FsCtxView<'_> {
     async fn get_directories(&mut self) -> Result<Vec<(Resource<WitDescriptor>, String)>> {

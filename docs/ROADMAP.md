@@ -1,14 +1,15 @@
 # Roadmap
 
-The storage engine is complete: milestones M0–M7 landed in `b11f95b`. What
-remains is the enclave itself.
+The storage engine is complete (M0–M7, `b11f95b`) and so is the runtime that
+loads a guest and gives it the filesystem (M10). What remains is the enclave's
+own plumbing — proving to KMS which code is running — and reclaiming space.
 
 | | | Status |
 |---|---|---|
 | M0–M7 | Merkle-anchored block store, POSIX layer, hard links, snapshots | ✅ done |
 | **M8** | [NSM attestation and KMS key release](#m8--attestation-and-key-release) | needs enclave hardware |
 | **M9** | [Garbage collection](#m9--garbage-collection) | not started |
-| **M10** | [`enclave-runtime`](#m10--the-enclave-runtime) | not started |
+| M10 | [`enclave-runtime`](#m10--the-enclave-runtime-) | ✅ done |
 
 ---
 
@@ -126,64 +127,39 @@ Two things fold in naturally:
 
 ---
 
-## M10 — The enclave runtime
+## M10 — The enclave runtime ✅
 
-A new crate that takes a guest component and gives it the filesystem, inside
-an enclave. `s3fs-runner` stays as it is: the plain-host CLI for development
-and MinIO testing, so the dev loop keeps working without NSM or vsock.
+Shipped. `enclave-runtime` mounts the store, loads a guest from a known path,
+and runs it; `s3fs-host` holds the `wasi:filesystem` implementation, the linker,
+the guest-environment policy, and the run loop.
 
 ```
 crates/
   s3fs-core         engine
-  s3fs-wasmtime     WASI bindings
-  s3fs-host         NEW  linker wiring + State, shared by both binaries
+  s3fs-host         wasi:filesystem + linker + env policy + run loop
   s3fs-runner       dev CLI, local and MinIO
-  enclave-runtime   NEW  vsock, NSM, KMS, guest ingestion
+  enclave-runtime   deployment target
 ```
 
-### `s3fs-host` — the shared part
+Configuration is environment-first with matching flags, because inside an
+enclave the image's `ENV` lines are the only configuration there is. The guest
+inherits that environment minus anything under `AWS_` or `S3FS_` — credentials
+and the runtime's own settings — which is the one rule that keeps the master
+key away from the code the enclave exists to contain.
 
-Both binaries do the same three things: build a `State` implementing `WasiView`
-and `S3WasiView` over one `ResourceTable`, add every `wasmtime-wasi` interface
-*except* filesystem, then instantiate `wasi:cli/command` and call `run`.
+`deploy/Dockerfile` builds an image with the guest at `/enclave/guest.wasm`, so
+PCR0 covers it. That is what will let M8's key policy attest to the code that
+reads the data rather than only to the runtime that loads it.
 
-That code currently lives once, in
-[`s3fs-runner/src/main.rs`](../crates/s3fs-runner/src/main.rs), and includes
-`add_wasi_minus_filesystem` — a hand-copied clone of
-`wasmtime_wasi::p2::add_to_linker_with_options_async` with the two
-`filesystem::*` lines removed. It will drift silently on any `wasmtime-wasi`
-bump, and duplicating it into a second binary would double that hazard. It
-should move into `s3fs-host` with a test that fails when the upstream
-interface list changes.
+### What M8 changes here
 
-### `enclave-runtime` — the deployment target
+Almost nothing structural, by design:
 
-Boot sequence:
-
-```
-1. NSM: generate a keypair, request an attestation document
-2. KMS Decrypt via vsock, Recipient = that document  →  master secret
-3. Mount the store over the vsock S3 proxy, verify the root chain,
-   enforce the sequence floor from the encryption context
-4. Load the guest component from the enclave image
-5. Instantiate, run, exit with the guest's status
-```
-
-**The guest ships inside the EIF.** Its bytes are covered by PCR0/PCR1, so the
-key policy that releases the filesystem key is attesting to exactly which code
-will read it. This is the property that makes the whole design worth having:
-without it, the enclave proves that *some* code with the right image hash is
-running, but not that the code touching your data is the code you audited.
-Changing the guest means rebuilding the image and updating the key policy —
-which is the intended friction, not an inconvenience to engineer around.
-
-Also needed:
-
-- A vsock proxy on the parent for S3 and KMS, plus its systemd unit and the
-  `nitro-cli` invocation, documented so a deployment is reproducible.
-- **Do not inherit the host environment into the guest.** `--guest-env` is
-  already an explicit allowlist; the enclave binary should keep that and
-  default to empty, since the KMS-released credentials live in that process.
-- A health/attestation endpoint over vsock so the parent can verify the
-  enclave came up and which root sequence it mounted, without being able to
-  influence either.
+- `StaticKey` becomes `KmsAttestedKey` — one more implementation of
+  `s3fs_host::MasterKeySource`, and `S3FS_MASTER_KEY` stops being read at all.
+- `AwsS3BackendConfig` gains the `http_client` field so the SDK can be pointed
+  at the parent's vsock proxy, plus a credential refresh path.
+- `RootRecord::attestation` starts carrying the PCR digest, turning the anchor
+  chain into a record of *which code* wrote each state.
+- `S3FS_MIN_ROOT_SEQ` moves into the KMS encryption context, so the freshness
+  floor comes from a service the storage operator does not control.

@@ -1,18 +1,17 @@
 [package]
-name = "s3fs-runner"
+name = "enclave-runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Wasmtime runner that loads a Wasm component and exposes wasi:filesystem backed by S3"
+description = "Runs a Wasm guest inside an AWS Nitro Enclave against a Merkle-anchored S3 filesystem"
 
 [[bin]]
-name = "s3fs-runner"
+name = "enclave-runtime"
 path = "src/main.rs"
 
 [dependencies]
-# All the wasmtime wiring lives in s3fs-host, shared with enclave-runtime.
 s3fs-host = { path = "../s3fs-host", features = ["aws"] }
 
 clap    = { version = "4", features = ["derive", "env"] }

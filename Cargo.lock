@@ -1492,6 +1492,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "enclave-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "s3fs-host",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3352,23 +3364,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "s3fs-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "s3fs-core",
- "s3fs-wasmtime",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wasmtime",
- "wasmtime-wasi",
- "wasmtime-wasi-io",
-]
-
-[[package]]
-name = "s3fs-wasmtime"
+name = "s3fs-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3380,6 +3376,18 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-io",
+]
+
+[[package]]
+name = "s3fs-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "s3fs-host",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -12,15 +12,15 @@ use wasmtime::component::Resource;
 use wasmtime::Result;
 use wasmtime_wasi::p2::bindings::io::streams::{InputStream, OutputStream};
 
-use crate::bindings::wasi::filesystem::types::{
+use crate::wasi::bindings::wasi::filesystem::types::{
     self as wit, Descriptor as WitDescriptor, DescriptorFlags, DescriptorStat, DescriptorType,
     DirectoryEntry, DirectoryEntryStream as WitDirectoryEntryStream, ErrorCode, Filesize,
     HostDescriptor, HostDirectoryEntryStream, MetadataHashValue, NewTimestamp,
     OpenFlags as WitOpenFlags, PathFlags,
 };
-use crate::descriptors::{Descriptor, DirectoryEntryStream};
-use crate::error_map::{from_fs, IntoS3WasiResult, S3WasiFsError, S3WasiFsResult};
-use crate::view::S3FsCtxView;
+use crate::wasi::descriptors::{Descriptor, DirectoryEntryStream};
+use crate::wasi::error_map::{from_fs, IntoS3WasiResult, S3WasiFsError, S3WasiFsResult};
+use crate::wasi::view::S3FsCtxView;
 
 // ---------------------------------------------------------------------------
 // types::Host
@@ -157,7 +157,7 @@ impl HostDescriptor for S3FsCtxView<'_> {
             Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
         };
         let s: wasmtime_wasi::p2::DynInputStream = Box::new(
-            crate::streams::S3InputStream::read_at(self.fs.clone(), handle, offset),
+            crate::wasi::streams::S3InputStream::read_at(self.fs.clone(), handle, offset),
         );
         let res = self
             .table
@@ -177,7 +177,7 @@ impl HostDescriptor for S3FsCtxView<'_> {
             Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
         };
         let s: wasmtime_wasi::p2::DynOutputStream = Box::new(
-            crate::streams::S3OutputStream::write_at(self.fs.clone(), handle, offset),
+            crate::wasi::streams::S3OutputStream::write_at(self.fs.clone(), handle, offset),
         );
         let res = self
             .table
@@ -197,7 +197,7 @@ impl HostDescriptor for S3FsCtxView<'_> {
         };
         let offset = handle.size().await;
         let s: wasmtime_wasi::p2::DynOutputStream = Box::new(
-            crate::streams::S3OutputStream::write_at(self.fs.clone(), handle, offset),
+            crate::wasi::streams::S3OutputStream::write_at(self.fs.clone(), handle, offset),
         );
         let res = self
             .table

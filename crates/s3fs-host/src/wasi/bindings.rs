@@ -11,14 +11,14 @@ wasmtime::component::bindgen!({
     world: "s3fs-host",
     imports: { default: async | trappable },
     trappable_error_type: {
-        "wasi:filesystem/types.error-code" => crate::error_map::S3WasiFsError,
+        "wasi:filesystem/types.error-code" => crate::wasi::error_map::S3WasiFsError,
     },
     with: {
         "wasi:io/poll":     wasmtime_wasi::p2::bindings::io::poll,
         "wasi:io/streams":  wasmtime_wasi::p2::bindings::io::streams,
         "wasi:io/error":    wasmtime_wasi::p2::bindings::io::error,
         "wasi:clocks/wall-clock": wasmtime_wasi::p2::bindings::clocks::wall_clock,
-        "wasi:filesystem/types.descriptor":             crate::descriptors::Descriptor,
-        "wasi:filesystem/types.directory-entry-stream": crate::descriptors::DirectoryEntryStream,
+        "wasi:filesystem/types.descriptor":             crate::wasi::descriptors::Descriptor,
+        "wasi:filesystem/types.directory-entry-stream": crate::wasi::descriptors::DirectoryEntryStream,
     },
 });

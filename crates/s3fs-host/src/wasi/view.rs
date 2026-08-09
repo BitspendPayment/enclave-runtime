@@ -21,7 +21,7 @@ pub struct S3FsCtxView<'a> {
     pub table: &'a mut ResourceTable,
 }
 
-/// Implement this on your store-data type `T` to plug `s3fs-wasmtime` into
+/// Implement this on your store-data type `T` to plug the filesystem into
 /// a `Linker<T>`. The closure passed to [`crate::add_to_linker`] uses this
 /// trait to fetch a fresh view per call.
 pub trait S3WasiView: Send {

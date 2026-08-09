@@ -8,7 +8,7 @@
 use s3fs_core::FsError;
 use wasmtime_wasi::TrappableError;
 
-use crate::bindings::wasi::filesystem::types::ErrorCode;
+use crate::wasi::bindings::wasi::filesystem::types::ErrorCode;
 
 /// The host-side error type the bindgen-generated traits return.
 pub type S3WasiFsError = TrappableError<ErrorCode>;

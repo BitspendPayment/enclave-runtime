@@ -13,7 +13,7 @@ use bytes::Bytes;
 use s3fs_core::{FileHandle, Fs};
 use wasmtime_wasi::p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult};
 
-use crate::error_map::from_fs;
+use crate::wasi::error_map::from_fs;
 
 /// Soft cap on `check_write` permits. Big enough to fit a typical write
 /// buffer in one shot.

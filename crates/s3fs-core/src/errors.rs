@@ -1,7 +1,7 @@
 //! `FsError` — the engine's internal error type.
 //!
 //! Translation to WASI Preview 2 `wasi:filesystem/types::error-code` happens in
-//! the `s3fs-wasmtime` crate. Inside the engine we keep error variants close to
+//! the `s3fs-host` crate. Inside the engine we keep error variants close to
 //! POSIX-flavored categories so call sites are obvious.
 
 use thiserror::Error;

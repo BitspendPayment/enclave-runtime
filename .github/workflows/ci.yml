@@ -38,29 +38,17 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --features aws
-        run: cargo build --workspace --features aws --all-targets
+        run: cargo build --workspace --features s3fs-host/aws --all-targets
       - name: cargo test --features aws (lib)
-        run: cargo test --workspace --features aws --lib
+        run: cargo test --workspace --features s3fs-host/aws --lib
       - name: cargo clippy --features aws
-        run: cargo clippy --workspace --features aws --all-targets -- -D warnings
+        run: cargo clippy --workspace --features s3fs-host/aws --all-targets -- -D warnings
 
   minio-integration:
     name: MinIO integration tests
     runs-on: ubuntu-latest
-    services:
-      minio:
-        image: minio/minio:RELEASE.2025-02-28T09-55-16Z
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/ready"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 12
-          ENTRYPOINT /usr/bin/docker-entrypoint.sh server /data
+    # The tests start their own MinIO via testcontainers; a service container
+    # here would be unused. The previous one was also malformed and never ran.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -102,3 +90,69 @@ jobs:
           export CFLAGS_wasm32_wasip2="--sysroot=$HOME/wasi-sdk/share/wasi-sysroot -DSQLITE_THREADSAFE=0 -DHAVE_USLEEP=1"
           cd examples/guest-fsdemo
           cargo build --release --target wasm32-wasip2
+
+  guest-e2e:
+    name: End-to-end (guest + MinIO)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+
+      # No wasi-sdk needed: guest-smoke is std-only, so this runs on every
+      # push rather than only where a C toolchain has been installed.
+      - name: build the guest
+        working-directory: examples/guest-smoke
+        run: cargo build --release --target wasm32-wasip2
+
+      - name: build enclave-runtime
+        run: cargo build --release -p enclave-runtime
+
+      - name: start MinIO
+        run: |
+          docker run -d --rm --name ci-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:9000/minio/health/ready && break
+            sleep 1
+          done
+          docker run --rm --network host --entrypoint sh minio/mc -c "
+            mc alias set m http://127.0.0.1:9000 minioadmin minioadmin
+            mc mb m/e2e-data
+            mc mb --with-lock m/e2e-roots"
+
+      # Twice, against the same buckets. The guest counts its own runs from a
+      # file it wrote, so a second run printing 'run 2' is proof that commits
+      # reached the store and the anchor chain was picked back up — not that
+      # the filesystem was silently reformatted.
+      - name: run the guest twice
+        env:
+          S3FS_MASTER_KEY: "00000000000000000000000000000000000000000000000000000000000000ab"
+          S3FS_BUCKET: e2e-data
+          S3FS_ROOTS_BUCKET: e2e-roots
+          S3FS_ENDPOINT: http://127.0.0.1:9000
+          S3FS_FORCE_PATH_STYLE: "1"
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+          S3FS_GUEST_PATH: examples/guest-smoke/target/wasm32-wasip2/release/guest-smoke.wasm
+          SMOKE_MARKER: from-ci
+        run: |
+          set -euo pipefail
+          out1=$(./target/release/enclave-runtime)
+          echo "$out1"
+          echo "$out1" | grep -qx OK
+          echo "$out1" | grep -qx "run 1"
+          echo "$out1" | grep -q "SMOKE_MARKER=from-ci"
+
+          out2=$(./target/release/enclave-runtime)
+          echo "$out2"
+          echo "$out2" | grep -qx OK
+          echo "$out2" | grep -qx "run 2"   # durability across mounts
+
+      - name: stop MinIO
+        if: always()
+        run: docker rm -f ci-minio || true

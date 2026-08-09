@@ -20,9 +20,11 @@ Three workspace crates plus an example guest:
 | Crate | Purpose |
 |---|---|
 | [`s3fs-core`](crates/s3fs-core/) | The engine. `Backend` trait with in-memory and AWS S3 backends; a copy-on-write block store (`store::*`) with encrypted blocks, an indirect-block tree, a dnode array, and the transaction-group commit protocol; POSIX semantics on top (`Fs`). **Zero wasmtime dependency** — usable from any host. |
-| [`s3fs-wasmtime`](crates/s3fs-wasmtime/) | Wasmtime host bindings. Plugs into a `Linker` and exposes `wasi:filesystem` to a guest. Reuses `wasmtime-wasi` for everything else. |
-| [`s3fs-runner`](crates/s3fs-runner/) | CLI binary that loads a `.wasm` component and runs it against a configured S3 bucket. |
-| [`examples/guest-fsdemo`](examples/guest-fsdemo/) | Example Wasm component. Exercises mkdir / write / sync / read / rename / SQLite end-to-end. |
+| [`s3fs-host`](crates/s3fs-host/) | `wasi:filesystem@0.2.x` over the engine, plus the linker, guest-environment policy, and run loop both binaries share. The AWS mount path is behind an `aws` feature, so the bindings stay usable over any `Backend`. |
+| [`s3fs-runner`](crates/s3fs-runner/) | Development CLI. Explicit flags; the guest gets no environment unless asked. |
+| [`enclave-runtime`](crates/enclave-runtime/) | Deployment target. Configured by environment, guest loaded from a known path inside the enclave image. |
+| [`examples/guest-smoke`](examples/guest-smoke/) | Minimal guest, no C toolchain needed. Exercises write / patch / rename / read_dir and the environment policy; run twice it proves durability. |
+| [`examples/guest-fsdemo`](examples/guest-fsdemo/) | Heavier guest: a real bundled SQLite database over `wasi:filesystem`. Needs wasi-sdk. |
 
 **Test coverage:** 333 unit tests plus a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor). End-to-end SQLite-on-S3 demo works.
 
@@ -85,7 +87,7 @@ opaque encrypted slabs, and the roots bucket holds the signed anchor chain.
                                  ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  wasmtime + wasmtime-wasi (io / cli / clocks / random / sockets) │
-│  + s3fs-wasmtime (filesystem only)                               │
+│  + s3fs-host::wasi (filesystem only)                             │
 │       Descriptor / DirectoryEntryStream resources                │
 │       S3InputStream / S3OutputStream over wasi:io                │
 └────────────────────────────────┬─────────────────────────────────┘
