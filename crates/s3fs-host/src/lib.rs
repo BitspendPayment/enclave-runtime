@@ -24,6 +24,7 @@
 //! KMS release gated on an NSM attestation document is a new implementation
 //! of one trait, not a change to any of the above.
 
+pub mod clock;
 pub mod env;
 pub mod flag;
 pub mod keys;
@@ -34,6 +35,7 @@ pub mod run;
 pub mod state;
 pub mod wasi;
 
+pub use clock::{open_clock, ClockSource, HostClock, PtpClock, TrustedClock, DEFAULT_PTP_DEVICE};
 pub use env::GuestEnvPolicy;
 pub use flag::parse_bool_flag;
 pub use keys::{MasterKeySource, StaticKey};

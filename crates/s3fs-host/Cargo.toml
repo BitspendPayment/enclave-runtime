@@ -21,6 +21,11 @@ wasmtime         = { version = "=44.0.0", features = ["component-model", "async"
 wasmtime-wasi    = { workspace = true }
 wasmtime-wasi-io = "=44.0.0"
 
+# The PTP clock is read through the POSIX dynamic-clock mechanism. rustix is
+# already compiled into the tree via wasmtime, so this adds no build cost and
+# avoids a direct libc dependency.
+rustix      = { version = "1", features = ["time", "fs"] }
+
 anyhow      = { workspace = true }
 async-trait = { workspace = true }
 bytes       = { workspace = true }

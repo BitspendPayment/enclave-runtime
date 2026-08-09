@@ -97,10 +97,17 @@ fn systemtime_to_wit(
 /// - `NoChange` → `None` (don't update this field)
 /// - `Now` → `Some(now)`
 /// - `Timestamp(dt)` → `Some(epoch + dt.seconds + dt.nanoseconds)`
-fn wit_timestamp_to_systemtime(ts: NewTimestamp) -> Option<std::time::SystemTime> {
+fn wit_timestamp_to_systemtime(
+    ts: NewTimestamp,
+    clock: &crate::clock::WallClockAdapter,
+) -> Option<std::time::SystemTime> {
+    use wasmtime_wasi::HostWallClock;
     match ts {
         NewTimestamp::NoChange => None,
-        NewTimestamp::Now => Some(std::time::SystemTime::now()),
+        // The runtime's clock, not the host's: a guest that reads
+        // `wall-clock` and then calls `set-times` with "now" must not see two
+        // different answers.
+        NewTimestamp::Now => Some(std::time::UNIX_EPOCH + clock.now()),
         NewTimestamp::Timestamp(dt) => {
             Some(std::time::UNIX_EPOCH + std::time::Duration::new(dt.seconds, dt.nanoseconds))
         }
@@ -263,8 +270,8 @@ impl HostDescriptor for S3FsCtxView<'_> {
             Descriptor::File { handle, .. } => handle,
             Descriptor::Dir { .. } => return Err(S3WasiFsError::from(ErrorCode::IsDirectory)),
         };
-        let atime = wit_timestamp_to_systemtime(data_access_timestamp);
-        let mtime = wit_timestamp_to_systemtime(data_modification_timestamp);
+        let atime = wit_timestamp_to_systemtime(data_access_timestamp, self.clock);
+        let mtime = wit_timestamp_to_systemtime(data_modification_timestamp, self.clock);
         self.fs.set_times(&handle, atime, mtime).await.into_wasi()
     }
 
@@ -383,8 +390,8 @@ impl HostDescriptor for S3FsCtxView<'_> {
         let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let follow = path_flags.contains(PathFlags::SYMLINK_FOLLOW);
-        let atime = wit_timestamp_to_systemtime(data_access_timestamp);
-        let mtime = wit_timestamp_to_systemtime(data_modification_timestamp);
+        let atime = wit_timestamp_to_systemtime(data_access_timestamp, self.clock);
+        let mtime = wit_timestamp_to_systemtime(data_modification_timestamp, self.clock);
         self.fs
             .set_times_at(&base, &path, atime, mtime, follow)
             .await

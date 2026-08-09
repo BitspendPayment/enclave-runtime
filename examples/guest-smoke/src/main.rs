@@ -38,6 +38,17 @@ fn run() -> Result<(), String> {
         }
     }
 
+    // Whatever the runtime's clock says. Inside an enclave this is the PTP
+    // hardware clock, which is the point: it reaches the guest through
+    // wasi:clocks/wall-clock like any other time source.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("clock before the epoch: {e}"))?;
+    println!("wall clock {}.{:09}", now.as_secs(), now.subsec_nanos());
+    if now.as_secs() < 1_577_836_800 {
+        return Err(format!("wall clock reads {}, before 2020", now.as_secs()));
+    }
+
     let dir = "/smoke";
     if fs::metadata(dir).is_err() {
         fs::create_dir(dir).map_err(|e| format!("create_dir {dir}: {e}"))?;

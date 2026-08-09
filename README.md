@@ -212,6 +212,64 @@ they share one commit, which is why 20 000 batched inserts land in less time
 than 25 unbatched ones.
 
 
+## Time
+
+An enclave's system clock is not its own. It is seeded by the hypervisor at
+boot, has no NTP, and drifts — and the party that sets it is the parent
+instance, which is exactly the party the enclave exists to distrust. AWS
+addresses this by exposing the Nitro card's PTP hardware clock, synchronised to
+the Amazon Time Sync Service, at `/dev/ptp0`.
+
+`enclave-runtime` reads that device and serves it to the guest as
+`wasi:clocks/wall-clock`, so a guest asking what time it is gets an answer the
+host cannot quietly move. `set-times` with "now" uses the same clock, so the two
+cannot disagree.
+
+| `--clock-source` | Behaviour |
+|---|---|
+| `ptp` | Read `/dev/ptp0`; refuse to start without it. **An enclave image should set this.** |
+| `host` | System clock, with a warning that time is untrusted. Development and CI. |
+| `auto` *(default)* | PTP if the device opens, host otherwise — warning loudly when it falls back, so a misconfigured enclave never looks like a correct one. |
+
+`--ptp-device` overrides the path. `--clock-check` prints readings and exits,
+without mounting anything:
+
+```console
+$ enclave-runtime --clock-check --clock-source ptp
+clock source: PTP hardware clock (/dev/ptp0)
+resolution:   1ns
+
+  reading                    vs CLOCK_REALTIME    read time
+  1786258105.437379703            -520.851 ms      10.0 us
+  1786258105.457452953            -520.851 ms      11.4 us
+  ...
+clock advanced monotonically across 5 readings
+```
+
+That output is from a real PHC on an ordinary laptop, and the two columns are
+the point of the feature. **−520 ms** of skew shows the PHC really is an
+independent clock, not `CLOCK_REALTIME` wearing a hat. **10–15 µs** per read,
+against roughly 0.3 µs for the system clock, is the price: a guest calling
+`wall-clock` in a tight loop will notice. If that ever matters, the fix is to
+sample the PHC periodically and track between samples with `CLOCK_MONOTONIC` —
+deliberately not built until a measurement asks for it.
+
+**The monotonic clock stays on `CLOCK_MONOTONIC`.** It backs WASI's timer
+subscriptions, so it must be cheap, and it must never step backwards — which a
+clock disciplined by an external source can, and a wall clock is allowed to.
+
+Verify on any machine with a PHC:
+
+```bash
+./deploy/ptp-check.sh              # passes the host's PHC into a container
+./deploy/ptp-check.sh --mode qemu  # boots a VM and uses ptp_kvm instead
+```
+
+Neither emulates Nitro; they exercise the same device interface. Full fidelity
+needs QEMU ≥ 9.1's `nitro-enclave` machine and an EIF, which belongs with
+attestation in [the roadmap](docs/ROADMAP.md).
+
+
 ## Building from source
 
 ```bash

@@ -9,6 +9,7 @@ use wasmtime::component::Component;
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 
+use crate::clock::{TrustedClock, WallClockAdapter};
 use crate::linker::build_linker;
 use crate::state::State;
 
@@ -60,8 +61,14 @@ pub fn read_component(path: &Path) -> Result<Vec<u8>> {
 }
 
 /// Compile and run a `wasi:cli/command` component against `fs`.
+///
+/// `clock` backs `wasi:clocks/wall-clock` and `set-times`' "now". The monotonic
+/// clock is left on `wasmtime-wasi`'s default: it backs timer subscriptions, so
+/// it must be cheap, and it must never step backwards — which a clock
+/// disciplined by an external source can.
 pub async fn run_component(
     fs: Arc<Fs>,
+    clock: Box<dyn TrustedClock>,
     component_bytes: &[u8],
     env: &[(String, String)],
     args: &[String],
@@ -75,12 +82,17 @@ pub async fn run_component(
         .map_err(|e| anyhow::anyhow!(e.to_string()))
         .context("compiling guest component")?;
 
+    // One adapter shared by the guest's clock interface and the filesystem's
+    // "now", so `set-times` cannot disagree with `wall-clock`.
+    let wall_clock = Arc::new(WallClockAdapter::new(clock)?);
+
     let mut wasi = WasiCtxBuilder::new();
     wasi.inherit_stdio();
     wasi.envs(env);
     wasi.args(args);
+    wasi.wall_clock(SharedWallClock(wall_clock.clone()));
 
-    let mut store = Store::new(&engine, State::new(wasi.build(), fs));
+    let mut store = Store::new(&engine, State::new(wasi.build(), fs, wall_clock));
 
     let command =
         wasmtime_wasi::p2::bindings::Command::instantiate_async(&mut store, &component, &linker)
@@ -149,5 +161,19 @@ mod tests {
             format!("{err:#}").contains("/enclave/definitely-absent.wasm"),
             "error must name the path: {err:#}"
         );
+    }
+}
+
+/// `WasiCtxBuilder::wall_clock` takes ownership, but the filesystem needs the
+/// same clock for `set-times`. This shares one.
+#[derive(Debug, Clone)]
+pub struct SharedWallClock(pub Arc<WallClockAdapter>);
+
+impl wasmtime_wasi::HostWallClock for SharedWallClock {
+    fn resolution(&self) -> std::time::Duration {
+        self.0.resolution()
+    }
+    fn now(&self) -> std::time::Duration {
+        self.0.now()
     }
 }

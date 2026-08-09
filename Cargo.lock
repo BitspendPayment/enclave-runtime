@@ -3370,6 +3370,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "rustix 1.1.4",
  "s3fs-core",
  "tokio",
  "tracing",

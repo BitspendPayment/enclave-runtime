@@ -63,6 +63,15 @@ exist:
   ([aws.rs](../crates/s3fs-core/src/backend/aws.rs)), so a KMS-attested
   session token expires mid-run with no recovery. Needs a refresh path.
 
+**3b. Cover the clock.** The guest's wall clock now comes from `/dev/ptp0`
+(see the README), but two things remain. The Object Lock retention deadline in
+[`RootStore::root_retention`](../crates/s3fs-core/src/store/root.rs) still uses
+`SystemTime::now()` — and a COMPLIANCE deadline computed from a wrong clock
+cannot be corrected afterwards by anyone, which makes it the sharpest version
+of this problem in the codebase. And attestation should eventually cover *which*
+clock was in use, so a relying party can tell a PTP-backed enclave from one that
+fell back to host time.
+
 **4. Bind the attestation into the anchor.** `RootRecord` already reserves an
 `attestation` field. Recording the PCR digest that produced each commit turns
 the root chain into an audit log of *which code* wrote each state, not merely

@@ -15,14 +15,18 @@ pub struct State {
     wasi: WasiCtx,
     table: ResourceTable,
     fs: Arc<Fs>,
+    /// The same clock the guest sees through `wasi:clocks`, so `set-times`
+    /// with "now" agrees with it.
+    clock: Arc<crate::clock::WallClockAdapter>,
 }
 
 impl State {
-    pub fn new(wasi: WasiCtx, fs: Arc<Fs>) -> Self {
+    pub fn new(wasi: WasiCtx, fs: Arc<Fs>, clock: Arc<crate::clock::WallClockAdapter>) -> Self {
         State {
             wasi,
             table: ResourceTable::new(),
             fs,
+            clock,
         }
     }
 
@@ -49,6 +53,7 @@ impl S3WasiView for State {
         S3FsCtxView {
             fs: &self.fs,
             table: &mut self.table,
+            clock: &self.clock,
         }
     }
 }

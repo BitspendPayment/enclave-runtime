@@ -47,6 +47,10 @@ COPY --from=build /src/examples/guest-smoke/target/wasm32-wasip2/release/guest-s
 # Deployment configuration. Every setting also has a flag, but inside an
 # enclave there is no shell to pass one, so these are what actually apply.
 ENV S3FS_GUEST_PATH=/enclave/guest.wasm
+# Read the Nitro PTP hardware clock and refuse to start without it. The
+# alternative is running on a clock the parent instance sets, which is the
+# party this whole design excludes.
+ENV S3FS_CLOCK_SOURCE=ptp
 # ENV S3FS_BUCKET=prod-data
 # ENV S3FS_ROOTS_BUCKET=prod-roots        # Object Lock COMPLIANCE lives here
 # ENV AWS_REGION=eu-west-2

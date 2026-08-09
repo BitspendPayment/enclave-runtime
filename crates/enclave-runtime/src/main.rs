@@ -27,8 +27,8 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use s3fs_host::{
-    mount, read_component, run_component, GuestEnvPolicy, MasterKeySource, MountConfig, StaticKey,
-    EXIT_RUNTIME_FAILURE,
+    mount, open_clock, read_component, run_component, ClockSource, GuestEnvPolicy, MasterKeySource,
+    MountConfig, StaticKey, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
 /// Where the guest lives inside the enclave image.
@@ -130,6 +130,27 @@ struct Cli {
     #[arg(long = "guest-env", value_name = "NAME[=VALUE]")]
     guest_env: Vec<String>,
 
+    /// Where the guest's wall-clock time comes from.
+    ///
+    /// `ptp` reads the Nitro PTP hardware clock and refuses to start without
+    /// it. `host` uses the system clock, which inside an enclave is whatever
+    /// the hypervisor last set — fine for development, untrusted in
+    /// production. `auto` prefers PTP and warns when it falls back.
+    ///
+    /// An enclave image should set this to `ptp`.
+    #[arg(long, env = "S3FS_CLOCK_SOURCE", default_value = "auto",
+          value_parser = ClockSource::parse)]
+    clock_source: ClockSource,
+
+    /// PTP character device to read.
+    #[arg(long, env = "S3FS_PTP_DEVICE", default_value = DEFAULT_PTP_DEVICE)]
+    ptp_device: PathBuf,
+
+    /// Report on the configured clock and exit, without mounting or running
+    /// anything. For diagnosing a deployment.
+    #[arg(long)]
+    clock_check: bool,
+
     /// Arguments passed to the guest.
     #[arg(last = true)]
     guest_args: Vec<String>,
@@ -198,6 +219,12 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> Result<s3fs_host::GuestOutcome> {
     let cli = Cli::parse();
 
+    let clock = open_clock(cli.clock_source, &cli.ptp_device)?;
+    if cli.clock_check {
+        clock_check(clock.as_ref())?;
+        return Ok(s3fs_host::GuestOutcome::Success);
+    }
+
     let keys = StaticKey::from_hex(&cli.master_key)?;
     tracing::info!(
         key_source = keys.describe(),
@@ -219,7 +246,57 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
         "running guest"
     );
 
-    run_component(fs, &component, &env, &cli.guest_args).await
+    run_component(fs, clock, &component, &env, &cli.guest_args).await
+}
+
+/// Print what the configured clock actually reports.
+///
+/// The delta against `CLOCK_REALTIME` is the interesting column: a PTP clock
+/// disciplined by an external source and a host clock set by the hypervisor
+/// have no reason to agree, and how far apart they are is exactly what this
+/// feature exists to expose.
+fn clock_check(clock: &dyn s3fs_host::TrustedClock) -> Result<()> {
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    println!("clock source: {}", clock.describe());
+    println!("resolution:   {:?}", clock.resolution());
+    println!();
+    println!(
+        "  {:<26} {:>16} {:>12}",
+        "reading", "vs CLOCK_REALTIME", "read time"
+    );
+
+    let mut previous: Option<Duration> = None;
+    for _ in 0..5 {
+        let started = Instant::now();
+        let now = clock.now()?;
+        let read_time = started.elapsed();
+        let realtime = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("host clock before the epoch");
+
+        // Signed skew, in milliseconds.
+        let skew_ms = now.as_secs_f64() * 1e3 - realtime.as_secs_f64() * 1e3;
+
+        if let Some(prev) = previous {
+            if now < prev {
+                anyhow::bail!("clock went backwards: {:?} then {:?}", prev, now);
+            }
+        }
+        previous = Some(now);
+
+        println!(
+            "  {:<26} {:>13.3} ms {:>9.1} us",
+            format!("{}.{:09}", now.as_secs(), now.subsec_nanos()),
+            skew_ms,
+            read_time.as_secs_f64() * 1e6
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    println!();
+    println!("clock advanced monotonically across 5 readings");
+    Ok(())
 }
 
 fn exit_code(code: i32) -> std::process::ExitCode {

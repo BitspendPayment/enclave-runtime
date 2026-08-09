@@ -15,8 +15,8 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use s3fs_host::{
-    mount, read_component, run_component, GuestEnvPolicy, MasterKeySource, MountConfig, StaticKey,
-    EXIT_RUNTIME_FAILURE,
+    mount, open_clock, read_component, run_component, ClockSource, GuestEnvPolicy, MasterKeySource,
+    MountConfig, StaticKey, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
 #[derive(Parser, Debug)]
@@ -94,6 +94,15 @@ struct Cli {
     /// than starting from empty.
     #[arg(long)]
     inherit_env: bool,
+
+    /// Where the guest's wall-clock time comes from: `auto`, `ptp`, or `host`.
+    #[arg(long, env = "S3FS_CLOCK_SOURCE", default_value = "auto",
+          value_parser = ClockSource::parse)]
+    clock_source: ClockSource,
+
+    /// PTP character device to read.
+    #[arg(long, env = "S3FS_PTP_DEVICE", default_value = DEFAULT_PTP_DEVICE)]
+    ptp_device: PathBuf,
 
     /// Path to the `.wasm` component file.
     #[arg(long, short = 'c')]
@@ -176,11 +185,12 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
         "starting"
     );
 
+    let clock = open_clock(cli.clock_source, &cli.ptp_device)?;
     let fs = mount(&cli.mount_config()?, &keys).await?;
     let component = read_component(&cli.component)?;
     let env = cli.env_policy().build()?;
 
-    run_component(fs, &component, &env, &cli.guest_args).await
+    run_component(fs, clock, &component, &env, &cli.guest_args).await
 }
 
 #[cfg(test)]

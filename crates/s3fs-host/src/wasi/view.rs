@@ -19,6 +19,9 @@ use wasmtime::component::ResourceTable;
 pub struct S3FsCtxView<'a> {
     pub fs: &'a Arc<Fs>,
     pub table: &'a mut ResourceTable,
+    /// The same clock the guest sees through `wasi:clocks/wall-clock`, so
+    /// `set-times` with "now" cannot disagree with what the guest just read.
+    pub clock: &'a Arc<crate::clock::WallClockAdapter>,
 }
 
 /// Implement this on your store-data type `T` to plug the filesystem into
