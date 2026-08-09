@@ -17,6 +17,7 @@ use wasmtime_wasi_http::p2::WasiHttpView;
 
 use crate::linker::build_linker;
 use crate::run::GuestEnvironment;
+use crate::serve::acme::CertificateSlot;
 use crate::serve::endpoints::EnclaveEndpoints;
 use crate::serve::tls::TlsIdentity;
 use crate::state::State;
@@ -31,6 +32,8 @@ pub struct ServeConfig {
     pub concurrency: usize,
     /// Certificate to terminate TLS with. `None` serves plaintext.
     pub tls: Option<TlsIdentity>,
+    /// A running ACME client, instead of a fixed certificate.
+    pub acme: Option<crate::serve::acme::Acme>,
     /// NSM to answer `/enclave/attestation` from.
     ///
     /// Only useful alongside `tls`: the document binds the serving
@@ -59,6 +62,7 @@ impl Default for ServeConfig {
             addr: ([0, 0, 0, 0], 8080).into(),
             concurrency: 1,
             tls: None,
+            acme: None,
             attestation: None,
         }
     }
@@ -177,8 +181,21 @@ impl ServeHandle {
 pub struct Server {
     guest: Arc<ServeHandle>,
     endpoints: Option<Arc<EnclaveEndpoints>>,
-    tls: Option<Arc<rustls::ServerConfig>>,
+    tls: Option<Tls>,
     addr: SocketAddr,
+}
+
+/// How TLS is terminated.
+enum Tls {
+    /// A certificate fixed at startup.
+    Fixed(Arc<rustls::ServerConfig>),
+    /// Two configurations, chosen per connection from the ClientHello: a
+    /// TLS-ALPN-01 validation connection is answered on this same port, which
+    /// is the reason that challenge type was chosen.
+    Acme {
+        config: Arc<rustls::ServerConfig>,
+        challenge: Arc<rustls::ServerConfig>,
+    },
 }
 
 impl Server {
@@ -197,7 +214,15 @@ impl Server {
     }
 
     pub fn with_tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
-        self.tls = Some(config);
+        self.tls = Some(Tls::Fixed(config));
+        self
+    }
+
+    pub fn with_acme(mut self, acme: &crate::serve::acme::Acme) -> Self {
+        self.tls = Some(Tls::Acme {
+            config: acme.server_config.clone(),
+            challenge: acme.challenge_config.clone(),
+        });
         self
     }
 
@@ -213,21 +238,21 @@ impl Server {
             "serving"
         );
 
-        let acceptor = self.tls.clone().map(tokio_rustls::TlsAcceptor::from);
         // What the *client* used. With TLS terminated here the guest is still
         // told `https`, or it would build wrong absolute URLs and set wrong
         // cookie flags.
-        let scheme = if acceptor.is_some() {
+        let scheme = if self.tls.is_some() {
             Scheme::Https
         } else {
             Scheme::Http
         };
+        let tls = self.tls.map(Arc::new);
 
         loop {
             let (client, peer) = listener.accept().await.context("accepting connection")?;
             let guest = self.guest.clone();
             let endpoints = self.endpoints.clone();
-            let acceptor = acceptor.clone();
+            let tls = tls.clone();
             // `Scheme` is not `Copy`, and the service closure is `Fn` — it may
             // run per request on a kept-alive connection, so it needs its own.
             let scheme = scheme.clone();
@@ -256,22 +281,76 @@ impl Server {
                     },
                 );
 
-                let result = match acceptor {
-                    Some(acceptor) => match acceptor.accept(client).await {
-                        Ok(stream) => {
-                            http1::Builder::new()
-                                .keep_alive(true)
-                                .serve_connection(TokioIo::new(stream), service)
-                                .await
+                let result = match tls.as_deref() {
+                    Some(Tls::Fixed(config)) => {
+                        let acceptor = tokio_rustls::TlsAcceptor::from(config.clone());
+                        match acceptor.accept(client).await {
+                            Ok(stream) => {
+                                http1::Builder::new()
+                                    .keep_alive(true)
+                                    .serve_connection(TokioIo::new(stream), service)
+                                    .await
+                            }
+                            Err(e) => {
+                                // Routine: scanners, health checks and clients
+                                // that reject a self-signed certificate all
+                                // land here. Not worth a warning each time.
+                                tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                                return;
+                            }
                         }
-                        Err(e) => {
-                            // Routine: scanners, health checks and clients
-                            // that reject a self-signed certificate all land
-                            // here. Not worth a warning each time.
-                            tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                    }
+                    Some(Tls::Acme { config, challenge }) => {
+                        // The ClientHello decides which configuration to use,
+                        // so the challenge and the real service share a port.
+                        let handshake =
+                            match tokio_rustls::LazyConfigAcceptor::new(Default::default(), client)
+                                .await
+                            {
+                                Ok(handshake) => handshake,
+                                Err(e) => {
+                                    tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                                    return;
+                                }
+                            };
+
+                        if rustls_acme::is_tls_alpn_challenge(&handshake.client_hello()) {
+                            // A validation connection carries no HTTP. The
+                            // handshake itself is the proof; completing it and
+                            // closing is the whole exchange.
+                            tracing::info!(%peer, "answering a TLS-ALPN-01 challenge");
+                            match handshake.into_stream(challenge.clone()).await {
+                                Ok(mut tls) => {
+                                    use tokio::io::AsyncWriteExt;
+                                    let _ = tls.shutdown().await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        %peer, error = %e,
+                                        "the ACME challenge handshake failed; \
+                                         issuance will not complete"
+                                    );
+                                }
+                            }
                             return;
                         }
-                    },
+
+                        match handshake.into_stream(config.clone()).await {
+                            Ok(stream) => {
+                                http1::Builder::new()
+                                    .keep_alive(true)
+                                    .serve_connection(TokioIo::new(stream), service)
+                                    .await
+                            }
+                            Err(e) => {
+                                // Every handshake lands here until the first
+                                // certificate arrives, which is the expected
+                                // state while an order is in flight.
+                                tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                                return;
+                            }
+                        }
+                    }
                     None => {
                         http1::Builder::new()
                             .keep_alive(true)
@@ -300,16 +379,28 @@ pub async fn serve_component(
     let handle = ServeHandle::new(&engine, component_bytes, guest, config.concurrency)?;
     let mut server = Server::new(handle, config.addr);
 
-    match (&config.tls, &config.attestation) {
-        (Some(tls), attestation) => {
+    // The slot the attestation endpoint reads. Fixed for a self-signed
+    // certificate; updated by the ACME client on issue and on every renewal,
+    // so a document always binds the certificate actually being presented.
+    let certificate = match (&config.tls, &config.acme) {
+        (Some(tls), _) => Some(CertificateSlot::fixed(tls.certificate_der.clone())),
+        (None, Some(acme)) => Some(acme.certificate.clone()),
+        (None, None) => None,
+    };
+
+    match (&certificate, &config.attestation) {
+        (Some(slot), attestation) => {
             if let Some(nsm) = attestation {
-                // Binds this certificate and this guest, and fails here if the
-                // device will not attest — before a single request is served.
-                let endpoints =
-                    EnclaveEndpoints::new(nsm.clone(), &tls.certificate_der, component_bytes)?;
+                // Fails here if the device will not attest — before a single
+                // request is served.
+                let endpoints = EnclaveEndpoints::new(nsm.clone(), slot.clone(), component_bytes)?;
                 server = server.with_endpoints(Arc::new(endpoints));
             }
-            server = server.with_tls(tls.config.clone());
+            server = match (&config.tls, &config.acme) {
+                (Some(tls), _) => server.with_tls(tls.config.clone()),
+                (None, Some(acme)) => server.with_acme(acme),
+                (None, None) => unreachable!("a certificate slot exists only with TLS or ACME"),
+            };
         }
         (None, Some(_)) => {
             anyhow::bail!(

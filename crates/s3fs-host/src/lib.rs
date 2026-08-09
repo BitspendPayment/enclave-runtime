@@ -45,7 +45,7 @@ pub use flag::parse_bool_flag;
 pub use keys::{MasterKeySource, StaticKey};
 pub use linker::build_linker;
 #[cfg(feature = "aws")]
-pub use mount::{mount, parse_fs_id, MountConfig};
+pub use mount::{mount, mount_with_backend, parse_fs_id, MountConfig, Mounted};
 pub use net::{bring_up, Network, NetworkConfig, NetworkMode, DEFAULT_GVFORWARDER};
 pub use nitro_nsm::{Nsm, NsmDevice, DEFAULT_NSM_DEVICE};
 pub use random::{open_entropy, GuestRandom, HostEntropy, RandomSource};
@@ -55,8 +55,8 @@ pub use run::{
 };
 #[cfg(feature = "serve")]
 pub use serve::{
-    serve_component, EgressPolicy, EnclaveEndpoints, ServeConfig, ServeHandle, Server, TlsIdentity,
-    TlsMode,
+    serve_component, AcmeConfig, CertificateSlot, EgressPolicy, EnclaveEndpoints, SealedAcmeCache,
+    ServeConfig, ServeHandle, Server, TlsIdentity, TlsMode,
 };
 pub use state::State;
 pub use wasi::{add_filesystem_to_linker, S3FsCtxView, S3WasiView};

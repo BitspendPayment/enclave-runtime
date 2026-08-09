@@ -34,6 +34,15 @@ use crate::errors::{FsError, FsResult};
 const INFO_BLOCK: &[u8] = b"s3fs/block/v1";
 const INFO_ROOTSIGN: &[u8] = b"s3fs/rootsign/v1";
 const INFO_DIRHASH: &[u8] = b"s3fs/dirhash/v1";
+/// Seals the runtime's own secrets — the ACME account key and the TLS
+/// certificate's private key — which live outside the filesystem.
+///
+/// Outside, because the guest's preopen is the filesystem *root*: anything
+/// stored there is readable by the guest, and a guest that could read the TLS
+/// private key could impersonate the enclave to every client. A separate label
+/// keeps that material cryptographically distinct from block data as well as
+/// physically separate.
+const INFO_RUNTIME_SEAL: &[u8] = b"s3fs/runtime-seal/v1";
 
 /// Length of an Ed25519 public key and of a raw signing seed.
 pub const ED25519_PUBLIC_KEY_LEN: usize = 32;
@@ -100,6 +109,7 @@ fn hkdf(secret: &MasterSecret, salt: &[u8], info: &[u8], out: &mut [u8]) -> FsRe
 /// All keys derived from one master secret, for one filesystem.
 pub struct KeyMaterial {
     block_key: LessSafeKey,
+    runtime_seal_key: LessSafeKey,
     signing_key: Ed25519KeyPair,
     public_key: [u8; ED25519_PUBLIC_KEY_LEN],
     dir_hash_key: [u8; 32],
@@ -121,6 +131,14 @@ impl KeyMaterial {
         );
         block_bytes.zeroize();
 
+        let mut seal_bytes = [0u8; 32];
+        hkdf(master, &fs_uuid, INFO_RUNTIME_SEAL, &mut seal_bytes)?;
+        let runtime_seal_key = LessSafeKey::new(
+            UnboundKey::new(&AES_256_GCM, &seal_bytes)
+                .map_err(|_| FsError::Io("AES key setup failed".to_string()))?,
+        );
+        seal_bytes.zeroize();
+
         let mut seed = [0u8; 32];
         hkdf(master, &fs_uuid, INFO_ROOTSIGN, &mut seed)?;
         let signing_key = Ed25519KeyPair::from_seed_unchecked(&seed)
@@ -135,6 +153,7 @@ impl KeyMaterial {
 
         Ok(KeyMaterial {
             block_key,
+            runtime_seal_key,
             signing_key,
             public_key,
             dir_hash_key,
@@ -144,6 +163,12 @@ impl KeyMaterial {
 
     pub fn block_key(&self) -> &LessSafeKey {
         &self.block_key
+    }
+
+    /// Seals runtime secrets stored outside the filesystem. See
+    /// [`INFO_RUNTIME_SEAL`].
+    pub fn runtime_seal_key(&self) -> &LessSafeKey {
+        &self.runtime_seal_key
     }
 
     pub fn signing_key(&self) -> &Ed25519KeyPair {

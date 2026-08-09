@@ -28,9 +28,9 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use s3fs_host::{
-    mount, open_clock, open_entropy, read_component, run_component, serve_component, ClockSource,
-    GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, NetworkConfig, NetworkMode,
-    RandomSource, ServeConfig, StaticKey, TlsIdentity, TlsMode, DEFAULT_GVFORWARDER,
+    open_clock, open_entropy, read_component, run_component, serve_component, AcmeConfig,
+    ClockSource, GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, NetworkConfig,
+    NetworkMode, RandomSource, ServeConfig, StaticKey, TlsIdentity, TlsMode, DEFAULT_GVFORWARDER,
     DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
@@ -234,6 +234,22 @@ struct Cli {
     #[arg(long = "tls-domain", env = "S3FS_TLS_DOMAINS", value_delimiter = ',')]
     tls_domains: Vec<String>,
 
+    /// Contact address registered with the ACME provider, for expiry notices.
+    #[arg(
+        long = "acme-contact",
+        env = "S3FS_ACME_CONTACTS",
+        value_delimiter = ','
+    )]
+    acme_contacts: Vec<String>,
+
+    /// ACME directory URL. Defaults to Let's Encrypt production.
+    ///
+    /// Point it at staging while setting a deployment up. Production allows
+    /// five duplicate certificates per week per domain, and an enclave that
+    /// keeps re-issuing will exhaust that and be unable to serve.
+    #[arg(long, env = "S3FS_ACME_DIRECTORY")]
+    acme_directory: Option<String>,
+
     /// How the enclave reaches the network.
     ///
     /// `gvproxy` runs the tap forwarder against the parent's gvproxy, which is
@@ -355,7 +371,11 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
         "starting"
     );
 
-    let fs = mount(&cli.mount_config()?, &keys).await?;
+    // Keeps the data backend and derived keys: the ACME cache seals its blobs
+    // under the same master secret and writes them as plain objects, outside
+    // the filesystem the guest can read.
+    let mounted = s3fs_host::mount_with_backend(&cli.mount_config()?, &keys).await?;
+    let fs = mounted.fs.clone();
 
     // Read the guest before building the environment so a missing component —
     // the likeliest misconfiguration inside an image — fails immediately and
@@ -374,13 +394,22 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
             run_component(fs, clock, entropy, &component, &env, &cli.guest_args).await
         }
         Mode::Serve => {
-            let tls = match cli.tls {
-                TlsMode::Off => None,
-                TlsMode::SelfSigned => Some(TlsIdentity::self_signed(&cli.tls_domains)?),
-                TlsMode::Acme => anyhow::bail!(
-                    "--tls acme is not implemented yet; use self-signed, which \
-                     attestation-verifying clients accept"
-                ),
+            let (tls, acme) = match cli.tls {
+                TlsMode::Off => (None, None),
+                TlsMode::SelfSigned => (Some(TlsIdentity::self_signed(&cli.tls_domains)?), None),
+                TlsMode::Acme => {
+                    let acme = s3fs_host::serve::acme::start(
+                        &AcmeConfig {
+                            domains: cli.tls_domains.clone(),
+                            contacts: cli.acme_contacts.clone(),
+                            directory: cli.acme_directory.clone(),
+                            prefix: mounted.bucket_prefix.clone(),
+                        },
+                        mounted.data.clone(),
+                        mounted.keys.clone(),
+                    )?;
+                    (None, Some(acme))
+                }
             };
             tracing::info!(
                 variables = env.len(),
@@ -398,6 +427,7 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
                     addr: cli.http_listen,
                     concurrency: cli.http_concurrency,
                     tls,
+                    acme,
                     attestation,
                 },
             )

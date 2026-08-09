@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use s3fs_core::backend::{AwsS3Backend, AwsS3BackendConfig, Backend};
+use s3fs_core::crypto::KeyMaterial;
 use s3fs_core::{Config, Fs};
 
 use crate::keys::MasterKeySource;
@@ -62,9 +63,30 @@ pub fn parse_fs_id(s: &str) -> Result<[u8; 16]> {
     Ok(out)
 }
 
+/// A mounted filesystem, plus the pieces a runtime needs alongside it.
+///
+/// The ACME cache writes sealed objects to the data bucket and seals them
+/// under a key derived from the same master secret, so it needs both — but it
+/// deliberately does *not* go through the filesystem, because the guest's
+/// preopen is the filesystem root and the blob contains a TLS private key.
+pub struct Mounted {
+    pub fs: Arc<Fs>,
+    pub data: Arc<dyn Backend>,
+    pub keys: Arc<KeyMaterial>,
+    pub bucket_prefix: String,
+}
+
 /// Connect both backends and mount, then report which committed state we came
 /// up on.
 pub async fn mount(config: &MountConfig, keys: &dyn MasterKeySource) -> Result<Arc<Fs>> {
+    Ok(mount_with_backend(config, keys).await?.fs)
+}
+
+/// As [`mount`], keeping the data backend and derived keys.
+pub async fn mount_with_backend(
+    config: &MountConfig,
+    keys: &dyn MasterKeySource,
+) -> Result<Mounted> {
     let data_cfg = config.backend_config(&config.bucket);
     let data: Arc<dyn Backend> = Arc::new(if config.skip_bucket_probe {
         AwsS3Backend::connect_unchecked(data_cfg).await?
@@ -95,8 +117,15 @@ pub async fn mount(config: &MountConfig, keys: &dyn MasterKeySource) -> Result<A
         .build();
 
     let master = keys.master_secret().await?;
+    // Derived twice — once here and once inside `Fs::mount` — rather than
+    // reaching into the store for them. The derivation is cheap and pure, and
+    // threading them out would widen the store's API for one caller.
+    let derived = Arc::new(
+        KeyMaterial::derive(&master, config.fs_id)
+            .map_err(|e| anyhow::anyhow!("deriving keys: {e}"))?,
+    );
     let fs = Fs::mount(
-        data,
+        data.clone(),
         roots,
         &master,
         config.fs_id,
@@ -123,7 +152,12 @@ pub async fn mount(config: &MountConfig, keys: &dyn MasterKeySource) -> Result<A
         "mounted"
     );
 
-    Ok(fs)
+    Ok(Mounted {
+        fs,
+        data,
+        keys: derived,
+        bucket_prefix: config.bucket_prefix.clone(),
+    })
 }
 
 #[cfg(test)]

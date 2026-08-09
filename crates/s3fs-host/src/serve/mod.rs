@@ -16,10 +16,12 @@
 //!                       └──▶ everything else ──▶ guest
 //! ```
 
+pub mod acme;
 pub mod endpoints;
 mod http;
 pub mod tls;
 
+pub use acme::{AcmeConfig, CertificateSlot, SealedAcmeCache};
 pub use endpoints::{EnclaveEndpoints, ENCLAVE_PREFIX};
 pub use http::{serve_component, ServeConfig, ServeHandle, Server};
 pub use tls::{TlsIdentity, TlsMode};

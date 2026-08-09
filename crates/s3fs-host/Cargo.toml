@@ -26,6 +26,10 @@ serve = [
     "dep:nitro-attestation",
     "dep:base64",
     "dep:hex",
+    "dep:rustls-acme",
+    "dep:blake3",
+    "dep:aws-lc-rs",
+    "dep:futures",
     "tokio/net",
     "tokio/io-util",
 ]
@@ -59,6 +63,17 @@ rcgen          = { version = "0.14", default-features = false, features = ["aws_
 nitro-attestation = { path = "../nitro-attestation", optional = true }
 base64         = { version = "0.22", optional = true }
 hex            = { version = "0.4", optional = true }
+# TLS-ALPN-01, so the challenge arrives on the port the parent already
+# forwards. `aws_lc_rs` keeps it on the same crypto stack as everything else.
+# `webpki-roots` is not optional in practice: reaching the ACME directory means
+# validating the CA's own TLS certificate, and the enclave cannot borrow the
+# parent's trust store — the parent is the party being excluded.
+rustls-acme    = { version = "0.15", default-features = false, features = ["tokio", "aws-lc-rs", "tls12", "webpki-roots"], optional = true }
+blake3         = { workspace = true, optional = true }
+# Sealing the ACME cache uses the same AES-256-GCM as the block store.
+aws-lc-rs      = { workspace = true, optional = true }
+# rustls-acme drives issuance through a Stream.
+futures        = { workspace = true, optional = true }
 
 # The PTP clock is read through the POSIX dynamic-clock mechanism. rustix is
 # already compiled into the tree via wasmtime, so this adds no build cost and

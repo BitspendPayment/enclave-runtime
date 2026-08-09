@@ -20,6 +20,8 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use nitro_attestation::AttestationHashes;
 use nitro_nsm::{AttestationRequest, Nsm};
+
+use crate::serve::acme::CertificateSlot;
 use tokio::sync::Semaphore;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
@@ -43,7 +45,12 @@ const CONCURRENT_ATTESTATIONS: usize = 4;
 /// What this enclave will say about itself.
 pub struct EnclaveEndpoints {
     nsm: Arc<dyn Nsm>,
-    hashes: AttestationHashes,
+    /// Read on every request rather than captured once: with ACME the
+    /// certificate arrives after startup and is replaced on renewal, and
+    /// attesting a certificate that is no longer being presented would break
+    /// the binding for every client at exactly the moment it mattered.
+    certificate: CertificateSlot,
+    guest: [u8; 32],
     /// Learned at startup from a document with no nonce.
     pcr0: Option<Vec<u8>>,
     module_id: Option<String>,
@@ -59,17 +66,28 @@ impl EnclaveEndpoints {
     /// enclave has been serving traffic that nobody could verify.
     pub fn new(
         nsm: Arc<dyn Nsm>,
-        tls_certificate_der: &[u8],
+        certificate: CertificateSlot,
         guest_component: &[u8],
     ) -> Result<Self> {
-        let hashes = AttestationHashes::new(tls_certificate_der, guest_component);
+        let guest = nitro_attestation::sha256(guest_component);
 
-        let document = nsm
-            .attest(&AttestationRequest::with_user_data(hashes.serialize()))
-            .context(
-                "the NSM would not produce an attestation document; \
-                 clients could not verify this enclave",
-            )?;
+        // Probe with whatever binding exists now. Under ACME there may be no
+        // certificate yet, and the probe is still worth making: its purpose is
+        // to prove the device answers at all.
+        let probe = match certificate.get() {
+            Some(der) => AttestationRequest::with_user_data(
+                AttestationHashes {
+                    tls_certificate: nitro_attestation::sha256(&der),
+                    guest,
+                }
+                .serialize(),
+            ),
+            None => AttestationRequest::default(),
+        };
+        let document = nsm.attest(&probe).context(
+            "the NSM would not produce an attestation document; \
+             clients could not verify this enclave",
+        )?;
 
         // Parsed, not verified: we are the enclave that just asked for it, and
         // the point is only to read back the PCRs it reports.
@@ -88,23 +106,32 @@ impl EnclaveEndpoints {
         };
 
         tracing::info!(
-            tls_certificate_sha256 = %hex::encode(hashes.tls_certificate),
-            guest_sha256 = %hex::encode(hashes.guest),
+            tls_certificate_sha256 = %certificate
+                .get()
+                .map(|der| hex::encode(nitro_attestation::sha256(&der)))
+                .unwrap_or_else(|| "(not issued yet)".into()),
+            guest_sha256 = %hex::encode(guest),
             pcr0 = %pcr0.as_deref().map(hex::encode).unwrap_or_else(|| "(unknown)".into()),
-            "attestation is bound to this certificate and guest"
+            "attestation is available"
         );
 
         Ok(EnclaveEndpoints {
             nsm,
-            hashes,
+            certificate,
+            guest,
             pcr0,
             module_id,
             limit: Semaphore::new(CONCURRENT_ATTESTATIONS),
         })
     }
 
-    pub fn hashes(&self) -> &AttestationHashes {
-        &self.hashes
+    /// What a document would bind right now, or `None` before a certificate
+    /// exists.
+    pub fn hashes(&self) -> Option<AttestationHashes> {
+        self.certificate.get().map(|der| AttestationHashes {
+            tls_certificate: nitro_attestation::sha256(&der),
+            guest: self.guest,
+        })
     }
 
     /// Answer if the path is ours, otherwise `None` so the guest sees it.
@@ -139,7 +166,15 @@ impl EnclaveEndpoints {
             );
         };
 
-        let request = AttestationRequest::with_user_data(self.hashes.serialize()).nonce(nonce);
+        // No certificate means no binding, and a document without one would
+        // let a client believe its connection was attested when it was not.
+        let Some(hashes) = self.hashes() else {
+            return text(
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                "no certificate has been issued yet, so nothing can be bound to it\n".to_string(),
+            );
+        };
+        let request = AttestationRequest::with_user_data(hashes.serialize()).nonce(nonce);
         match self.nsm.attest(&request) {
             Ok(document) => {
                 let body = base64::engine::general_purpose::STANDARD.encode(&document);
@@ -176,13 +211,16 @@ impl EnclaveEndpoints {
         if let Some(pcr0) = &self.pcr0 {
             out.push_str(&format!("pcr0             {}\n", hex::encode(pcr0)));
         }
-        out.push_str(&format!(
-            "tls_certificate  sha256:{}\n",
-            hex::encode(self.hashes.tls_certificate)
-        ));
+        match self.hashes() {
+            Some(hashes) => out.push_str(&format!(
+                "tls_certificate  sha256:{}\n",
+                hex::encode(hashes.tls_certificate)
+            )),
+            None => out.push_str("tls_certificate  (not issued yet)\n"),
+        }
         out.push_str(&format!(
             "guest            sha256:{}\n",
-            hex::encode(self.hashes.guest)
+            hex::encode(self.guest)
         ));
         out.push_str("attestation      GET /enclave/attestation?nonce=<hex>\n");
         text(hyper::StatusCode::OK, out)
@@ -274,8 +312,12 @@ mod tests {
     #[tokio::test]
     async fn an_attestation_request_carries_the_binding_and_the_nonce() {
         let nsm = Arc::new(nitro_nsm::fake::FakeNsm::new());
-        let endpoints =
-            EnclaveEndpoints::new(nsm.clone(), b"a certificate", b"a guest").expect("endpoints");
+        let endpoints = EnclaveEndpoints::new(
+            nsm.clone(),
+            CertificateSlot::fixed(b"a certificate".to_vec()),
+            b"a guest",
+        )
+        .expect("endpoints");
 
         let response = endpoints
             .handle("/enclave/attestation", Some("nonce=00112233445566778899"))
@@ -336,13 +378,15 @@ mod tests {
     fn construction_fails_if_the_device_will_not_attest() {
         let nsm = Arc::new(nitro_nsm::fake::FakeNsm::new());
         nsm.empty.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(EnclaveEndpoints::new(nsm, b"cert", b"guest").is_err());
+        assert!(
+            EnclaveEndpoints::new(nsm, CertificateSlot::fixed(b"cert".to_vec()), b"guest").is_err()
+        );
     }
 
     fn fake_endpoints() -> EnclaveEndpoints {
         EnclaveEndpoints::new(
             Arc::new(nitro_nsm::fake::FakeNsm::new()),
-            b"a certificate",
+            CertificateSlot::fixed(b"a certificate".to_vec()),
             b"a guest",
         )
         .expect("endpoints")

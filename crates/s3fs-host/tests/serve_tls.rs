@@ -127,6 +127,7 @@ async fn start() -> Harness {
                 addr,
                 concurrency: 1,
                 tls: Some(tls),
+                acme: None,
                 attestation: Some(nsm_for_server),
             },
         )
