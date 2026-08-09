@@ -29,8 +29,9 @@ use anyhow::Result;
 use clap::Parser;
 use s3fs_host::{
     mount, open_clock, open_entropy, read_component, run_component, serve_component, ClockSource,
-    GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, RandomSource, ServeConfig,
-    StaticKey, TlsIdentity, TlsMode, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
+    GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, NetworkConfig, NetworkMode,
+    RandomSource, ServeConfig, StaticKey, TlsIdentity, TlsMode, DEFAULT_GVFORWARDER,
+    DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
 /// Where the guest lives inside the enclave image.
@@ -233,6 +234,25 @@ struct Cli {
     #[arg(long = "tls-domain", env = "S3FS_TLS_DOMAINS", value_delimiter = ',')]
     tls_domains: Vec<String>,
 
+    /// How the enclave reaches the network.
+    ///
+    /// `gvproxy` runs the tap forwarder against the parent's gvproxy, which is
+    /// the only way an enclave gets an interface at all — it has no NIC, only
+    /// vsock. Without it nothing that speaks TCP works: not S3, not ACME, not
+    /// even DNS.
+    ///
+    /// `none` assumes the network is already there, which is true everywhere
+    /// except inside an enclave.
+    ///
+    /// An enclave image should set this to `gvproxy`.
+    #[arg(long, env = "S3FS_NETWORK", default_value = "none",
+          value_parser = NetworkMode::parse)]
+    network: NetworkMode,
+
+    /// The tap forwarder binary, shipped inside the enclave image.
+    #[arg(long, env = "S3FS_GVFORWARDER", default_value = DEFAULT_GVFORWARDER)]
+    gvforwarder: PathBuf,
+
     /// Serve `/enclave/attestation` and `/enclave/config`.
     ///
     /// On by default: an enclave nobody can verify is an enclave for nothing.
@@ -318,6 +338,15 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
         entropy_check(entropy.as_ref())?;
         return Ok(s3fs_host::GuestOutcome::Success);
     }
+
+    // Before anything that needs a socket. Mounting reaches S3, so a runtime
+    // that mounted first would fail with an S3 error that says nothing about
+    // the real cause.
+    let _network = s3fs_host::bring_up(&NetworkConfig {
+        mode: cli.network,
+        gvforwarder: cli.gvforwarder.clone(),
+        ..Default::default()
+    })?;
 
     let keys = StaticKey::from_hex(&cli.master_key)?;
     tracing::info!(

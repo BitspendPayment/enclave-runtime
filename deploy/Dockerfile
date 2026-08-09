@@ -33,6 +33,21 @@ RUN rustup target add wasm32-wasip2 \
 # needs no C toolchain.
 RUN cd examples/guest-smoke && cargo build --release --target wasm32-wasip2
 
+# ---- the tap forwarder ------------------------------------------------------
+# An enclave has no NIC, so nothing that speaks TCP works until this turns the
+# vsock channel into an interface. It ships *inside* the image rather than
+# being fetched at boot, so PCR0 covers it: a forwarder streamed in later would
+# be code the attestation says nothing about, sitting on every packet.
+#
+# Pinned by digest. A floating tag would change PCR0 without anything in this
+# repository changing, which would look like the image had been tampered with.
+FROM golang:1.23-bookworm AS gvforwarder
+ARG GVISOR_TAP_VSOCK_VERSION=v0.8.6
+RUN git clone --depth 1 --branch ${GVISOR_TAP_VSOCK_VERSION} \
+        https://github.com/containers/gvisor-tap-vsock /src \
+ && cd /src \
+ && CGO_ENABLED=0 go build -o /gvforwarder ./cmd/gvforwarder
+
 # ---- runtime ----------------------------------------------------------------
 FROM debian:bookworm-slim
 
@@ -41,6 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/target/release/enclave-runtime /usr/local/bin/enclave-runtime
+COPY --from=gvforwarder /gvforwarder /usr/local/bin/gvforwarder
 COPY --from=build /src/examples/guest-smoke/target/wasm32-wasip2/release/guest-smoke.wasm \
                   /enclave/guest.wasm
 
@@ -55,6 +71,18 @@ ENV S3FS_CLOCK_SOURCE=ptp
 # The alternative is a kernel pool that is NSM-seeded in an enclave but says
 # nothing about it, and the guest builds keys from these bytes.
 ENV S3FS_RANDOM_SOURCE=nsm
+# Bring up the tap device over vsock before anything opens a socket. The parent
+# instance must be running `gvproxy --listen vsock://:1024` — see
+# deploy/parent/run-parent.sh. Without it the runtime waits, then says so.
+ENV S3FS_NETWORK=gvproxy
+# Serve the guest over HTTPS, terminated here. A certificate generated inside
+# the enclave, with its hash signed into the attestation document, is what lets
+# a client prove its session ends in *this* code rather than in the parent.
+ENV S3FS_MODE=serve
+ENV S3FS_HTTP_LISTEN=0.0.0.0:443
+ENV S3FS_TLS=self-signed
+# ENV S3FS_TLS=acme                       # browser-trusted, needs a real domain
+# ENV S3FS_TLS_DOMAINS=enclave.example.com
 # ENV S3FS_BUCKET=prod-data
 # ENV S3FS_ROOTS_BUCKET=prod-roots        # Object Lock COMPLIANCE lives here
 # ENV AWS_REGION=eu-west-2

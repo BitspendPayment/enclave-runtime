@@ -31,6 +31,7 @@ pub mod keys;
 pub mod linker;
 #[cfg(feature = "aws")]
 pub mod mount;
+pub mod net;
 pub mod random;
 pub mod run;
 #[cfg(feature = "serve")]
@@ -45,6 +46,7 @@ pub use keys::{MasterKeySource, StaticKey};
 pub use linker::build_linker;
 #[cfg(feature = "aws")]
 pub use mount::{mount, parse_fs_id, MountConfig};
+pub use net::{bring_up, Network, NetworkConfig, NetworkMode, DEFAULT_GVFORWARDER};
 pub use nitro_nsm::{Nsm, NsmDevice, DEFAULT_NSM_DEVICE};
 pub use random::{open_entropy, GuestRandom, HostEntropy, RandomSource};
 pub use run::{
