@@ -158,10 +158,14 @@ async fn start() -> Harness {
 /// A TLS request, returning the status, body, and the certificate the server
 /// presented — which is the whole point.
 async fn https(addr: std::net::SocketAddr, path: &str) -> (u16, String, Vec<u8>) {
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAny))
-        .with_no_client_auth();
+    let config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AcceptAny))
+    .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let name = rustls::pki_types::ServerName::try_from("enclave.test").unwrap();
 

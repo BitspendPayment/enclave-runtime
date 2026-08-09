@@ -62,10 +62,21 @@ impl TlsIdentity {
 
         let certs: Vec<CertificateDer<'static>> =
             chain.into_iter().map(CertificateDer::from).collect();
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .context("building the TLS configuration")?;
+        // The provider is named rather than left to `ServerConfig::builder()`,
+        // which resolves it from rustls's compiled-in features and **panics**
+        // when more than one is present. That is not hypothetical here: the
+        // AWS SDK brings rustls with `ring` while this crate asks for
+        // `aws-lc-rs`, so in any build with the `aws` feature both exist and
+        // there is no unambiguous default. Naming it also keeps the whole
+        // image on one implementation of these primitives.
+        let config = rustls::ServerConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .context("selecting TLS protocol versions")?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("building the TLS configuration")?;
 
         Ok(TlsIdentity {
             certificate_der: leaf,

@@ -246,10 +246,16 @@ struct Fetched {
 fn fetch(url: &str, nonce: &[u8]) -> Result<Fetched> {
     let (host, port, path) = split_url(url)?;
 
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(danger::AcceptAnyServerCert))
-        .with_no_client_auth();
+    // Named explicitly: `builder()` resolves the provider from rustls's
+    // compiled-in features and panics when more than one is present.
+    let config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .context("selecting TLS protocol versions")?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(danger::AcceptAnyServerCert))
+    .with_no_client_auth();
 
     let server_name = rustls_pki_types::ServerName::try_from(host.clone())
         .with_context(|| format!("{host:?} is not a valid server name"))?;
