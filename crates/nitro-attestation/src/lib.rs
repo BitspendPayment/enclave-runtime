@@ -100,12 +100,18 @@ pub enum Trust {
     /// Signature and certificate chain verified against the pinned root.
     ChainVerified,
     /// Signature verified against the document's own leaf certificate, but the
-    /// chain was checked against a caller-supplied root that is not AWS's.
-    ///
-    /// This is what the QEMU harness produces: the emulator signs with a key
-    /// it generated, so the document is structurally real and cryptographically
-    /// self-consistent while proving nothing about AWS hardware.
+    /// chain was checked against a caller-supplied root that is not AWS's — so
+    /// the document is cryptographically self-consistent while proving nothing
+    /// about AWS hardware.
     SelfSigned,
+    /// Nothing was verified: the contents were read and no signature was
+    /// checked, because there was none to check.
+    ///
+    /// QEMU's emulated NSM produces documents in this state — it does not sign
+    /// them, and uses an invalid COSE algorithm identifier to say so. A
+    /// document at this level is worth exactly what the connection it arrived
+    /// over is worth.
+    Unsigned,
 }
 
 /// A document that passed [`verify`].
@@ -217,13 +223,44 @@ impl Default for VerifyOptions {
 /// For inspection only. Nothing a document says is worth acting on until
 /// [`verify`] has run: the payload is attacker-controlled until its signature
 /// is checked.
+///
+/// Deliberately more tolerant than [`verify`], because one producer needs it:
+/// QEMU's emulated NSM does not sign at all. Its source says so —
+/// *"we don't actually sign the data, so we use -1 as the 'alg' value"* — and
+/// -1 is not a COSE algorithm identifier, so a strict COSE parser rejects the
+/// document before reaching the payload. Reading the payload anyway is what
+/// lets the emulator harness check the *contents* the runtime asked for, while
+/// [`verify`] keeps refusing it.
 pub fn parse(cose: &[u8]) -> Result<AttestationDocument> {
-    let sign1 = parse_cose(cose)?;
-    let payload = sign1
-        .payload
-        .as_ref()
-        .context("COSE_Sign1 has no payload")?;
-    decode_payload(payload)
+    if let Ok(sign1) = parse_cose(cose) {
+        let payload = sign1
+            .payload
+            .as_ref()
+            .context("COSE_Sign1 has no payload")?;
+        return decode_payload(payload);
+    }
+    decode_payload(&payload_from_raw_cose(cose)?)
+}
+
+/// Pull the payload out of a COSE_Sign1 without interpreting its headers.
+///
+/// The structure is a 4-element array — protected, unprotected, payload,
+/// signature — and the payload is element 2 whatever the headers claim.
+fn payload_from_raw_cose(cose: &[u8]) -> Result<Vec<u8>> {
+    let value: ciborium::Value = ciborium::from_reader(cose).context("document is not CBOR")?;
+    // Tagged (18) or bare.
+    let value = match value {
+        ciborium::Value::Tag(_, inner) => *inner,
+        other => other,
+    };
+    let array = value.as_array().context("COSE_Sign1 is not a CBOR array")?;
+    if array.len() != 4 {
+        bail!("COSE_Sign1 has {} elements, expected 4", array.len());
+    }
+    array[2]
+        .as_bytes()
+        .cloned()
+        .context("COSE_Sign1 payload is not a byte string")
 }
 
 /// Parse and verify a COSE_Sign1 attestation document.

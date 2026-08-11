@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use nitro_attestation::{
-    AttestationHashes, Expectations, Trust, VerifyOptions, AWS_NITRO_ROOT_G1_PEM,
+    AttestationHashes, Expectations, Trust, Verified, VerifyOptions, AWS_NITRO_ROOT_G1_PEM,
 };
 
 #[derive(Parser, Debug)]
@@ -62,12 +62,26 @@ struct Cli {
     #[arg(long)]
     trust_root: Option<std::path::PathBuf>,
 
-    /// Accept a document that does not chain to the AWS root.
-    ///
-    /// For the QEMU harness, which signs with a key it generated. The result
-    /// is reported as self-signed and proves nothing about AWS hardware.
+    /// Accept a document that does not chain to the AWS root, reporting the
+    /// result as self-signed.
     #[arg(long)]
     allow_untrusted_root: bool,
+
+    /// Check the document's *contents* without verifying any signature.
+    ///
+    /// Only one producer needs this and it is not a real enclave: QEMU's
+    /// emulated NSM does not sign its documents at all — its source says
+    /// "we don't actually sign the data, so we use -1 as the 'alg' value".
+    /// There is no signature to check and no chain to follow, so nothing here
+    /// says the document came from an enclave, or from AWS, or from anything
+    /// other than whoever answered the connection.
+    ///
+    /// What it still checks is what the *runtime* put in: the nonce, PCR0,
+    /// and whether user_data binds the certificate this connection was
+    /// served. Those are our code's job and worth testing. The signature is
+    /// AWS hardware's job and cannot be tested here.
+    #[arg(long)]
+    unsigned_emulator: bool,
 
     /// Reject a document older than this many seconds.
     #[arg(long, default_value_t = 300)]
@@ -109,14 +123,25 @@ fn run() -> Result<()> {
     };
 
     let now = SystemTime::now();
-    let verified = nitro_attestation::verify(
-        &document,
-        &VerifyOptions {
-            trust_root,
-            now,
-            allow_untrusted_root: cli.allow_untrusted_root,
-        },
-    )?;
+    let verified = if cli.unsigned_emulator {
+        eprintln!(
+            "WARNING: --unsigned-emulator: no signature and no chain were checked. \
+             Nothing here says who produced this document."
+        );
+        Verified {
+            document: nitro_attestation::parse(&document)?,
+            trust: Trust::Unsigned,
+        }
+    } else {
+        nitro_attestation::verify(
+            &document,
+            &VerifyOptions {
+                trust_root,
+                now,
+                allow_untrusted_root: cli.allow_untrusted_root,
+            },
+        )?
+    };
 
     let mut expectations = Expectations {
         max_age: Some(Duration::from_secs(cli.max_age)),
@@ -142,6 +167,7 @@ fn run() -> Result<()> {
     match verified.trust {
         Trust::ChainVerified => println!("chain      verified to the AWS Nitro root"),
         Trust::SelfSigned => println!("chain      SELF-SIGNED — proves nothing about AWS hardware"),
+        Trust::Unsigned => println!("chain      UNSIGNED — nothing verified; contents only"),
     }
 
     check_binding(

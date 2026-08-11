@@ -11,3 +11,8 @@ Cargo.lock.bak
 *.iml
 .DS_Store
 /wasm-cache/
+
+# OpenTofu/Terraform working directory: vendored provider binaries, hundreds of
+# MB, re-fetched by `tofu init`. The lock file IS committed — it pins provider
+# versions and belongs under review.
+deploy/tofu/.terraform/

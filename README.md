@@ -606,12 +606,68 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-## Enclave deployment notes
+## Building and deploying
 
-The original motivation: running this stack inside an [AWS Nitro Enclave](https://aws.amazon.com/ec2/nitro/nitro-enclaves/). Two integration points the enclave consumer is responsible for (these are NOT in this crate):
+```console
+$ nix build .#eif                    # the enclave image + pcr.json
+$ packer build … deploy/ami          # an AMI with nitro-cli, gvproxy, the EIF
+$ tofu apply -var ami_id=ami-…       # a parent instance running it
+```
 
-1. **Vsock-aware HTTP client.** `AwsS3BackendConfig` doesn't currently expose this seam — a future patch will add an `http_client: Option<SharedHttpClient>` field that the enclave repo can fill with a vsock-backed `hyper` client. The aws-sdk-s3 default uses TCP.
-2. **Cred sourcing via Nitro KMS attestation.** Static creds get passed to `AwsS3BackendConfig` — the parent EC2 ships KMS-encrypted creds over vsock; the enclave decrypts via attested KMS Decrypt and hands the plaintext to the backend.
+Two build tools, split along the trust boundary rather than by taste.
+
+**Nix builds everything inside the enclave**, because PCR0 is a digest of
+exactly those bytes and the number is only worth something if an independent
+party can rebuild the image and get the same one. `nix build .#eif --rebuild`
+verifies that. Earning it took `cpio --reproducible` (the `newc` header records
+inode and device numbers, so even the two-file bootstrap ramdisk differed every
+build), fixed uid/gid/mtime, sorted members, and `faketime` around `eif_build`,
+which stamps wall-clock `BuildTime` into the image's metadata. Details in
+[`deploy/nix/README.md`](deploy/nix/README.md).
+
+**Packer builds the parent**, which is the party the enclave *excludes*. PCR0
+covers the enclave, not its host, so reproducing the host buys no security
+property — and AWS ships and supports `nitro-cli` and the allocator on Amazon
+Linux 2023. No Docker on the parent: it is needed only by `nitro-cli
+build-enclave`, and Nix builds the image.
+
+`gvproxy` and the `gvforwarder` inside the EIF come from one nixpkgs package,
+built static, so both ends of the vsock share a pin and can't drift.
+
+### The end-to-end
+
+[`deploy/qemu-nitro/run-e2e.sh`](deploy/qemu-nitro/run-e2e.sh) boots the image
+under QEMU's `nitro-enclave` machine with a real gvproxy, and asserts three
+things that had never been checked together:
+
+```
+1/3  the filesystem is mounted over gvproxy    counter: 1 then 2
+2/3  the attestation binds this connection     binding    the attested
+                                               certificate is the one
+                                               serving this connection
+3/3  the attested PCR0 is the build's          build:    b3edc9c9…
+                                               attested: b3edc9c9…
+```
+
+The enclave gets an address by DHCP over the emulated vsock, mounts the
+Merkle-anchored filesystem from MinIO on the host through gvproxy, terminates
+TLS with a certificate generated inside itself, and serves the guest.
+
+**What it does not prove.** QEMU's emulated NSM does not sign attestation
+documents — its source says *"we don't actually sign the data, so we use -1 as
+the 'alg' value"*, and -1 is not a COSE algorithm identifier. So no signature
+and no certificate chain are checked, only the contents the runtime put there.
+`nitro-attest --unsigned-emulator` says so on every run. The signature path
+needs real Nitro hardware.
+
+### What the enclave consumer still owns
+
+**Credential sourcing via KMS attestation.** Static credentials are passed in
+today. M8 replaces that with `kms:Decrypt` carrying an attestation document,
+gated on PCR0 — at which point nothing on the parent holds a key that reads the
+filesystem. The vsock HTTP client that milestone once needed is no longer
+required: gvproxy gives the enclave an ordinary IP stack, so the AWS SDK works
+unmodified.
 
 ## License
 

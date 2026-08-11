@@ -140,8 +140,15 @@ pub fn bring_up(config: &NetworkConfig) -> Result<Option<Network>> {
     let child = Command::new(&config.gvforwarder)
         .arg("-url")
         .arg(&url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // No `-debug`: it dumps a decode of every frame, which buries the DHCP
+        // client's output — and the DHCP client is what usually fails.
+        // Inherited, not discarded. If the forwarder cannot create its tap
+        // device it says so and exits, and the only symptom visible from here
+        // is the gateway never answering — a timeout thirty seconds later
+        // that names the parent's gvproxy, which is usually running fine.
+        // Inside an enclave the console is the only place a diagnosis can go.
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| {
             format!(
@@ -168,8 +175,11 @@ pub fn bring_up(config: &NetworkConfig) -> Result<Option<Network>> {
 /// gvproxy answers DNS on the gateway address.
 fn write_resolv_conf() -> Result<()> {
     let contents = format!("nameserver {GATEWAY}\n");
-    // /etc is a tmpfs in the enclave image, so this is not persistent and does
-    // not need to be.
+    // An enclave image is whatever the ramdisk contains, and a minimal one may
+    // have no /etc at all — the failure is then `No such file or directory`
+    // against a path that looks like it must exist, several layers below
+    // anything that mentions DNS.
+    std::fs::create_dir_all("/etc").context("creating /etc")?;
     std::fs::write("/etc/resolv.conf", contents).context("writing /etc/resolv.conf")
 }
 

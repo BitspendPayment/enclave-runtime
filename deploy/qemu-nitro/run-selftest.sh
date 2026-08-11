@@ -22,13 +22,22 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="${WORK:-$REPO/target/qemu-nitro}"
-EIF="$WORK/selftest.eif"
 RUNDIR="$WORK/run"
 IMAGE="${QEMU_IMAGE:-s3fs-qemu-nitro:latest}"
 TIMEOUT="${TIMEOUT:-120}"
 CONSOLE="$RUNDIR/console.log"
 
-[[ -f "$EIF" ]] || { echo "no EIF at $EIF — run build-eif.sh first" >&2; exit 1; }
+# Built by Nix now, so the image is reproducible and the shell script that
+# used to assemble it is gone. `build-eif.sh` remains only as documentation of
+# the layout; `nix build` is what produces the bytes.
+command -v nix >/dev/null || { echo "nix is not on PATH; see deploy/nix/README.md" >&2; exit 1; }
+nix build "$REPO#eif-selftest" --out-link "$WORK/eif-selftest" 2>&1 | tail -2
+EIF_DIR="$(readlink -f "$WORK/eif-selftest" 2>/dev/null || true)"
+# nix-portable keeps its store outside /nix except inside its own namespace; on
+# a normal Nix install the first branch always wins.
+[[ -d "$EIF_DIR" ]] || EIF_DIR="$HOME/.nix-portable$(readlink "$WORK/eif-selftest")"
+EIF="$EIF_DIR/selftest.eif"
+[[ -f "$EIF" ]] || { echo "cannot resolve the built EIF" >&2; exit 1; }
 [[ -e /dev/kvm ]] || { echo "no /dev/kvm — the nitro-enclave machine needs KVM" >&2; exit 1; }
 
 rm -rf "$RUNDIR"; mkdir -p "$RUNDIR"
@@ -79,12 +88,12 @@ set +e
 timeout "$TIMEOUT" docker run --rm \
     --device /dev/kvm \
     --network none \
-    -v "$WORK:/work" \
+    -v "$EIF_DIR:/eif:ro" \
     -v "$RUNDIR:/run/vsock" \
     "$IMAGE" \
     qemu-system-x86_64 \
         -M nitro-enclave,vsock=chr0,id=selftest \
-        -kernel /work/selftest.eif \
+        -kernel /eif/selftest.eif \
         -chardev socket,id=chr0,path=/run/vsock/vhost.socket \
         -m 1G -smp 2 -nographic -no-reboot \
     2>&1 | tee "$CONSOLE"
