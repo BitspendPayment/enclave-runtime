@@ -192,7 +192,9 @@ pub struct Fs {
 }
 
 impl Fs {
-    /// Mount a filesystem, formatting the buckets if they are empty.
+    /// Mount an existing filesystem. Fails with [`FsError::NoFilesystem`] if
+    /// the store is empty — see [`Store::open_existing`] for why that is not a
+    /// cue to create one.
     ///
     /// `roots` is the Object Lock bucket holding the anchor chain; `data`
     /// holds the slabs. They may be the same bucket, but splitting them is
@@ -212,7 +214,7 @@ impl Fs {
         min_root_seq: Option<u64>,
     ) -> FsResult<Arc<Fs>> {
         let keys = Arc::new(KeyMaterial::derive(master, fs_uuid)?);
-        let store = Store::open(
+        let store = Store::open_existing(
             data,
             roots,
             keys,
@@ -220,6 +222,23 @@ impl Fs {
             min_root_seq,
         )
         .await?;
+        Ok(Fs::from_store(Arc::new(store), config))
+    }
+
+    /// Create a filesystem in an empty store.
+    ///
+    /// Separate from [`Fs::mount`] on purpose: creating one is an assertion
+    /// that no filesystem should already exist here, and the caller is the only
+    /// party that can make it.
+    pub async fn create(
+        data: Arc<dyn Backend>,
+        roots: Arc<dyn Backend>,
+        master: &MasterSecret,
+        fs_uuid: [u8; 16],
+        config: Arc<Config>,
+    ) -> FsResult<Arc<Fs>> {
+        let keys = Arc::new(KeyMaterial::derive(master, fs_uuid)?);
+        let store = Store::create(data, roots, keys, Arc::new(config.store.clone())).await?;
         Ok(Fs::from_store(Arc::new(store), config))
     }
 

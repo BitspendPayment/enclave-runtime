@@ -34,8 +34,8 @@ use clap::Parser;
 use enclave_runtime::{
     open_clock, open_entropy, read_component, run_component, serve_component, AcmeConfig,
     ClockSource, GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, NetworkConfig,
-    NetworkMode, RandomSource, ServeConfig, StaticKey, TlsIdentity, TlsMode, DEFAULT_GVFORWARDER,
-    DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
+    NetworkMode, RandomSource, ReceiptTrust, ServeConfig, StaticKey, TlsIdentity, TlsMode,
+    DEFAULT_GVFORWARDER, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
 /// Where the guest lives inside the enclave image.
@@ -198,6 +198,26 @@ struct Cli {
     /// NSM character device to read.
     #[arg(long, env = "S3FS_NSM_DEVICE", default_value = DEFAULT_NSM_DEVICE)]
     nsm_device: PathBuf,
+
+    /// How a state-origin receipt must be trusted.
+    ///
+    /// `required` demands a signature chaining to the AWS Nitro root.
+    /// `unsigned-emulator` reads the contents without checking anything,
+    /// because QEMU's emulated NSM does not sign — and because the image's
+    /// environment is measured, PCR0 tells a client which of the two an
+    /// enclave was built with. A production image never sets it.
+    #[arg(long, env = "S3FS_RECEIPT_TRUST", default_value = "required",
+          value_parser = ReceiptTrust::parse)]
+    receipt_trust: ReceiptTrust,
+
+    /// Authorise a successor enclave image, by PCR0, then exit.
+    ///
+    /// Run against the *outgoing* image. It extends PCR31 with the successor's
+    /// PCR0 — irreversibly, for this enclave's life — and attests, so the
+    /// resulting receipt proves both who wrote it and that they had committed
+    /// to this specific successor before doing so.
+    #[arg(long, env = "S3FS_AUTHORISE_SUCCESSOR", value_name = "PCR0_HEX")]
+    authorise_successor: Option<String>,
 
     /// Report on the configured clock and entropy source and exit, without
     /// mounting or running anything. For diagnosing a deployment, and the only
@@ -390,10 +410,42 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         "starting"
     );
 
-    // Keeps the data backend and derived keys: the ACME cache seals its blobs
-    // under the same master secret and writes them as plain objects, outside
-    // the filesystem the guest can read.
-    let mounted = enclave_runtime::mount_with_backend(&cli.mount_config()?, &keys).await?;
+    let mount_config = cli.mount_config()?;
+    let backends = enclave_runtime::connect(&mount_config).await?;
+
+    // Authorising a successor is not a way to start serving: it extends a PCR
+    // irreversibly and writes a receipt, then stops. Doing it in the same
+    // process that goes on to serve would mean an enclave running with a
+    // register it changed halfway through its own life.
+    if let Some(successor) = &cli.authorise_successor {
+        let pcr0 = hex::decode(successor.trim())
+            .map_err(|_| anyhow::anyhow!("--authorise-successor is not hex"))?;
+        enclave_runtime::authorise_successor(&backends, &mount_config, &entropy, &keys, &pcr0)
+            .await?;
+        return Ok(enclave_runtime::GuestOutcome::Success);
+    }
+
+    // Decide whether this enclave is entitled to the state it is about to
+    // load, before it loads any of it.
+    let booted = enclave_runtime::boot(
+        &backends,
+        &mount_config,
+        &enclave_runtime::BootConfig {
+            trust: cli.receipt_trust,
+        },
+        &entropy,
+        &keys,
+    )
+    .await?;
+
+    tracing::info!(
+        mode = ?booted.mode,
+        pcr0 = %hex::encode(&booted.pcr0),
+        state_root = %hex::encode(booted.state_root),
+        "state origin established"
+    );
+
+    let mounted = booted.mounted;
     let fs = mounted.fs.clone();
 
     // Read the guest before building the environment so a missing component —

@@ -30,17 +30,31 @@ impl Harness {
         }
     }
 
+    /// Create on first use, mount thereafter. `Fs::mount` no longer formats an
+    /// empty store, so tests that want a filesystem have to say so.
     async fn mount(&self) -> Arc<Fs> {
-        Fs::mount(
+        let secret = MasterSecret::from_bytes([21u8; 32]);
+        match Fs::mount(
             self.data.clone(),
             self.roots.clone(),
-            &MasterSecret::from_bytes([21u8; 32]),
+            &secret,
             [9u8; 16],
             self.config.clone(),
             None,
         )
         .await
-        .unwrap()
+        {
+            Err(crate::FsError::NoFilesystem) => Fs::create(
+                self.data.clone(),
+                self.roots.clone(),
+                &secret,
+                [9u8; 16],
+                self.config.clone(),
+            )
+            .await
+            .unwrap(),
+            other => other.unwrap(),
+        }
     }
 }
 

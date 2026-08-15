@@ -63,6 +63,17 @@ impl Nsm for HostEntropy {
         getrandom::fill(buf).map_err(|e| anyhow::anyhow!("kernel getrandom(2): {e}"))
     }
 
+    /// PCRs are a property of a real enclave. There is nothing to report and
+    /// nothing to extend, so both refuse rather than inventing a register file
+    /// that would let boot logic appear to work outside an enclave.
+    fn describe_pcr(&self, _index: u16) -> Result<nitro_nsm::Pcr> {
+        anyhow::bail!("no PCRs: entropy is coming from the kernel, not an NSM")
+    }
+
+    fn extend_pcr(&self, _index: u16, _data: &[u8]) -> Result<Vec<u8>> {
+        anyhow::bail!("no PCRs to extend: entropy is coming from the kernel, not an NSM")
+    }
+
     /// There is no attestation without an NSM, and no substitute worth
     /// inventing.
     ///

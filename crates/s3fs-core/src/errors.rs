@@ -75,6 +75,16 @@ pub enum FsError {
     /// This is never transient and must never be retried or degraded around.
     /// Producing it poisons the mount: the store is either lying or corrupt,
     /// and in both cases the only safe response is to stop serving bytes.
+    /// The store holds no filesystem.
+    ///
+    /// Distinct from `NotFound`, which is about a path inside a mounted
+    /// filesystem. This says the *store* is empty, and it is returned rather
+    /// than quietly formatting one: an enclave pointed at an empty store must
+    /// be able to tell "this filesystem is new" from "everything has been
+    /// hidden", and only the caller knows which it is entitled to assume.
+    #[error("the store holds no filesystem")]
+    NoFilesystem,
+
     #[error("integrity check failed: {0}")]
     Integrity(&'static str),
 

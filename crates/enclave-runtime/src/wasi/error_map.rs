@@ -36,6 +36,11 @@ pub fn from_fs(e: FsError) -> ErrorCode {
         FsError::Loop => ErrorCode::Loop,
         FsError::CrossDevice => ErrorCode::CrossDevice,
         FsError::BadDescriptor => ErrorCode::BadDescriptor,
+        // A guest can never see this: it is raised while deciding whether to
+        // mount, long before any descriptor exists. Mapped rather than left to
+        // the catch-all so that adding a variant to `FsError` keeps producing
+        // a compile error here, which is how this arm was noticed.
+        FsError::NoFilesystem => ErrorCode::NoEntry,
         FsError::WouldBlock => ErrorCode::WouldBlock,
         // PreconditionFailed (CAS conflict) — surface as Exist for `O_EXCL`-
         // style failures; callers that want different semantics can re-map

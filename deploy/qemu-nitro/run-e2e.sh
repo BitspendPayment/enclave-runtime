@@ -72,7 +72,7 @@ rm -rf "$RUNDIR"; mkdir -p "$RUNDIR"
 pids=()
 cleanup() {
     for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null || true; done
-    docker rm -f e2e-minio >/dev/null 2>&1 || true
+    docker rm -f e2e-minio e2e-qemu e2e-qemu-resume >/dev/null 2>&1 || true
     wait 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -189,8 +189,9 @@ docker logs -f e2e-qemu > "$CONSOLE" 2>&1 &
 
 # The runtime colourises its logs, so escape sequences land between a field
 # name and its value — `addr<esc>[0m<esc>[2m=` — and a grep for "addr=" simply
-# never matches. Everything that reads the console goes through this.
-plain() { sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$CONSOLE" 2>/dev/null; }
+# never matches. Everything that reads a console goes through this.
+plain_of() { sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$1" 2>/dev/null; }
+plain() { plain_of "$CONSOLE"; }
 
 fail() {
     echo
@@ -261,6 +262,64 @@ say "3/3  the attested PCR0 is the one the build produced"
 echo "build:    $EXPECTED_PCR0"
 echo "attested: $(grep -oE '^PCR0 +[0-9a-f]+' "$RUNDIR/attest.log" | awk '{print $2}')"
 
+# ---------------------------------------------------------------------------
+# 4/4 — the boot machine, across a restart.
+# ---------------------------------------------------------------------------
+# The first boot found an empty store and created a filesystem. That used to be
+# what happened for *any* store that answered "nothing", including one whose
+# contents had been hidden. The second boot has to recognise the state as its
+# own and resume — which is only possible if the receipt the first boot wrote
+# verifies against the state now present.
+say "4/4  a second boot resumes rather than starting over"
+plain | grep -q 'mode=Genesis' || fail "the first boot should have been a genesis"
+
+docker rm -f e2e-qemu >/dev/null 2>&1 || true
+sleep 2
+
+RESUME_CONSOLE="$RUNDIR/console-resume.log"
+docker run --rm -d --name e2e-qemu-resume \
+    --device /dev/kvm \
+    --network none \
+    -v "$EIF_DIR:/eif:ro" \
+    -v "$RUNDIR:/run/vsock" \
+    "$IMAGE" \
+    qemu-system-x86_64 \
+        -M nitro-enclave,vsock=chr0,id=e2e \
+        -kernel /eif/s3fs-qemu.eif \
+        -chardev socket,id=chr0,path=/run/vsock/vhost.socket \
+        -m 3G -smp 2 -nographic -no-reboot >/dev/null
+docker logs -f e2e-qemu-resume > "$RESUME_CONSOLE" 2>&1 &
+
+resumed=""
+for _ in $(seq "$TIMEOUT"); do
+    plain_of "$RESUME_CONSOLE" | grep -q "state origin established" && { resumed=1; break; }
+    plain_of "$RESUME_CONSOLE" | grep -qE "Kernel panic|failed to start the guest" && break
+    sleep 1
+done
+if [[ -z "$resumed" ]]; then
+    echo "FAIL: the second boot never established a state origin" >&2
+    plain_of "$RESUME_CONSOLE" | tail -25 >&2
+    docker rm -f e2e-qemu-resume >/dev/null 2>&1 || true
+    exit 1
+fi
+
+plain_of "$RESUME_CONSOLE" | grep -E "state origin established" | tail -1
+if ! plain_of "$RESUME_CONSOLE" | grep -q "mode=Resume"; then
+    echo "FAIL: the second boot did not resume — it should not have created anything" >&2
+    plain_of "$RESUME_CONSOLE" | grep -E "mode=|refus" | tail -5 >&2
+    docker rm -f e2e-qemu-resume >/dev/null 2>&1 || true
+    exit 1
+fi
+
+# Same filesystem, same identity: the receipt names this state and no other.
+first_root="$(plain | grep -oE 'state_root=[0-9a-f]+' | head -1)"
+second_root="$(plain_of "$RESUME_CONSOLE" | grep -oE 'state_root=[0-9a-f]+' | head -1)"
+echo "genesis $first_root"
+echo "resume  $second_root"
+[[ "$first_root" == "$second_root" ]] \
+    || { echo "FAIL: the state_root changed across a restart" >&2; exit 1; }
+
+docker rm -f e2e-qemu-resume >/dev/null 2>&1 || true
 docker rm -f e2e-qemu >/dev/null 2>&1 || true
 
 cat <<EOF
@@ -269,6 +328,7 @@ cat <<EOF
   filesystem mounted over vsock through gvproxy, writes durable in MinIO
   TLS terminated in the enclave, certificate hash bound into the document
   the document's PCR0 matches the reproducible build
+  genesis wrote an attested state origin, and a restart resumed it
 
 NOT proven here. QEMU's emulated NSM does not sign attestation documents, so
 no signature and no certificate chain were checked — only the contents the

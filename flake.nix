@@ -216,6 +216,10 @@
       # all resolve, and needs no hand-written replacement.
       busybox = pkgs.pkgsStatic.busybox;
 
+      # Which store the production image belongs to. Baked in, so PCR0 covers
+      # it — see deploy/nix/deployment.nix for why that has to be true.
+      deployment = import ./deploy/nix/deployment.nix;
+
       # What both the production and emulator images are made of. Only the
       # environment differs between them.
       runtimeImage = {
@@ -251,6 +255,20 @@
           S3FS_GVFORWARDER = "/usr/local/bin/gvforwarder";
           S3FS_RANDOM_SOURCE = "nsm";
           S3FS_CLOCK_SOURCE = "ptp";
+
+          # The store this image is for. Attested, because a receipt only
+          # means "no filesystem here" if the host cannot choose "here".
+          S3FS_BUCKET = deployment.dataBucket;
+          S3FS_ROOTS_BUCKET = deployment.rootsBucket;
+          S3FS_BUCKET_PREFIX = deployment.bucketPrefix;
+          S3FS_ID = deployment.fsId;
+          AWS_REGION = deployment.region;
+          S3FS_TLS_DOMAINS = lib.concatStringsSep "," deployment.tlsDomains;
+
+          # A production image demands a receipt signed by AWS. The emulator
+          # image overrides this, and because the environment is measured,
+          # PCR0 tells a client which kind it is talking to.
+          S3FS_RECEIPT_TRUST = "required";
         };
       };
 
@@ -289,6 +307,11 @@
           name = "s3fs-qemu";
           env = runtimeImage.env // {
             S3FS_CLOCK_SOURCE = "host";
+            # QEMU's NSM does not sign attestation documents, so a receipt it
+            # produced has no signature to check. Contents are still verified —
+            # PCR0, PCR31 and the state_root — which is the whole boot machine
+            # minus the one part that needs real hardware.
+            S3FS_RECEIPT_TRUST = "unsigned-emulator";
             S3FS_ENDPOINT = "http://192.168.127.254:9000";
             S3FS_FORCE_PATH_STYLE = "1";
             S3FS_BUCKET = "e2e-data";

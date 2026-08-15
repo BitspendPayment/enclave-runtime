@@ -105,8 +105,20 @@ pub struct Store {
 }
 
 impl Store {
-    /// Mount an existing filesystem, or create one if the bucket is empty.
-    pub async fn open(
+    /// Mount an existing filesystem. Fails with [`FsError::NoFilesystem`] if
+    /// the store is empty.
+    ///
+    /// It used to format in that case, and that was the single most dangerous
+    /// line in the crate: an enclave pointed at a store that answered
+    /// "nothing" created a fresh filesystem and served it. Every check below
+    /// then passed — the signature, the hash chain, the Merkle root — because
+    /// they all attested to the *new* filesystem, while the guest saw an empty
+    /// database where its data should have been.
+    ///
+    /// Creating a filesystem is now something a caller has to ask for by name,
+    /// because only the caller can know whether it is entitled to. Inside an
+    /// enclave that entitlement is a state-origin receipt.
+    pub async fn open_existing(
         data: Arc<dyn Backend>,
         roots: Arc<dyn Backend>,
         keys: Arc<KeyMaterial>,
@@ -119,8 +131,28 @@ impl Store {
 
         match root_store.mount(min_seq).await? {
             Some(root) => Store::from_root(blocks, root_store, keys, root).await,
-            None => Store::format(blocks, root_store, keys, config).await,
+            None => Err(FsError::NoFilesystem),
         }
+    }
+
+    /// Create a brand-new filesystem in an empty store.
+    ///
+    /// Refuses if one already exists, so a caller that has misjudged which
+    /// mode it is in cannot overwrite a filesystem it should have mounted.
+    pub async fn create(
+        data: Arc<dyn Backend>,
+        roots: Arc<dyn Backend>,
+        keys: Arc<KeyMaterial>,
+        config: Arc<StoreConfig>,
+    ) -> FsResult<Store> {
+        config.validate()?;
+        let blocks = Arc::new(BlockStore::new(data, keys.clone(), config.clone()));
+        let root_store = Arc::new(RootStore::new(roots, keys.clone(), config.clone()));
+
+        if root_store.mount(None).await?.is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+        Store::format(blocks, root_store, keys, config).await
     }
 
     async fn from_root(
@@ -209,6 +241,14 @@ impl Store {
     }
 
     /// The currently committed root record.
+    /// Fetch a historical root without disturbing the session floor.
+    ///
+    /// The boot machine needs the seq-0 record to identify *which history*
+    /// this filesystem is, and that record is by definition below the floor.
+    pub async fn snapshot_root(&self, seq: u64) -> FsResult<RootRecord> {
+        self.roots.load_snapshot(seq).await
+    }
+
     pub async fn root(&self) -> FsResult<RootRecord> {
         let st = self.state.lock().await;
         st.check()?;
@@ -468,13 +508,31 @@ mod tests {
             }
         }
 
+        /// Create on first use, mount thereafter — what `Store::open` used to
+        /// do implicitly, now spelled out because the implicit version was the
+        /// bug.
         async fn open(&self) -> FsResult<Store> {
-            Store::open(
+            match self.mount(None).await {
+                Err(FsError::NoFilesystem) => {
+                    Store::create(
+                        self.data.clone(),
+                        self.roots.clone(),
+                        self.keys.clone(),
+                        self.config.clone(),
+                    )
+                    .await
+                }
+                other => other,
+            }
+        }
+
+        async fn mount(&self, min_seq: Option<u64>) -> FsResult<Store> {
+            Store::open_existing(
                 self.data.clone(),
                 self.roots.clone(),
                 self.keys.clone(),
                 self.config.clone(),
-                None,
+                min_seq,
             )
             .await
         }
@@ -801,6 +859,75 @@ mod tests {
         assert!(store.poison().await.is_none());
     }
 
+    // ---- genesis is not a fallback ----------------------------------------
+
+    /// The whole point of the split. An empty store used to mean "make me a
+    /// filesystem"; a store that answers "nothing" is now an error, because
+    /// only the caller can tell a genuinely new filesystem from one that has
+    /// been hidden.
+    #[tokio::test]
+    async fn mounting_an_empty_store_refuses_rather_than_formatting() {
+        let h = Harness::new();
+        assert!(matches!(h.mount(None).await, Err(FsError::NoFilesystem)));
+
+        // And it really was left empty — the failed mount must not have
+        // created anything on its way out.
+        assert!(matches!(h.mount(None).await, Err(FsError::NoFilesystem)));
+    }
+
+    /// The other direction: a caller that has misjudged which mode it is in
+    /// must not be able to overwrite a filesystem it should have mounted.
+    #[tokio::test]
+    async fn creating_over_an_existing_filesystem_is_refused() {
+        let h = Harness::new();
+        let store = h.open().await.unwrap();
+        let objid = store.reserve_objid().await.unwrap();
+        store
+            .commit(BTreeMap::from([(objid, file(objid, 7))]))
+            .await
+            .unwrap();
+        let before = store.root().await.unwrap();
+        drop(store);
+
+        assert!(matches!(
+            Store::create(
+                h.data.clone(),
+                h.roots.clone(),
+                h.keys.clone(),
+                h.config.clone()
+            )
+            .await,
+            Err(FsError::AlreadyExists)
+        ));
+
+        // The refusal left the existing filesystem exactly as it was.
+        let after = h.mount(None).await.unwrap().root().await.unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn a_created_filesystem_mounts_back() {
+        let h = Harness::new();
+        let genesis = Store::create(
+            h.data.clone(),
+            h.roots.clone(),
+            h.keys.clone(),
+            h.config.clone(),
+        )
+        .await
+        .unwrap()
+        .root()
+        .await
+        .unwrap();
+
+        assert_eq!(genesis.seq, 0);
+        assert!(
+            genesis.prev_root_hash.is_zero(),
+            "genesis has no predecessor"
+        );
+        assert_eq!(h.mount(None).await.unwrap().root().await.unwrap(), genesis);
+    }
+
     // ---- rollback ----------------------------------------------------------
 
     #[tokio::test]
@@ -817,26 +944,11 @@ mod tests {
         drop(store);
 
         // Mounting with a floor at or below the real tip is fine.
-        assert!(Store::open(
-            h.data.clone(),
-            h.roots.clone(),
-            h.keys.clone(),
-            h.config.clone(),
-            Some(3)
-        )
-        .await
-        .is_ok());
+        assert!(h.mount(Some(3)).await.is_ok());
 
         // A floor above it means the store is behind where we know it to be.
         assert!(matches!(
-            Store::open(
-                h.data.clone(),
-                h.roots.clone(),
-                h.keys.clone(),
-                h.config.clone(),
-                Some(4)
-            )
-            .await,
+            h.mount(Some(4)).await,
             Err(FsError::Rollback {
                 expected: 4,
                 found: 3

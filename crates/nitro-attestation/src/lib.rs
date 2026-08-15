@@ -129,27 +129,60 @@ pub struct Verified {
 /// this enclave and this connection.
 #[derive(Debug, Default, Clone)]
 pub struct Expectations {
-    /// Required PCR0, hex or raw. Pins the enclave image.
-    pub pcr0: Option<Vec<u8>>,
+    /// Required PCR values by index.
+    ///
+    /// PCR0 pins the enclave image and is what a client normally checks.
+    /// Higher registers matter for handoffs: a predecessor extends one to
+    /// commit to its successor, so the successor checks *that* index to prove
+    /// it was named. See [`Expectations::pcr`].
+    pub pcrs: BTreeMap<u32, Vec<u8>>,
     /// The nonce the verifier sent. Rejects a replayed document.
     pub nonce: Option<Vec<u8>>,
     /// Required `user_data`, byte for byte.
     pub user_data: Option<Vec<u8>>,
     /// Maximum age, against the document's own timestamp.
+    ///
+    /// Left `None` for a document that is a statement about an *origin* rather
+    /// than a proof of liveness — a state-origin receipt is supposed to be
+    /// old, and expiring one would make a filesystem unmountable by the
+    /// passage of time. Set it for anything a client fetches live.
     pub max_age: Option<Duration>,
+}
+
+impl Expectations {
+    /// Require `index` to hold `value`.
+    pub fn pcr(mut self, index: u32, value: impl Into<Vec<u8>>) -> Self {
+        self.pcrs.insert(index, value.into());
+        self
+    }
+
+    /// Require the document to have been produced by a given enclave image.
+    pub fn pcr0(self, value: impl Into<Vec<u8>>) -> Self {
+        self.pcr(0, value)
+    }
+
+    pub fn user_data(mut self, value: impl Into<Vec<u8>>) -> Self {
+        self.user_data = Some(value.into());
+        self
+    }
+
+    pub fn nonce(mut self, value: impl Into<Vec<u8>>) -> Self {
+        self.nonce = Some(value.into());
+        self
+    }
 }
 
 impl Verified {
     /// Apply [`Expectations`], failing on the first that does not hold.
     pub fn expect(&self, expectations: &Expectations, now: SystemTime) -> Result<()> {
-        if let Some(want) = &expectations.pcr0 {
+        for (index, want) in &expectations.pcrs {
             let got = self
                 .document
-                .pcr(0)
-                .context("document carries no PCR0 to compare")?;
+                .pcr(*index)
+                .with_context(|| format!("document carries no PCR{index} to compare"))?;
             if got != want.as_slice() {
                 bail!(
-                    "PCR0 mismatch: enclave is running {}, expected {}",
+                    "PCR{index} mismatch: document says {}, expected {}",
                     hex::encode(got),
                     hex::encode(want)
                 );
@@ -798,7 +831,7 @@ mod tests {
         verified
             .expect(
                 &Expectations {
-                    pcr0: Some(vec![0x07; 48]),
+                    pcrs: [(0u32, vec![0x07; 48])].into(),
                     nonce: Some(b"n".to_vec()),
                     user_data: Some(b"ud".to_vec()),
                     max_age: Some(Duration::from_secs(60)),
@@ -814,7 +847,7 @@ mod tests {
         let err = verified
             .expect(
                 &Expectations {
-                    pcr0: Some(vec![0x09; 48]),
+                    pcrs: [(0u32, vec![0x09; 48])].into(),
                     ..Default::default()
                 },
                 SystemTime::now(),

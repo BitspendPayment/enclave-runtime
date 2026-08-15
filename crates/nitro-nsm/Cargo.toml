@@ -20,6 +20,9 @@ path = "src/bin/nsm-selftest.rs"
 # statically linked musl binary, so a C dependency anywhere here would mean
 # a cross-compiling toolchain for something that needs two syscalls.
 [dependencies]
+# SHA-384, for computing what a PCR extension would produce. Same crypto stack
+# as everything else rather than a second hash implementation.
+aws-lc-rs = { workspace = true }
 anyhow   = { workspace = true }
 ciborium = "0.2"
 rustix   = { version = "1", features = ["fs"] }

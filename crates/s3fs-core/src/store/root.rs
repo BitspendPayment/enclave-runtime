@@ -27,6 +27,15 @@
 //! enclave's KMS encryption context, which [`RootStore::mount`] accepts as
 //! `min_seq`).
 //!
+//! There was a second and worse version of this, now closed. A cold mount also
+//! could not distinguish "this filesystem is new" from "everything has been
+//! hidden", because `Store::open` created one when it found none — so an
+//! enclave pointed at an emptied store served a fresh, correctly-signed,
+//! entirely wrong filesystem, and every check above passed because they all
+//! attested to the new one. Mounting and creating are now separate calls, and
+//! `enclave_runtime::boot` decides which it is entitled to make by checking an
+//! NSM attestation the host cannot forge.
+//!
 //! Within a session the gap does not exist: `expected_seq` only ever rises, so
 //! a root older than one already accepted is rejected outright.
 

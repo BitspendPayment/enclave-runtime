@@ -79,13 +79,19 @@ of this problem in the codebase. And attestation should eventually cover *which*
 clock was in use, so a relying party can tell a PTP-backed enclave from one that
 fell back to host time.
 
-**4. Bind the attestation into the anchor.** `RootRecord` already reserves an
-`attestation` field. Recording the PCR digest that produced each commit turns
-the root chain into an audit log of *which code* wrote each state, not merely
-what the state was.
+**4. Bind the attestation into the anchor.** *Partly done, differently.*
+`enclave_runtime::boot` writes a state-origin receipt at genesis — an NSM
+attestation committing to the filesystem's identity — and every later boot
+verifies it, so *which code created this state* is now established. `RootRecord`
+has no `attestation` field (an earlier version of this document claimed it did);
+recording a PCR digest per *commit* would turn the chain into a full audit log
+rather than a statement about the origin, and would put an NSM signature in the
+write path of every transaction.
 
-**5. Close the cold-mount gap.** `--min-root-seq` is currently supplied by
-hand. Carrying it in the KMS encryption context would make the floor something
+**5. Close the cold-mount gap.** The *substitution* half is closed: a store
+with no filesystem no longer yields a new one, because genesis needs a receipt
+to be absent and Object Lock keeps it present. The *rollback* half remains —
+`--min-root-seq` is still supplied by hand. Carrying it in the KMS encryption context would make the floor something
 the enclave receives from a service the storage operator does not control —
 the one thing that closes the residual risk documented in
 [`store/root.rs`](../crates/s3fs-core/src/store/root.rs).

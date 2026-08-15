@@ -10,10 +10,14 @@ Designed for [AWS Nitro Enclaves](https://aws.amazon.com/ec2/nitro/nitro-enclave
 
 ## Status
 
-Pre-1.0. The storage engine is complete; the enclave integration is not.
-[`docs/ROADMAP.md`](docs/ROADMAP.md) covers what remains: NSM attestation and
-KMS key release (M8), garbage collection (M9), and the `enclave-runtime` crate
-that runs a guest inside a Nitro Enclave (M10).
+Pre-1.0. The storage engine is complete, and so is the runtime that mounts it
+inside an enclave and serves a guest over TLS. What remains is one thing that
+matters: **the master secret is not really sealed yet.** Genesis mints it from
+NSM entropy and stores only a sealed blob, but the only implementation of that
+sealing writes the secret behind a marker saying it did not seal it — enough to
+exercise every boot path under QEMU, and no protection at all. Real sealing is
+KMS `Decrypt` with a `Recipient`, which needs Nitro hardware to test.
+[`docs/ROADMAP.md`](docs/ROADMAP.md) has that (M8) and garbage collection (M9).
 
 Four workspace crates plus example guests:
 
@@ -27,7 +31,7 @@ Four workspace crates plus example guests:
 | [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Needs wasi-sdk. |
 | [`examples/guest-fsdemo`](examples/guest-fsdemo/) | The original smaller SQLite demo. |
 
-**Test coverage:** 451 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), and two suites that serve a real component over TLS and check the attestation binding. There are no cargo features to select: `cargo test --workspace` runs everything.
+**Test coverage:** 499 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the attestation binding. There are no cargo features to select: `cargo test --workspace` runs everything; 23 of those tests skip themselves without MinIO or enclave hardware.
 
 ## Quick start: run a Wasm guest against MinIO
 
@@ -391,6 +395,106 @@ groundwork for M8.
 This needs `/dev/kvm` and so does not run on GitHub-hosted runners, the same
 limitation the PTP harness has.
 
+
+## Which state an enclave will load
+
+An enclave that mounts the wrong filesystem is worse than one that fails, and
+until recently this code could not tell the difference. `Store::open` ended
+with `None => Store::format(…)`, so an enclave pointed at an emptied store
+created a fresh filesystem and served it — correctly signed, correctly
+hash-chained, and completely wrong. Every check the design makes passed,
+because they all attested to the *new* filesystem while the guest saw an empty
+database where its data should have been.
+
+`store/root.rs` already documented the neighbouring risk, rollback: *"a cold
+mount cannot distinguish 'the tip is N' from 'the tip is N, and the store is
+hiding N+1'"*. This was the worse one it did not name.
+
+### The state-origin receipt
+
+Genesis now writes an NSM attestation document whose `user_data` commits to a
+hash over this filesystem's identity, following
+[ArkLabsHQ/enclave#151](https://github.com/ArkLabsHQ/enclave/pull/151):
+
+```text
+state_root = BLAKE3(CBOR[
+    "s3fs/state-origin/v1",
+    fs_uuid,                     which filesystem
+    data_bucket, roots_bucket,
+    bucket_prefix,               which store
+    genesis_root_hash,           which history, pinned to the seq-0 record
+    sha256(sealed master key),   which key — the CIPHERTEXT's hash, never the key
+])
+```
+
+Every later boot recomputes it from what it just loaded and requires the
+receipt to name exactly that. The host cannot forge one, because AWS signs it.
+
+| receipt | store | PCR0 | |
+|---|---|---|---|
+| absent | empty | — | **genesis** — mint key, seal, create, write receipt |
+| absent | present | — | **refuse** — state nobody accounted for |
+| present | empty | — | **refuse** — state has been hidden |
+| present | present | mine | **resume** |
+| present | present | other | **migration**, if authorised |
+
+QEMU's emulated NSM does not sign — its source says so — so the harness must be
+able to accept an unsigned receipt, and an escape hatch like that is worth
+nothing if it can be switched on from outside. `S3FS_RECEIPT_TRUST` is set in
+the image: `required` in the production EIF, `unsigned-emulator` only in
+`eif-qemu`. It is therefore covered by PCR0, so *whether this enclave would
+accept an unsigned receipt* is something a client reads off the attestation
+rather than has to trust.
+
+### Three things make a *missing* receipt mean something
+
+The receipt is self-authenticating, so the host cannot forge one — but "no
+receipt" is what authorises genesis, so the absence has to be as trustworthy as
+the presence. None of these is sufficient alone:
+
+- **Object Lock COMPLIANCE** — nobody, including the account root, can delete
+  the receipt once written.
+- **Attested bucket identity** — the bucket names live in the image, so PCR0
+  covers them. Without this the host points the enclave at an empty bucket and
+  everything else passes. This is why
+  [`deploy/nix/deployment.nix`](deploy/nix/deployment.nix) exists, and why
+  changing a bucket changes PCR0.
+- **TLS to S3, validated inside the enclave** — the parent proxies the bytes
+  but cannot substitute them. It can block, which fails closed.
+
+Still out of scope, unchanged: S3 lying about `HEAD`. That is AWS, whom we
+already trust for the signature on the receipt itself.
+
+### The master secret belongs to the state
+
+It used to arrive as `S3FS_MASTER_KEY`, from the parent — and a parent that
+supplies the key *has* the key. Genesis now mints it, seals it, and stores only
+the sealed form; resume opens that. The receipt commits to `sha256` of the
+**ciphertext**, never the secret, because a receipt is readable by anyone who
+can read the bucket.
+
+**Sealing is not finished.** `StaticKey` seals by *not* sealing — it writes the
+secret behind a marker saying so, which exercises every boot mode without
+hardware and protects nothing. Real sealing is KMS `Decrypt` with a `Recipient`
+under a policy conditioned on `kms:RecipientAttestation:PCR0`, and that is
+where *"only the correct enclave boots"* is actually enforced: a wrong enclave
+does not get a refused mount, it gets no key at all. It is the next
+implementation of one trait and nothing above it changes.
+
+### Upgrades
+
+A resuming enclave demands the receipt carry its own PCR0, so any image change
+would otherwise make the filesystem unmountable. The outgoing image authorises
+the incoming one explicitly:
+
+```console
+$ enclave-runtime --authorise-successor <new PCR0>   # run against the OLD image
+```
+
+It extends **PCR31** with the successor's PCR0 — irreversibly, for that
+enclave's life — then attests. The resulting receipt proves both who wrote it
+and that they had committed to that specific successor beforehand, in two
+independent places. A receipt naming one image does not admit another.
 
 ## Serving HTTP
 

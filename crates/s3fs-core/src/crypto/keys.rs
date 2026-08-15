@@ -58,6 +58,17 @@ impl MasterSecret {
         MasterSecret(bytes)
     }
 
+    /// The raw bytes.
+    ///
+    /// Named to be conspicuous at the call site. There is exactly one
+    /// legitimate reason to reach in here — sealing the secret so it can be
+    /// stored — and everything else should take a `&MasterSecret` and derive
+    /// what it needs through [`KeyMaterial`], which is why no plain `as_bytes`
+    /// exists.
+    pub fn expose_secret(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// Parse a 64-character hex string, as supplied by `--data-key` or an
     /// environment variable in development.
     pub fn from_hex(s: &str) -> FsResult<Self> {

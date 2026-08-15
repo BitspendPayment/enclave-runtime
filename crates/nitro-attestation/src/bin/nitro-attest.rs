@@ -153,7 +153,7 @@ fn run() -> Result<()> {
         expectations.nonce = Some(nonce.clone());
     }
     if let Some(pcr0) = &cli.pcr0 {
-        expectations.pcr0 = Some(hex::decode(pcr0.trim()).context("--pcr0 is not hex")?);
+        expectations = expectations.pcr0(hex::decode(pcr0.trim()).context("--pcr0 is not hex")?);
     }
     verified.expect(&expectations, now)?;
 

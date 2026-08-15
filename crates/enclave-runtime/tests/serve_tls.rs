@@ -72,6 +72,21 @@ impl Nsm for SigningNsm {
             .document(request.user_data.clone(), request.nonce.clone(), self.pcr0)
     }
 
+    fn describe_pcr(&self, index: u16) -> anyhow::Result<nitro_nsm::Pcr> {
+        Ok(nitro_nsm::Pcr {
+            locked: index < 3,
+            value: if index == 0 {
+                self.pcr0.to_vec()
+            } else {
+                nitro_nsm::PCR_ZERO.to_vec()
+            },
+        })
+    }
+
+    fn extend_pcr(&self, _index: u16, _data: &[u8]) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("this fake does not model PCR extension")
+    }
+
     fn describe(&self) -> String {
         "signing test NSM".into()
     }
@@ -279,7 +294,7 @@ async fn the_attested_certificate_is_the_one_serving_the_connection() {
             &Expectations {
                 nonce: Some(nonce.to_vec()),
                 user_data: Some(expected.serialize()),
-                pcr0: Some(harness.nsm.pcr0.to_vec()),
+                pcrs: [(0u32, harness.nsm.pcr0.to_vec())].into(),
                 max_age: Some(std::time::Duration::from_secs(60)),
             },
             std::time::SystemTime::now(),

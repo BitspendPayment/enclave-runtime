@@ -6,9 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use s3fs_core::backend::{AwsS3Backend, AwsS3BackendConfig, Backend};
 use s3fs_core::crypto::KeyMaterial;
-use s3fs_core::{Config, Fs};
-
-use crate::keys::MasterKeySource;
+use s3fs_core::{Config, Fs, MasterSecret};
 
 /// Everything needed to open the store.
 #[derive(Debug, Clone)]
@@ -65,6 +63,10 @@ pub fn parse_fs_id(s: &str) -> Result<[u8; 16]> {
 
 /// A mounted filesystem, plus the pieces a runtime needs alongside it.
 ///
+/// `Debug` names the store rather than dumping the filesystem: an `Fs` renders
+/// its whole handle table, which is noise in a boot log and unbounded in a
+/// panic message.
+///
 /// The ACME cache writes sealed objects to the data bucket and seals them
 /// under a key derived from the same master secret, so it needs both — but it
 /// deliberately does *not* go through the filesystem, because the guest's
@@ -76,17 +78,27 @@ pub struct Mounted {
     pub bucket_prefix: String,
 }
 
-/// Connect both backends and mount, then report which committed state we came
-/// up on.
-pub async fn mount(config: &MountConfig, keys: &dyn MasterKeySource) -> Result<Arc<Fs>> {
-    Ok(mount_with_backend(config, keys).await?.fs)
+impl std::fmt::Debug for Mounted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mounted")
+            .field("bucket_prefix", &self.bucket_prefix)
+            .finish_non_exhaustive()
+    }
 }
 
-/// As [`mount`], keeping the data backend and derived keys.
-pub async fn mount_with_backend(
-    config: &MountConfig,
-    keys: &dyn MasterKeySource,
-) -> Result<Mounted> {
+/// Both backends, connected but not yet mounted.
+///
+/// Separate from mounting because the boot machine has to *read* the store —
+/// the state-origin receipt lives in the roots bucket — before it can decide
+/// whether this is a genesis or a resume, and only after deciding does it know
+/// which master secret to use.
+pub struct Backends {
+    pub data: Arc<dyn Backend>,
+    pub roots: Arc<dyn Backend>,
+}
+
+/// Connect to both buckets.
+pub async fn connect(config: &MountConfig) -> Result<Backends> {
     let data_cfg = config.backend_config(&config.bucket);
     let data: Arc<dyn Backend> = Arc::new(if config.skip_bucket_probe {
         AwsS3Backend::connect_unchecked(data_cfg).await?
@@ -111,29 +123,71 @@ pub async fn mount_with_backend(
         Arc::new(AwsS3Backend::connect_unchecked(config.backend_config(roots_name)).await?)
     };
 
+    Ok(Backends { data, roots })
+}
+
+/// Mount an existing filesystem with a secret the caller has already resolved.
+pub async fn mount_existing(
+    backends: &Backends,
+    config: &MountConfig,
+    master: &MasterSecret,
+) -> Result<Mounted> {
+    finish(backends, config, master, false).await
+}
+
+/// Create a filesystem. Only genesis calls this.
+pub async fn create(
+    backends: &Backends,
+    config: &MountConfig,
+    master: &MasterSecret,
+) -> Result<Mounted> {
+    finish(backends, config, master, true).await
+}
+
+async fn finish(
+    backends: &Backends,
+    config: &MountConfig,
+    master: &MasterSecret,
+    genesis: bool,
+) -> Result<Mounted> {
+    let data = backends.data.clone();
+    let roots = backends.roots.clone();
+
     let fs_config = Config::builder()
         .bucket_prefix(config.bucket_prefix.clone())
         .mount_path(config.mount_path.clone())
         .build();
 
-    let master = keys.master_secret().await?;
     // Derived twice — once here and once inside `Fs::mount` — rather than
     // reaching into the store for them. The derivation is cheap and pure, and
     // threading them out would widen the store's API for one caller.
     let derived = Arc::new(
-        KeyMaterial::derive(&master, config.fs_id)
+        KeyMaterial::derive(master, config.fs_id)
             .map_err(|e| anyhow::anyhow!("deriving keys: {e}"))?,
     );
-    let fs = Fs::mount(
-        data.clone(),
-        roots,
-        &master,
-        config.fs_id,
-        Arc::new(fs_config),
-        config.min_root_seq,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("mounting filesystem: {e}"))?;
+
+    let fs = if genesis {
+        Fs::create(
+            data.clone(),
+            roots,
+            master,
+            config.fs_id,
+            Arc::new(fs_config),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("creating filesystem: {e}"))?
+    } else {
+        Fs::mount(
+            data.clone(),
+            roots,
+            master,
+            config.fs_id,
+            Arc::new(fs_config),
+            config.min_root_seq,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("mounting filesystem: {e}"))?
+    };
 
     // The operator's evidence of which committed state this process came up
     // on. Under attestation this is what the health endpoint reports, and it
@@ -144,11 +198,12 @@ pub async fn mount_with_backend(
         .await
         .map_err(|e| anyhow::anyhow!("reading root record: {e}"))?;
     tracing::info!(
+        mode = if genesis { "genesis" } else { "resume" },
         root_seq = root.seq,
         txg = root.txg,
         merkle_root = %root.merkle_root(),
         data_bucket = %config.bucket,
-        roots_bucket = %roots_name,
+        roots_bucket = %config.roots_bucket.as_deref().unwrap_or(&config.bucket),
         "mounted"
     );
 

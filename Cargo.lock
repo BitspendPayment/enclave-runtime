@@ -1724,6 +1724,7 @@ dependencies = [
  "blake3",
  "bytes",
  "cap-rand",
+ "ciborium",
  "clap",
  "futures",
  "getrandom 0.3.4",
@@ -2897,6 +2898,7 @@ name = "nitro-nsm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "ciborium",
  "rustix 1.1.4",
 ]

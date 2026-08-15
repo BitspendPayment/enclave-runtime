@@ -108,8 +108,54 @@ pub trait Nsm: Send + Sync + fmt::Debug {
     /// is checked somewhere else.
     fn attest(&self, request: &AttestationRequest) -> Result<Vec<u8>>;
 
+    /// Read a Platform Configuration Register.
+    ///
+    /// Returns the value and whether it is locked. PCR0-2 are set by the
+    /// hypervisor from the image and locked; the upper registers are the
+    /// enclave's to use.
+    fn describe_pcr(&self, index: u16) -> Result<Pcr>;
+
+    /// Extend a PCR, returning its new value.
+    ///
+    /// `new = SHA384(old ‖ data)`, and it cannot be undone for the life of the
+    /// enclave — which is the property that makes it useful. An enclave that
+    /// extends a register before attesting has permanently committed to
+    /// whatever it extended with, and every document it produces afterwards
+    /// says so.
+    ///
+    /// Fails with a read-only error on a locked register.
+    fn extend_pcr(&self, index: u16, data: &[u8]) -> Result<Vec<u8>>;
+
     /// Short description for logs.
     fn describe(&self) -> String;
+}
+
+/// A Platform Configuration Register.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pcr {
+    pub locked: bool,
+    pub value: Vec<u8>,
+}
+
+/// The register a predecessor extends to name its successor.
+///
+/// 0-2 are the image measurements and locked. 16 upwards are free; 31 is the
+/// convention ArkLabs uses for exactly this, and matching it costs nothing.
+pub const PCR_SUCCESSOR: u16 = 31;
+
+/// What a PCR holds before anything extends it: 48 zero bytes.
+pub const PCR_ZERO: [u8; 48] = [0u8; 48];
+
+/// The value `index` would hold after one extension with `data`.
+///
+/// Lets a successor check that its predecessor committed to *it* without
+/// having to trust anything but the arithmetic.
+pub fn pcr_extend(current: &[u8], data: &[u8]) -> Vec<u8> {
+    use aws_lc_rs::digest;
+    let mut ctx = digest::Context::new(&digest::SHA384);
+    ctx.update(current);
+    ctx.update(data);
+    ctx.finish().as_ref().to_vec()
 }
 
 /// The real device.
@@ -225,9 +271,92 @@ impl Nsm for NsmDevice {
         decode_attestation(&response)
     }
 
+    fn describe_pcr(&self, index: u16) -> Result<Pcr> {
+        let response = self.request(&encode_pcr_request("DescribePCR", index, None))?;
+        decode_describe_pcr(&response)
+    }
+
+    fn extend_pcr(&self, index: u16, data: &[u8]) -> Result<Vec<u8>> {
+        let response = self.request(&encode_pcr_request("ExtendPCR", index, Some(data)))?;
+        decode_extend_pcr(&response)
+    }
+
     fn describe(&self) -> String {
         format!("Nitro Security Module ({})", self.device.display())
     }
+}
+
+/// `{"DescribePCR": {"index": n}}` or `{"ExtendPCR": {"index": n, "data": …}}`.
+fn encode_pcr_request(name: &str, index: u16, data: Option<&[u8]>) -> Vec<u8> {
+    let mut fields = vec![(
+        ciborium::Value::Text("index".into()),
+        ciborium::Value::Integer(index.into()),
+    )];
+    if let Some(data) = data {
+        fields.push((
+            ciborium::Value::Text("data".into()),
+            ciborium::Value::Bytes(data.to_vec()),
+        ));
+    }
+    let value = ciborium::Value::Map(vec![(
+        ciborium::Value::Text(name.to_string()),
+        ciborium::Value::Map(fields),
+    )]);
+    let mut out = Vec::new();
+    ciborium::into_writer(&value, &mut out).expect("writing to a Vec cannot fail");
+    out
+}
+
+/// Pull the single value out of `{"<name>": {…}}`, surfacing `{"Error": …}`.
+fn pcr_response_fields(cbor: &[u8], name: &str) -> Result<Vec<(ciborium::Value, ciborium::Value)>> {
+    let value: ciborium::Value =
+        ciborium::from_reader(cbor).with_context(|| format!("decoding the NSM {name} response"))?;
+    let outer = value
+        .as_map()
+        .with_context(|| format!("NSM response is not a map: {value:?}"))?;
+    let (key, inner) = outer.first().context("NSM response map is empty")?;
+    let key = key.as_text().unwrap_or("<non-text>");
+    if key != name {
+        bail!("NSM answered {key:?} instead of {name}: {inner:?}");
+    }
+    inner
+        .as_map()
+        .cloned()
+        .with_context(|| format!("{name} value is not a map: {inner:?}"))
+}
+
+fn field<'a>(
+    fields: &'a [(ciborium::Value, ciborium::Value)],
+    name: &str,
+) -> Option<&'a ciborium::Value> {
+    fields
+        .iter()
+        .find(|(k, _)| k.as_text() == Some(name))
+        .map(|(_, v)| v)
+}
+
+fn decode_describe_pcr(cbor: &[u8]) -> Result<Pcr> {
+    let fields = pcr_response_fields(cbor, "DescribePCR")?;
+    Ok(Pcr {
+        locked: field(&fields, "lock")
+            .and_then(|v| match v {
+                ciborium::Value::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .context("DescribePCR has no boolean 'lock'")?,
+        value: field(&fields, "data")
+            .and_then(|v| v.as_bytes())
+            .cloned()
+            .context("DescribePCR has no 'data'")?,
+    })
+}
+
+fn decode_extend_pcr(cbor: &[u8]) -> Result<Vec<u8>> {
+    let fields = pcr_response_fields(cbor, "ExtendPCR")?;
+    field(&fields, "data")
+        .and_then(|v| v.as_bytes())
+        .cloned()
+        .context("ExtendPCR has no 'data'")
 }
 
 /// `{"Attestation": {"user_data": <bytes>, ...}}`, with absent fields
@@ -386,6 +515,9 @@ pub mod fake {
         /// can never accidentally satisfy a real verifier.
         pub attestation: Mutex<Vec<u8>>,
         pub last_attestation_request: Mutex<Option<AttestationRequest>>,
+        /// Real registers, so extend arithmetic and the locked-register
+        /// refusal can be exercised without a device.
+        pub pcrs: Mutex<Vec<Pcr>>,
     }
 
     impl Default for FakeNsm {
@@ -396,6 +528,20 @@ pub mod fake {
                 chunk: 256,
                 attestation: Mutex::new(b"not-a-signed-attestation-document".to_vec()),
                 last_attestation_request: Mutex::new(None),
+                // 0-2 locked and non-zero, as the hypervisor leaves them;
+                // everything above free and zeroed.
+                pcrs: Mutex::new(
+                    (0..32)
+                        .map(|i| Pcr {
+                            locked: i < 3,
+                            value: if i < 3 {
+                                vec![0x10 + i as u8; 48]
+                            } else {
+                                PCR_ZERO.to_vec()
+                            },
+                        })
+                        .collect(),
+                ),
             }
         }
     }
@@ -434,9 +580,55 @@ pub mod fake {
             Ok(self.attestation.lock().unwrap().clone())
         }
 
+        fn describe_pcr(&self, index: u16) -> Result<Pcr> {
+            self.pcrs
+                .lock()
+                .unwrap()
+                .get(index as usize)
+                .cloned()
+                .context("no such PCR")
+        }
+
+        fn extend_pcr(&self, index: u16, data: &[u8]) -> Result<Vec<u8>> {
+            let mut pcrs = self.pcrs.lock().unwrap();
+            let pcr = pcrs.get_mut(index as usize).context("no such PCR")?;
+            if pcr.locked {
+                bail!("PCR {index} is read-only");
+            }
+            pcr.value = pcr_extend(&pcr.value, data);
+            Ok(pcr.value.clone())
+        }
+
         fn describe(&self) -> String {
             "fake NSM".into()
         }
+    }
+
+    #[test]
+    fn extending_is_the_documented_arithmetic() {
+        let nsm = FakeNsm::new();
+        let after = nsm.extend_pcr(PCR_SUCCESSOR, b"successor").unwrap();
+        assert_eq!(after, pcr_extend(&PCR_ZERO, b"successor"));
+        assert_eq!(nsm.describe_pcr(PCR_SUCCESSOR).unwrap().value, after);
+    }
+
+    /// Extension accumulates. A successor checking `extend(0, me)` is checking
+    /// that the register was extended exactly once, with itself — twice, or
+    /// with anything else first, does not match.
+    #[test]
+    fn extending_twice_does_not_look_like_extending_once() {
+        let nsm = FakeNsm::new();
+        nsm.extend_pcr(PCR_SUCCESSOR, b"a").unwrap();
+        let twice = nsm.extend_pcr(PCR_SUCCESSOR, b"b").unwrap();
+        assert_ne!(twice, pcr_extend(&PCR_ZERO, b"b"));
+    }
+
+    #[test]
+    fn the_image_registers_cannot_be_extended() {
+        let nsm = FakeNsm::new();
+        assert!(nsm.extend_pcr(0, b"anything").is_err());
+        assert!(nsm.describe_pcr(0).unwrap().locked);
+        assert!(!nsm.describe_pcr(PCR_SUCCESSOR).unwrap().locked);
     }
 
     /// The device rejects a `null` field outright — `fill_attestation_property`

@@ -30,6 +30,7 @@
 //! release gated on an NSM attestation document is a new implementation of one
 //! trait, not a change to any of the above.
 
+pub mod boot;
 pub mod clock;
 pub mod env;
 pub mod flag;
@@ -43,12 +44,13 @@ pub mod serve;
 pub mod state;
 pub mod wasi;
 
+pub use boot::{authorise_successor, boot, BootConfig, BootMode, Booted, ReceiptTrust};
 pub use clock::{open_clock, ClockSource, HostClock, PtpClock, TrustedClock, DEFAULT_PTP_DEVICE};
 pub use env::GuestEnvPolicy;
 pub use flag::parse_bool_flag;
-pub use keys::{MasterKeySource, StaticKey};
+pub use keys::{MasterKeySource, SealedKey, StaticKey};
 pub use linker::build_linker;
-pub use mount::{mount, mount_with_backend, parse_fs_id, MountConfig, Mounted};
+pub use mount::{connect, create, mount_existing, parse_fs_id, Backends, MountConfig, Mounted};
 pub use net::{bring_up, Network, NetworkConfig, NetworkMode, DEFAULT_GVFORWARDER};
 pub use nitro_nsm::{Nsm, NsmDevice, DEFAULT_NSM_DEVICE};
 pub use random::{open_entropy, GuestRandom, HostEntropy, RandomSource};

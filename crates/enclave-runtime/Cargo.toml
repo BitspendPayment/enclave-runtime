@@ -70,6 +70,9 @@ aws-lc-rs      = { workspace = true }
 blake3         = { workspace = true }
 # rustls-acme drives issuance through a Stream.
 futures        = { workspace = true }
+# The state_root pre-image and the receipt payloads. CBOR because the
+# receipt travels in an attestation document, which is CBOR already.
+ciborium       = "0.2"
 base64         = "0.22"
 hex            = "0.4"
 
