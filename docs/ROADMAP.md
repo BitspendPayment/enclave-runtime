@@ -123,7 +123,16 @@ A slab is dead when no root you intend to keep references any block in it.
 it wrong deletes live data. Hence: not shipped rather than shipped
 approximately.
 
-Proposed `s3fs-runner gc --keep-roots N`:
+**It needs a home first.** `s3fs-runner` was deleted once `enclave-runtime`
+became a superset of it, so there is currently no binary for operator tooling —
+and GC should not go in `enclave-runtime`. That binary ships *inside* the
+enclave image, so every flag added to it changes PCR0 and enlarges the attested
+surface. Sweeping dead blocks is something an operator does to a store from
+outside; it has no business being measured as part of the code a client
+attests. M9 starts by adding a small unattested CLI for this and anything like
+it (`fsck`, `show-root`, `verify-chain`).
+
+Proposed `gc --keep-roots N`:
 
 1. Mark: walk the blkptr trees of the newest `N` roots, collecting live
    `(txg, slab)` pairs. Bounded by live data, not by history.
@@ -159,10 +168,11 @@ the guest-environment policy, and the run loop.
 
 ```
 crates/
-  s3fs-core         engine
-  s3fs-host         wasi:filesystem + linker + env policy + run loop
-  s3fs-runner       dev CLI, local and MinIO
-  enclave-runtime   deployment target
+  s3fs-core           engine
+  s3fs-host           wasi:filesystem + linker + env policy + serve loop
+  nitro-nsm           /dev/nsm: entropy and attestation requests
+  nitro-attestation   parse and verify documents; the nitro-attest client
+  enclave-runtime     deployment target
 ```
 
 Configuration is environment-first with matching flags, because inside an

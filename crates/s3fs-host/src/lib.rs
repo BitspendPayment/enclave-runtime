@@ -1,11 +1,10 @@
 //! `s3fs-host` — `wasi:filesystem` over the block store, plus the wiring that
 //! turns a mounted filesystem and a Wasm component into a running guest.
 //!
-//! Shared by two binaries with different jobs. `s3fs-runner` is the
-//! development CLI: explicit flags, local or MinIO storage. `enclave-runtime`
-//! is the deployment target: configured by environment, guest loaded from a
-//! known path inside the enclave image. Both need the same four things, and
-//! this crate is those four things.
+//! Everything `enclave-runtime` needs, and nothing specific to it. The split
+//! is not organisational: this crate is written against `s3fs_core::Fs` and a
+//! `Backend`, so a host with its own state type can take the pieces it wants
+//! without the deployment binary's opinions about configuration.
 //!
 //! ```text
 //!   mount   config          ──▶ Arc<Fs>          two backends, verified root

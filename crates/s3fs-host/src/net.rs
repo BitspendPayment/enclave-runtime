@@ -222,8 +222,8 @@ mod tests {
         assert!(NetworkMode::parse("bridge").is_err());
     }
 
-    /// The default must do nothing: `s3fs-runner` and every test run outside
-    /// an enclave, where spawning a forwarder would fail or, worse, succeed.
+    /// The default must do nothing. Tests and local runs happen outside an
+    /// enclave, where spawning a forwarder would fail — or, worse, succeed.
     #[test]
     fn the_default_touches_nothing() {
         assert_eq!(NetworkConfig::default().mode, NetworkMode::None);

@@ -21,8 +21,9 @@ Three workspace crates plus an example guest:
 |---|---|
 | [`s3fs-core`](crates/s3fs-core/) | The engine. `Backend` trait with in-memory and AWS S3 backends; a copy-on-write block store (`store::*`) with encrypted blocks, an indirect-block tree, a dnode array, and the transaction-group commit protocol; POSIX semantics on top (`Fs`). **Zero wasmtime dependency** — usable from any host. |
 | [`s3fs-host`](crates/s3fs-host/) | `wasi:filesystem@0.2.x` over the engine, plus the linker, guest-environment policy, and run loop both binaries share. The AWS mount path is behind an `aws` feature, so the bindings stay usable over any `Backend`. |
-| [`s3fs-runner`](crates/s3fs-runner/) | Development CLI. Explicit flags; the guest gets no environment unless asked. |
-| [`enclave-runtime`](crates/enclave-runtime/) | Deployment target. Configured by environment, guest loaded from a known path inside the enclave image. |
+| [`nitro-nsm`](crates/nitro-nsm/) | `/dev/nsm`: entropy and attestation requests. Its own crate so it links into a small static binary for an enclave image. |
+| [`nitro-attestation`](crates/nitro-attestation/) | Parses and verifies attestation documents, and the `nitro-attest` client. Depends on nothing else here — a verifier has no `/dev/nsm` and is often not Linux. |
+| [`enclave-runtime`](crates/enclave-runtime/) | Deployment target, and the only binary that runs a guest. Configured by environment, guest loaded from a known path inside the enclave image. |
 | [`examples/guest-smoke`](examples/guest-smoke/) | Minimal guest, no C toolchain needed. Exercises write / patch / rename / read_dir and the environment policy; run twice it proves durability. |
 | [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Needs wasi-sdk. |
 | [`examples/guest-fsdemo`](examples/guest-fsdemo/) | The original smaller SQLite demo. |
@@ -52,10 +53,11 @@ AR_wasm32_wasip2=$HOME/wasi-sdk/bin/ar \
 CFLAGS_wasm32_wasip2="--sysroot=$HOME/wasi-sdk/share/wasi-sysroot -DSQLITE_THREADSAFE=0 -DHAVE_USLEEP=1" \
   cargo build --release --target wasm32-wasip2
 
-# 3. Build the runner and execute the guest
+# 3. Build the runtime and execute the guest
 cd ../..
-cargo build --release -p s3fs-runner
-./target/release/s3fs-runner \
+cargo build --release -p enclave-runtime --features aws
+./target/release/enclave-runtime \
+  --no-inherit-env \
   --bucket demo-data \
   --roots-bucket demo-roots \
   --region us-east-1 \
@@ -64,8 +66,21 @@ cargo build --release -p s3fs-runner
   --secret-access-key minioadmin \
   --force-path-style \
   --master-key 0000000000000000000000000000000000000000000000000000000000000001 \
-  --component examples/guest-fsdemo/target/wasm32-wasip2/release/guest-fsdemo.wasm
+  --guest-path examples/guest-fsdemo/target/wasm32-wasip2/release/guest-fsdemo.wasm
 # → prints "OK"
+```
+
+`--no-inherit-env` matters outside an enclave. The default is to pass this
+process's environment to the guest, minus `AWS_*` and `S3FS_*` — right for an
+enclave image, where the environment *is* the curated deployment
+configuration, and wrong on a developer's machine, where it forwards whatever
+happens to be in your shell. The denylist withholds this runtime's own
+credentials; it does not know about your `GITHUB_TOKEN`.
+
+Name what the guest should get instead:
+
+```bash
+--no-inherit-env --guest-env LOG_LEVEL=debug --guest-env HOME
 ```
 
 `--master-key` is a development seam: every other key is derived from it by HKDF. In an

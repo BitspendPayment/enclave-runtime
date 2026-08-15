@@ -5,7 +5,6 @@ members = [
     "crates/nitro-nsm",
     "crates/s3fs-core",
     "crates/s3fs-host",
-    "crates/s3fs-runner",
     "crates/enclave-runtime",
 ]
 

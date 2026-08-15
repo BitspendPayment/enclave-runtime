@@ -15,7 +15,7 @@
 //! cargo build --release --target wasm32-wasip2
 //! ```
 //!
-//! Run via the `s3fs-runner` against MinIO or AWS. The component prints
+//! Run via `enclave-runtime` against MinIO or AWS. The component prints
 //! `OK` on success or `FAIL: ...` on the first failure.
 
 use std::fs;

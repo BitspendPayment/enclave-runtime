@@ -136,6 +136,13 @@ struct Cli {
 
     /// Give the guest nothing but what `--guest-env` names.
     ///
+    /// **Use this when running outside an enclave.** Inheritance is right for
+    /// an enclave image, where the environment is curated deployment
+    /// configuration; it is wrong on a developer's machine, where it forwards
+    /// that machine's whole environment to the guest. The denylist below
+    /// withholds this runtime's own credentials, not a `GITHUB_TOKEN` or an
+    /// `SSH_AUTH_SOCK`.
+    ///
     /// By default it inherits this process's environment minus anything under
     /// `AWS_` or `S3FS_`, which is where the credentials and this runtime's
     /// own configuration live.
@@ -144,8 +151,16 @@ struct Cli {
 
     /// Extra variable for the guest, as `NAME` (inherit that one by name) or
     /// `NAME=VALUE`. Applied after inheritance, so it overrides — including
-    /// for names that are otherwise withheld. Repeatable.
-    #[arg(long = "guest-env", value_name = "NAME[=VALUE]")]
+    /// for names that are otherwise withheld. Repeatable, or comma-separated.
+    ///
+    /// Paired with `--no-inherit-env` this is the explicit model: the guest
+    /// gets exactly what is named here and nothing else.
+    #[arg(
+        long = "guest-env",
+        env = "S3FS_GUEST_ENV",
+        value_delimiter = ',',
+        value_name = "NAME[=VALUE]"
+    )]
     guest_env: Vec<String>,
 
     /// Where the guest's wall-clock time comes from.
@@ -606,6 +621,51 @@ mod tests {
             "/tmp/other.wasm",
         ]);
         assert_eq!(cli.guest_path, PathBuf::from("/tmp/other.wasm"));
+    }
+
+    /// The explicit model, which is what `--no-inherit-env` leaves you with:
+    /// the guest gets exactly what is named and nothing else. This was
+    /// `s3fs-runner`'s whole reason to exist before it was deleted, so it is
+    /// tested here rather than assumed.
+    #[test]
+    fn named_variables_reach_the_guest_when_nothing_is_inherited() {
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--no-inherit-env",
+            "--guest-env",
+            "LOG_LEVEL=debug",
+        ]);
+        assert_eq!(
+            cli.env_policy().build().unwrap(),
+            vec![("LOG_LEVEL".to_string(), "debug".to_string())]
+        );
+    }
+
+    /// Repeatable *and* comma-separated, because inside an enclave the setting
+    /// arrives as one `S3FS_GUEST_ENV` string and there is nowhere to repeat a
+    /// flag from.
+    #[test]
+    fn guest_env_accepts_a_comma_separated_list() {
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--no-inherit-env",
+            "--guest-env",
+            "A=1,B=2",
+        ]);
+        let env = cli.env_policy().build().unwrap();
+        assert_eq!(
+            env,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string())
+            ]
+        );
     }
 
     #[test]
