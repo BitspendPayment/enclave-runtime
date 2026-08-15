@@ -18,9 +18,7 @@ pub struct State {
     /// The same clock the guest sees through `wasi:clocks`, so `set-times`
     /// with "now" agrees with it.
     clock: Arc<crate::clock::WallClockAdapter>,
-    #[cfg(feature = "serve")]
     http: wasmtime_wasi_http::WasiHttpCtx,
-    #[cfg(feature = "serve")]
     egress: crate::serve::EgressPolicy,
 }
 
@@ -31,9 +29,7 @@ impl State {
             table: ResourceTable::new(),
             fs,
             clock,
-            #[cfg(feature = "serve")]
             http: wasmtime_wasi_http::WasiHttpCtx::new(),
-            #[cfg(feature = "serve")]
             egress: crate::serve::EgressPolicy::Denied,
         }
     }
@@ -70,7 +66,6 @@ impl S3WasiView for State {
 /// same `ResourceTable` as everything else — a second table would hand the
 /// guest stream handles that look valid and resolve to nothing, the same trap
 /// documented on [`S3WasiView`].
-#[cfg(feature = "serve")]
 impl wasmtime_wasi_http::p2::WasiHttpView for State {
     fn http(&mut self) -> wasmtime_wasi_http::p2::WasiHttpCtxView<'_> {
         wasmtime_wasi_http::p2::WasiHttpCtxView {

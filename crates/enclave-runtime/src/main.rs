@@ -15,11 +15,15 @@
 //! in over vsock would leave a valid attestation proving something much
 //! weaker.
 //!
-//! What is *not* here yet: NSM attestation, KMS key release, and the vsock
-//! transport. The master secret still comes from configuration, which is a
-//! development seam — a key in an environment variable is visible to the
-//! parent instance, exactly the party an enclave exists to exclude. Replacing
-//! it is a new [`s3fs_host::MasterKeySource`] implementation and nothing else.
+//! Argument parsing over [`enclave_runtime`], which is the same crate: the
+//! library half is everything below this file, and lives beside it rather than
+//! inside it so integration tests can reach it.
+//!
+//! What is *not* here yet is KMS key release. The master secret still comes
+//! from configuration, which is a development seam — a key in an environment
+//! variable is visible to the parent instance, exactly the party an enclave
+//! exists to exclude. Replacing it is a new
+//! [`enclave_runtime::MasterKeySource`] implementation and nothing else.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -27,7 +31,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use s3fs_host::{
+use enclave_runtime::{
     open_clock, open_entropy, read_component, run_component, serve_component, AcmeConfig,
     ClockSource, GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, NetworkConfig,
     NetworkMode, RandomSource, ServeConfig, StaticKey, TlsIdentity, TlsMode, DEFAULT_GVFORWARDER,
@@ -127,11 +131,11 @@ struct Cli {
     session_token: Option<String>,
 
     /// Path-style addressing, required by MinIO and many S3-compatibles.
-    #[arg(long, env = "S3FS_FORCE_PATH_STYLE", value_parser = s3fs_host::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
+    #[arg(long, env = "S3FS_FORCE_PATH_STYLE", value_parser = enclave_runtime::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
     force_path_style: bool,
 
     /// Skip the `HeadBucket` startup probe.
-    #[arg(long, env = "S3FS_SKIP_BUCKET_PROBE", value_parser = s3fs_host::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
+    #[arg(long, env = "S3FS_SKIP_BUCKET_PROBE", value_parser = enclave_runtime::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
     skip_bucket_probe: bool,
 
     /// Give the guest nothing but what `--guest-env` names.
@@ -146,7 +150,7 @@ struct Cli {
     /// By default it inherits this process's environment minus anything under
     /// `AWS_` or `S3FS_`, which is where the credentials and this runtime's
     /// own configuration live.
-    #[arg(long, env = "S3FS_NO_INHERIT_ENV", value_parser = s3fs_host::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
+    #[arg(long, env = "S3FS_NO_INHERIT_ENV", value_parser = enclave_runtime::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
     no_inherit_env: bool,
 
     /// Extra variable for the guest, as `NAME` (inherit that one by name) or
@@ -289,7 +293,7 @@ struct Cli {
     /// On by default: an enclave nobody can verify is an enclave for nothing.
     /// Turning it off is for running the same image outside one, where the NSM
     /// is absent and startup would otherwise fail.
-    #[arg(long, env = "S3FS_ATTESTATION", value_parser = s3fs_host::parse_bool_flag,
+    #[arg(long, env = "S3FS_ATTESTATION", value_parser = enclave_runtime::parse_bool_flag,
           num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
     attestation: bool,
 
@@ -311,7 +315,7 @@ impl Cli {
             force_path_style: self.force_path_style,
             bucket_prefix: self.bucket_prefix.clone(),
             mount_path: self.mount_path.clone(),
-            fs_id: s3fs_host::parse_fs_id(&self.fs_id)?,
+            fs_id: enclave_runtime::parse_fs_id(&self.fs_id)?,
             min_root_seq: self.min_root_seq,
             skip_bucket_probe: self.skip_bucket_probe,
             request_timeout: Duration::from_secs(30),
@@ -358,7 +362,7 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
-async fn run() -> Result<s3fs_host::GuestOutcome> {
+async fn run() -> Result<enclave_runtime::GuestOutcome> {
     let cli = Cli::parse();
 
     let clock = open_clock(cli.clock_source, &cli.ptp_device)?;
@@ -367,13 +371,13 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
         clock_check(clock.as_ref())?;
         println!();
         entropy_check(entropy.as_ref())?;
-        return Ok(s3fs_host::GuestOutcome::Success);
+        return Ok(enclave_runtime::GuestOutcome::Success);
     }
 
     // Before anything that needs a socket. Mounting reaches S3, so a runtime
     // that mounted first would fail with an S3 error that says nothing about
     // the real cause.
-    let _network = s3fs_host::bring_up(&NetworkConfig {
+    let _network = enclave_runtime::bring_up(&NetworkConfig {
         mode: cli.network,
         gvforwarder: cli.gvforwarder.clone(),
         ..Default::default()
@@ -389,7 +393,7 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
     // Keeps the data backend and derived keys: the ACME cache seals its blobs
     // under the same master secret and writes them as plain objects, outside
     // the filesystem the guest can read.
-    let mounted = s3fs_host::mount_with_backend(&cli.mount_config()?, &keys).await?;
+    let mounted = enclave_runtime::mount_with_backend(&cli.mount_config()?, &keys).await?;
     let fs = mounted.fs.clone();
 
     // Read the guest before building the environment so a missing component —
@@ -413,7 +417,7 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
                 TlsMode::Off => (None, None),
                 TlsMode::SelfSigned => (Some(TlsIdentity::self_signed(&cli.tls_domains)?), None),
                 TlsMode::Acme => {
-                    let acme = s3fs_host::serve::acme::start(
+                    let acme = enclave_runtime::serve::acme::start(
                         &AcmeConfig {
                             domains: cli.tls_domains.clone(),
                             contacts: cli.acme_contacts.clone(),
@@ -449,7 +453,7 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
             .await?;
             // `serve_component` only returns on error; reaching here means the
             // accept loop stopped, which is not a guest exit.
-            Ok(s3fs_host::GuestOutcome::Failed)
+            Ok(enclave_runtime::GuestOutcome::Failed)
         }
     }
 }
@@ -460,7 +464,7 @@ async fn run() -> Result<s3fs_host::GuestOutcome> {
 /// disciplined by an external source and a host clock set by the hypervisor
 /// have no reason to agree, and how far apart they are is exactly what this
 /// feature exists to expose.
-fn clock_check(clock: &dyn s3fs_host::TrustedClock) -> Result<()> {
+fn clock_check(clock: &dyn enclave_runtime::TrustedClock) -> Result<()> {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     println!("clock source: {}", clock.describe());
@@ -528,7 +532,7 @@ fn init_tracing() {
 /// do catch the failure modes that actually occur: a stub that returns zeros, a
 /// buffer never written, a device answering the same block every time. That is
 /// exactly how an emulator or a misconfigured driver misbehaves.
-fn entropy_check(source: &dyn s3fs_host::Nsm) -> Result<()> {
+fn entropy_check(source: &dyn enclave_runtime::Nsm) -> Result<()> {
     use std::time::Instant;
 
     println!("entropy source: {}", source.describe());

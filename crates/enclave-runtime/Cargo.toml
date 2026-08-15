@@ -7,15 +7,92 @@ license.workspace = true
 repository.workspace = true
 description = "Runs a Wasm guest inside an AWS Nitro Enclave against a Merkle-anchored S3 filesystem"
 
+# Library plus binary. The library half was `s3fs-host` until it had exactly
+# one consumer; the binary half is argument parsing over it. They are one crate
+# because the split had stopped describing anything — `s3fs-host` had grown the
+# NSM, the vsock tap device and the attestation endpoints, none of which mean
+# anything outside an enclave.
+#
+# It stays a library rather than collapsing into `main.rs` because integration
+# tests cannot import a binary-only crate, and `tests/serve_tls.rs` is where
+# the certificate-binding property is actually checked.
+[lib]
+name = "enclave_runtime"
+path = "src/lib.rs"
+
 [[bin]]
 name = "enclave-runtime"
 path = "src/main.rs"
 
-[dependencies]
-s3fs-host = { path = "../s3fs-host", features = ["aws", "serve"] }
+# No features. There used to be `aws` and `serve`, so a host embedding only the
+# `wasi:filesystem` bindings could skip the AWS SDK and hyper. With one
+# consumer that always wants both, they bought nothing and cost
+# `--features aws,s3fs-host/serve` on every command. The layer that is
+# genuinely reusable is `s3fs-core`, which still has no wasmtime dependency at
+# all.
 
-clap    = { version = "4", features = ["derive", "env"] }
-tokio   = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
-anyhow  = { workspace = true }
-tracing = { workspace = true }
+[dependencies]
+s3fs-core = { path = "../s3fs-core", features = ["aws"] }
+nitro-nsm = { path = "../nitro-nsm" }
+nitro-attestation = { path = "../nitro-attestation" }
+
+# The host compiles components, so it needs cranelift on top of the runtime.
+wasmtime         = { version = "=44.0.0", features = ["component-model", "async", "runtime", "cranelift", "std"] }
+wasmtime-wasi    = { workspace = true }
+wasmtime-wasi-io = "=44.0.0"
+
+# `default-send-request` is deliberately OFF. With it on, `wasi:http`'s
+# outgoing-handler quietly gains a working implementation — a guest could make
+# arbitrary outbound requests, through a second rustls and its own root store,
+# neither of which anything here configures. With it off, `send_request`
+# becomes a trait method we are *required* to write, so refusing egress is a
+# visible decision rather than a feature flag nobody looked at. See
+# `serve::EgressPolicy`.
+wasmtime-wasi-http = { version = "=44.0.0", default-features = false, features = ["p2"] }
+hyper          = { version = "1", features = ["http1", "server"] }
+http           = "1"
+http-body-util = "0.1"
+
+# aws-lc-rs, not ring: it is already the crypto stack for the block store's
+# AEAD, signatures and key derivation, and a second one would mean two
+# implementations of the same primitives inside one attested image.
+rustls         = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs", "tls12"] }
+tokio-rustls   = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
+rcgen          = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# TLS-ALPN-01, so the challenge arrives on the port the parent already
+# forwards. `webpki-roots` is not optional in practice: reaching the ACME
+# directory means validating the CA's own TLS certificate, and the enclave
+# cannot borrow the parent's trust store — the parent is the party being
+# excluded.
+rustls-acme    = { version = "0.15", default-features = false, features = ["tokio", "aws-lc-rs", "tls12", "webpki-roots"] }
+# Sealing the ACME cache uses the same AES-256-GCM as the block store.
+aws-lc-rs      = { workspace = true }
+blake3         = { workspace = true }
+# rustls-acme drives issuance through a Stream.
+futures        = { workspace = true }
+base64         = "0.22"
+hex            = "0.4"
+
+# The PTP clock is read through the POSIX dynamic-clock mechanism. rustix is
+# already compiled into the tree via wasmtime, so this adds no build cost and
+# avoids a direct libc dependency.
+rustix      = { version = "1", features = ["time", "fs"] }
+# Pinned to whatever `wasmtime-wasi` accepts for `secure_random`, which is
+# cap-rand's re-export of rand 0.8 — not a version to guess at.
+cap-rand    = "3"
+getrandom   = "0.3"
+
+clap        = { version = "4", features = ["derive", "env"] }
+anyhow      = { workspace = true }
+async-trait = { workspace = true }
+bytes       = { workspace = true }
+tokio       = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "signal", "net", "io-util"] }
+tracing     = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+# Checking that a generated certificate really parses as X.509.
+x509-parser = "0.18"
+nitro-nsm = { path = "../nitro-nsm", features = ["testing"] }
+# Builds genuinely signed attestation documents for the TLS binding tests.
+nitro-attestation = { path = "../nitro-attestation", features = ["testing"] }

@@ -12,7 +12,7 @@ env:
 
 jobs:
   build:
-    name: build + test (default features)
+    name: build + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,22 +27,6 @@ jobs:
         run: cargo test --workspace --lib
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-
-  build-aws:
-    name: build + test (aws feature)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo build --features aws
-        run: cargo build --workspace --features s3fs-host/aws --all-targets
-      - name: cargo test --features aws (lib)
-        run: cargo test --workspace --features s3fs-host/aws --lib
-      - name: cargo clippy --features aws
-        run: cargo clippy --workspace --features s3fs-host/aws --all-targets -- -D warnings
 
   serve-http:
     name: Serving a wasi:http guest
@@ -63,16 +47,13 @@ jobs:
         working-directory: examples/guest-http
         run: cargo build --release --target wasm32-wasip2
 
-      - name: cargo clippy --features serve
-        run: cargo clippy --workspace --features s3fs-host/serve --all-targets -- -D warnings
-
       - name: serve integration tests
-        run: cargo test -p s3fs-host --features serve --test serve_guest -- --include-ignored
+        run: cargo test -p enclave-runtime --test serve_guest -- --include-ignored
 
       # The milestone's central claim: a client opens a real TLS connection and
       # checks that the attestation document binds the certificate it just saw.
       - name: TLS termination and the attestation binding
-        run: cargo test -p s3fs-host --features serve --test serve_tls -- --include-ignored
+        run: cargo test -p enclave-runtime --test serve_tls -- --include-ignored
 
       - name: build the verifier CLI
         run: cargo build -p nitro-attestation --features cli

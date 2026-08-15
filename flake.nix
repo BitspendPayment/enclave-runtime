@@ -78,10 +78,10 @@
         pname = "enclave-runtime";
         version = "0.1.0";
         src = workspaceSrc;
-        # No `--features`: the binary has none of its own. It gets `aws` and
-        # `serve` through its `s3fs-host` dependency declaration, which is
-        # where the deployment's shape is actually decided.
-        cargoExtraArgs = "--locked -p enclave-runtime";
+        # `--bin` so crane builds the binary rather than also the library's
+        # test targets. The crate has no features to select: it is one crate
+        # with one shape.
+        cargoExtraArgs = "--locked -p enclave-runtime --bin enclave-runtime";
         # The workspace has integration tests needing a built wasm guest and a
         # running MinIO. `nix flake check` runs the unit tests instead.
         doCheck = false;

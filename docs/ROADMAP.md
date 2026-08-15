@@ -163,13 +163,12 @@ Two things fold in naturally:
 ## M10 — The enclave runtime ✅
 
 Shipped. `enclave-runtime` mounts the store, loads a guest from a known path,
-and runs it; `s3fs-host` holds the `wasi:filesystem` implementation, the linker,
+and runs it. The library half of that crate holds the `wasi:filesystem` implementation, the linker,
 the guest-environment policy, and the run loop.
 
 ```
 crates/
   s3fs-core           engine
-  s3fs-host           wasi:filesystem + linker + env policy + serve loop
   nitro-nsm           /dev/nsm: entropy and attestation requests
   nitro-attestation   parse and verify documents; the nitro-attest client
   enclave-runtime     deployment target
@@ -190,7 +189,7 @@ reads the data rather than only to the runtime that loads it.
 Almost nothing structural, by design:
 
 - `StaticKey` becomes `KmsAttestedKey` — one more implementation of
-  `s3fs_host::MasterKeySource`, and `S3FS_MASTER_KEY` stops being read at all.
+  `enclave_runtime::MasterKeySource`, and `S3FS_MASTER_KEY` stops being read at all.
 - `AwsS3BackendConfig` gains the `http_client` field so the SDK can be pointed
   at the parent's vsock proxy, plus a credential refresh path.
 - `RootRecord::attestation` starts carrying the PCR digest, turning the anchor

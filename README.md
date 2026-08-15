@@ -15,20 +15,19 @@ Pre-1.0. The storage engine is complete; the enclave integration is not.
 KMS key release (M8), garbage collection (M9), and the `enclave-runtime` crate
 that runs a guest inside a Nitro Enclave (M10).
 
-Three workspace crates plus an example guest:
+Four workspace crates plus example guests:
 
 | Crate | Purpose |
 |---|---|
 | [`s3fs-core`](crates/s3fs-core/) | The engine. `Backend` trait with in-memory and AWS S3 backends; a copy-on-write block store (`store::*`) with encrypted blocks, an indirect-block tree, a dnode array, and the transaction-group commit protocol; POSIX semantics on top (`Fs`). **Zero wasmtime dependency** — usable from any host. |
-| [`s3fs-host`](crates/s3fs-host/) | `wasi:filesystem@0.2.x` over the engine, plus the linker, guest-environment policy, and run loop both binaries share. The AWS mount path is behind an `aws` feature, so the bindings stay usable over any `Backend`. |
 | [`nitro-nsm`](crates/nitro-nsm/) | `/dev/nsm`: entropy and attestation requests. Its own crate so it links into a small static binary for an enclave image. |
 | [`nitro-attestation`](crates/nitro-attestation/) | Parses and verifies attestation documents, and the `nitro-attest` client. Depends on nothing else here — a verifier has no `/dev/nsm` and is often not Linux. |
-| [`enclave-runtime`](crates/enclave-runtime/) | Deployment target, and the only binary that runs a guest. Configured by environment, guest loaded from a known path inside the enclave image. |
+| [`enclave-runtime`](crates/enclave-runtime/) | Everything above the engine: `wasi:filesystem@0.2.x`, the linker, the guest-environment policy, the vsock tap device, TLS termination and the attestation endpoints — plus the binary that ties them together. A library beside the binary so integration tests can reach it. |
 | [`examples/guest-smoke`](examples/guest-smoke/) | Minimal guest, no C toolchain needed. Exercises write / patch / rename / read_dir and the environment policy; run twice it proves durability. |
 | [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Needs wasi-sdk. |
 | [`examples/guest-fsdemo`](examples/guest-fsdemo/) | The original smaller SQLite demo. |
 
-**Test coverage:** 333 unit tests plus a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor). End-to-end SQLite-on-S3 demo works.
+**Test coverage:** 451 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), and two suites that serve a real component over TLS and check the attestation binding. There are no cargo features to select: `cargo test --workspace` runs everything.
 
 ## Quick start: run a Wasm guest against MinIO
 
@@ -103,7 +102,7 @@ opaque encrypted slabs, and the roots bucket holds the signed anchor chain.
                                  ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  wasmtime + wasmtime-wasi (io / cli / clocks / random / sockets) │
-│  + s3fs-host::wasi (filesystem only)                             │
+│  + enclave_runtime::wasi (filesystem only)                       │
 │       Descriptor / DirectoryEntryStream resources                │
 │       S3InputStream / S3OutputStream over wasi:io                │
 └────────────────────────────────┬─────────────────────────────────┘
@@ -433,7 +432,7 @@ enclave exists to exclude.
 It exports `wasi:http/incoming-handler` and receives a **parsed request**. It
 never sees a socket, a connection, a certificate or a TLS record. It cannot
 open one either: the linker grants no `wasi:sockets` permission, and
-`wasi:http/outgoing-handler` is wired to an [`EgressPolicy`](crates/s3fs-host/src/serve/mod.rs)
+`wasi:http/outgoing-handler` is wired to an [`EgressPolicy`](crates/enclave-runtime/src/serve/mod.rs)
 that refuses every request.
 
 That refusal is explicit rather than incidental. `wasmtime-wasi-http`'s

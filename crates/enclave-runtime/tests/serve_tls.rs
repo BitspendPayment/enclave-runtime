@@ -17,18 +17,18 @@
 //!
 //! ```console
 //! $ (cd examples/guest-http && cargo build --release --target wasm32-wasip2)
-//! $ cargo test -p s3fs-host --features serve --test serve_tls -- --include-ignored
+//! $ cargo test -p enclave-runtime --test serve_tls -- --include-ignored
 //! ```
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use enclave_runtime::{GuestEnvironment, HostClock, ServeConfig, TlsIdentity};
 use nitro_attestation::testing::TestChain;
 use nitro_attestation::{AttestationHashes, Expectations, Trust, VerifyOptions};
 use nitro_nsm::{AttestationRequest, Nsm};
 use s3fs_core::backend::memory::MemoryBackend;
 use s3fs_core::{Config, Fs, MasterSecret};
-use s3fs_host::{GuestEnvironment, HostClock, ServeConfig, TlsIdentity};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn component_path() -> PathBuf {
@@ -84,7 +84,7 @@ struct Harness {
     guest_bytes: Vec<u8>,
 }
 
-/// Start the real [`s3fs_host::serve_component`] on an ephemeral port.
+/// Start the real [`enclave_runtime::serve_component`] on an ephemeral port.
 async fn start() -> Harness {
     let backend = Arc::new(MemoryBackend::new());
     let fs = Fs::mount(
@@ -120,7 +120,7 @@ async fn start() -> Harness {
     let bytes = guest_bytes.clone();
     let nsm_for_server = nsm.clone();
     tokio::spawn(async move {
-        let _ = s3fs_host::serve_component(
+        let _ = enclave_runtime::serve_component(
             &bytes,
             guest,
             ServeConfig {

@@ -10,17 +10,17 @@
 //!
 //! ```console
 //! $ (cd examples/guest-http && cargo build --release --target wasm32-wasip2)
-//! $ cargo test -p s3fs-host --features serve --test serve_guest -- --ignored
+//! $ cargo test -p enclave-runtime --test serve_guest -- --ignored
 //! ```
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use enclave_runtime::{GuestEnvironment, HostClock, ServeHandle};
 use http_body_util::{BodyExt, Full};
 use s3fs_core::backend::memory::MemoryBackend;
 use s3fs_core::{Config, Fs, MasterSecret};
-use s3fs_host::{GuestEnvironment, HostClock, ServeHandle};
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
@@ -173,7 +173,7 @@ async fn a_traversing_path_is_refused() {
 /// linker the runtime uses rather than against the policy type in isolation.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_linker_denies_guest_egress() {
-    use s3fs_host::EgressPolicy;
+    use enclave_runtime::EgressPolicy;
     use wasmtime_wasi_http::p2::{types::OutgoingRequestConfig, WasiHttpHooks};
 
     let mut policy = EgressPolicy::Denied;

@@ -8,7 +8,7 @@
 
 wasmtime::component::bindgen!({
     path: "../../wit",
-    world: "s3fs-host",
+    world: "enclave-runtime",
     imports: { default: async | trappable },
     trappable_error_type: {
         "wasi:filesystem/types.error-code" => crate::wasi::error_map::S3WasiFsError,
