@@ -13,19 +13,27 @@
 //! | Forge a root | Ed25519 signature over the whole record, verified against the key we derived — not the key the record names |
 //! | Alter data under a valid root | The signed `meta_dnode` pointer's BLAKE3 checksum |
 //! | Replay an old root at its own key | `seq` is checked against the key it was read from, and against an in-session floor |
-//! | Delete a root to hide history | Object Lock COMPLIANCE: undeletable by every principal, including the account root |
+//! | Destroy a root to erase history | Object Lock COMPLIANCE: the version is undeletable by every principal, including the account root |
+//! | Hide a root behind a delete marker | Tip discovery and loading read the *retained* version, so a marker changes nothing |
 //! | Splice two histories together | `prev_root_hash`, which the signature covers |
 //! | Two writers racing | `If-None-Match: *`, so exactly one wins `seq + 1` |
 //!
 //! ## The residual risk
 //!
 //! A cold mount cannot distinguish "the tip is N" from "the tip is N, and the
-//! store is hiding N+1". Object Lock means roots past N cannot be *deleted*,
-//! so hiding them requires S3 itself to lie about `HEAD` — but nothing here
-//! excludes that cryptographically. Closing it needs an anchor outside S3 (a
-//! conditional counter in another service, or a floor supplied through the
-//! enclave's KMS encryption context, which [`RootStore::mount`] accepts as
-//! `min_seq`).
+//! store is hiding N+1". Closing it needs an anchor outside S3 (a conditional
+//! counter in another service, or a floor supplied through the enclave's KMS
+//! encryption context, which [`RootStore::mount`] accepts as `min_seq`).
+//!
+//! What *used* to make this reachable through a legal API call has been closed.
+//! Object Lock protects a version, not the name it lives under: a
+//! `DeleteObject` with no version id writes a delete marker, and `HEAD` and
+//! `GetObject` then report the tip missing while it sits underneath,
+//! undeletable. So hiding N+1 needed no lie from S3 at all — just a delete
+//! nobody was allowed to refuse. [`RootStore::exists`] and [`RootStore::load`]
+//! now read the retained version, which a marker cannot conceal. Hiding a root
+//! now requires S3 itself to lie, which is where this paragraph always assumed
+//! the bar was.
 //!
 //! There was a second and worse version of this, now closed. A cold mount also
 //! could not distinguish "this filesystem is new" from "everything has been
@@ -260,8 +268,26 @@ impl RootStore {
         self.expected_seq.load(Ordering::SeqCst)
     }
 
+    /// Is there a record at this sequence?
+    ///
+    /// Asks for the *retained* version rather than `HEAD`-ing the current one.
+    /// A `DeleteObject` without a version id writes a delete marker that hides
+    /// an Object-Locked record from `HEAD` and `GetObject` while leaving it
+    /// undeletable underneath — so a `HEAD` here would let a host roll the
+    /// chain back by hiding its tip, using nothing but a legal S3 call.
+    ///
+    /// Costs a `ListObjectVersions` per probe, on a binary search that runs
+    /// once per mount. Not the commit path.
+    ///
+    /// If the enclave's role lacks `s3:ListBucketVersions` this errors rather
+    /// than answering `false`, so a missing permission is a refusal to mount
+    /// and not a silent rollback.
     async fn exists(&self, seq: u64) -> FsResult<bool> {
-        match self.backend.head_blob(&self.config.root_key(seq)).await {
+        match self
+            .backend
+            .get_retained_blob(&self.config.root_key(seq))
+            .await
+        {
             Ok(_) => Ok(true),
             Err(FsError::NotFound) => Ok(false),
             Err(e) => Err(e),
@@ -269,10 +295,13 @@ impl RootStore {
     }
 
     /// Fetch and verify the record at `seq`.
+    ///
+    /// The retained version, for the reason [`RootStore::exists`] gives: a
+    /// record that has been hidden behind a delete marker is still the record.
     pub async fn load(&self, seq: u64) -> FsResult<RootRecord> {
         let got = self
             .backend
-            .get_blob(&self.config.root_key(seq), None)
+            .get_retained_blob(&self.config.root_key(seq))
             .await?;
         let record = RootRecord::decode_and_verify(&got.body, &self.keys, seq)?;
         let floor = self.expected_seq();
@@ -347,7 +376,7 @@ impl RootStore {
     async fn verify_at(&self, seq: u64) -> FsResult<RootRecord> {
         let got = self
             .backend
-            .get_blob(&self.config.root_key(seq), None)
+            .get_retained_blob(&self.config.root_key(seq))
             .await?;
         RootRecord::decode_and_verify(&got.body, &self.keys, seq)
     }
@@ -665,24 +694,32 @@ mod tests {
         assert_eq!(rs.load(0).await.unwrap(), first);
     }
 
+    /// Retention makes a record impossible to *destroy*, not impossible to
+    /// hide: a `DeleteObject` without a version id succeeds and writes a delete
+    /// marker over it. What matters is that the store looks past one.
     #[tokio::test]
-    async fn a_published_root_cannot_be_deleted_or_overwritten() {
+    async fn a_published_root_can_be_hidden_but_still_loads() {
         let (backend, keys, rs) = setup();
         let r = seal(&keys, 0, None);
         rs.publish(&r).await.unwrap();
 
         let key = rs.config.root_key(0);
-        assert!(matches!(
-            backend.delete_blob(&key).await,
-            Err(FsError::AccessDenied)
-        ));
+        backend
+            .delete_blob(&key)
+            .await
+            .expect("S3 permits a delete marker over a retained version");
+        assert!(
+            matches!(backend.get_blob(&key, None).await, Err(FsError::NotFound)),
+            "the marker hides it from an ordinary read"
+        );
+
         assert!(matches!(
             backend
                 .put_blob(PutBlobInput::new(key, Bytes::from_static(b"forged")))
                 .await,
             Err(FsError::AccessDenied)
         ));
-        assert_eq!(rs.load(0).await.unwrap(), r);
+        assert_eq!(rs.load(0).await.unwrap(), r, "and the store still finds it");
     }
 
     // ---- tip discovery -----------------------------------------------------

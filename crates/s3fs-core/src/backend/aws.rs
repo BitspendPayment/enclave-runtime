@@ -246,6 +246,74 @@ impl Backend for AwsS3Backend {
         })
     }
 
+    async fn get_retained_blob(&self, key: &str) -> FsResult<GetBlobOutput> {
+        // `ListObjectVersions` still reports a version that a delete marker is
+        // hiding, so this is what tells "never written" from "hidden". The
+        // prefix is not an exact match, hence the `Key == key` filter.
+        let listed = self
+            .client
+            .list_object_versions()
+            .bucket(&self.bucket)
+            .prefix(key)
+            .send()
+            .await
+            .map_err(|e| map_sdk_error("ListObjectVersions", e))?;
+
+        // Oldest first: `last_modified` ascending, so the version the
+        // conditional PUT created wins over anything layered on later.
+        let mut versions: Vec<_> = listed
+            .versions
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|v| v.key.as_deref() == Some(key))
+            .collect();
+        versions.sort_by_key(|v| v.last_modified.map(|d| d.as_nanos()).unwrap_or(i128::MIN));
+
+        let version_id = versions
+            .into_iter()
+            .find_map(|v| v.version_id)
+            .ok_or(FsError::NotFound)?;
+
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .map_err(|e| map_sdk_error("GetObject(versionId)", e))?;
+
+        let e_tag = resp.e_tag.clone().unwrap_or_default();
+        let last_modified = resp
+            .last_modified
+            .as_ref()
+            .map(dt_to_systemtime)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let content_type = resp.content_type.clone();
+        let metadata = resp.metadata.clone().unwrap_or_default();
+        let body = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| FsError::Io(format!("GetObject(versionId) body: {e}")))?
+            .into_bytes();
+        let size = body.len() as u64;
+
+        Ok(GetBlobOutput {
+            meta: BlobMeta {
+                key: key.to_string(),
+                e_tag,
+                size,
+                last_modified,
+                content_type,
+                metadata,
+                is_dir_marker: key.ends_with('/'),
+            },
+            body,
+        })
+    }
+
     async fn put_blob(&self, input: PutBlobInput) -> FsResult<BlobMeta> {
         let key = input.key.clone();
         let body = ByteStream::from(input.body.to_vec());

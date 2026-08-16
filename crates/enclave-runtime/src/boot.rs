@@ -208,9 +208,24 @@ pub struct BootConfig {
     pub trust: ReceiptTrust,
 }
 
-/// Read an object, distinguishing "absent" from "could not read".
+/// Read an origin record, distinguishing "absent" from "could not read" — and
+/// both of those from "hidden".
+///
+/// [`Backend::get_retained_blob`] rather than `get_blob`, because this is the
+/// one place in the system where **absence is a decision**. Object Lock makes
+/// these records indestructible but not unhideable: a `DeleteObject` without a
+/// version id writes a delete marker, an ordinary `GetObject` then answers
+/// `NoSuchKey`, and a conditional PUT over the marker succeeds because the
+/// current version is no longer an object. Hide the receipt and the sealed key
+/// together and this function would report `(None, None)` — genesis — and the
+/// enclave would create a second filesystem beside the one it was hiding,
+/// with every signature along the way valid.
+///
+/// Every other record here is content-verified, so hiding is the only attack
+/// that has no signature to fail. Reading the retained version is what makes it
+/// fail instead.
 async fn maybe_get(backend: &Arc<dyn Backend>, key: &str) -> Result<Option<Vec<u8>>> {
-    match backend.get_blob(key, None).await {
+    match backend.get_retained_blob(key).await {
         Ok(out) => Ok(Some(out.body.to_vec())),
         Err(FsError::NotFound) => Ok(None),
         Err(e) => Err(anyhow::Error::msg(e.to_string())).with_context(|| format!("reading {key}")),
@@ -455,7 +470,11 @@ async fn genesis(
         .put_blob_if_not_exists(locked(&key_object, sealed.as_bytes().to_vec(), config))
         .await
         .map_err(|e| match e {
-            FsError::Conflict => anyhow::anyhow!(
+            // `AlreadyExists`, not `Conflict`: that is what both backends
+            // return from a failed conditional PUT (`backend/mod.rs`), and
+            // matching `Conflict` here meant this arm never fired — a genesis
+            // race reported the generic message instead of the specific one.
+            FsError::AlreadyExists => anyhow::anyhow!(
                 "another enclave is performing genesis on this filesystem right now"
             ),
             other => anyhow::anyhow!("storing the sealed master key: {other}"),

@@ -957,8 +957,12 @@ mod tests {
     }
 
     /// The end-to-end rollback story: an adversary who can write to the bucket
-    /// cannot make a mount accept an older state, because the newer roots
-    /// cannot be deleted and the sequence is checked against the key.
+    /// cannot make a mount accept an older state.
+    ///
+    /// Not because the newer root cannot be deleted — it can be *hidden*, and
+    /// this test does exactly that — but because a hidden version is still a
+    /// version, and tip discovery reads the retained one. The sequence is
+    /// checked against the key on top of that.
     #[tokio::test]
     async fn an_adversary_cannot_rewind_the_filesystem() {
         let h = Harness::new();
@@ -975,11 +979,20 @@ mod tests {
             .unwrap();
         drop(store);
 
-        // Try to delete the newest root: Object Lock refuses.
-        assert!(matches!(
-            h.roots.delete_blob(&h.config.root_key(2)).await,
-            Err(FsError::AccessDenied)
-        ));
+        // Hide the newest root. S3 allows this: the delete marker goes on top
+        // and the retained version stays underneath, undeletable.
+        h.roots
+            .delete_blob(&h.config.root_key(2))
+            .await
+            .expect("a delete marker is a legal write");
+        assert!(
+            matches!(
+                h.roots.get_blob(&h.config.root_key(2), None).await,
+                Err(FsError::NotFound)
+            ),
+            "an ordinary read now reports the tip missing — which is the whole \
+             attack, and why tip discovery must not use one"
+        );
 
         // Try to replay the older root over the newer key: also refused, and
         // even if it landed, its `seq` would not match the key.

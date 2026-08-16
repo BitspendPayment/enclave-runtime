@@ -226,6 +226,28 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
 
     async fn get_blob(&self, key: &str, range: Option<Range<u64>>) -> FsResult<GetBlobOutput>;
 
+    /// Read the **retained** version of an object, seeing past a delete marker.
+    ///
+    /// Object Lock protects a *version*. It does not stop a `DeleteObject`
+    /// without a version id, which inserts a delete marker: `GetObject` then
+    /// answers `NoSuchKey` while the retained version sits underneath,
+    /// genuinely undeletable. Confirmed against MinIO — the delete returns
+    /// `{"DeleteMarker": true}` and succeeds, and deleting the version itself
+    /// fails with *"Object is WORM protected"*.
+    ///
+    /// That gap matters wherever **absence carries meaning**. A substituted
+    /// object is caught by a signature; a hidden one has no signature to check,
+    /// so "nobody ever wrote this" and "somebody hid it" become the same
+    /// answer — and for the boot machine the first authorises creating a new
+    /// filesystem. This method is how they stay distinguishable.
+    ///
+    /// Returns the **oldest** non-marker version: the one the conditional PUT
+    /// created and retention pinned. Anything newer was written by someone not
+    /// using a conditional PUT, which is to say not by us.
+    ///
+    /// Needs `s3:ListBucketVersions` in addition to `s3:GetObject`.
+    async fn get_retained_blob(&self, key: &str) -> FsResult<GetBlobOutput>;
+
     async fn put_blob(&self, input: PutBlobInput) -> FsResult<BlobMeta>;
 
     /// Atomic create. Returns [`crate::errors::FsError::AlreadyExists`] if the

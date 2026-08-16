@@ -208,29 +208,92 @@ async fn a_second_boot_resumes_the_same_state() {
     );
 }
 
-/// Object Lock is the reason the two refusals below are hard to reach: a host
-/// that wants to hide state cannot delete it. Worth asserting, because the
-/// whole "a 404 means there is no filesystem" argument rests on it.
+/// **The delete marker.** Object Lock protects a *version*; it does not stop a
+/// `DeleteObject` without a version id, which writes a marker that hides the
+/// object from every ordinary read while the bytes stay undeletable underneath.
+///
+/// That gap is only dangerous here, where absence is what authorises genesis:
+/// hide the receipt *and* the sealed key and the naive reading is
+/// `(None, None)` — create a filesystem — while the real one sits in the same
+/// bucket. The enclave reads the retained version instead, so the records are
+/// still found and the boot still resumes.
 #[tokio::test]
-async fn the_origin_records_cannot_be_deleted() {
+async fn hiding_the_origin_records_behind_a_delete_marker_does_not_work() {
+    let store = Store::new();
+    let nsm: Arc<dyn Nsm> = TestNsm::with_pcr0(0xaa);
+    let first = boot(&store, &nsm).await.expect("genesis");
+
+    let receipt = format!("origin/{}.receipt", hex::encode([3u8; 16]));
+    let sealed = format!("origin/{}.key", hex::encode([3u8; 16]));
+
+    // Both succeed, as S3 does. Refusing would be the comfortable answer and
+    // is not the true one.
+    store
+        .roots
+        .delete_blob(&receipt)
+        .await
+        .expect("S3 allows a delete marker");
+    store
+        .roots
+        .delete_blob(&sealed)
+        .await
+        .expect("S3 allows a delete marker");
+
+    // Gone, as far as an ordinary read can tell.
+    assert!(store.roots.get_blob(&receipt, None).await.is_err());
+    assert!(store.roots.get_blob(&sealed, None).await.is_err());
+
+    // And the enclave resumes the filesystem it already had, rather than
+    // starting a second one beside it.
+    let second = boot(&store, &nsm)
+        .await
+        .expect("the records are still there");
+    assert_eq!(second.mode, BootMode::Resume);
+    assert_eq!(
+        second.state_root, first.state_root,
+        "a hidden origin must not become a new one"
+    );
+}
+
+/// The same attack against a store that reads the *current* version, to show
+/// the test above is not passing for an unrelated reason. This is what the
+/// enclave used to do, and it ends in a second filesystem.
+#[tokio::test]
+async fn reading_the_current_version_is_what_made_hiding_work() {
     let store = Store::new();
     let nsm: Arc<dyn Nsm> = TestNsm::with_pcr0(0xaa);
     boot(&store, &nsm).await.expect("genesis");
 
     let receipt = format!("origin/{}.receipt", hex::encode([3u8; 16]));
-    let sealed = format!("origin/{}.key", hex::encode([3u8; 16]));
+    store.roots.delete_blob(&receipt).await.unwrap();
 
+    // What `get_blob` — the old read — would have reported.
     assert!(
-        store.roots.delete_blob(&receipt).await.is_err(),
-        "COMPLIANCE retention must refuse to delete the receipt"
+        store.roots.get_blob(&receipt, None).await.is_err(),
+        "the marker hides it"
     );
+    // What the conditional PUT would then have allowed: the genesis lease is
+    // free again, so a second enclave could take it.
+    let retaken = store
+        .roots
+        .put_blob_if_not_exists(s3fs_core::backend::PutBlobInput::new(
+            receipt.clone(),
+            bytes::Bytes::from_static(b"a forged origin"),
+        ))
+        .await;
     assert!(
-        store.roots.delete_blob(&sealed).await.is_err(),
-        "COMPLIANCE retention must refuse to delete the sealed key"
+        retaken.is_ok(),
+        "the lease is retakeable over a marker — this is why absence must be \
+         read from the retained version, not the current one"
     );
 
-    // And the enclave still resumes, because nothing was removed.
-    assert_eq!(boot(&store, &nsm).await.unwrap().mode, BootMode::Resume);
+    // And the retained version is still the real one underneath.
+    let retained = store.roots.get_retained_blob(&receipt).await.unwrap();
+    assert_ne!(
+        retained.body.as_ref(),
+        b"a forged origin",
+        "Object Lock kept the original version"
+    );
 }
 
 /// **The state substitution.** A receipt with no filesystem under it: either
@@ -238,8 +301,8 @@ async fn the_origin_records_cannot_be_deleted() {
 /// describes. Either way there is nothing here this enclave may serve, and the
 /// old code would have made a fresh empty filesystem instead.
 ///
-/// Written directly rather than by deleting, because deleting is what the test
-/// above shows cannot happen — this is the shape, not the route to it.
+/// Written directly rather than by hiding, because the test above shows hiding
+/// no longer produces this state — this is the shape, not the route to it.
 #[tokio::test]
 async fn a_receipt_without_a_filesystem_is_refused() {
     let store = Store::new();

@@ -261,9 +261,19 @@ async fn multipart_lifecycle_with_upload_part_copy() {
 
 // ---------- Object Lock ----------
 
+/// What Object Lock COMPLIANCE actually buys, against a real S3 implementation.
+///
+/// It buys indestructibility, not invisibility. `DeleteObject` without a
+/// version id **succeeds** and writes a delete marker; an ordinary `GetObject`
+/// then answers `NoSuchKey`. The version underneath cannot be removed — that
+/// fails with *"Object is WORM protected"* — and
+/// [`Backend::get_retained_blob`] is how the engine reaches it.
+///
+/// This test used to assert the delete was refused. It was wrong, and it is
+/// where the whole delete-marker problem was found.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker; run with --features aws -- --ignored"]
-async fn object_lock_makes_a_root_record_undeletable() {
+async fn a_retained_root_can_be_hidden_but_not_destroyed() {
     let (_c, data) = fresh_minio_with_bucket("data-lock").await;
     let roots = extra_bucket(&data, "roots-lock", true).await;
 
@@ -278,18 +288,52 @@ async fn object_lock_makes_a_root_record_undeletable() {
         .with_object_lock(lock);
     roots.put_blob_if_not_exists(input).await.unwrap();
 
-    // The rollback guarantee, checked against a real S3 implementation rather
-    // than the in-memory fake: neither delete nor overwrite is permitted.
-    let err = roots.delete_blob("roots/0000000000000000").await;
-    assert!(err.is_err(), "a retained root must not be deletable");
+    // S3 permits this. Asserting otherwise is how the fake came to be stronger
+    // than the thing it stands for.
+    roots
+        .delete_blob("roots/0000000000000000")
+        .await
+        .expect("a delete marker is a legal write");
 
+    // Hidden from the ordinary read the engine used to use...
+    assert!(
+        matches!(
+            roots.get_blob("roots/0000000000000000", None).await,
+            Err(FsError::NotFound)
+        ),
+        "a delete marker must hide the current version"
+    );
+
+    // ...and still there, which is the guarantee that survives.
     assert_eq!(
         roots
-            .get_blob("roots/0000000000000000", None)
+            .get_retained_blob("roots/0000000000000000")
+            .await
+            .expect("the retained version is reachable past the marker")
+            .body,
+        Bytes::from_static(b"anchor")
+    );
+
+    // Why hiding is dangerous where absence carries meaning: the conditional
+    // PUT that serves as "am I the first here?" is satisfied again.
+    roots
+        .put_blob_if_not_exists(PutBlobInput::new(
+            "roots/0000000000000000",
+            Bytes::from_static(b"forged"),
+        ))
+        .await
+        .expect("If-None-Match is satisfied by a delete marker");
+
+    // But the pinned version is untouched underneath, so reading the retained
+    // version still gets the real one.
+    assert_eq!(
+        roots
+            .get_retained_blob("roots/0000000000000000")
             .await
             .unwrap()
             .body,
-        Bytes::from_static(b"anchor")
+        Bytes::from_static(b"anchor"),
+        "the retained version must outrank anything written over the marker"
     );
 }
 

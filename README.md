@@ -31,7 +31,7 @@ Four workspace crates plus example guests:
 | [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Needs wasi-sdk. |
 | [`examples/guest-fsdemo`](examples/guest-fsdemo/) | The original smaller SQLite demo. |
 
-**Test coverage:** 499 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the attestation binding. There are no cargo features to select: `cargo test --workspace` runs everything; 23 of those tests skip themselves without MinIO or enclave hardware.
+**Test coverage:** 501 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the attestation binding. There are no cargo features to select: `cargo test --workspace` runs everything; 23 of those tests skip themselves without MinIO or enclave hardware.
 
 ## Quick start: run a Wasm guest against MinIO
 
@@ -452,8 +452,9 @@ The receipt is self-authenticating, so the host cannot forge one — but "no
 receipt" is what authorises genesis, so the absence has to be as trustworthy as
 the presence. None of these is sufficient alone:
 
-- **Object Lock COMPLIANCE** — nobody, including the account root, can delete
-  the receipt once written.
+- **Object Lock COMPLIANCE** — nobody, including the account root, can destroy
+  the receipt once written. It can be *hidden*, which took some closing: see
+  below.
 - **Attested bucket identity** — the bucket names live in the image, so PCR0
   covers them. Without this the host points the enclave at an empty bucket and
   everything else passes. This is why
@@ -464,6 +465,46 @@ the presence. None of these is sufficient alone:
 
 Still out of scope, unchanged: S3 lying about `HEAD`. That is AWS, whom we
 already trust for the signature on the receipt itself.
+
+#### A delete marker hides what it cannot destroy
+
+Object Lock COMPLIANCE protects a *version*. It does not stop a `DeleteObject`
+without a `versionId`, which inserts a **delete marker** — and a plain
+`GetObject` then answers `NoSuchKey` while the retained version sits underneath,
+genuinely undeletable. Verified against MinIO:
+
+```console
+$ aws s3api delete-object --bucket lockprobe --key roots/0
+{ "DeleteMarker": true, "VersionId": "71eff5c3-…" }        # succeeds
+$ aws s3api get-object --bucket lockprobe --key roots/0 -
+NoSuchKey: The specified key does not exist.               # invisible
+$ aws s3api delete-object --bucket lockprobe --key roots/0 --version-id afc3c2fd-…
+InvalidRequest: Object is WORM protected and cannot be overwritten
+```
+
+For the boot machine, hidden is as good as deleted: mark both the receipt and
+the sealed key and the enclave sees `(None, None)`, takes the genesis path, and
+creates a fresh filesystem — precisely the substitution the receipt exists to
+refuse. `RootStore::find_tip` has the same exposure, since it discovers the tip
+by probing for keys.
+
+Worse, a hidden key accepts a conditional create: `If-None-Match: *` tests the
+*current* version, and a delete marker is a current version that is not an
+object — so the PUT that serves as "am I the first here?" answers yes.
+
+**Closed.** `Backend::get_retained_blob` finds the version through
+`ListObjectVersions` and reads it by `versionId`, which a marker cannot conceal
+because the version cannot be removed. The boot machine reads its origin records
+that way, and so do `RootStore::exists` and `RootStore::load` — which also
+closes the *rollback* half, since hiding the tip was the same trick. If the
+enclave's role lacks `s3:ListBucketVersions`, the read errors rather than
+answering "absent", so a missing permission refuses the mount instead of
+silently starting over.
+
+This was found because `object_lock_makes_a_root_record_undeletable` in the
+MinIO suite was failing. It was asserting the comfortable claim; the fake
+backend asserted it too, and modelled "a non-versioned bucket", which is
+something S3 will not let you have with Object Lock at all.
 
 ### The master secret belongs to the state
 

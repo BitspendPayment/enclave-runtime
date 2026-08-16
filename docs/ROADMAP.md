@@ -79,6 +79,16 @@ of this problem in the codebase. And attestation should eventually cover *which*
 clock was in use, so a relying party can tell a PTP-backed enclave from one that
 fell back to host time.
 
+**3c. Read past delete markers — done.** Object Lock protects a *version*, not
+the name it lives under: a `DeleteObject` with no version id writes a delete
+marker, and `HEAD`/`GetObject` then report an Object-Locked record missing while
+it sits underneath, undeletable. That made "hide the tip" a legal S3 call rather
+than a lie from S3, and made a hidden state-origin receipt indistinguishable from
+none — which authorises genesis. [`Backend::get_retained_blob`](../crates/s3fs-core/src/backend/mod.rs)
+reads the version through `ListObjectVersions`; the boot machine and
+`RootStore::exists`/`load` use it. Needs `s3:ListBucketVersions` on the enclave's
+role, and errors rather than answering "absent" without it.
+
 **4. Bind the attestation into the anchor.** *Partly done, differently.*
 `enclave_runtime::boot` writes a state-origin receipt at genesis — an NSM
 attestation committing to the filesystem's identity — and every later boot
