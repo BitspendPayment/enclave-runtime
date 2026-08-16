@@ -40,16 +40,18 @@ fn body(bytes: &[u8]) -> HyperOutgoingBody {
 async fn handle_for(env: &[(String, String)]) -> ServeHandle {
     let backend = Arc::new(MemoryBackend::new());
     let master = MasterSecret::from_bytes([7u8; 32]);
-    let fs = Fs::mount(
+    // `create`, not `mount`: mounting stopped formatting an empty store when
+    // the boot machine landed, because a store that answers "nothing" is now a
+    // refusal rather than an invitation to make a fresh filesystem.
+    let fs = Fs::create(
         backend.clone(),
         backend,
         &master,
         [0u8; 16],
         Arc::new(Config::default()),
-        None,
     )
     .await
-    .expect("mounting the memory-backed filesystem");
+    .expect("creating the memory-backed filesystem");
 
     let guest = GuestEnvironment::new(
         fs,

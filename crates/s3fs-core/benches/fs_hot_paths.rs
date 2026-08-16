@@ -30,16 +30,15 @@ async fn fresh_fs(record_size: usize) -> Arc<Fs> {
         .record_size(record_size)
         .root_retention(None)
         .build();
-    Fs::mount(
+    Fs::create(
         Arc::new(MemoryBackend::new()) as Arc<dyn Backend>,
         Arc::new(MemoryBackend::new()) as Arc<dyn Backend>,
         &MasterSecret::from_bytes([1u8; 32]),
         [0u8; 16],
         Arc::new(config),
-        None,
     )
     .await
-    .expect("mount")
+    .expect("creating the filesystem")
 }
 
 /// Write and commit a whole file: the full path through encryption, the

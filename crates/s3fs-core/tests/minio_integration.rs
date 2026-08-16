@@ -307,17 +307,33 @@ fn engine_config() -> Config {
         .build()
 }
 
+/// Create on first use, mount thereafter — several tests here remount a bucket
+/// to prove the state survived, and `Fs::mount` no longer formats an empty
+/// store, so wanting a filesystem has to be said out loud.
 async fn mount(data: &AwsS3Backend, roots: &AwsS3Backend) -> Arc<Fs> {
-    Fs::mount(
-        Arc::new(data.clone()) as Arc<dyn Backend>,
-        Arc::new(roots.clone()) as Arc<dyn Backend>,
+    let data = Arc::new(data.clone()) as Arc<dyn Backend>;
+    let roots = Arc::new(roots.clone()) as Arc<dyn Backend>;
+    match Fs::mount(
+        data.clone(),
+        roots.clone(),
         &MasterSecret::from_bytes(TEST_MASTER),
         TEST_FS_ID,
         Arc::new(engine_config()),
         None,
     )
     .await
-    .expect("mount")
+    {
+        Err(s3fs_core::FsError::NoFilesystem) => Fs::create(
+            data,
+            roots,
+            &MasterSecret::from_bytes(TEST_MASTER),
+            TEST_FS_ID,
+            Arc::new(engine_config()),
+        )
+        .await
+        .expect("create"),
+        other => other.expect("mount"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

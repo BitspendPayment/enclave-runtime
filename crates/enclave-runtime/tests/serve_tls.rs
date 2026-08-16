@@ -102,16 +102,17 @@ struct Harness {
 /// Start the real [`enclave_runtime::serve_component`] on an ephemeral port.
 async fn start() -> Harness {
     let backend = Arc::new(MemoryBackend::new());
-    let fs = Fs::mount(
+    // `create`, not `mount`: an empty store is a refusal since the boot
+    // machine landed, not an invitation to format one.
+    let fs = Fs::create(
         backend.clone(),
         backend,
         &MasterSecret::from_bytes([9u8; 32]),
         [0u8; 16],
         Arc::new(Config::default()),
-        None,
     )
     .await
-    .expect("mount");
+    .expect("creating the filesystem");
 
     let nsm = Arc::new(SigningNsm::new());
     let guest_bytes = std::fs::read(component_path()).unwrap_or_else(|e| {
