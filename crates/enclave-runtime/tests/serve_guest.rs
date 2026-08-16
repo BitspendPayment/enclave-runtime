@@ -70,7 +70,7 @@ async fn handle_for(env: &[(String, String)]) -> ServeHandle {
         )
     });
 
-    let engine = wasmtime::Engine::new(&wasmtime::Config::new()).expect("engine");
+    let engine = ServeHandle::engine_with_watchdog().expect("engine");
     ServeHandle::new(&engine, &bytes, guest, 1).expect("preparing the guest")
 }
 
@@ -193,4 +193,51 @@ async fn the_linker_denies_guest_egress() {
         panic!("egress must be refused");
     };
     assert!(format!("{err:?}").contains("HttpRequestDenied"), "{err:?}");
+}
+
+/// A guest that never returns and never answers.
+///
+/// Without a watchdog this is not a slow request, it is a permanent one: the
+/// `oneshot::Sender` lives in the `Store`, the `Store` was moved into the
+/// spawned task, so `receiver.await` can never resolve, the concurrency permit
+/// is never released, and at the default of one request in flight the server
+/// is finished for the life of the process.
+///
+/// The assertions are ordered accordingly — the second one is the point. The
+/// first only shows the request gave up; the second shows the *server* did not.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn a_hung_guest_does_not_wedge_the_server() {
+    let handle = handle_for(&[])
+        .await
+        .with_timeout(std::time::Duration::from_secs(3));
+
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri("http://enclave.test/hang")
+        .body(body(b""))
+        .expect("well-formed request");
+
+    // Belt and braces: if the watchdog regresses this fails rather than hanging
+    // the whole suite, which is what it would do otherwise.
+    let hung = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        handle.handle(Scheme::Http, req),
+    )
+    .await
+    .expect("the watchdog did not fire; the request hung");
+
+    // Either mechanism is a correct outcome and which one fires depends on
+    // where the guest is stuck: spinning wasm is trapped by the epoch, a guest
+    // parked in a host call is abandoned by the timeout. Asserting on one would
+    // make this a test of the message rather than of the guarantee.
+    hung.expect_err("a guest that never answers must not succeed");
+
+    // The permit was released and the guest instance is gone, so the next
+    // request is served normally. This is the assertion that matters.
+    let (status, body) = get(&handle, "/").await;
+    assert_eq!(
+        status, 200,
+        "the server was wedged by the hung request: {body}"
+    );
 }

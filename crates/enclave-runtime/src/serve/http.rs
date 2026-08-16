@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use hyper::server::conn::http1;
@@ -41,6 +42,12 @@ pub struct ServeConfig {
     /// without TLS is refused rather than silently serving documents that
     /// promise a binding they do not have.
     pub attestation: Option<Arc<dyn Nsm>>,
+    /// How long a guest may take to produce a response head.
+    ///
+    /// A guest that neither returns nor sets a response otherwise hangs the
+    /// request forever, and at `concurrency: 1` that is the whole server. See
+    /// [`EPOCH_TICK`].
+    pub request_timeout: Duration,
 }
 
 impl Default for ServeConfig {
@@ -64,9 +71,21 @@ impl Default for ServeConfig {
             tls: None,
             acme: None,
             attestation: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 }
+
+/// How often the epoch advances, and therefore the resolution of the deadline
+/// a spinning guest is trapped by.
+///
+/// Coarse on purpose: the ticker wakes on every interval for the life of the
+/// process, and the deadline only needs to be accurate to a fraction of the
+/// request timeout.
+const EPOCH_TICK: Duration = Duration::from_millis(250);
+
+/// Default ceiling on producing a response head.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A compiled guest plus the environment its instances are built from.
 ///
@@ -78,9 +97,40 @@ pub struct ServeHandle {
     pre: ProxyPre<State>,
     guest: Arc<GuestEnvironment>,
     limit: Arc<Semaphore>,
+    /// Ceiling on producing a response head. See [`ServeHandle::watchdog`].
+    timeout: Duration,
 }
 
 impl ServeHandle {
+    /// An `Engine` configured for the watchdog, plus the ticker that drives it.
+    ///
+    /// Epoch interruption is what makes a spinning guest interruptible at all:
+    /// without it, wasm that never yields cannot be stopped, and
+    /// `tokio::task::abort` has no await point to act on. The returned task
+    /// advances the epoch forever and is detached — it must outlive every
+    /// request, and there is nothing to join it back to.
+    pub fn engine_with_watchdog() -> Result<Engine> {
+        let mut config = wasmtime::Config::new();
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config)?;
+
+        let ticker = engine.weak();
+        tokio::task::spawn(async move {
+            let mut interval = tokio::time::interval(EPOCH_TICK);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                // A weak handle, so this task cannot keep a dropped engine
+                // alive — it simply stops when the engine goes.
+                match ticker.upgrade() {
+                    Some(engine) => engine.increment_epoch(),
+                    None => break,
+                }
+            }
+        });
+        Ok(engine)
+    }
+
     pub fn new(
         engine: &Engine,
         component_bytes: &[u8],
@@ -108,7 +158,34 @@ impl ServeHandle {
             pre,
             guest: Arc::new(guest),
             limit: Arc::new(Semaphore::new(concurrency.max(1))),
+            timeout: DEFAULT_REQUEST_TIMEOUT,
         })
+    }
+
+    /// Override the response-head deadline.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Ticks of [`EPOCH_TICK`] a guest gets before the epoch traps it.
+    ///
+    /// Deliberately **shorter** than the timeout, and that ordering is the
+    /// whole mechanism. The epoch is the only thing that can stop wasm which
+    /// never yields; `tokio::task::abort` needs an await point and a spinning
+    /// guest never reaches one. Give the deadline slack *past* the timeout —
+    /// as a first attempt here did, to get a tidier error message — and the
+    /// abort fires first against a guest nothing can interrupt, which leaves
+    /// the task spinning for the life of the process and hangs runtime
+    /// shutdown. The nicer message cost the entire guarantee.
+    ///
+    /// So the epoch fires first and the guest traps with a real reason. The
+    /// timeout stays as the backstop for what the epoch cannot see: a guest
+    /// parked in a *host* call, where there is no wasm executing to interrupt
+    /// but there is an await point for `abort` to land on.
+    fn watchdog(&self) -> u64 {
+        let ticks = self.timeout.as_millis() / EPOCH_TICK.as_millis();
+        (ticks.saturating_sub(2)).max(1) as u64
     }
 
     /// Run one request through a fresh guest instance.
@@ -138,6 +215,12 @@ impl ServeHandle {
             .context("request limiter closed")?;
 
         let mut store = Store::new(self.pre.engine(), self.guest.new_state()?);
+        // Two mechanisms, because neither covers the other. The epoch traps
+        // wasm that spins without yielding — the only thing that can stop it,
+        // and what gives `abort` an await point to act on. The timeout below
+        // bounds the wait regardless of *why* the guest is quiet, including a
+        // host call that never returns, which the epoch cannot see.
+        store.set_epoch_deadline(self.watchdog());
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let req = store.data_mut().http().new_incoming_request(scheme, req)?;
         let out = store.data_mut().http().new_response_outparam(sender)?;
@@ -153,7 +236,23 @@ impl ServeHandle {
                 .await
         });
 
-        match receiver.await {
+        let waited = match tokio::time::timeout(self.timeout, receiver).await {
+            Ok(waited) => waited,
+            Err(_) => {
+                // Nothing arrived in time. Abort so the permit is released and
+                // the task cannot linger: without this the sender lives inside
+                // the `Store` inside the task, `receiver` never resolves, and
+                // at `concurrency: 1` one such request is the whole server for
+                // the life of the process.
+                task.abort();
+                anyhow::bail!(
+                    "guest did not produce a response within {:?}; abandoned",
+                    self.timeout
+                );
+            }
+        };
+
+        match waited {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(e)) => Err(e.into()),
             // The sender dropped with the `Store`, so the guest returned or
@@ -375,8 +474,9 @@ pub async fn serve_component(
 ) -> Result<()> {
     // wasmtime 44 enables async at the engine level when the `async` feature
     // is on; `Config::async_support` is a no-op. Same as `run_component`.
-    let engine = Engine::new(&wasmtime::Config::new())?;
-    let handle = ServeHandle::new(&engine, component_bytes, guest, config.concurrency)?;
+    let engine = ServeHandle::engine_with_watchdog()?;
+    let handle = ServeHandle::new(&engine, component_bytes, guest, config.concurrency)?
+        .with_timeout(config.request_timeout);
     let mut server = Server::new(handle, config.addr);
 
     // The slot the attestation endpoint reads. Fixed for a self-signed

@@ -210,6 +210,15 @@ struct Cli {
           value_parser = ReceiptTrust::parse)]
     receipt_trust: ReceiptTrust,
 
+    /// Seconds a guest may take to produce a response head before the request
+    /// is abandoned.
+    ///
+    /// A guest that neither returns nor answers otherwise hangs forever, and
+    /// with one request in flight at a time that is the whole server. Baked
+    /// into the image like every other setting, so PCR0 covers it.
+    #[arg(long, env = "S3FS_REQUEST_TIMEOUT_SECS", default_value_t = 30)]
+    request_timeout_secs: u64,
+
     /// Authorise a successor enclave image, by PCR0, then exit.
     ///
     /// Run against the *outgoing* image. It extends PCR31 with the successor's
@@ -500,6 +509,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
                     tls,
                     acme,
                     attestation,
+                    request_timeout: Duration::from_secs(cli.request_timeout_secs),
                 },
             )
             .await?;

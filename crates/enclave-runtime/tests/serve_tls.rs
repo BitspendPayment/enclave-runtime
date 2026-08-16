@@ -145,6 +145,7 @@ async fn start() -> Harness {
                 tls: Some(tls),
                 acme: None,
                 attestation: Some(nsm_for_server),
+                request_timeout: std::time::Duration::from_secs(30),
             },
         )
         .await;

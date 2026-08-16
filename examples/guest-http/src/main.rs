@@ -44,6 +44,16 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
             write_file(&p["/files/".len()..], &body)
         }
         ("GET", p) if p.starts_with("/files/") => read_file(&p["/files/".len()..]),
+        // A guest that never returns and never sets a response. Deliberately
+        // here rather than in a test fixture: it is the one behaviour a host
+        // cannot provoke from the outside, and without it the runtime's
+        // watchdog has nothing to be tested against.
+        ("GET", "/hang") => {
+            #[allow(clippy::empty_loop)]
+            loop {
+                std::hint::spin_loop();
+            }
+        }
         _ => Ok(text(
             StatusCode::NOT_FOUND,
             format!("no route for {method} {path}\n"),
