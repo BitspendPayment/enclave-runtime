@@ -493,3 +493,96 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
             .supported_schemes()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Client authentication, over a real handshake.
+// ---------------------------------------------------------------------------
+
+/// A self-signed client certificate and the key that proves it.
+fn client_credential(name: &str) -> (Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>) {
+    let cert = rcgen::generate_simple_self_signed(vec![name.to_string()]).expect("client cert");
+    let der = cert.cert.der().to_vec();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
+    (der, key)
+}
+
+/// `GET /whoami` over TLS, presenting a client certificate if one is given.
+async fn https_as(
+    addr: std::net::SocketAddr,
+    credential: Option<(Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>)>,
+) -> String {
+    let builder = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AcceptAny));
+
+    let config = match credential {
+        Some((der, key)) => builder
+            .with_client_auth_cert(vec![der.into()], key)
+            .expect("client auth"),
+        None => builder.with_no_client_auth(),
+    };
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let name = rustls::pki_types::ServerName::try_from("enclave.test").unwrap();
+    let socket = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut stream = connector.connect(name, socket).await.expect("handshake");
+
+    let request = "GET /whoami HTTP/1.1\r\nHost: enclave.test\r\nConnection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response).await;
+    let text = String::from_utf8_lossy(&response).into_owned();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    // The guest's responses are chunked, so the body arrives wrapped in size
+    // lines. Only the payload matters here; a real client would dechunk.
+    body.lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && u32::from_str_radix(line, 16).is_err()
+        })
+        .collect::<Vec<_>>()
+        .join("")
+        .trim()
+        .to_string()
+}
+
+/// The whole chain, end to end: a client presents a certificate, rustls proves
+/// it holds the matching key, the runtime turns that into an identity, and the
+/// guest is told — over a real handshake rather than by handing `handle` a
+/// value directly.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn a_client_certificate_becomes_the_identity_the_guest_sees() {
+    let harness = start().await;
+    let (der, key) = client_credential("client-a.test");
+    let expected = hex::encode(nitro_attestation::sha256(&der));
+
+    assert_eq!(https_as(harness.addr, Some((der, key))).await, expected);
+}
+
+/// Two clients are two identities. If this returned the same value twice the
+/// identity would be a property of the connection rather than of the client.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn two_clients_are_two_identities() {
+    let harness = start().await;
+    let a = https_as(harness.addr, Some(client_credential("client-a.test"))).await;
+    let b = https_as(harness.addr, Some(client_credential("client-b.test"))).await;
+
+    assert_ne!(a, b);
+    assert_ne!(a, "(anonymous)");
+}
+
+/// Client authentication is *optional*, and it has to stay that way: a browser,
+/// `curl` or a health check presents no certificate and must still be served,
+/// arriving as anonymous rather than being rejected at the handshake.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn a_client_without_a_certificate_is_still_served() {
+    let harness = start().await;
+    assert_eq!(https_as(harness.addr, None).await, "(anonymous)");
+}

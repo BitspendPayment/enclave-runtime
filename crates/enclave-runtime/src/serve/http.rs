@@ -19,6 +19,7 @@ use wasmtime_wasi_http::p2::WasiHttpView;
 use crate::linker::build_linker;
 use crate::run::GuestEnvironment;
 use crate::serve::acme::CertificateSlot;
+use crate::serve::client::ClientIdentity;
 use crate::serve::endpoints::EnclaveEndpoints;
 use crate::serve::tls::TlsIdentity;
 use crate::state::State;
@@ -261,15 +262,29 @@ impl ServeHandle {
     /// `hyper::body::Incoming`, which cannot be constructed outside a real
     /// connection — the whole dispatch path would be untestable without a
     /// listening socket.
+    /// `client` is required rather than defaulted, so every caller has to
+    /// answer the question. `None` is a real answer — an unauthenticated
+    /// connection — but it has to be given, not inherited by omission.
     pub async fn handle<B>(
         &self,
         scheme: Scheme,
-        req: hyper::Request<B>,
+        mut req: hyper::Request<B>,
+        client: Option<&ClientIdentity>,
     ) -> Result<hyper::Response<HyperOutgoingBody>>
     where
         B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
         B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
     {
+        // Before anything else touches the request, and before it is handed to
+        // `new_incoming_request`, which copies the header map into the guest
+        // verbatim. This is the only ingress, so this is the only place the
+        // header can be made trustworthy.
+        //
+        // Note it cannot be done in `EgressPolicy::is_forbidden_header`: that
+        // hook runs *inside* `new_incoming_request`, after injection, so it
+        // could only delete the header — silently, with no error anywhere.
+        ClientIdentity::apply_to(client, &mut req);
+
         let permit = self
             .limit
             .clone()
@@ -456,6 +471,63 @@ impl ServeHandle {
     }
 }
 
+/// The identity a completed handshake proved, if the client presented one.
+///
+/// Client authentication is optional, so `None` is an ordinary outcome — a
+/// browser, `curl`, or a health check. It is not an error; it is a connection
+/// that gets whatever an unauthenticated caller is allowed.
+fn peer_identity(conn: &rustls::ServerConnection) -> Option<ClientIdentity> {
+    let leaf = conn.peer_certificates()?.first()?;
+    Some(ClientIdentity::from_certificate(leaf))
+}
+
+/// Serve one connection, whatever it is wrapped in.
+///
+/// Generic over the stream so the three arms above — fixed TLS, ACME TLS and
+/// plaintext — share one body instead of three copies of it. All three satisfy
+/// the bound, so this monomorphises and costs nothing at runtime.
+///
+/// The service closure is built here rather than by the caller because it must
+/// capture `client`, and `client` does not exist until the handshake has
+/// completed.
+async fn serve_connection<S>(
+    io: S,
+    guest: Arc<ServeHandle>,
+    endpoints: Option<Arc<EnclaveEndpoints>>,
+    scheme: Scheme,
+    client: Option<ClientIdentity>,
+) -> std::result::Result<(), hyper::Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let guest = guest.clone();
+        let endpoints = endpoints.clone();
+        let scheme = scheme.clone();
+        // Cloned per request because the closure is `Fn` — it runs again for
+        // every request on a kept-alive connection.
+        let client = client.clone();
+        async move {
+            // The runtime's own paths are checked first and are not
+            // forwardable: a guest able to answer under `/enclave/` could serve
+            // any attestation it liked.
+            if let Some(endpoints) = &endpoints {
+                let path = req.uri().path().to_string();
+                let query = req.uri().query().map(str::to_string);
+                if let Some(response) = endpoints.handle(&path, query.as_deref()).await {
+                    return Ok::<_, anyhow::Error>(response);
+                }
+            }
+            guest.handle(scheme, req, client.as_ref()).await
+        }
+    });
+
+    http1::Builder::new()
+        .keep_alive(true)
+        .serve_connection(TokioIo::new(io), service)
+        .await
+}
+
 /// The accept loop: TLS if configured, `/enclave/*` to the runtime, the rest
 /// to the guest.
 ///
@@ -542,38 +614,17 @@ impl Server {
             let scheme = scheme.clone();
 
             tokio::task::spawn(async move {
-                let service = hyper::service::service_fn(
-                    move |req: hyper::Request<hyper::body::Incoming>| {
-                        let guest = guest.clone();
-                        let endpoints = endpoints.clone();
-                        let scheme = scheme.clone();
-                        async move {
-                            // The runtime's own paths are checked first and are
-                            // not forwardable: a guest able to answer under
-                            // `/enclave/` could serve any attestation it liked.
-                            if let Some(endpoints) = &endpoints {
-                                let path = req.uri().path().to_string();
-                                let query = req.uri().query().map(str::to_string);
-                                if let Some(response) =
-                                    endpoints.handle(&path, query.as_deref()).await
-                                {
-                                    return Ok::<_, anyhow::Error>(response);
-                                }
-                            }
-                            guest.handle(scheme, req).await
-                        }
-                    },
-                );
-
+                // The service closure is built *inside* each arm below, after
+                // the handshake, because that is the only point at which the
+                // peer's certificate exists. Built out here — as it was — the
+                // connection's identity could never reach a request.
                 let result = match tls.as_deref() {
                     Some(Tls::Fixed(config)) => {
                         let acceptor = tokio_rustls::TlsAcceptor::from(config.clone());
                         match acceptor.accept(client).await {
                             Ok(stream) => {
-                                http1::Builder::new()
-                                    .keep_alive(true)
-                                    .serve_connection(TokioIo::new(stream), service)
-                                    .await
+                                let client = peer_identity(stream.get_ref().1);
+                                serve_connection(stream, guest, endpoints, scheme, client).await
                             }
                             Err(e) => {
                                 // Routine: scanners, health checks and clients
@@ -621,10 +672,8 @@ impl Server {
 
                         match handshake.into_stream(config.clone()).await {
                             Ok(stream) => {
-                                http1::Builder::new()
-                                    .keep_alive(true)
-                                    .serve_connection(TokioIo::new(stream), service)
-                                    .await
+                                let client = peer_identity(stream.get_ref().1);
+                                serve_connection(stream, guest, endpoints, scheme, client).await
                             }
                             Err(e) => {
                                 // Every handshake lands here until the first
@@ -635,12 +684,10 @@ impl Server {
                             }
                         }
                     }
-                    None => {
-                        http1::Builder::new()
-                            .keep_alive(true)
-                            .serve_connection(TokioIo::new(client), service)
-                            .await
-                    }
+                    // No TLS, so no certificate and no identity. Whatever the
+                    // client says about itself is discarded, same as any other
+                    // unauthenticated connection.
+                    None => serve_connection(client, guest, endpoints, scheme, None).await,
                 };
                 if let Err(e) = result {
                     tracing::debug!(%peer, error = %e, "connection ended");

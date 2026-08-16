@@ -60,6 +60,17 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
             ),
         )),
         ("GET", "/env") => Ok(text(StatusCode::OK, environment())),
+        // Whatever the runtime says about the caller. A guest can only ever
+        // read this header, never write it, and the runtime overwrites it on
+        // every request — so what arrives here is the runtime's word, not the
+        // client's.
+        ("GET", "/whoami") => Ok(text(
+            StatusCode::OK,
+            match req.headers().get("x-enclave-client") {
+                Some(v) => format!("{}\n", v.to_str().unwrap_or("(not utf-8)")),
+                None => "(anonymous)\n".to_string(),
+            },
+        )),
         ("POST", p) | ("PUT", p) if p.starts_with("/files/") => {
             let body = req.body_mut().bytes_contents().await?;
             write_file(&p["/files/".len()..], &body)

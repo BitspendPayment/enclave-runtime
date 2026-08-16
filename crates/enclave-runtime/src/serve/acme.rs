@@ -375,7 +375,23 @@ pub fn start(
     };
 
     let state = acme.state();
-    let server_config = state.default_rustls_config();
+    // Built here rather than taken from `state.default_rustls_config()`, which
+    // hardcodes `with_no_client_auth()`. Without this the ACME path would
+    // silently never see a client certificate — the identity plumbing would be
+    // present, correct, and dead. `state.resolver()` is the supported way to
+    // supply the ACME certificate to a configuration you own.
+    let server_config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .context("selecting TLS protocol versions for ACME")?
+        .with_client_cert_verifier(crate::serve::client::AnyClientCertificate::new())
+        .with_cert_resolver(state.resolver()),
+    );
+    // The challenge config keeps no client auth: the CA validating
+    // TLS-ALPN-01 presents no certificate, and asking for one would be noise
+    // on the one handshake that must not fail.
     let challenge_config = state.challenge_rustls_config();
     let mut state = state;
 

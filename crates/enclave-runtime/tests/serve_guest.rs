@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use enclave_runtime::{GuestEnvironment, GuestLifetime, HostClock, ServeHandle};
+use enclave_runtime::{ClientIdentity, GuestEnvironment, GuestLifetime, HostClock, ServeHandle};
 use http_body_util::{BodyExt, Full};
 use s3fs_core::backend::memory::MemoryBackend;
 use s3fs_core::{Config, Fs, MasterSecret};
@@ -90,7 +90,7 @@ async fn request(
         .body(body(body_bytes))
         .expect("well-formed request");
     let resp = handle
-        .handle(Scheme::Http, req)
+        .handle(Scheme::Http, req, None)
         .await
         .expect("guest handled the request");
     let status = resp.status().as_u16();
@@ -222,7 +222,7 @@ async fn a_hung_guest_does_not_wedge_the_server() {
     // the whole suite, which is what it would do otherwise.
     let hung = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        handle.handle(Scheme::Http, req),
+        handle.handle(Scheme::Http, req, None),
     )
     .await
     .expect("the watchdog did not fire; the request hung");
@@ -334,7 +334,7 @@ async fn a_trapped_session_is_rebuilt_not_reused() {
         .expect("well-formed request");
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        handle.handle(Scheme::Http, req),
+        handle.handle(Scheme::Http, req, None),
     )
     .await
     .expect("the watchdog did not fire");
@@ -346,5 +346,81 @@ async fn a_trapped_session_is_rebuilt_not_reused() {
         body.trim(),
         "1",
         "a trapped instance was reused instead of rebuilt"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The client identity the guest is told about.
+// ---------------------------------------------------------------------------
+
+async fn whoami(
+    handle: &ServeHandle,
+    client: Option<&ClientIdentity>,
+    forged: Option<&str>,
+) -> String {
+    let mut builder = hyper::Request::builder()
+        .method("GET")
+        .uri("http://enclave.test/whoami");
+    if let Some(value) = forged {
+        // Three copies, because one survivor is all a forgery needs and
+        // `append` would leave exactly that.
+        builder = builder
+            .header("x-enclave-client", value)
+            .header("x-enclave-client", value)
+            .header("x-enclave-client", value);
+    }
+    let req = builder.body(body(b"")).expect("well-formed request");
+    let resp = handle
+        .handle(Scheme::Http, req, client)
+        .await
+        .expect("guest handled the request");
+    let collected = resp.into_body().collect().await.expect("collecting body");
+    String::from_utf8_lossy(&collected.to_bytes())
+        .trim()
+        .to_string()
+}
+
+/// The runtime's word reaches the guest.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn the_guest_is_told_who_is_calling() {
+    let handle = handle_for(&[]).await;
+    let id = ClientIdentity::from_certificate(b"a client certificate");
+    assert_eq!(
+        whoami(&handle, Some(&id), None).await,
+        hex::encode(id.key())
+    );
+}
+
+/// The forgery. A client sending the header itself must not be believed, and
+/// sending it three times must not leave one behind — the guest's
+/// `fields.get()` returns a list, so a survivor at `[0]` would be the
+/// attacker's.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn a_client_cannot_forge_its_own_identity() {
+    let handle = handle_for(&[]).await;
+    let real = ClientIdentity::from_certificate(b"the real client");
+    let stolen = hex::encode(ClientIdentity::from_certificate(b"someone else").key());
+
+    assert_eq!(
+        whoami(&handle, Some(&real), Some(&stolen)).await,
+        hex::encode(real.key()),
+        "a client-supplied header was believed"
+    );
+}
+
+/// And the shorter route to the same forgery: no identity at all, so the
+/// client's own header must be removed rather than passed through.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn an_unauthenticated_client_reaches_the_guest_as_anonymous() {
+    let handle = handle_for(&[]).await;
+    let stolen = hex::encode(ClientIdentity::from_certificate(b"someone else").key());
+
+    assert_eq!(
+        whoami(&handle, None, Some(&stolen)).await,
+        "(anonymous)",
+        "an unauthenticated client forged an identity"
     );
 }

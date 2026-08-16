@@ -74,7 +74,11 @@ impl TlsIdentity {
         )
         .with_safe_default_protocol_versions()
         .context("selecting TLS protocol versions")?
-        .with_no_client_auth()
+        // Client authentication is *offered*, not required: a browser or a
+        // health check with no certificate still completes the handshake and
+        // arrives without an identity. Requiring one here would break every
+        // ordinary client and the ACME challenge with them.
+        .with_client_cert_verifier(crate::serve::client::AnyClientCertificate::new())
         .with_single_cert(certs, key)
         .context("building the TLS configuration")?;
 
