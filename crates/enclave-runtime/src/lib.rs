@@ -59,8 +59,8 @@ pub use run::{
     EXIT_RUNTIME_FAILURE,
 };
 pub use serve::{
-    serve_component, AcmeConfig, CertificateSlot, EgressPolicy, EnclaveEndpoints, SealedAcmeCache,
-    ServeConfig, ServeHandle, Server, TlsIdentity, TlsMode,
+    serve_component, AcmeConfig, CertificateSlot, EgressPolicy, EnclaveEndpoints, GuestLifetime,
+    SealedAcmeCache, ServeConfig, ServeHandle, Server, TlsIdentity, TlsMode,
 };
 pub use state::State;
 pub use wasi::{add_filesystem_to_linker, S3FsCtxView, S3WasiView};

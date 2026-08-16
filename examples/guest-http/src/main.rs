@@ -19,6 +19,7 @@
 //! $ curl localhost:8080/files/notes.txt
 //! ```
 
+use std::cell::Cell;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
@@ -30,6 +31,16 @@ use wstd::http::{Body, Error, Request, Response, StatusCode};
 /// is obvious in a bucket listing which objects came from the example.
 const STATE_DIR: &str = "/http-example";
 
+thread_local! {
+    /// A counter that touches no storage at all.
+    ///
+    /// `/counter` proves the *filesystem* carried state between requests; this
+    /// proves the **instance** did. They answer different questions, and with a
+    /// guest instantiated per request this one can only ever return 1 — which
+    /// is exactly the assertion that tells the two execution models apart.
+    static IN_MEMORY: Cell<u64> = const { Cell::new(0) };
+}
+
 #[wstd::http_server]
 async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
     let path = req.uri().path().to_string();
@@ -38,6 +49,16 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
     let result = match (method.as_str(), path.as_str()) {
         ("GET", "/") => Ok(text(StatusCode::OK, banner())),
         ("GET", "/counter") => counter().map(|n| text(StatusCode::OK, format!("{n}\n"))),
+        ("GET", "/memory") => Ok(text(
+            StatusCode::OK,
+            format!(
+                "{}\n",
+                IN_MEMORY.with(|c| {
+                    c.set(c.get() + 1);
+                    c.get()
+                })
+            ),
+        )),
         ("GET", "/env") => Ok(text(StatusCode::OK, environment())),
         ("POST", p) | ("PUT", p) if p.starts_with("/files/") => {
             let body = req.body_mut().bytes_contents().await?;

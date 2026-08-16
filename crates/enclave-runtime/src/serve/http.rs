@@ -48,6 +48,8 @@ pub struct ServeConfig {
     /// request forever, and at `concurrency: 1` that is the whole server. See
     /// [`EPOCH_TICK`].
     pub request_timeout: Duration,
+    /// Whether a guest instance lives one request or many.
+    pub lifetime: GuestLifetime,
 }
 
 impl Default for ServeConfig {
@@ -72,6 +74,10 @@ impl Default for ServeConfig {
             acme: None,
             attestation: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            // A handler, not a process. A session shared by every caller is
+            // worse than per-request isolation, so this stays off until a
+            // session belongs to one authenticated client.
+            lifetime: GuestLifetime::Request,
         }
     }
 }
@@ -87,6 +93,45 @@ const EPOCH_TICK: Duration = Duration::from_millis(250);
 /// Default ceiling on producing a response head.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Whether a guest instance lives for one request or for many.
+///
+/// A `Request` guest is a handler: fresh linear memory every time, so nothing
+/// survives except what it wrote to the filesystem. A `Session` guest is a
+/// process — it keeps its memory, and with it any cache, connection or state it
+/// holds. That state is **outside** everything the store guarantees: not in the
+/// Merkle tree, not in a root record, not attested, and gone on restart with
+/// nothing recording that it went.
+///
+/// Set from the image environment, so PCR0 says which model an enclave runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestLifetime {
+    Request,
+    Session,
+}
+
+impl GuestLifetime {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "request" | "per-request" => Ok(GuestLifetime::Request),
+            "session" | "long-running" => Ok(GuestLifetime::Session),
+            other => Err(format!("expected one of request, session; got {other:?}")),
+        }
+    }
+}
+
+/// A guest instance that outlives the request that created it.
+///
+/// The `Proxy` belongs here, not to a request: `instantiate_async` binds it to
+/// this store, and re-instantiating per request would add a component instance
+/// to the store **every time**. `Instance` is a `Copy` index with no `Drop` and
+/// instance state only grows until the store dies, so that is the one way to
+/// leak unboundedly here — the resource table is a slab with a free list and
+/// does not.
+struct Session {
+    store: Store<State>,
+    proxy: wasmtime_wasi_http::p2::bindings::Proxy,
+}
+
 /// A compiled guest plus the environment its instances are built from.
 ///
 /// Compilation and `instantiate_pre` happen once, at startup: per-request
@@ -99,6 +144,16 @@ pub struct ServeHandle {
     limit: Arc<Semaphore>,
     /// Ceiling on producing a response head. See [`ServeHandle::watchdog`].
     timeout: Duration,
+    lifetime: GuestLifetime,
+    /// The long-running instance, when there is one.
+    ///
+    /// `Option` inside the lock rather than beside it, so "checked out" and
+    /// "absent" are distinguishable: a request that finds `None` while holding
+    /// the lock knows to instantiate, and one that finds the lock held knows to
+    /// wait. Two separate pieces of state could not tell those apart, and a
+    /// request that guessed wrong would build a second instance over the same
+    /// filesystem.
+    session: Arc<tokio::sync::Mutex<Option<Session>>>,
 }
 
 impl ServeHandle {
@@ -159,7 +214,15 @@ impl ServeHandle {
             guest: Arc::new(guest),
             limit: Arc::new(Semaphore::new(concurrency.max(1))),
             timeout: DEFAULT_REQUEST_TIMEOUT,
+            lifetime: GuestLifetime::Request,
+            session: Arc::new(tokio::sync::Mutex::new(None)),
         })
+    }
+
+    /// Keep the guest instance alive across requests.
+    pub fn with_lifetime(mut self, lifetime: GuestLifetime) -> Self {
+        self.lifetime = lifetime;
+        self
     }
 
     /// Override the response-head deadline.
@@ -188,7 +251,7 @@ impl ServeHandle {
         (ticks.saturating_sub(2)).max(1) as u64
     }
 
-    /// Run one request through a fresh guest instance.
+    /// Run one request, in whichever guest lifetime this handle was built for.
     ///
     /// `scheme` is what the *client* used, which is not what this function was
     /// reached over: with TLS terminated upstream of here the connection is
@@ -207,19 +270,31 @@ impl ServeHandle {
         B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
         B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
     {
-        let _permit = self
+        let permit = self
             .limit
             .clone()
             .acquire_owned()
             .await
             .context("request limiter closed")?;
 
+        match self.lifetime {
+            GuestLifetime::Request => self.in_fresh_instance(permit, scheme, req).await,
+            GuestLifetime::Session => self.in_session(permit, scheme, req).await,
+        }
+    }
+
+    /// A guest instance per request: nothing survives but what was committed.
+    async fn in_fresh_instance<B>(
+        &self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        scheme: Scheme,
+        req: hyper::Request<B>,
+    ) -> Result<hyper::Response<HyperOutgoingBody>>
+    where
+        B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
+    {
         let mut store = Store::new(self.pre.engine(), self.guest.new_state()?);
-        // Two mechanisms, because neither covers the other. The epoch traps
-        // wasm that spins without yielding — the only thing that can stop it,
-        // and what gives `abort` an await point to act on. The timeout below
-        // bounds the wait regardless of *why* the guest is quiet, including a
-        // host call that never returns, which the epoch cannot see.
         store.set_epoch_deadline(self.watchdog());
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let req = store.data_mut().http().new_incoming_request(scheme, req)?;
@@ -236,14 +311,124 @@ impl ServeHandle {
                 .await
         });
 
+        self.await_head(task, receiver, permit).await
+    }
+
+    /// A guest instance that persists: the same linear memory, request after
+    /// request.
+    ///
+    /// The lock is taken for the whole call — including the body, because
+    /// `call_handle` does not return until the guest has finished writing it —
+    /// and it is what serialises this client. That is not a limitation to be
+    /// engineered away: two concurrent requests cannot share one linear memory
+    /// without wasm threads, so a guest that keeps state in memory is
+    /// single-threaded by construction.
+    async fn in_session<B>(
+        &self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        scheme: Scheme,
+        req: hyper::Request<B>,
+    ) -> Result<hyper::Response<HyperOutgoingBody>>
+    where
+        B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
+    {
+        // Owned, so it can move into the task below and outlive this function.
+        // A borrowed guard could not: the task must own everything it touches,
+        // which is the same constraint that makes the store move rather than be
+        // borrowed.
+        let mut guard = self.session.clone().lock_owned().await;
+        if guard.is_none() {
+            *guard = Some(self.instantiate().await?);
+        }
+
+        let session = guard.as_mut().expect("just instantiated");
+        // Reset every request: fuel drains and the epoch deadline is absolute,
+        // so on a reused store request N+1 would inherit whatever N left.
+        session.store.set_epoch_deadline(self.watchdog());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let req = session
+            .store
+            .data_mut()
+            .http()
+            .new_incoming_request(scheme, req)?;
+        let out = session
+            .store
+            .data_mut()
+            .http()
+            .new_response_outparam(sender)?;
+
+        let task = tokio::task::spawn(async move {
+            let mut guard = guard;
+            let session = guard.as_mut().expect("held across the call");
+            let result = session
+                .proxy
+                .wasi_http_incoming_handler()
+                .call_handle(&mut session.store, req, out)
+                .await;
+
+            // Discard rather than carry. A trap leaves the instance in an
+            // unknown state; leftover resources are addressable by the next
+            // request on this same session. Setting `None` here is what makes
+            // the next checkout re-instantiate instead of inheriting either.
+            if result.is_err() {
+                tracing::warn!("guest session trapped; it will be rebuilt");
+                *guard = None;
+            } else if !session.store.data().resources_settled() {
+                tracing::warn!("guest left resources behind; its session will be rebuilt");
+                *guard = None;
+            }
+            result
+            // The guard drops here, releasing the session for the next request.
+        });
+
+        self.await_head(task, receiver, permit).await
+    }
+
+    /// Build the long-running instance.
+    ///
+    /// Once per session, never per request — see [`Session`].
+    async fn instantiate(&self) -> Result<Session> {
+        let mut store = Store::new(self.pre.engine(), self.guest.new_state()?);
+        // Instantiation runs guest code (the component's initialiser), so it
+        // needs a deadline of its own or a guest that hangs in `start` would
+        // hang the request that triggered it.
+        store.set_epoch_deadline(self.watchdog());
+        let proxy = self
+            .pre
+            .instantiate_async(&mut store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+            .context("instantiating the guest session")?;
+        Ok(Session { store, proxy })
+    }
+
+    /// Wait for the guest to produce a response head, or give up on it.
+    ///
+    /// `permit` is held for the duration and released on return — which is when
+    /// the head is ready, not when the body has finished. That is deliberate:
+    /// the body streams from the task afterwards, and holding the permit until
+    /// it drained would make a slow reader block the next request.
+    async fn await_head(
+        &self,
+        task: tokio::task::JoinHandle<wasmtime::Result<()>>,
+        receiver: tokio::sync::oneshot::Receiver<
+            std::result::Result<
+                hyper::Response<HyperOutgoingBody>,
+                wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
+            >,
+        >,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<hyper::Response<HyperOutgoingBody>> {
+        let _permit = permit;
+
         let waited = match tokio::time::timeout(self.timeout, receiver).await {
             Ok(waited) => waited,
             Err(_) => {
-                // Nothing arrived in time. Abort so the permit is released and
-                // the task cannot linger: without this the sender lives inside
-                // the `Store` inside the task, `receiver` never resolves, and
-                // at `concurrency: 1` one such request is the whole server for
-                // the life of the process.
+                // Nothing arrived in time. The epoch should already have
+                // trapped a spinning guest — see `watchdog` — so reaching here
+                // means the guest is parked somewhere the epoch cannot see,
+                // which is exactly where `abort` does work.
                 task.abort();
                 anyhow::bail!(
                     "guest did not produce a response within {:?}; abandoned",
@@ -476,7 +661,8 @@ pub async fn serve_component(
     // is on; `Config::async_support` is a no-op. Same as `run_component`.
     let engine = ServeHandle::engine_with_watchdog()?;
     let handle = ServeHandle::new(&engine, component_bytes, guest, config.concurrency)?
-        .with_timeout(config.request_timeout);
+        .with_timeout(config.request_timeout)
+        .with_lifetime(config.lifetime);
     let mut server = Server::new(handle, config.addr);
 
     // The slot the attestation endpoint reads. Fixed for a self-signed
