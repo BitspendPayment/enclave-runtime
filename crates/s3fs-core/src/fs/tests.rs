@@ -693,15 +693,57 @@ async fn opening_with_neither_read_nor_write_is_rejected() {
     ));
 }
 
+/// Every mutator that takes a handle, not just the one that writes bytes.
+/// `set_times` used to be exempt, which made `flags.write` mean "may change the
+/// contents" rather than "may change the file".
 #[tokio::test]
-async fn writing_to_a_read_only_handle_is_refused() {
+async fn mutating_through_a_read_only_handle_is_refused() {
     let fs = fs().await;
     write_file(&fs, "/f", b"x").await;
     let h = fs.open("/f", OpenFlags::read_only()).await.unwrap();
+
     assert!(matches!(
         fs.pwrite(&h, 0, b"nope").await,
         Err(FsError::BadDescriptor)
     ));
+    assert!(matches!(
+        fs.set_size(&h, 0).await,
+        Err(FsError::BadDescriptor)
+    ));
+    let when = crate::inode::from_nanos(1_700_000_000_000_000_000);
+    assert!(matches!(
+        fs.set_times(&h, Some(when), Some(when)).await,
+        Err(FsError::BadDescriptor)
+    ));
+}
+
+/// Why the gate matters here more than it would in an ordinary filesystem:
+/// every mutation commits, and every commit publishes a signed root record
+/// under Object Lock that nothing can afterwards remove. A refusal that still
+/// advanced the chain would be worse than no refusal, because it would look
+/// safe.
+#[tokio::test]
+async fn a_read_only_handle_cannot_advance_the_anchor_chain() {
+    let fs = fs().await;
+    write_file(&fs, "/f", b"x").await;
+    let before = fs.store().root().await.unwrap().seq;
+
+    let h = fs.open("/f", OpenFlags::read_only()).await.unwrap();
+    let when = crate::inode::from_nanos(1_700_000_000_000_000_000);
+    let _ = fs.pwrite(&h, 0, b"nope").await;
+    let _ = fs.set_size(&h, 0).await;
+    let _ = fs.set_times(&h, Some(when), Some(when)).await;
+    fs.close(&h).await.unwrap();
+
+    assert_eq!(
+        fs.store().root().await.unwrap().seq,
+        before,
+        "a read-only handle committed something"
+    );
+
+    // And the timestamps it tried to set did not land.
+    let ino = fs.lookup_at(&fs.root(), "f").await.unwrap();
+    assert_ne!(fs.stat(&ino).await.unwrap().mtime, when);
 }
 
 #[tokio::test]

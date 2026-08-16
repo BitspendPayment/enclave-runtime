@@ -981,6 +981,21 @@ impl Fs {
         atime: Option<SystemTime>,
         mtime: Option<SystemTime>,
     ) -> FsResult<()> {
+        // The same gate `pwrite` and `set_size` apply, and it was missing here.
+        // A timestamp is metadata, but setting one is still a *commit*: `flush`
+        // publishes a new signed root record under Object Lock retention. A
+        // handle opened read-only that can advance the anchor chain is not
+        // read-only in any sense worth the name.
+        //
+        // POSIX would settle this by ownership rather than by the descriptor's
+        // open mode — `futimens` on an `O_RDONLY` fd is legal for the owner.
+        // There is no owner here: [`Attrs`] carries `mode` but no uid, so
+        // "are you allowed?" has no answer other than what the handle was
+        // opened for. `set_times_at` stays ungated for the same reason, having
+        // no handle to ask.
+        if !handle.flags.write {
+            return Err(FsError::BadDescriptor);
+        }
         let mut st = handle.state.lock().await;
         if let Some(t) = atime {
             st.atime_nanos = to_nanos(t);

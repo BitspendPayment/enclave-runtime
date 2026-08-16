@@ -31,7 +31,7 @@ Four workspace crates plus example guests:
 | [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Needs wasi-sdk. |
 | [`examples/guest-fsdemo`](examples/guest-fsdemo/) | The original smaller SQLite demo. |
 
-**Test coverage:** 501 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the attestation binding. There are no cargo features to select: `cargo test --workspace` runs everything; 23 of those tests skip themselves without MinIO or enclave hardware.
+**Test coverage:** 502 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the attestation binding. There are no cargo features to select: `cargo test --workspace` runs everything; 23 of those tests skip themselves without MinIO or enclave hardware.
 
 ## Quick start: run a Wasm guest against MinIO
 
