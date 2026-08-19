@@ -353,6 +353,16 @@ async fn a_trapped_session_is_rebuilt_not_reused() {
 // The client identity the guest is told about.
 // ---------------------------------------------------------------------------
 
+/// A real certificate, because an identity is now the public key inside one.
+fn identity(name: &str) -> ClientIdentity {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+    let cert = rcgen::CertificateParams::new(vec![name.to_string()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    ClientIdentity::from_certificate(cert.der()).expect("a certificate we just made parses")
+}
+
 async fn whoami(
     handle: &ServeHandle,
     client: Option<&ClientIdentity>,
@@ -385,7 +395,7 @@ async fn whoami(
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn the_guest_is_told_who_is_calling() {
     let handle = handle_for(&[]).await;
-    let id = ClientIdentity::from_certificate(b"a client certificate");
+    let id = identity("a-client");
     assert_eq!(
         whoami(&handle, Some(&id), None).await,
         hex::encode(id.key())
@@ -400,8 +410,8 @@ async fn the_guest_is_told_who_is_calling() {
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn a_client_cannot_forge_its_own_identity() {
     let handle = handle_for(&[]).await;
-    let real = ClientIdentity::from_certificate(b"the real client");
-    let stolen = hex::encode(ClientIdentity::from_certificate(b"someone else").key());
+    let real = identity("the-real-client");
+    let stolen = hex::encode(identity("someone-else").key());
 
     assert_eq!(
         whoami(&handle, Some(&real), Some(&stolen)).await,
@@ -416,7 +426,7 @@ async fn a_client_cannot_forge_its_own_identity() {
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn an_unauthenticated_client_reaches_the_guest_as_anonymous() {
     let handle = handle_for(&[]).await;
-    let stolen = hex::encode(ClientIdentity::from_certificate(b"someone else").key());
+    let stolen = hex::encode(identity("someone-else").key());
 
     assert_eq!(
         whoami(&handle, None, Some(&stolen)).await,

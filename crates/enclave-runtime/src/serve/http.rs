@@ -478,7 +478,7 @@ impl ServeHandle {
 /// that gets whatever an unauthenticated caller is allowed.
 fn peer_identity(conn: &rustls::ServerConnection) -> Option<ClientIdentity> {
     let leaf = conn.peer_certificates()?.first()?;
-    Some(ClientIdentity::from_certificate(leaf))
+    ClientIdentity::from_certificate(leaf)
 }
 
 /// Serve one connection, whatever it is wrapped in.

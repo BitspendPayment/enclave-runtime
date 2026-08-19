@@ -40,20 +40,43 @@ pub struct ClientIdentity {
 }
 
 impl ClientIdentity {
-    /// Identify a client by its certificate.
+    /// Identify a client by the **public key** in its certificate.
     ///
-    /// The digest is over the whole certificate rather than the public key
-    /// inside it, because extracting the key means parsing untrusted DER and
-    /// there is no parser in this image. The consequence is worth knowing
-    /// before anything depends on it: **re-issuing a certificate around the
-    /// same key produces a different identity.** That is harmless while an
-    /// identity only selects a session, and would not be once it derives a
-    /// filesystem — see the plan's Phase 4.
-    pub fn from_certificate(der: &[u8]) -> Self {
-        let key = nitro_attestation::sha256(der);
+    /// SHA-256 over the `SubjectPublicKeyInfo`, which is the construction
+    /// certificate pinning uses (RFC 7469). Not over the whole certificate,
+    /// and the difference is the point: a certificate carries a validity
+    /// period and a serial number that change on every renewal, so hashing all
+    /// of it would make a client who rotates a certificate around the *same
+    /// key* look like a different client.
+    ///
+    /// That would be survivable while an identity only picks a session — a
+    /// renewed client would lose in-memory state and no more. It stops being
+    /// survivable once an identity derives a filesystem, because a routine,
+    /// scheduled renewal would point a client at empty storage while their data
+    /// stayed encrypted under keys nothing would ever derive again, in a bucket
+    /// that retains objects for ten years.
+    ///
+    /// The parse comes from `webpki`, which rustls has already run over this
+    /// exact certificate to check the handshake signature — so nothing new
+    /// enters the image, and no DER is parsed by two implementations.
+    ///
+    /// `None` if the certificate will not parse, which should be unreachable:
+    /// the signature check that admitted this client parsed it first. Anonymous
+    /// is the safe direction if it ever happens.
+    pub fn from_certificate(der: &[u8]) -> Option<Self> {
+        let der = rustls::pki_types::CertificateDer::from(der);
+        let parsed = match webpki::EndEntityCert::try_from(&der) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!(error = %e, "a verified client certificate would not parse");
+                return None;
+            }
+        };
+
+        let key = nitro_attestation::sha256(parsed.subject_public_key_info().as_ref());
         let header =
             HeaderValue::from_str(&hex::encode(key)).expect("hex is always a valid header value");
-        ClientIdentity { key, header }
+        Some(ClientIdentity { key, header })
     }
 
     pub fn key(&self) -> &[u8; 32] {
@@ -177,18 +200,22 @@ impl ClientCertVerifier for AnyClientCertificate {
 mod tests {
     use super::*;
 
-    #[test]
-    fn an_identity_is_the_digest_of_the_certificate() {
-        let id = ClientIdentity::from_certificate(b"a certificate");
-        assert_eq!(id.key(), &nitro_attestation::sha256(b"a certificate"));
-        assert_ne!(ClientIdentity::from_certificate(b"another").key(), id.key());
+    /// An identity from a real certificate, since one cannot be made from
+    /// arbitrary bytes any more.
+    fn test_identity(name: &str) -> ClientIdentity {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let cert = rcgen::CertificateParams::new(vec![name.to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        ClientIdentity::from_certificate(cert.der()).expect("parses")
     }
 
     /// The forgery, in the form it actually takes: a client sending the header
     /// itself, several times, hoping one survives.
     #[test]
     fn injection_overwrites_every_value_a_client_supplied() {
-        let id = ClientIdentity::from_certificate(b"the real client");
+        let id = test_identity("the real client");
         let mut req = hyper::Request::builder()
             .uri("http://enclave.test/")
             .header(X_ENCLAVE_CLIENT, "deadbeef")
@@ -216,5 +243,52 @@ mod tests {
         ClientIdentity::apply_to(None, &mut req);
 
         assert_eq!(req.headers().get_all(X_ENCLAVE_CLIENT).iter().count(), 0);
+    }
+
+    /// Two certificates around one key. Different bytes, different serials —
+    /// the same client, and so the same identity.
+    ///
+    /// This is the whole reason the digest is over the public key rather than
+    /// the certificate. Hash the certificate instead and this fails, which is
+    /// what a client would experience as their data vanishing on a renewal.
+    #[test]
+    fn renewing_a_certificate_does_not_change_who_you_are() {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+
+        let mut first = rcgen::CertificateParams::new(vec!["client-a".to_string()]).unwrap();
+        first.serial_number = Some(rcgen::SerialNumber::from(1u64));
+        let first = first.self_signed(&key).unwrap();
+
+        let mut renewed = rcgen::CertificateParams::new(vec!["client-a".to_string()]).unwrap();
+        renewed.serial_number = Some(rcgen::SerialNumber::from(2u64));
+        let renewed = renewed.self_signed(&key).unwrap();
+
+        assert_ne!(
+            first.der().as_ref(),
+            renewed.der().as_ref(),
+            "the certificates must actually differ, or this proves nothing"
+        );
+        assert_eq!(
+            ClientIdentity::from_certificate(first.der()).unwrap().key(),
+            ClientIdentity::from_certificate(renewed.der())
+                .unwrap()
+                .key(),
+        );
+    }
+
+    /// And a different key is a different client, however alike the
+    /// certificates look otherwise.
+    #[test]
+    fn a_different_key_is_a_different_client() {
+        assert_ne!(
+            test_identity("client-a").key(),
+            test_identity("client-a").key(),
+            "two independently generated keys produced one identity"
+        );
+    }
+
+    #[test]
+    fn a_certificate_that_does_not_parse_yields_no_identity() {
+        assert!(ClientIdentity::from_certificate(b"not a certificate").is_none());
     }
 }

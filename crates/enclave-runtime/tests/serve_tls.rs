@@ -498,12 +498,28 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 // Client authentication, over a real handshake.
 // ---------------------------------------------------------------------------
 
-/// A self-signed client certificate and the key that proves it.
+/// A client key, and a certificate built around it.
+///
+/// Separated so a test can build a *second* certificate on the same key, which
+/// is what a renewal is.
+fn client_key() -> rcgen::KeyPair {
+    rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).expect("client key")
+}
+
+fn certificate_for(
+    key: &rcgen::KeyPair,
+    name: &str,
+    serial: u64,
+) -> (Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>) {
+    let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).expect("params");
+    params.serial_number = Some(rcgen::SerialNumber::from(serial));
+    let cert = params.self_signed(key).expect("client cert");
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into());
+    (cert.der().to_vec(), key_der)
+}
+
 fn client_credential(name: &str) -> (Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>) {
-    let cert = rcgen::generate_simple_self_signed(vec![name.to_string()]).expect("client cert");
-    let der = cert.cert.der().to_vec();
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
-    (der, key)
+    certificate_for(&client_key(), name, 1)
 }
 
 /// `GET /whoami` over TLS, presenting a client certificate if one is given.
@@ -559,7 +575,11 @@ async fn https_as(
 async fn a_client_certificate_becomes_the_identity_the_guest_sees() {
     let harness = start().await;
     let (der, key) = client_credential("client-a.test");
-    let expected = hex::encode(nitro_attestation::sha256(&der));
+    let expected = hex::encode(
+        enclave_runtime::ClientIdentity::from_certificate(&der)
+            .expect("parses")
+            .key(),
+    );
 
     assert_eq!(https_as(harness.addr, Some((der, key))).await, expected);
 }
@@ -585,4 +605,32 @@ async fn two_clients_are_two_identities() {
 async fn a_client_without_a_certificate_is_still_served() {
     let harness = start().await;
     assert_eq!(https_as(harness.addr, None).await, "(anonymous)");
+}
+
+/// The rotation property, over a real handshake rather than in isolation: the
+/// same client renews its certificate and is still the same client.
+///
+/// A renewal is routine — certificates expire. If this failed, a client would
+/// reconnect after one and be treated as a stranger, which once an identity
+/// selects storage means being handed an empty filesystem while their data
+/// stays encrypted under keys nothing derives again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn a_renewed_certificate_is_the_same_client() {
+    let harness = start().await;
+    let key = client_key();
+
+    let before = https_as(
+        harness.addr,
+        Some(certificate_for(&key, "client-a.test", 1)),
+    )
+    .await;
+    let after = https_as(
+        harness.addr,
+        Some(certificate_for(&key, "client-a.test", 2)),
+    )
+    .await;
+
+    assert_ne!(before, "(anonymous)", "the certificate was not accepted");
+    assert_eq!(before, after, "a renewal changed who the client is");
 }

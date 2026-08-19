@@ -1738,6 +1738,7 @@ dependencies = [
  "rustix 1.1.4",
  "rustls 0.23.40",
  "rustls-acme",
+ "rustls-webpki 0.103.13",
  "s3fs-core",
  "tokio",
  "tokio-rustls 0.26.4",
