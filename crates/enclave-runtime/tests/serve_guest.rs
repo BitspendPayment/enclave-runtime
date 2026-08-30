@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use enclave_runtime::{ClientIdentity, GuestEnvironment, GuestLifetime, HostClock, ServeHandle};
+use enclave_runtime::{ClientIdentity, GuestEnvironment, HostClock, ServeHandle};
 use http_body_util::{BodyExt, Full};
 use s3fs_core::backend::memory::MemoryBackend;
 use s3fs_core::{Config, Fs, MasterSecret};
@@ -243,110 +243,84 @@ async fn a_hung_guest_does_not_wedge_the_server() {
 }
 
 // ---------------------------------------------------------------------------
-// A guest that is a process rather than a handler.
+// One instance per request. No two requests share one.
 // ---------------------------------------------------------------------------
 
-/// `/memory` increments a counter that touches no storage. Per request it can
-/// only ever be 1 — a fresh instance has fresh memory — so this is the
-/// assertion that tells the two execution models apart, in the direction that
-/// proves the default is still the default.
+/// The isolation invariant, stated as a test.
+///
+/// `/memory` increments a counter held in the guest's linear memory and written
+/// nowhere. A fresh instance has fresh memory, so it can only ever answer `1`.
+/// Any other answer means two requests reached the same instance — and with
+/// one instance behind two clients, the `Store` boundary that separates them
+/// has moved from the runtime into guest code, where a single bug confuses two
+/// clients instead of one.
+///
+/// This is the test that fails if anyone reintroduces a shared instance. It
+/// sends enough requests to mean it.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn a_per_request_guest_remembers_nothing() {
+async fn no_two_requests_share_an_instance() {
     let handle = handle_for(&[]).await;
-    for _ in 0..3 {
-        let (status, body) = get(&handle, "/memory").await;
-        assert_eq!(status, 200);
-        assert_eq!(
-            body.trim(),
-            "1",
-            "a fresh instance kept state it should not"
-        );
-    }
-}
-
-/// The same route against a session: the instance persists, so the counter
-/// climbs. Nothing was written to the filesystem to make that happen, which is
-/// the whole distinction.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn a_session_guest_keeps_its_memory_between_requests() {
-    let handle = handle_for(&[]).await.with_lifetime(GuestLifetime::Session);
-    for expected in 1..=4 {
+    for n in 1..=200 {
         let (status, body) = get(&handle, "/memory").await;
         assert_eq!(status, 200, "body: {body}");
         assert_eq!(
             body.trim(),
-            expected.to_string(),
-            "the instance was rebuilt"
+            "1",
+            "request {n} reached an instance a previous request had already used"
         );
     }
 }
 
-/// The trap that would make sessions leak: `Store.instances` only grows, and
-/// `Instance` is a `Copy` index with no `Drop`. Instantiating per request on a
-/// reused store adds a component instance and its linear memory every time,
-/// bounded only by wasmtime's default of 10,000.
-///
-/// There is no public counter for that, so this asserts the observable
-/// consequence instead: the guest's memory is continuous across many requests,
-/// which it could not be if a new instance were being built.
+/// The guest is built before the listener binds, not on the first request. A
+/// guest that will not instantiate should stop the enclave rather than serving
+/// 500s while looking healthy.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn a_session_instantiates_once_however_many_requests() {
-    let handle = handle_for(&[]).await.with_lifetime(GuestLifetime::Session);
-    for _ in 0..200 {
-        let (status, _) = get(&handle, "/memory").await;
-        assert_eq!(status, 200);
-    }
+async fn the_guest_is_proved_to_instantiate_at_startup() {
+    let handle = handle_for(&[]).await;
+    handle
+        .verify_instantiates()
+        .await
+        .expect("the guest instantiates");
+
+    // And keeps nothing: the check must not leave an instance behind for a
+    // request to inherit.
     let (_, body) = get(&handle, "/memory").await;
     assert_eq!(
         body.trim(),
-        "201",
-        "the instance was rebuilt at some point, so it is being made per request"
+        "1",
+        "the startup check left an instance behind"
     );
 }
 
-/// A session that traps is discarded rather than carried: the next request gets
-/// a rebuilt instance, which is observable because its memory starts over.
-/// Carrying it would hand the next request an instance in an unknown state.
+/// A trap dies with its request. There is no instance to poison and nothing to
+/// rebuild, so the next request is simply unaffected — which is the property
+/// that a shared instance could not offer at any price.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn a_trapped_session_is_rebuilt_not_reused() {
+async fn a_trap_dies_with_its_request() {
     let handle = handle_for(&[])
         .await
-        .with_lifetime(GuestLifetime::Session)
         .with_timeout(std::time::Duration::from_secs(3));
 
-    let (_, first) = get(&handle, "/memory").await;
-    assert_eq!(first.trim(), "1");
-    // Twice, so the pre-trap value is one a per-request guest could never
-    // produce. Without this the assertion after the trap holds trivially in
-    // either mode and the test proves nothing.
-    let (_, second) = get(&handle, "/memory").await;
-    assert_eq!(second.trim(), "2", "this is not running as a session");
-
-    // `/hang` spins until the epoch traps it, which poisons the instance.
+    // `/hang` spins until the epoch traps it.
     let req = hyper::Request::builder()
         .method("GET")
         .uri("http://enclave.test/hang")
         .body(body(b""))
         .expect("well-formed request");
-    let _ = tokio::time::timeout(
+    let wedged = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         handle.handle(Scheme::Http, req, None),
     )
     .await
     .expect("the watchdog did not fire");
+    assert!(wedged.is_err(), "a wedged guest was reported as success");
 
-    // Rebuilt, so the counter starts over rather than continuing at 2.
     let (status, body) = get(&handle, "/memory").await;
-    assert_eq!(status, 200, "the session did not recover: {body}");
-    assert_eq!(
-        body.trim(),
-        "1",
-        "a trapped instance was reused instead of rebuilt"
-    );
+    assert_eq!(status, 200, "the service did not recover: {body}");
+    assert_eq!(body.trim(), "1");
 }
 
 // ---------------------------------------------------------------------------

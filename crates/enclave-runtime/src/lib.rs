@@ -60,8 +60,8 @@ pub use run::{
 };
 pub use serve::{
     serve_component, AcmeConfig, AnyClientCertificate, CertificateSlot, ClientIdentity,
-    EgressPolicy, EnclaveEndpoints, GuestLifetime, SealedAcmeCache, ServeConfig, ServeHandle,
-    Server, TlsIdentity, TlsMode, X_ENCLAVE_CLIENT,
+    EgressPolicy, EnclaveEndpoints, SealedAcmeCache, ServeConfig, ServeHandle, Server, TlsIdentity,
+    TlsMode, X_ENCLAVE_CLIENT,
 };
 pub use state::State;
 pub use wasi::{add_filesystem_to_linker, S3FsCtxView, S3WasiView};

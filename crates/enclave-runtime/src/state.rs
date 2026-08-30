@@ -37,20 +37,6 @@ impl State {
     pub fn fs(&self) -> &Arc<Fs> {
         &self.fs
     }
-
-    /// Whether the guest left anything behind in the resource table.
-    ///
-    /// Meaningless for a `State` that lives one request — the whole table goes
-    /// with it. It matters when a `State` is reused across requests: the host
-    /// pushes an `incoming-request` and a `response-outparam` per call and
-    /// never removes them, so everything here is reclaimed by the guest
-    /// dropping its handles. A guest that does not is not leaking unboundedly
-    /// (the table is a slab with a free list) but it *is* leaving entries a
-    /// later request could still address, so the caller discards the session
-    /// rather than carrying it.
-    pub fn resources_settled(&self) -> bool {
-        self.table.is_empty()
-    }
 }
 
 impl WasiView for State {

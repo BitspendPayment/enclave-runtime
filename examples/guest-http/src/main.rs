@@ -34,10 +34,12 @@ const STATE_DIR: &str = "/http-example";
 thread_local! {
     /// A counter that touches no storage at all.
     ///
-    /// `/counter` proves the *filesystem* carried state between requests; this
-    /// proves the **instance** did. They answer different questions, and with a
-    /// guest instantiated per request this one can only ever return 1 — which
-    /// is exactly the assertion that tells the two execution models apart.
+    /// `/counter` proves the *filesystem* carried state between requests. This
+    /// proves the opposite, and it is the more important of the two: a fresh
+    /// instance has fresh memory, so `/memory` must answer 1 forever. Any other
+    /// answer means two requests reached the same instance, and the boundary
+    /// between two clients has quietly moved out of the runtime and into this
+    /// file.
     static IN_MEMORY: Cell<u64> = const { Cell::new(0) };
 }
 

@@ -219,16 +219,6 @@ struct Cli {
     #[arg(long, env = "S3FS_REQUEST_TIMEOUT_SECS", default_value_t = 30)]
     request_timeout_secs: u64,
 
-    /// Whether a guest instance lives one request or many.
-    ///
-    /// `request` is a handler: fresh memory each time, so nothing survives but
-    /// what reached the filesystem. `session` is a process — it keeps its
-    /// memory, and that memory is outside everything the store guarantees.
-    /// Baked into the image, so PCR0 says which model an enclave runs.
-    #[arg(long, env = "S3FS_GUEST_LIFETIME", default_value = "request",
-          value_parser = enclave_runtime::GuestLifetime::parse)]
-    guest_lifetime: enclave_runtime::GuestLifetime,
-
     /// Authorise a successor enclave image, by PCR0, then exit.
     ///
     /// Run against the *outgoing* image. It extends PCR31 with the successor's
@@ -520,7 +510,6 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
                     acme,
                     attestation,
                     request_timeout: Duration::from_secs(cli.request_timeout_secs),
-                    lifetime: cli.guest_lifetime,
                 },
             )
             .await?;

@@ -25,7 +25,7 @@ pub mod tls;
 pub use acme::{AcmeConfig, CertificateSlot, SealedAcmeCache};
 pub use client::{AnyClientCertificate, ClientIdentity, X_ENCLAVE_CLIENT};
 pub use endpoints::{EnclaveEndpoints, ENCLAVE_PREFIX};
-pub use http::{serve_component, GuestLifetime, ServeConfig, ServeHandle, Server};
+pub use http::{serve_component, ServeConfig, ServeHandle, Server};
 pub use tls::{TlsIdentity, TlsMode};
 
 use wasmtime_wasi_http::p2::{
