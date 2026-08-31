@@ -324,6 +324,12 @@
             # PCR0, PCR31 and the state_root — which is the whole boot machine
             # minus the one part that needs real hardware.
             S3FS_RECEIPT_TRUST = "unsigned-emulator";
+            # A directory per client, which the e2e exercises with two client
+            # certificates. Concurrency has to rise with it or every client
+            # still queues behind every other and the per-client locks buy
+            # nothing.
+            S3FS_WARM_INSTANCES = "1";
+            S3FS_HTTP_CONCURRENCY = "8";
             # And it cannot use KMS at all, for the same reason: KMS verifies
             # the attestation document carrying the enclave's recipient public
             # key, and will not accept one that is unsigned. So the emulator

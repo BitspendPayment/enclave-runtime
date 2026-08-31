@@ -267,6 +267,43 @@ struct Cli {
     #[arg(long, env = "S3FS_REQUEST_TIMEOUT_SECS", default_value_t = 30)]
     request_timeout_secs: u64,
 
+    /// Give each authenticated client their own filesystem and warm instance.
+    ///
+    /// Off by default, and the reason is not caution about the feature but
+    /// about what it changes around it. Today one request runs at a time,
+    /// globally. With this on, a client is serialised against **itself** and
+    /// nobody else — two clients execute guest code simultaneously, over
+    /// separate filesystems with separate transaction locks. Any guest
+    /// invariant that quietly relied on global serialisation breaks, silently.
+    ///
+    /// Raise `--http-concurrency` alongside it: at 1 every client still queues
+    /// behind every other whatever the per-client locks say.
+    ///
+    /// Baked into the image, so PCR0 records which model an enclave runs.
+    #[arg(long, env = "S3FS_WARM_INSTANCES", value_parser = enclave_runtime::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
+    warm_instances: bool,
+
+    /// Clients kept warm at once.
+    ///
+    /// A warm client costs a wasm linear memory and nothing else — the
+    /// filesystem and its block cache are shared — so this bounds instance
+    /// memory rather than cache memory. Past it, the least recently used idle
+    /// client is dropped; one serving a request is never evicted.
+    #[arg(long, env = "S3FS_MAX_TENANTS", default_value_t = 64)]
+    max_tenants: usize,
+
+    /// Seconds a mounted client may sit idle before it is dropped.
+    #[arg(long, env = "S3FS_TENANT_IDLE_SECS", default_value_t = 900)]
+    tenant_idle_secs: u64,
+
+    /// Requests one client's instance serves before it is rebuilt.
+    ///
+    /// Wasm linear memory never shrinks, so an instance that lived forever
+    /// would only grow. Rebuilding costs ~24 µs and keeps the mount, which is
+    /// the part that costs S3 round trips.
+    #[arg(long, env = "S3FS_MAX_REQUESTS_PER_INSTANCE", default_value_t = 10_000)]
+    max_requests_per_instance: u64,
+
     /// Authorise a successor enclave image, by PCR0, then exit.
     ///
     /// Run against the *outgoing* image. It extends PCR31 with the successor's
@@ -564,6 +601,36 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             );
 
             let attestation = cli.attestation.then(|| entropy.clone());
+
+            // Per-client views of the one filesystem, when the deployment
+            // asked for them. Each client's guest sees its own directory as
+            // `/`; the mount, the block cache and the transaction stream are
+            // shared, so a client costs a directory rather than a mount.
+            let tenancy = if cli.warm_instances {
+                if cli.http_concurrency <= 1 {
+                    tracing::warn!(
+                        "warm instances are on but --http-concurrency is 1, so every client \
+                         still queues behind every other. Raise it, or the per-client locks \
+                         buy nothing."
+                    );
+                }
+                let limits = enclave_runtime::PoolLimits {
+                    max_tenants: cli.max_tenants,
+                    idle_timeout: Duration::from_secs(cli.tenant_idle_secs),
+                    max_requests_per_instance: cli.max_requests_per_instance,
+                };
+                tracing::info!(
+                    max_tenants = limits.max_tenants,
+                    "serving each client its own directory of the filesystem"
+                );
+                Some(std::sync::Arc::new(enclave_runtime::Tenancy::new(
+                    booted.master.clone(),
+                    limits,
+                )))
+            } else {
+                None
+            };
+
             let guest = GuestEnvironment::new(fs, clock, entropy, &env, &cli.guest_args)?;
             serve_component(
                 &component,
@@ -575,8 +642,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
                     acme,
                     attestation,
                     request_timeout: Duration::from_secs(cli.request_timeout_secs),
-                    // Off until the flags that turn it on land beside it.
-                    tenancy: None,
+                    tenancy,
                 },
             )
             .await?;
@@ -884,6 +950,25 @@ mod tests {
             "arn:aws:kms:eu-west-2:1:key/a",
         ])
         .contains("--master-key-parameter"));
+    }
+
+    /// Warm instances are off unless a deployment asks. Turning them on
+    /// changes what two clients may do at the same time, so it must be a
+    /// decision rather than a default — and PCR0 records it.
+    #[test]
+    fn per_client_filesystems_are_opt_in() {
+        assert!(!cli_from(&["--bucket", "b"]).warm_instances);
+        assert!(cli_from(&["--bucket", "b", "--warm-instances"]).warm_instances);
+    }
+
+    /// Warm clients are bounded by default. Each costs a wasm linear memory,
+    /// so an unbounded pool is an enclave that dies of memory exhaustion under
+    /// the load it was built for.
+    #[test]
+    fn the_warm_client_count_is_bounded_by_default() {
+        let cli = cli_from(&["--bucket", "b"]);
+        assert_eq!(cli.max_tenants, 64);
+        assert!(cli.tenant_idle_secs > 0, "idle tenants are never reclaimed");
     }
 
     /// The encryption context is built from the filesystem id and the

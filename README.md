@@ -650,6 +650,74 @@ Hashing the public key rather than the certificate is what survives renewal. A
 client that re-issues around the same key is the same client to the guest, and
 its data does not vanish on the day its certificate expires.
 
+### A directory per client
+
+`--warm-instances` gives every authenticated client its own corner of the
+filesystem. There is still **one** mounted filesystem, one block cache and one
+transaction stream; what is per-client is a directory under `/tenants/<id>/`, a
+warm guest instance, and a lock.
+
+The identifier is derived, never stored: `HKDF(master, sha256(client SPKI))`.
+The same client lands on the same directory on every boot from nothing but the
+handshake, and without the master secret nobody can work out which directory is
+whose.
+
+#### The separation is the runtime's, not the guest's
+
+Each client's instance is handed **its own directory as its preopen**, and the
+resolver refuses every way a path can name something above it:
+
+| | |
+|---|---|
+| absolute paths | restart at the tenant's root, so `/etc/passwd` means `<tenant>/etc/passwd` |
+| `..` | stops at the tenant's root, however many are chained |
+| absolute symlink targets | resolve from the tenant's root too |
+| asking a descriptor for its parent | the tenant's root is its own parent |
+
+Those are the only four routes out, and they hold inductively: a walk starts at
+the tenant's root or below, and none of them can take it higher. `guest-http`
+has an `/escape/<path>` route that opens whatever it is given with **no
+validation at all**, and the test suite points it at other tenants' files to
+prove the refusals come from the capability layer rather than from a
+well-behaved guest.
+
+#### What it costs, and what it does not
+
+A client costs a directory — no mount, no second key derivation, no signed root
+record to read, no extra cache. That is why this is worth doing with one
+filesystem rather than many.
+
+What it does change is concurrency. Today one request runs at a time, globally.
+With this on, a client is serialised against *itself* and nobody else, which is
+what makes a nonce reservation safe while letting two clients' guests run at
+once. Their **commits still queue**, though: one filesystem means one
+transaction lock, so the gain is in guest execution and reads rather than in
+writes. And any guest invariant that quietly relied on global serialisation now
+breaks — which is why this is opt-in, and why PCR0 records it.
+
+```console
+$ S3FS_WARM_INSTANCES=1 S3FS_HTTP_CONCURRENCY=8 S3FS_MAX_TENANTS=64 \
+  ... enclave-runtime
+```
+
+`--max-tenants` bounds warm *instances*, each of which costs a wasm linear
+memory; past it the least recently used idle client is dropped, and one serving
+a request is never evicted. Raise `--http-concurrency` alongside it, or every
+client still queues behind every other whatever the per-client locks say.
+
+#### Why there is no separate register
+
+An earlier design gave each client its own filesystem, which needed a register
+to answer "should this client have one?" — because a host who hid a client's
+root record would otherwise get a fresh, empty filesystem built for them, with
+their policy reset and their nonce ledger emptied.
+
+With one filesystem that question answers itself. `/tenants/<id>` either exists
+in the Merkle tree or it does not; the tree is covered by one signed root
+record, and that record is attested by the state-origin receipt at boot. Hiding
+one client's directory means changing the root hash, which fails before a single
+request is served. The filesystem is the register.
+
 ### The attestation binding
 
 The TLS key is generated inside the enclave and never leaves it. Its
