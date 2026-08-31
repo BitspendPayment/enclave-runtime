@@ -103,3 +103,10 @@ x509-parser = "0.18"
 nitro-nsm = { path = "../nitro-nsm", features = ["testing"] }
 # Builds genuinely signed attestation documents for the TLS binding tests.
 nitro-attestation = { path = "../nitro-attestation", features = ["testing"] }
+# The fresh-versus-warm instance question: how much of a request is
+# instantiation, and is it enough to justify pooling instances per client.
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "instance_cost"
+harness = false

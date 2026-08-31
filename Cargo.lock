@@ -1726,6 +1726,7 @@ dependencies = [
  "cap-rand",
  "ciborium",
  "clap",
+ "criterion",
  "futures",
  "getrandom 0.3.4",
  "hex",
