@@ -19,11 +19,13 @@
 //! library half is everything below this file, and lives beside it rather than
 //! inside it so integration tests can reach it.
 //!
-//! What is *not* here yet is KMS key release. The master secret still comes
-//! from configuration, which is a development seam — a key in an environment
-//! variable is visible to the parent instance, exactly the party an enclave
-//! exists to exclude. Replacing it is a new
-//! [`enclave_runtime::MasterKeySource`] implementation and nothing else.
+//! The master secret comes from `--master-key-source`, which has no default:
+//! `kms` mints it inside the enclave and lets KMS release it only against an
+//! attestation whose PCR0 matches the key policy, and `static` takes it from
+//! configuration for development and for the QEMU harness. Supplying a
+//! plaintext key under `kms` is refused rather than ignored — a key in an
+//! environment variable is visible to the parent instance, exactly the party
+//! an enclave exists to exclude.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -34,7 +36,7 @@ use clap::Parser;
 use enclave_runtime::{
     open_clock, open_entropy, read_component, run_component, serve_component, AcmeConfig,
     ClockSource, GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, NetworkConfig,
-    NetworkMode, RandomSource, ReceiptTrust, ServeConfig, StaticKey, TlsIdentity, TlsMode,
+    NetworkMode, RandomSource, ReceiptTrust, ServeConfig, TlsIdentity, TlsMode,
     DEFAULT_GVFORWARDER, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
@@ -81,9 +83,55 @@ struct Cli {
     #[arg(long, env = "S3FS_ROOTS_BUCKET")]
     roots_bucket: Option<String>,
 
-    /// 32-byte master secret, hex encoded. Every other key derives from it.
+    /// Where the master secret comes from.
+    ///
+    /// `kms` mints it inside the enclave and lets KMS release it only against
+    /// an attestation whose PCR0 matches the key policy — so a wrong image
+    /// gets no key at all, rather than a refused mount. `static` takes it from
+    /// `--master-key` and stores it unsealed; it exists for development and
+    /// for the QEMU harness, whose emulated NSM cannot produce a document KMS
+    /// would accept.
+    ///
+    /// No default. This is the one setting that should never be inherited by
+    /// omission, and because the image environment is measured, PCR0 records
+    /// which of the two an enclave was built with.
+    #[arg(long, env = "S3FS_MASTER_KEY_SOURCE",
+          value_parser = enclave_runtime::MasterKeySourceKind::parse)]
+    master_key_source: enclave_runtime::MasterKeySourceKind,
+
+    /// 32-byte master secret, hex encoded. **`--master-key-source=static` only.**
+    ///
+    /// Supplying it under `kms` is refused rather than ignored: a key from
+    /// configuration is a key the parent instance holds, which is precisely
+    /// what KMS release exists to prevent.
     #[arg(long, env = "S3FS_MASTER_KEY")]
-    master_key: String,
+    master_key: Option<String>,
+
+    /// The customer master key that releases this filesystem's secret. Its
+    /// policy — `kms:RecipientAttestation:PCR0` — is the security control.
+    #[arg(long, env = "S3FS_KMS_KEY_ID")]
+    kms_key_id: Option<String>,
+
+    /// SSM parameter holding the KMS ciphertext, and nothing else.
+    #[arg(long, env = "S3FS_MASTER_KEY_PARAMETER")]
+    master_key_parameter: Option<String>,
+
+    /// Deployment name, mixed into the KMS encryption context alongside the
+    /// filesystem id — so a staging enclave cannot open a production
+    /// filesystem even when pointed at the same parameter.
+    #[arg(long, env = "S3FS_ENVIRONMENT", default_value = "production")]
+    environment: String,
+
+    /// Endpoint overrides for KMS and SSM, separate from `--endpoint`.
+    ///
+    /// S3's override points at MinIO in development; a MinIO endpoint is not a
+    /// KMS endpoint, and reusing it would fail in a way that reads like a
+    /// credentials problem.
+    #[arg(long, env = "S3FS_KMS_ENDPOINT")]
+    kms_endpoint: Option<String>,
+
+    #[arg(long, env = "S3FS_SSM_ENDPOINT")]
+    ssm_endpoint: Option<String>,
 
     /// Filesystem identifier, 32 hex characters — the key-derivation salt, so
     /// two filesystems under one master secret stay independent.
@@ -351,6 +399,23 @@ impl Cli {
         })
     }
 
+    fn master_key_config(&self) -> Result<enclave_runtime::MasterKeyConfig> {
+        Ok(enclave_runtime::MasterKeyConfig {
+            kind: self.master_key_source,
+            master_key: self.master_key.clone(),
+            kms_key_id: self.kms_key_id.clone(),
+            parameter: self.master_key_parameter.clone(),
+            environment: self.environment.clone(),
+            fs_id: enclave_runtime::parse_fs_id(&self.fs_id)?,
+            region: self.region.clone(),
+            kms_endpoint: self.kms_endpoint.clone(),
+            ssm_endpoint: self.ssm_endpoint.clone(),
+            access_key_id: self.access_key_id.clone(),
+            secret_access_key: self.secret_access_key.clone(),
+            session_token: self.session_token.clone(),
+        })
+    }
+
     fn env_policy(&self) -> GuestEnvPolicy {
         if self.no_inherit_env {
             GuestEnvPolicy::explicit_only(self.guest_env.clone())
@@ -412,7 +477,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         ..Default::default()
     })?;
 
-    let keys = StaticKey::from_hex(&cli.master_key)?;
+    let keys = enclave_runtime::open_key_source(&cli.master_key_config()?, entropy.clone())?;
     tracing::info!(
         key_source = keys.describe(),
         guest = %cli.guest_path.display(),
@@ -659,8 +724,13 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    /// The minimum a parse needs, so a test can say only what it is about.
+    ///
+    /// `--master-key-source` is here because it has no default and never
+    /// should: an enclave's key handling is not something to inherit by
+    /// omission. Tests that care which source is chosen pass their own.
     fn cli_from(args: &[&str]) -> Cli {
-        let mut full = vec!["enclave-runtime"];
+        let mut full = vec!["enclave-runtime", "--master-key-source", "static"];
         full.extend_from_slice(args);
         Cli::try_parse_from(full).expect("parse")
     }
@@ -735,9 +805,100 @@ mod tests {
     }
 
     #[test]
-    fn the_bucket_and_master_key_are_required() {
+    fn the_bucket_and_key_source_are_required() {
         assert!(Cli::try_parse_from(["enclave-runtime"]).is_err());
         assert!(Cli::try_parse_from(["enclave-runtime", "--bucket", "b"]).is_err());
+        // A bucket without a key source is not enough: there is no default,
+        // and picking one would mean guessing at how the enclave gets its key.
+        assert!(Cli::try_parse_from([
+            "enclave-runtime",
+            "--bucket",
+            "b",
+            "--master-key",
+            &"ab".repeat(32),
+        ])
+        .is_err());
+    }
+
+    fn key_config(args: &[&str]) -> Result<enclave_runtime::MasterKeyConfig> {
+        let mut full = vec!["--bucket", "b"];
+        full.extend_from_slice(args);
+        Cli::try_parse_from(std::iter::once("enclave-runtime").chain(full.iter().copied()))
+            .expect("parse")
+            .master_key_config()
+    }
+
+    fn source_error(args: &[&str]) -> String {
+        let config = key_config(args).expect("config");
+        let nsm = std::sync::Arc::new(nitro_nsm::fake::FakeNsm::new());
+        format!(
+            "{:#}",
+            enclave_runtime::open_key_source(&config, nsm)
+                .expect_err("this combination must be refused")
+        )
+    }
+
+    /// The refusal that matters most. A production image that still carried
+    /// `S3FS_MASTER_KEY` would work perfectly — quietly taking its key from
+    /// the parent instance, which is the whole thing KMS release prevents.
+    #[test]
+    fn a_plaintext_key_is_refused_under_kms() {
+        let err = source_error(&[
+            "--master-key-source",
+            "kms",
+            "--kms-key-id",
+            "arn:aws:kms:eu-west-2:1:key/a",
+            "--master-key-parameter",
+            "/p",
+            "--master-key",
+            &"ab".repeat(32),
+        ]);
+        assert!(err.contains("refused"), "unexpected error: {err}");
+    }
+
+    /// The mirror image: KMS settings under `static` mean one of the two is
+    /// not what was meant, and there is no safe way to guess which.
+    #[test]
+    fn kms_settings_are_refused_under_static() {
+        let err = source_error(&[
+            "--master-key-source",
+            "static",
+            "--master-key",
+            &"ab".repeat(32),
+            "--kms-key-id",
+            "arn:aws:kms:eu-west-2:1:key/a",
+        ]);
+        assert!(err.contains("alongside KMS settings"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn each_source_names_the_setting_it_is_missing() {
+        assert!(source_error(&["--master-key-source", "static"]).contains("--master-key"));
+        assert!(source_error(&["--master-key-source", "kms"]).contains("--kms-key-id"));
+        assert!(source_error(&[
+            "--master-key-source",
+            "kms",
+            "--kms-key-id",
+            "arn:aws:kms:eu-west-2:1:key/a",
+        ])
+        .contains("--master-key-parameter"));
+    }
+
+    /// The encryption context is built from the filesystem id and the
+    /// environment, so it is the same at mint and at open by construction.
+    #[test]
+    fn the_key_config_carries_the_encryption_context_inputs() {
+        let config = key_config(&[
+            "--master-key-source",
+            "kms",
+            "--fs-id",
+            &"cd".repeat(16),
+            "--environment",
+            "staging",
+        ])
+        .expect("config");
+        assert_eq!(config.environment, "staging");
+        assert_eq!(config.fs_id, [0xcd; 16]);
     }
 
     #[test]

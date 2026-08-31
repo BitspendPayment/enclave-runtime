@@ -88,10 +88,18 @@ ENV S3FS_TLS=self-signed
 # ENV AWS_REGION=eu-west-2
 # ENV S3FS_MIN_ROOT_SEQ=0                 # freshness floor from outside the store
 #
-# S3FS_MASTER_KEY is deliberately NOT set here. A key baked into the image is
-# a key readable by anyone who can pull the image, and one passed by the parent
-# is readable by the party the enclave exists to exclude. It is a development
-# seam only; the attestation milestone replaces it with a KMS release gated on
-# the NSM attestation document, at which point nothing sets it at all.
+# The master secret is minted by KMS inside the enclave and released only
+# against an attestation whose PCR0 matches the key policy. A wrong image does
+# not get a refused mount; it gets no key at all.
+ENV S3FS_MASTER_KEY_SOURCE=kms
+# ENV S3FS_KMS_KEY_ID=arn:aws:kms:eu-west-2:...:key/...
+# ENV S3FS_MASTER_KEY_PARAMETER=/enclave-runtime/prod/<fs-id>/master-key
+# ENV S3FS_ENVIRONMENT=production        # part of the encryption context
+#
+# S3FS_MASTER_KEY is deliberately NOT set, and the runtime *refuses to start*
+# if it is set alongside the line above. A key baked into the image is readable
+# by anyone who can pull the image, and one passed by the parent is readable by
+# the party the enclave exists to exclude — so the combination is an error
+# rather than a precedence rule.
 
 ENTRYPOINT ["/usr/local/bin/enclave-runtime"]

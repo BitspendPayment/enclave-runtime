@@ -1,96 +1,10 @@
-//! Where the master secret comes from, and where it goes.
-//!
-//! Two operations, not one, because genesis and resume are different
-//! questions. Genesis **mints** a secret that has never existed before and
-//! hands back the sealed form for the caller to persist; resume **opens** the
-//! blob that a previous genesis wrote. A single `master_secret()` could not
-//! express the difference, and the difference is the point: a filesystem's key
-//! is created once, with it, and recovered every time after.
-//!
-//! ## Why the secret belongs to the stored state
-//!
-//! It used to arrive as `S3FS_MASTER_KEY`, from the parent instance. A parent
-//! that supplies the key *has* the key, and can decrypt the whole filesystem —
-//! so the party an enclave exists to exclude held the only thing that mattered.
-//! No amount of boot verification fixes that: an enclave could prove perfectly
-//! that it had loaded genuine state while the host read that state over its
-//! shoulder.
-//!
-//! Minting inside the enclave and persisting only the sealed form is what
-//! closes it. The plaintext exists in enclave memory and nowhere else.
-//!
-//! ## What is not built yet
-//!
-//! [`StaticKey`] seals by *not* sealing: it writes the secret into the blob
-//! behind a marker that says so. That is enough to exercise every boot mode —
-//! genesis, resume, migration and all four refusals — without hardware, and it
-//! is what the QEMU harness uses. It is not protection, and it does not
-//! pretend to be.
-//!
-//! Real sealing needs KMS: `Decrypt` with a `Recipient` carrying an
-//! attestation document, under a key policy conditioned on
-//! `kms:RecipientAttestation:PCR0`. That is where *"only the correct enclave
-//! boots"* is actually enforced — a wrong enclave does not get a refused
-//! mount, it gets no key at all — and it is the next implementation of this
-//! trait. Nothing above this file changes when it lands.
+//! The development key source: a secret from configuration, stored in the clear.
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use s3fs_core::MasterSecret;
 
-/// A master secret in the form that is safe to store.
-///
-/// Opaque bytes: what is inside depends on which [`MasterKeySource`] produced
-/// it, and no caller should look. A state-origin receipt commits to
-/// `sha256(bytes)` — never the plaintext, because the receipt is readable by
-/// anyone who can read the bucket it sits in.
-#[derive(Clone, PartialEq, Eq)]
-pub struct SealedKey(Vec<u8>);
-
-impl SealedKey {
-    pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        SealedKey(bytes)
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
-    /// What a receipt commits to.
-    pub fn sha256(&self) -> [u8; 32] {
-        nitro_attestation::sha256(&self.0)
-    }
-}
-
-/// Never print the blob. For [`StaticKey`] it *is* the secret, and a `Debug`
-/// that rendered it would put a master key in any log line that formats a
-/// struct containing one.
-impl std::fmt::Debug for SealedKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "SealedKey({} bytes, sha256 {})",
-            self.0.len(),
-            hex::encode(&self.sha256()[..8])
-        )
-    }
-}
-
-#[async_trait]
-pub trait MasterKeySource: Send + Sync + std::fmt::Debug {
-    /// A short description for startup logging. Must not reveal key material.
-    fn describe(&self) -> &'static str;
-
-    /// Create a secret that has never existed before, and return it with the
-    /// form the caller must persist.
-    ///
-    /// Only genesis calls this. Calling it against a filesystem that already
-    /// exists would produce a key that cannot read it.
-    async fn mint(&self) -> Result<(MasterSecret, SealedKey)>;
-
-    /// Recover the secret from a blob a previous genesis wrote.
-    async fn open(&self, sealed: &SealedKey) -> Result<MasterSecret>;
-}
+use super::{MasterKeySource, SealedKey};
 
 /// Marks a blob that is not sealed at all, so that nothing can mistake one for
 /// protection, and so a real source can refuse to open one.

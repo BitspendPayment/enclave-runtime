@@ -48,7 +48,10 @@ pub use boot::{authorise_successor, boot, BootConfig, BootMode, Booted, ReceiptT
 pub use clock::{open_clock, ClockSource, HostClock, PtpClock, TrustedClock, DEFAULT_PTP_DEVICE};
 pub use env::GuestEnvPolicy;
 pub use flag::parse_bool_flag;
-pub use keys::{MasterKeySource, SealedKey, StaticKey};
+pub use keys::{
+    open_key_source, KeyPointer, KmsAttestedKey, KmsKeyConfig, MasterKeyConfig, MasterKeySource,
+    MasterKeySourceKind, SealedKey, StaticKey,
+};
 pub use linker::build_linker;
 pub use mount::{connect, create, mount_existing, parse_fs_id, Backends, MountConfig, Mounted};
 pub use net::{bring_up, Network, NetworkConfig, NetworkMode, DEFAULT_GVFORWARDER};

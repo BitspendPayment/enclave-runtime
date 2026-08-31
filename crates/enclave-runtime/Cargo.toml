@@ -96,6 +96,21 @@ bytes       = { workspace = true }
 tokio       = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "signal", "net", "io-util"] }
 tracing     = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# CiphertextForRecipient — what KMS returns when the response is encrypted to
+# the enclave rather than sent as plaintext — is a CMS EnvelopedData (RFC 5652).
+# The crate parses the structure; `keys::recipient` decides what shape is
+# acceptable, which is deliberately one shape and no other.
+cms = { version = "0.2.3", default-features = false, features = ["alloc"] }
+# Already pulled in by `cms`; named here for the OIDs and the OCTET STRING the
+# unwrap has to read out of the algorithm parameters.
+der = { version = "0.7", default-features = false, features = ["alloc", "oid", "std"] }
+# The master secret is minted and released by KMS, never by configuration.
+# `Recipient` is the parameter that matters: it makes KMS encrypt its answer to
+# a key inside the enclave and omit `Plaintext` entirely, so the parent can
+# proxy the call without being able to read it. SSM holds the resulting
+# ciphertext, and nothing else.
+aws-sdk-kms = { version = "1.51.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-sdk-ssm = { version = "1.56.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
 
 [dev-dependencies]
 # Checking that a generated certificate really parses as X.509.
@@ -106,6 +121,11 @@ nitro-attestation = { path = "../nitro-attestation", features = ["testing"] }
 # The fresh-versus-warm instance question: how much of a request is
 # instantiation, and is it enough to justify pooling instances per client.
 criterion = { version = "0.5", features = ["async_tokio"] }
+# Building the CMS envelope a test has to unwrap. Both arrive with `cms`
+# anyway; naming them here keeps the test encoder honest rather than reaching
+# through a re-export.
+spki = "0.7"
+x509-cert = "0.2"
 
 [[bench]]
 name = "instance_cost"

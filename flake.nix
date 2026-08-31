@@ -269,6 +269,18 @@
           # image overrides this, and because the environment is measured,
           # PCR0 tells a client which kind it is talking to.
           S3FS_RECEIPT_TRUST = "required";
+
+          # The master secret is minted by KMS inside the enclave and released
+          # only against an attestation whose PCR0 matches the key policy. A
+          # wrong image does not get a refused mount — it gets no key at all.
+          #
+          # S3FS_MASTER_KEY is deliberately absent, and the runtime *refuses*
+          # to start if it is set alongside this: a key from configuration is a
+          # key the parent instance holds, which is the whole thing this
+          # prevents. S3FS_KMS_KEY_ID and S3FS_MASTER_KEY_PARAMETER come from
+          # the deployment, since they name resources this repository does not
+          # own.
+          S3FS_MASTER_KEY_SOURCE = "kms";
         };
       };
 
@@ -312,6 +324,12 @@
             # PCR0, PCR31 and the state_root — which is the whole boot machine
             # minus the one part that needs real hardware.
             S3FS_RECEIPT_TRUST = "unsigned-emulator";
+            # And it cannot use KMS at all, for the same reason: KMS verifies
+            # the attestation document carrying the enclave's recipient public
+            # key, and will not accept one that is unsigned. So the emulator
+            # keeps the development key source. PCR0 differs between the two
+            # images, so a client can tell which it is talking to.
+            S3FS_MASTER_KEY_SOURCE = "static";
             S3FS_ENDPOINT = "http://192.168.127.254:9000";
             S3FS_FORCE_PATH_STYLE = "1";
             S3FS_BUCKET = "e2e-data";
