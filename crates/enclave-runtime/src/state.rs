@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::wasi::{S3FsCtxView, S3WasiView};
-use s3fs_core::Fs;
+use s3fs_core::{Fs, Inode};
 use wasmtime::component::ResourceTable;
 use wasmtime::{Result, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -15,6 +15,8 @@ pub struct State {
     wasi: WasiCtx,
     table: ResourceTable,
     fs: Arc<Fs>,
+    /// What this guest sees as `/` — see [`S3FsCtxView::scope`].
+    scope: Arc<Inode>,
     /// The same clock the guest sees through `wasi:clocks`, so `set-times`
     /// with "now" agrees with it.
     clock: Arc<crate::clock::WallClockAdapter>,
@@ -24,8 +26,20 @@ pub struct State {
 
 impl State {
     pub fn new(wasi: WasiCtx, fs: Arc<Fs>, clock: Arc<crate::clock::WallClockAdapter>) -> Self {
+        let scope = fs.root();
+        Self::scoped(wasi, fs, scope, clock)
+    }
+
+    /// A `State` whose guest sees `scope` as `/` and can name nothing above it.
+    pub fn scoped(
+        wasi: WasiCtx,
+        fs: Arc<Fs>,
+        scope: Arc<Inode>,
+        clock: Arc<crate::clock::WallClockAdapter>,
+    ) -> Self {
         State {
             wasi,
+            scope,
             table: ResourceTable::new(),
             fs,
             clock,
@@ -36,6 +50,19 @@ impl State {
 
     pub fn fs(&self) -> &Arc<Fs> {
         &self.fs
+    }
+
+    /// Whether the guest left anything behind in the resource table.
+    ///
+    /// Meaningless for a `State` that lives one request — the whole table goes
+    /// with it. It matters for a *pooled* instance: the host pushes an
+    /// `incoming-request` and a `response-outparam` per call and never removes
+    /// them, so everything here is reclaimed by the guest dropping its handles.
+    /// A guest that does not is not leaking unboundedly — the table is a slab
+    /// with a free list — but it is leaving entries a later request from the
+    /// same client could still address.
+    pub fn resources_settled(&self) -> bool {
+        self.table.is_empty()
     }
 }
 
@@ -56,6 +83,7 @@ impl S3WasiView for State {
         // resolve to nothing.
         S3FsCtxView {
             fs: &self.fs,
+            scope: &self.scope,
             table: &mut self.table,
             clock: &self.clock,
         }

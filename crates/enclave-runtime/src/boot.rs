@@ -48,7 +48,7 @@ use anyhow::{bail, Context, Result};
 use nitro_attestation::{Expectations, Trust, VerifyOptions};
 use nitro_nsm::{AttestationRequest, Nsm, PCR_SUCCESSOR, PCR_ZERO};
 use s3fs_core::backend::{Backend, ObjectLock, PutBlobInput};
-use s3fs_core::FsError;
+use s3fs_core::{FsError, MasterSecret};
 
 use crate::keys::{MasterKeySource, SealedKey};
 use crate::mount::{Backends, MountConfig, Mounted};
@@ -83,6 +83,17 @@ pub struct Booted {
     pub state_root: [u8; 32],
     /// The PCR0 this enclave is running under.
     pub pcr0: Vec<u8>,
+    /// The recovered master secret.
+    ///
+    /// Returned rather than dropped because per-client filesystems derive
+    /// their identifiers from it — see [`s3fs_core::MasterSecret::derive_tenant_id`]
+    /// — and there is nowhere else to get it: the runtime's own `KeyMaterial`
+    /// holds only what was derived *for* the runtime filesystem.
+    ///
+    /// It zeroizes on drop and never prints. It is already resident in this
+    /// process either way; what this changes is that it stays reachable, and
+    /// the alternative was re-opening the key source per client.
+    pub master: MasterSecret,
 }
 
 /// The identity a receipt commits to.
@@ -321,6 +332,7 @@ pub async fn boot(
                 mounted,
                 state_root,
                 pcr0,
+                master,
             })
         }
 
@@ -509,6 +521,7 @@ async fn genesis(
         mounted,
         state_root,
         pcr0,
+        master,
     })
 }
 

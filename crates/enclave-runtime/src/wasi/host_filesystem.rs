@@ -136,13 +136,14 @@ fn split_at_path(p: &str) -> (&str, &str) {
 
 async fn resolve_parent(
     fs: &s3fs_core::Fs,
+    scope: &std::sync::Arc<s3fs_core::Inode>,
     base: &std::sync::Arc<s3fs_core::Inode>,
     parent_path: &str,
 ) -> S3WasiFsResult<std::sync::Arc<s3fs_core::Inode>> {
     if parent_path.is_empty() {
         Ok(base.clone())
     } else {
-        fs.lookup_at(base, parent_path)
+        fs.lookup_within(scope, base, parent_path)
             .await
             .map_err(|e| S3WasiFsError::from(from_fs(e)))
     }
@@ -347,7 +348,7 @@ impl HostDescriptor for S3FsCtxView<'_> {
         let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let (parent_path, name) = split_at_path(&path);
-        let parent = resolve_parent(self.fs, &base, parent_path).await?;
+        let parent = resolve_parent(self.fs, self.scope, &base, parent_path).await?;
         self.fs.mkdir(&parent, name).await.map(|_| ()).into_wasi()
     }
 
@@ -412,10 +413,11 @@ impl HostDescriptor for S3FsCtxView<'_> {
         let old_base = old_d.at_base();
         let new_base = new_d.at_base();
         let (parent_path, name) = split_at_path(&new_path);
-        let new_parent = resolve_parent(self.fs, &new_base, parent_path).await?;
+        let new_parent = resolve_parent(self.fs, self.scope, &new_base, parent_path).await?;
 
         self.fs
-            .link_at(
+            .link_within(
+                self.scope,
                 &old_base,
                 &old_path,
                 &new_parent,
@@ -448,7 +450,11 @@ impl HostDescriptor for S3FsCtxView<'_> {
         if !path_flags.contains(PathFlags::SYMLINK_FOLLOW) {
             // Probe the leaf without following. NotFound is fine — open_at
             // may be creating. Actual symlink → Loop.
-            if let Ok(probe) = self.fs.lookup_at_no_follow(&base, &path).await {
+            if let Ok(probe) = self
+                .fs
+                .lookup_within_no_follow(self.scope, &base, &path)
+                .await
+            {
                 if matches!(
                     self.fs.stat(&probe).await.map(|a| a.kind),
                     Ok(InodeKind::Symlink)
@@ -460,7 +466,7 @@ impl HostDescriptor for S3FsCtxView<'_> {
 
         let handle = self
             .fs
-            .open_at(&base, &path, flags)
+            .open_within(self.scope, &base, &path, flags)
             .await
             .map_err(|e| S3WasiFsError::from(from_fs(e)))?;
 
@@ -486,7 +492,11 @@ impl HostDescriptor for S3FsCtxView<'_> {
                 return Err(S3WasiFsError::from(ErrorCode::NotDirectory));
             }
             Descriptor::File {
-                parent: self.fs.parent_of(&handle.inode).await.map_err(from_fs)?,
+                parent: self
+                    .fs
+                    .parent_within(self.scope, &handle.inode)
+                    .await
+                    .map_err(from_fs)?,
                 handle,
             }
         };
@@ -506,7 +516,7 @@ impl HostDescriptor for S3FsCtxView<'_> {
         let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let (parent_path, name) = split_at_path(&path);
-        let parent = resolve_parent(self.fs, &base, parent_path).await?;
+        let parent = resolve_parent(self.fs, self.scope, &base, parent_path).await?;
         self.fs.readlink_at(&parent, name).await.into_wasi()
     }
 
@@ -518,7 +528,7 @@ impl HostDescriptor for S3FsCtxView<'_> {
         let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let (parent_path, name) = split_at_path(&path);
-        let parent = resolve_parent(self.fs, &base, parent_path).await?;
+        let parent = resolve_parent(self.fs, self.scope, &base, parent_path).await?;
         self.fs.rmdir(&parent, name).await.into_wasi()
     }
 
@@ -536,8 +546,8 @@ impl HostDescriptor for S3FsCtxView<'_> {
         let new_base = new_d.at_base();
         let (op, oname) = split_at_path(&old_path);
         let (np, nname) = split_at_path(&new_path);
-        let old_parent = resolve_parent(self.fs, &old_base, op).await?;
-        let new_parent = resolve_parent(self.fs, &new_base, np).await?;
+        let old_parent = resolve_parent(self.fs, self.scope, &old_base, op).await?;
+        let new_parent = resolve_parent(self.fs, self.scope, &new_base, np).await?;
         self.fs
             .rename(&old_parent, oname, &new_parent, nname)
             .await
@@ -553,7 +563,7 @@ impl HostDescriptor for S3FsCtxView<'_> {
         let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let (parent_path, name) = split_at_path(&new_path);
-        let parent = resolve_parent(self.fs, &base, parent_path).await?;
+        let parent = resolve_parent(self.fs, self.scope, &base, parent_path).await?;
         self.fs
             .symlink_at(&parent, name, &old_path)
             .await
@@ -569,7 +579,7 @@ impl HostDescriptor for S3FsCtxView<'_> {
         let d = get_descriptor_owned(self.table, &fd).map_err(S3WasiFsError::trap)?;
         let base = d.at_base();
         let (parent_path, name) = split_at_path(&path);
-        let parent = resolve_parent(self.fs, &base, parent_path).await?;
+        let parent = resolve_parent(self.fs, self.scope, &base, parent_path).await?;
         self.fs.unlink(&parent, name).await.into_wasi()
     }
 

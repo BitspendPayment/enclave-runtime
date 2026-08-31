@@ -107,11 +107,14 @@ impl GuestEnvironment {
         &self.fs
     }
 
-    /// Build a fresh [`State`] with this environment's capabilities.
+    /// Build a fresh [`State`] whose guest sees `scope` as `/`.
     ///
-    /// Each call draws a new insecure-random seed from the entropy source, so
-    /// two guest instances do not share a hash seed.
-    pub fn new_state(&self) -> Result<State> {
+    /// Everything else — the filesystem, the clock, the entropy source, the
+    /// environment, the arguments — is shared. One mounted filesystem, one
+    /// block cache, one transaction stream; what differs between two clients
+    /// is only which directory each of them calls `/`, and that separation is
+    /// enforced by the resolver rather than by anything the guest does.
+    pub fn new_state_scoped(&self, scope: Arc<s3fs_core::Inode>) -> Result<State> {
         let mut wasi = WasiCtxBuilder::new();
         wasi.inherit_stdio();
         wasi.envs(&self.env);
@@ -122,11 +125,20 @@ impl GuestEnvironment {
         wasi.insecure_random_seed(random.insecure_seed()?);
         wasi.secure_random(random);
 
-        Ok(State::new(
+        Ok(State::scoped(
             wasi.build(),
             self.fs.clone(),
+            scope,
             self.clock.clone(),
         ))
+    }
+
+    /// Build a fresh [`State`] with this environment's capabilities.
+    ///
+    /// Each call draws a new insecure-random seed from the entropy source, so
+    /// two guest instances do not share a hash seed.
+    pub fn new_state(&self) -> Result<State> {
+        self.new_state_scoped(self.fs.root())
     }
 }
 

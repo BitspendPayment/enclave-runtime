@@ -78,6 +78,26 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
             write_file(&p["/files/".len()..], &body)
         }
         ("GET", p) if p.starts_with("/files/") => read_file(&p["/files/".len()..]),
+        // A guest that does **not** validate the path, on purpose.
+        //
+        // `/files/` sanitises; this deliberately does not, so a test can point
+        // it at `../../` or `/tenants/someone-else` and see what the *runtime*
+        // does. That is the whole question for a tenant: separation has to be
+        // the capability layer's, not this file's, and the only way to show it
+        // is with a guest that is not helping.
+        ("GET", p) if p.starts_with("/escape/") => {
+            let target = &p["/escape/".len()..];
+            match fs::read(target) {
+                Ok(bytes) => Ok(text(
+                    StatusCode::OK,
+                    format!("read {} bytes from {target}\n", bytes.len()),
+                )),
+                Err(e) => Ok(text(
+                    StatusCode::NOT_FOUND,
+                    format!("refused {target}: {e}\n"),
+                )),
+            }
+        }
         // A guest that never returns and never sets a response. Deliberately
         // here rather than in a test fixture: it is the one behaviour a host
         // cannot provoke from the outside, and without it the runtime's

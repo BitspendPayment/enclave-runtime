@@ -42,6 +42,7 @@ pub mod random;
 pub mod run;
 pub mod serve;
 pub mod state;
+pub mod tenant;
 pub mod wasi;
 
 pub use boot::{authorise_successor, boot, BootConfig, BootMode, Booted, ReceiptTrust};
@@ -63,8 +64,9 @@ pub use run::{
 };
 pub use serve::{
     serve_component, AcmeConfig, AnyClientCertificate, CertificateSlot, ClientIdentity,
-    EgressPolicy, EnclaveEndpoints, SealedAcmeCache, ServeConfig, ServeHandle, Server, TlsIdentity,
-    TlsMode, X_ENCLAVE_CLIENT,
+    EgressPolicy, EnclaveEndpoints, GuestInstance, PoolLimits, SealedAcmeCache, ServeConfig,
+    ServeHandle, Server, Tenancy, TenantPool, TlsIdentity, TlsMode, X_ENCLAVE_CLIENT,
 };
 pub use state::State;
+pub use tenant::{tenant_root, tenants, Arrival, TenantRoot};
 pub use wasi::{add_filesystem_to_linker, S3FsCtxView, S3WasiView};

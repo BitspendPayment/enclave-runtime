@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use s3fs_core::Fs;
+use s3fs_core::{Fs, Inode};
 use wasmtime::component::ResourceTable;
 
 /// "View" struct holding mutable references the host trait impls need.
@@ -18,6 +18,14 @@ use wasmtime::component::ResourceTable;
 /// writes them.
 pub struct S3FsCtxView<'a> {
     pub fs: &'a Arc<Fs>,
+    /// What this guest sees as `/`.
+    ///
+    /// The filesystem root for a guest that has the whole store; a tenant's
+    /// own directory when clients are separated inside one filesystem. Every
+    /// path this view resolves is confined to it — see
+    /// [`s3fs_core::Fs::lookup_within`] — so separation is a property of the
+    /// capability layer rather than something guest code is trusted to keep.
+    pub scope: &'a Arc<Inode>,
     pub table: &'a mut ResourceTable,
     /// The same clock the guest sees through `wasi:clocks/wall-clock`, so
     /// `set-times` with "now" cannot disagree with what the guest just read.

@@ -575,6 +575,8 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
                     acme,
                     attestation,
                     request_timeout: Duration::from_secs(cli.request_timeout_secs),
+                    // Off until the flags that turn it on land beside it.
+                    tenancy: None,
                 },
             )
             .await?;

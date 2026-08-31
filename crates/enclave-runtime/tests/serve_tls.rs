@@ -146,6 +146,7 @@ async fn start() -> Harness {
                 acme: None,
                 attestation: Some(nsm_for_server),
                 request_timeout: std::time::Duration::from_secs(30),
+                tenancy: None,
             },
         )
         .await;

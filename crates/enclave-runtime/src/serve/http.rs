@@ -33,9 +33,12 @@ use crate::run::GuestEnvironment;
 use crate::serve::acme::CertificateSlot;
 use crate::serve::client::ClientIdentity;
 use crate::serve::endpoints::EnclaveEndpoints;
+use crate::serve::pool::{LiveTenant, PoolLimits, TenantPool};
 use crate::serve::tls::TlsIdentity;
 use crate::state::State;
+use crate::tenant::tenant_root;
 use nitro_nsm::Nsm;
+use s3fs_core::MasterSecret;
 
 /// How the guest is served.
 #[derive(Debug)]
@@ -61,6 +64,9 @@ pub struct ServeConfig {
     /// request forever, and at `concurrency: 1` that is the whole server. See
     /// [`EPOCH_TICK`].
     pub request_timeout: Duration,
+    /// Give each authenticated client their own filesystem. `None` keeps the
+    /// original model: one filesystem, a fresh instance per request.
+    pub tenancy: Option<Arc<Tenancy>>,
 }
 
 impl Default for ServeConfig {
@@ -85,6 +91,10 @@ impl Default for ServeConfig {
             acme: None,
             attestation: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            // Off. Turning it on changes what two clients may do at the same
+            // time, which a guest may have been relying on — so it is asked
+            // for, never inherited.
+            tenancy: None,
         }
     }
 }
@@ -100,6 +110,16 @@ const EPOCH_TICK: Duration = Duration::from_millis(250);
 /// Default ceiling on producing a response head.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A guest instance and the store it is bound to.
+///
+/// The two travel together because `instantiate_async` binds a `Proxy` to one
+/// store: separating them would produce a handle that looks usable and
+/// resolves against the wrong memory.
+pub struct GuestInstance {
+    store: Store<State>,
+    proxy: wasmtime_wasi_http::p2::bindings::Proxy,
+}
+
 /// A compiled guest plus the environment its instances are built from.
 ///
 /// Compilation and `instantiate_pre` happen once, at startup: per-request
@@ -112,6 +132,45 @@ pub struct ServeHandle {
     limit: Arc<Semaphore>,
     /// Ceiling on producing a response head. See [`ServeHandle::watchdog`].
     timeout: Duration,
+    /// Per-client filesystems, when the deployment asked for them.
+    ///
+    /// `None` is the original model and stays the default: one filesystem, a
+    /// fresh instance per request, every request serialised against every
+    /// other. Turning this on changes what two clients can do at the same time,
+    /// which is a property a guest may have been relying on — so it is opted
+    /// into, and PCR0 records the choice.
+    tenancy: Option<Arc<Tenancy>>,
+}
+
+/// Everything needed to give a client their own corner of the filesystem.
+///
+/// No backends and no mounting: there is one filesystem, and a client costs a
+/// directory in it. What is per-client is the *view* — which directory the
+/// guest calls `/` — plus a warm instance and a lock.
+pub struct Tenancy {
+    pool: TenantPool<GuestInstance>,
+    master: MasterSecret,
+}
+
+impl std::fmt::Debug for Tenancy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tenancy")
+            .field("tenants", &self.pool.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Tenancy {
+    pub fn new(master: MasterSecret, limits: PoolLimits) -> Self {
+        Tenancy {
+            pool: TenantPool::new(limits),
+            master,
+        }
+    }
+
+    pub fn pool(&self) -> &TenantPool<GuestInstance> {
+        &self.pool
+    }
 }
 
 impl ServeHandle {
@@ -172,7 +231,20 @@ impl ServeHandle {
             guest: Arc::new(guest),
             limit: Arc::new(Semaphore::new(concurrency.max(1))),
             timeout: DEFAULT_REQUEST_TIMEOUT,
+            tenancy: None,
         })
+    }
+
+    /// The environment instances are built from — the runtime's own
+    /// filesystem, the clock, and the entropy source.
+    pub fn environment(&self) -> &Arc<GuestEnvironment> {
+        &self.guest
+    }
+
+    /// Give each authenticated client their own filesystem and warm instance.
+    pub fn with_tenancy(mut self, tenancy: Arc<Tenancy>) -> Self {
+        self.tenancy = Some(tenancy);
+        self
     }
 
     /// Override the response-head deadline.
@@ -241,7 +313,138 @@ impl ServeHandle {
             .await
             .context("request limiter closed")?;
 
-        self.in_fresh_instance(permit, scheme, req).await
+        // A client with a proven identity and a deployment that asked for
+        // tenancy gets their own filesystem. Everyone else — including every
+        // anonymous caller — gets the original path: a fresh instance over the
+        // runtime's own filesystem, occupying no slot that a real client could
+        // otherwise have had.
+        match (&self.tenancy, client) {
+            (Some(tenancy), Some(client)) => {
+                self.in_tenant(tenancy.clone(), client.key(), permit, scheme, req)
+                    .await
+            }
+            _ => self.in_fresh_instance(permit, scheme, req).await,
+        }
+    }
+
+    /// One request, in this client's own filesystem and warm instance.
+    ///
+    /// The lock is held for the whole call — including the body, because
+    /// `call_handle` does not return until the guest has finished writing it —
+    /// and it is what serialises this client against **itself and nothing
+    /// else**. Two clients holding two different locks over two different
+    /// filesystems is the entire point: their commits do not queue, because
+    /// there is nothing for them to queue on.
+    async fn in_tenant<B>(
+        &self,
+        tenancy: Arc<Tenancy>,
+        client: &[u8; 32],
+        permit: tokio::sync::OwnedSemaphorePermit,
+        scheme: Scheme,
+        req: hyper::Request<B>,
+    ) -> Result<hyper::Response<HyperOutgoingBody>>
+    where
+        B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
+    {
+        // Checked out before the lock is taken, so the eviction sweep can see
+        // this tenant is busy and leave it alone. The guard releases that mark
+        // however the request ends.
+        let checkout = tenancy.pool.checkout(client);
+        // Owned, so it can move into the task below and outlive this function.
+        let mut guard = checkout.slot().tenant().clone().lock_owned().await;
+
+        if guard.is_none() {
+            // First use of this slot, under the lock — so two simultaneous
+            // first requests from one client resolve to one directory, the
+            // second waiting here rather than racing the first.
+            let opened = tenant_root(self.guest.fs(), &tenancy.master, client).await?;
+            tracing::info!(
+                client = %hex::encode(&client[..8]),
+                tenant = %hex::encode(opened.tenant_id),
+                arrival = ?opened.arrival,
+                "tenant directory ready"
+            );
+            *guard = Some(LiveTenant {
+                scope: opened.scope,
+                tenant_id: opened.tenant_id,
+                instance: None,
+                requests: 0,
+            });
+        }
+
+        let tenant = guard.as_mut().expect("just built");
+        // Rebuilt when absent, and when this one has served long enough: wasm
+        // linear memory never shrinks, so an instance that lived forever would
+        // only grow. Cheap — ~24 µs, and no I/O, because there is no
+        // filesystem to bring up with it.
+        let stale = tenant.requests >= tenancy.pool.limits().max_requests_per_instance;
+        if tenant.instance.is_none() || stale {
+            tenant.instance = Some(self.instantiate(tenant.scope.clone()).await?);
+            tenant.requests = 0;
+        }
+        tenant.requests += 1;
+
+        let instance = tenant.instance.as_mut().expect("just built");
+        // Reset every request: the epoch deadline is absolute, so a reused
+        // store would otherwise inherit whatever the last request left.
+        instance.store.set_epoch_deadline(self.watchdog());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let req = instance
+            .store
+            .data_mut()
+            .http()
+            .new_incoming_request(scheme, req)?;
+        let out = instance
+            .store
+            .data_mut()
+            .http()
+            .new_response_outparam(sender)?;
+
+        let task = tokio::task::spawn(async move {
+            // Moved in so the lock outlives the response head: a pooled store
+            // must not be handed to the next request until this call has
+            // finished writing its body.
+            let mut guard = guard;
+            let _checkout = checkout;
+            let tenant = guard.as_mut().expect("held across the call");
+            let instance = tenant.instance.as_mut().expect("built before the call");
+            let result = instance
+                .proxy
+                .wasi_http_incoming_handler()
+                .call_handle(&mut instance.store, req, out)
+                .await;
+
+            if result.is_err() {
+                // One client's instance, and nothing else. The filesystem is
+                // shared and untouched; the next caller for this client gets a
+                // fresh instance over the same directory.
+                tracing::warn!("guest trapped; this client's instance will be rebuilt");
+                tenant.instance = None;
+            } else if !instance.store.data().resources_settled() {
+                tracing::debug!("guest left resources behind; rebuilding its instance");
+                tenant.instance = None;
+            }
+            result
+        });
+
+        self.await_head(task, receiver, permit).await
+    }
+
+    /// Build an instance whose guest sees `scope` as `/`.
+    ///
+    /// The one place a store and an instance are made, so the per-request path
+    /// and the per-tenant path cannot drift in what a guest is handed.
+    async fn instantiate(&self, scope: Arc<s3fs_core::Inode>) -> Result<GuestInstance> {
+        let mut store = Store::new(self.pre.engine(), self.guest.new_state_scoped(scope)?);
+        store.set_epoch_deadline(self.watchdog());
+        let proxy = self
+            .pre
+            .instantiate_async(&mut store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+            .context("instantiating the guest")?;
+        Ok(GuestInstance { store, proxy })
     }
 
     /// The only dispatch path. A fresh store, a fresh instance, both dropped
@@ -593,8 +796,11 @@ pub async fn serve_component(
     // wasmtime 44 enables async at the engine level when the `async` feature
     // is on; `Config::async_support` is a no-op. Same as `run_component`.
     let engine = ServeHandle::engine_with_watchdog()?;
-    let handle = ServeHandle::new(&engine, component_bytes, guest, config.concurrency)?
+    let mut handle = ServeHandle::new(&engine, component_bytes, guest, config.concurrency)?
         .with_timeout(config.request_timeout);
+    if let Some(tenancy) = &config.tenancy {
+        handle = handle.with_tenancy(tenancy.clone());
+    }
 
     // Before the listener binds. A guest that will not instantiate should stop
     // the enclave, not the first client unlucky enough to arrive.
