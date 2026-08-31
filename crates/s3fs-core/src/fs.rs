@@ -298,11 +298,28 @@ impl Fs {
         path: &str,
         follow_final: bool,
     ) -> FsResult<Arc<Inode>> {
+        self.resolve_within(ROOT_OBJID, base, path, follow_final)
+            .await
+    }
+
+    /// Resolve without leaving the subtree rooted at `scope`.
+    ///
+    /// This is the capability boundary between two tenants of one filesystem.
+    /// See [`resolve_in`] for what it forecloses and why those are the only
+    /// three routes out.
+    async fn resolve_within(
+        &self,
+        scope: u64,
+        base: &Arc<Inode>,
+        path: &str,
+        follow_final: bool,
+    ) -> FsResult<Arc<Inode>> {
         let objset = self.objset().await?;
         let blocks = self.blocks();
         let objid = resolve_in(
             &objset,
             &blocks,
+            scope,
             base.objid(),
             path,
             follow_final,
@@ -311,6 +328,42 @@ impl Fs {
         .await?;
         let d = objset.get_allocated(&blocks, objid).await?;
         Ok(Inode::new(objid, d.gen))
+    }
+
+    /// [`Fs::lookup_at`], confined to `scope`.
+    pub async fn lookup_within(
+        &self,
+        scope: &Arc<Inode>,
+        base: &Arc<Inode>,
+        path: &str,
+    ) -> FsResult<Arc<Inode>> {
+        self.resolve_within(scope.objid(), base, path, true).await
+    }
+
+    /// [`Fs::lookup_at_no_follow`], confined to `scope`.
+    pub async fn lookup_within_no_follow(
+        &self,
+        scope: &Arc<Inode>,
+        base: &Arc<Inode>,
+        path: &str,
+    ) -> FsResult<Arc<Inode>> {
+        self.resolve_within(scope.objid(), base, path, false).await
+    }
+
+    /// [`Fs::parent_of`], confined to `scope`.
+    ///
+    /// The scope is its own parent, so a descriptor at the top of a tenant's
+    /// subtree cannot be walked upwards out of it — `..` is not the only way
+    /// to ask for a parent, and this is the other one.
+    pub async fn parent_within(
+        &self,
+        scope: &Arc<Inode>,
+        ino: &Arc<Inode>,
+    ) -> FsResult<Arc<Inode>> {
+        if ino.objid() == scope.objid() {
+            return Ok(scope.clone());
+        }
+        self.parent_of(ino).await
     }
 
     // -- metadata -----------------------------------------------------------
@@ -481,8 +534,30 @@ impl Fs {
         new_name: &str,
         follow: bool,
     ) -> FsResult<()> {
+        self.link_within(&self.root(), old_base, old_path, new_base, new_name, follow)
+            .await
+    }
+
+    /// [`Fs::link_at`], confined to `scope`.
+    ///
+    /// The *source* is the one that matters here: a hard link is a second name
+    /// for an existing inode, so linking to something outside the scope would
+    /// pull it inside permanently — an escape that survives the request that
+    /// made it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn link_within(
+        &self,
+        scope: &Arc<Inode>,
+        old_base: &Arc<Inode>,
+        old_path: &str,
+        new_base: &Arc<Inode>,
+        new_name: &str,
+        follow: bool,
+    ) -> FsResult<()> {
         validate_segment(new_name)?;
-        let target = self.resolve(old_base, old_path, follow).await?;
+        let target = self
+            .resolve_within(scope.objid(), old_base, old_path, follow)
+            .await?;
 
         let mut txn = self.store.begin().await?;
         let blocks = txn.blocks().clone();
@@ -692,11 +767,27 @@ impl Fs {
         path: &str,
         flags: OpenFlags,
     ) -> FsResult<Arc<FileHandle>> {
+        self.open_within(&self.root(), base, path, flags).await
+    }
+
+    /// [`Fs::open_at`], confined to `scope`.
+    ///
+    /// Both halves have to be confined, not just the lookup: a path that does
+    /// not resolve may still be *created*, and creating
+    /// `../someone-else/file` would be an escape that writes rather than
+    /// reads.
+    pub async fn open_within(
+        &self,
+        scope: &Arc<Inode>,
+        base: &Arc<Inode>,
+        path: &str,
+        flags: OpenFlags,
+    ) -> FsResult<Arc<FileHandle>> {
         if !flags.read && !flags.write {
             return Err(FsError::Invalid("open with no read or write"));
         }
 
-        let existing = match self.resolve(base, path, true).await {
+        let existing = match self.resolve_within(scope.objid(), base, path, true).await {
             Ok(ino) => Some(ino),
             Err(FsError::NotFound) if flags.create => None,
             Err(e) => return Err(e),
@@ -709,7 +800,7 @@ impl Fs {
                 }
                 ino
             }
-            None => self.create_file(base, path).await?,
+            None => self.create_file(scope.objid(), base, path).await?,
         };
 
         let d = self.dnode(inode.objid()).await?;
@@ -729,12 +820,12 @@ impl Fs {
     }
 
     /// Create an empty regular file at `path`, which must not exist.
-    async fn create_file(&self, base: &Arc<Inode>, path: &str) -> FsResult<Arc<Inode>> {
+    async fn create_file(&self, scope: u64, base: &Arc<Inode>, path: &str) -> FsResult<Arc<Inode>> {
         let (parent_path, name) = split_last(path)?;
         let parent = if parent_path.is_empty() {
             base.clone()
         } else {
-            self.resolve(base, parent_path, true).await?
+            self.resolve_within(scope, base, parent_path, true).await?
         };
         validate_segment(name)?;
 
@@ -1110,6 +1201,10 @@ impl SnapshotFs {
         let objid = resolve_in(
             &self.objset,
             &self.blocks,
+            // A snapshot is read-only and whole: there is no tenant to confine
+            // to, and confining to one would hide the rest of a snapshot from
+            // the operator reading it.
+            ROOT_OBJID,
             base.objid(),
             path,
             true,
@@ -1215,9 +1310,27 @@ async fn read_symlink(blocks: &BlockStore, d: &Dnode) -> FsResult<String> {
 ///
 /// Recursion is bounded by `depth`, which is decremented on every symlink hop
 /// rather than every component, so a chain of links cannot outlast it.
+/// Walk `path`, never leaving the subtree rooted at `scope`.
+///
+/// `scope` is what makes this a capability rather than a convention. Every way
+/// a path can name something above where it started is redirected to `scope`
+/// instead of to the filesystem root:
+///
+/// - an **absolute path** starts at `scope`, so `/etc/passwd` means
+///   `<scope>/etc/passwd` and cannot mean anything else;
+/// - **`..`** at `scope` stays at `scope`, so no number of them walks out;
+/// - an **absolute symlink target** resolves from `scope` too, so a guest
+///   cannot manufacture an escape by writing one.
+///
+/// Those three are the whole attack surface, and they hold inductively: a walk
+/// begins at `scope` or below, and none of the three can take it higher.
+///
+/// Pass [`ROOT_OBJID`] for an unscoped filesystem, which is what a guest with
+/// the whole store as its preopen gets.
 async fn resolve_in(
     objset: &ObjectSet,
     blocks: &BlockStore,
+    scope: u64,
     start: u64,
     path: &str,
     follow_final: bool,
@@ -1226,11 +1339,7 @@ async fn resolve_in(
     if depth == 0 {
         return Err(FsError::Loop);
     }
-    let mut current = if path.starts_with('/') {
-        ROOT_OBJID
-    } else {
-        start
-    };
+    let mut current = if path.starts_with('/') { scope } else { start };
 
     let components: Vec<&str> = path
         .split('/')
@@ -1241,6 +1350,12 @@ async fn resolve_in(
         let last = i + 1 == components.len();
 
         if *comp == ".." {
+            // Clamped at the scope, not at the mount. Without this a tenant
+            // holding `/tenants/a` would reach `/tenants` — and from there
+            // every other tenant — with two components of ordinary path.
+            if current == scope {
+                continue;
+            }
             let d = objset.get_allocated(blocks, current).await?;
             // The root is its own parent, so `..` stops at the mount rather
             // than escaping it.
@@ -1259,11 +1374,20 @@ async fn resolve_in(
             let link = objset.get_allocated(blocks, current).await?;
             let target = read_symlink(blocks, &link).await?;
             let from = if target.starts_with('/') {
-                ROOT_OBJID
+                scope
             } else {
                 dir_dnode.objid
             };
-            current = Box::pin(resolve_in(objset, blocks, from, &target, true, depth - 1)).await?;
+            current = Box::pin(resolve_in(
+                objset,
+                blocks,
+                scope,
+                from,
+                &target,
+                true,
+                depth - 1,
+            ))
+            .await?;
         }
     }
     Ok(current)
@@ -1271,3 +1395,123 @@ async fn resolve_in(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use crate::backend::memory::MemoryBackend;
+    use crate::config::Config;
+    use crate::crypto::MasterSecret;
+
+    /// Two tenants under `/tenants`, plus a secret at the root that neither
+    /// should ever reach.
+    async fn tenanted() -> (Arc<Fs>, Arc<Inode>, Arc<Inode>) {
+        let backend = Arc::new(MemoryBackend::new());
+        let fs = Fs::create(
+            backend.clone(),
+            backend,
+            &MasterSecret::from_bytes([3u8; 32]),
+            [0u8; 16],
+            Arc::new(Config::default()),
+        )
+        .await
+        .unwrap();
+
+        let root = fs.root();
+        fs.mkdir(&root, "runtime-only").await.unwrap();
+        let tenants = fs.mkdir(&root, "tenants").await.unwrap();
+        let alice = fs.mkdir(&tenants, "alice").await.unwrap();
+        let bob = fs.mkdir(&tenants, "bob").await.unwrap();
+        fs.mkdir(&bob, "bobs-private").await.unwrap();
+        (fs, alice, bob)
+    }
+
+    /// Inside her own subtree Alice works normally.
+    #[tokio::test]
+    async fn a_scope_does_not_restrict_what_is_inside_it() {
+        let (fs, alice, _) = tenanted().await;
+        fs.mkdir(&alice, "work").await.unwrap();
+        assert!(fs.lookup_within(&alice, &alice, "work").await.is_ok());
+        assert!(fs.lookup_within(&alice, &alice, "/work").await.is_ok());
+        assert!(fs
+            .lookup_within(&alice, &alice, "work/../work")
+            .await
+            .is_ok());
+    }
+
+    /// An absolute path means the *scope's* root, not the filesystem's. This
+    /// is the first of the three escapes and the most obvious to try.
+    #[tokio::test]
+    async fn an_absolute_path_cannot_leave_the_scope() {
+        let (fs, alice, _) = tenanted().await;
+        assert!(fs
+            .lookup_within(&alice, &alice, "/tenants/bob")
+            .await
+            .is_err());
+        assert!(fs
+            .lookup_within(&alice, &alice, "/runtime-only")
+            .await
+            .is_err());
+        // And it is not that the names are unknown — unscoped they resolve.
+        let root = fs.root();
+        assert!(fs.lookup_at(&root, "/tenants/bob").await.is_ok());
+    }
+
+    /// The second escape: no number of `..` walks out.
+    #[tokio::test]
+    async fn dot_dot_cannot_climb_out_of_the_scope() {
+        let (fs, alice, _) = tenanted().await;
+        for path in ["..", "../..", "../bob", "../../runtime-only", "../../.."] {
+            assert!(
+                fs.lookup_within(&alice, &alice, path).await.is_err()
+                    || fs
+                        .lookup_within(&alice, &alice, path)
+                        .await
+                        .map(|i| i.objid())
+                        .unwrap()
+                        == alice.objid(),
+                "{path} escaped the scope"
+            );
+        }
+    }
+
+    /// The third, and the one a guest can build for itself: an absolute
+    /// symlink resolves from the scope too, so writing one buys nothing.
+    #[tokio::test]
+    async fn an_absolute_symlink_cannot_leave_the_scope() {
+        let (fs, alice, _) = tenanted().await;
+        fs.symlink_at(&alice, "escape", "/tenants/bob/bobs-private")
+            .await
+            .unwrap();
+        assert!(fs.lookup_within(&alice, &alice, "escape").await.is_err());
+
+        fs.symlink_at(&alice, "up", "../../runtime-only")
+            .await
+            .unwrap();
+        assert!(fs.lookup_within(&alice, &alice, "up").await.is_err());
+    }
+
+    /// `..` is not the only way to ask for a parent. A descriptor at the top
+    /// of a scope must not be walkable upwards either.
+    #[tokio::test]
+    async fn the_scope_is_its_own_parent() {
+        let (fs, alice, _) = tenanted().await;
+        let parent = fs.parent_within(&alice, &alice).await.unwrap();
+        assert_eq!(parent.objid(), alice.objid());
+        // Unscoped, the same call does reach `/tenants` — which is exactly the
+        // difference the scope makes.
+        assert_ne!(fs.parent_of(&alice).await.unwrap().objid(), alice.objid());
+    }
+
+    /// Two tenants, same relative path, different files. The separation is the
+    /// resolver's, not the guest's.
+    #[tokio::test]
+    async fn two_scopes_name_different_files() {
+        let (fs, alice, bob) = tenanted().await;
+        fs.mkdir(&alice, "data").await.unwrap();
+        fs.mkdir(&bob, "data").await.unwrap();
+        let a = fs.lookup_within(&alice, &alice, "/data").await.unwrap();
+        let b = fs.lookup_within(&bob, &bob, "/data").await.unwrap();
+        assert_ne!(a.objid(), b.objid());
+    }
+}
