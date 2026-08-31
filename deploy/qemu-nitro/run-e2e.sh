@@ -237,14 +237,14 @@ done
 # ---------------------------------------------------------------------------
 # The assertions.
 # ---------------------------------------------------------------------------
-say "1/3  the filesystem is mounted over gvproxy"
+say "1/5  the filesystem is mounted over gvproxy"
 first="$(curl -sk --max-time 20 "https://127.0.0.1:$HTTPS_PORT/counter")" || fail "no answer from the guest"
 second="$(curl -sk --max-time 20 "https://127.0.0.1:$HTTPS_PORT/counter")" || fail "no answer from the guest"
 echo "counter: $first then $second"
 [[ "${second//[^0-9]/}" -eq $(( ${first//[^0-9]/} + 1 )) ]] \
     || fail "the counter did not advance ($first → $second); writes are not reaching MinIO"
 
-say "2/3  the attestation binds this connection's certificate"
+say "2/5  the attestation binds this connection's certificate"
 "$ATTEST" \
     --url "https://127.0.0.1:$HTTPS_PORT/enclave/attestation" \
     --unsigned-emulator \
@@ -255,7 +255,7 @@ say "2/3  the attestation binds this connection's certificate"
 grep -q "binding    the attested certificate" "$RUNDIR/attest.log" \
     || fail "the document did not bind the certificate this connection was served"
 
-say "3/3  the attested PCR0 is the one the build produced"
+say "3/5  the attested PCR0 is the one the build produced"
 # `nitro-attest --pcr0` already enforced this, so reaching here means it held.
 # Printing both is what makes the claim checkable by eye rather than taken on
 # trust from an exit code.
@@ -263,14 +263,29 @@ echo "build:    $EXPECTED_PCR0"
 echo "attested: $(grep -oE '^PCR0 +[0-9a-f]+' "$RUNDIR/attest.log" | awk '{print $2}')"
 
 # ---------------------------------------------------------------------------
-# 4/4 — the boot machine, across a restart.
+# 4/5 — one instance per request, and work nobody asked for.
+# ---------------------------------------------------------------------------
+say "4/5  no two requests share an instance"
+
+# `/memory` counts in the guest's linear memory and writes nowhere. A fresh
+# instance has fresh memory, so it can only ever answer 1. Any other answer
+# means two requests reached the same instance — and the boundary between two
+# clients has moved out of the runtime and into guest code.
+m1="$(curl -sk --max-time 20 "https://127.0.0.1:$HTTPS_PORT/memory")"
+m2="$(curl -sk --max-time 20 "https://127.0.0.1:$HTTPS_PORT/memory")"
+echo "memory: $m1 then $m2"
+[[ "${m1//[^0-9]/}" -eq 1 && "${m2//[^0-9]/}" -eq 1 ]] \
+    || fail "two requests shared an instance ($m1, $m2)"
+
+# ---------------------------------------------------------------------------
+# 5/5 — the boot machine, across a restart.
 # ---------------------------------------------------------------------------
 # The first boot found an empty store and created a filesystem. That used to be
 # what happened for *any* store that answered "nothing", including one whose
 # contents had been hidden. The second boot has to recognise the state as its
 # own and resume — which is only possible if the receipt the first boot wrote
 # verifies against the state now present.
-say "4/4  a second boot resumes rather than starting over"
+say "5/5  a second boot resumes rather than starting over"
 plain | grep -q 'mode=Genesis' || fail "the first boot should have been a genesis"
 
 docker rm -f e2e-qemu >/dev/null 2>&1 || true
@@ -328,6 +343,7 @@ cat <<EOF
   filesystem mounted over vsock through gvproxy, writes durable in MinIO
   TLS terminated in the enclave, certificate hash bound into the document
   the document's PCR0 matches the reproducible build
+  no two requests shared a guest instance
   genesis wrote an attested state origin, and a restart resumed it
 
 NOT proven here. QEMU's emulated NSM does not sign attestation documents, so

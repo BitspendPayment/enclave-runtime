@@ -608,6 +608,48 @@ like corruption rather than contention.
 So `--http-concurrency` defaults to `1`. Raise it for a guest that keeps no
 cross-request state in the filesystem.
 
+### One instance per request
+
+No two requests ever share a guest instance. A fresh `Store` is built for each,
+and both go when the response does.
+
+That is where the boundary between two clients actually lives. A `Store` is
+what separates two wasm instances; give two clients one instance and the
+separation stops being a runtime guarantee and becomes guest code, so a bug
+that confuses two clients is no longer a leak of one but a total compromise. A
+trap has nothing to poison, and leaked resource handles die with the store,
+both for the same reason.
+
+The consequence for a guest is a single line: **storage is the only state there
+is.** Nothing in memory outlives the call that created it, so whatever must
+persist — for a cosigner, the nonce ledger before anything else — goes to the
+filesystem, where it is Merkle-anchored, attested and still there after a
+restart.
+
+### Who is calling
+
+TLS client certificates are accepted but not *trusted*: there is no CA, and
+none is wanted. What the handshake proves is possession of a private key, and
+that is the whole claim — the runtime hashes the certificate's
+`SubjectPublicKeyInfo` and hands the guest the result:
+
+```text
+  x-enclave-client: <hex sha256 of the client's SPKI>
+```
+
+Absent for a client that presented nothing, which is an ordinary outcome rather
+than an error. Present, it is the runtime's word and not the client's: the
+header is overwritten on every request before the guest sees it, so a client
+sending its own — once or ten times — cannot be believed.
+
+With a fresh instance per request this is the *only* thing tying a request to
+its client's state in the store. There is no session, and nothing else the
+guest could key on.
+
+Hashing the public key rather than the certificate is what survives renewal. A
+client that re-issues around the same key is the same client to the guest, and
+its data does not vanish on the day its certificate expires.
+
 ### The attestation binding
 
 The TLS key is generated inside the enclave and never leaves it. Its
