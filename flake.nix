@@ -68,6 +68,16 @@
       nativeArgs = {
         strictDeps = true;
         nativeBuildInputs = with pkgs; [ cmake pkg-config perl ];
+        # OpenSSL, for `openssl-sys` under `webauthn-rs`. It is here reluctantly
+        # and the reluctance is the point: this is a second crypto stack, with a
+        # native library, entering the closure that PCR0 measures — alongside
+        # aws-lc-rs, which already provides every primitive it is used for.
+        #
+        # It is also load-bearing rather than cosmetic. Without it the enclave
+        # image does not build at all, which is how the cost first showed up:
+        # a host cargo build succeeded against the system OpenSSL and the
+        # reproducible build did not.
+        buildInputs = [ pkgs.openssl ];
         # aws-lc-sys drives cmake itself; letting Nix's cmake hook configure
         # the crate's own build tree makes it fail confusingly.
         dontUseCmakeConfigure = true;
@@ -250,7 +260,10 @@
           S3FS_GUEST_PATH = "/guest.wasm";
           S3FS_MODE = "serve";
           S3FS_HTTP_LISTEN = "0.0.0.0:443";
-          S3FS_TLS = "self-signed";
+          # ACME, not self-signed: a platform authenticator will not attest
+          # against a certificate a browser does not trust, so a self-signed one
+          # would mean no passkey could ever register.
+          S3FS_TLS = "acme";
           S3FS_NETWORK = "gvproxy";
           S3FS_GVFORWARDER = "/usr/local/bin/gvforwarder";
           S3FS_RANDOM_SOURCE = "nsm";
@@ -281,6 +294,19 @@
           # the deployment, since they name resources this repository does not
           # own.
           S3FS_MASTER_KEY_SOURCE = "kms";
+
+          # Every request that could reach the guest needs a fresh WebAuthn
+          # assertion bound to exactly that request. Without an RP id the
+          # runtime serves the guest to anyone who can open a connection and
+          # says so at startup — which is a development arrangement, not this
+          # one. The domain must be the one the app's passkeys are scoped to,
+          # and it must be browser-trusted, hence ACME rather than self-signed.
+          S3FS_WEBAUTHN_RP_ID = deployment.rpId;
+          S3FS_WEBAUTHN_ORIGIN = "https://" + deployment.rpId;
+          #
+          # S3FS_ENROLLMENT_TOKEN is deliberately NOT set here. It authorizes
+          # creating a tenant, so baking one into the image would put a
+          # permanent invite in every copy of it. Supply one per enrollment.
         };
       };
 
@@ -336,6 +362,27 @@
             # keeps the development key source. PCR0 differs between the two
             # images, so a client can tell which it is talking to.
             S3FS_MASTER_KEY_SOURCE = "static";
+            # Self-signed, overriding production's ACME. There is no real
+            # domain here and nothing publicly reachable for Let's Encrypt to
+            # validate, so an ACME order fails forever on an empty identifier
+            # and no certificate is ever issued — which stalls every handshake
+            # rather than failing loudly. That is how this was found.
+            #
+            # It costs nothing that matters here: browser trust is what a
+            # *platform authenticator* needs, and the harness drives the gate
+            # with a software passkey that does not care who signed the
+            # certificate.
+            S3FS_TLS = "self-signed";
+            # The gate, with a relying party the harness can drive. A platform
+            # authenticator would refuse this self-signed certificate, so the
+            # e2e exercises the gate with the software passkey the `testing`
+            # feature provides rather than a real one.
+            S3FS_WEBAUTHN_RP_ID = "enclave.test";
+            S3FS_WEBAUTHN_ORIGIN = "https://enclave.test";
+            # Two, so the harness can enrol two tenants and show that neither
+            # sees the other. A token is single-use by design and there is
+            # deliberately no way to mint one over the wire.
+            S3FS_ENROLLMENT_TOKEN = "qemu-e2e-enrollment-token,qemu-e2e-enrollment-token-2";
             S3FS_ENDPOINT = "http://192.168.127.254:9000";
             S3FS_FORCE_PATH_STYLE = "1";
             S3FS_BUCKET = "e2e-data";

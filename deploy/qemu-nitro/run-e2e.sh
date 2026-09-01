@@ -71,10 +71,26 @@ rm -rf "$RUNDIR"; mkdir -p "$RUNDIR"
 
 pids=()
 cleanup() {
-    for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null || true; done
+    # `kill 0` signals the whole process group, this script included, so a stray
+    # 0 in this array ends the harness by SIGTERM instead of letting it exit —
+    # which is how a run that had already printed PASS still reported 143.
+    for p in "${pids[@]:-}"; do
+        if [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )); then
+            kill "$p" 2>/dev/null || true
+        fi
+    done
+    # `docker logs -f` never ends on its own, so the job table has to be killed
+    # rather than waited on.
+    local remaining
+    remaining="$(jobs -p 2>/dev/null || true)"
+    if [[ -n "$remaining" ]]; then
+        # shellcheck disable=SC2086
+        kill $remaining 2>/dev/null || true
+    fi
     docker rm -f e2e-minio e2e-qemu e2e-qemu-resume >/dev/null 2>&1 || true
-    wait 2>/dev/null || true
+    return 0
 }
+
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
@@ -107,6 +123,21 @@ say "building the verifier"
 ( cd "$REPO" && cargo build --release -p nitro-attestation --features cli ) 2>&1 | tail -2
 ATTEST="$REPO/target/release/nitro-attest"
 [[ -x "$ATTEST" ]] || { echo "nitro-attest did not build" >&2; exit 1; }
+
+# The client half of the WebAuthn gate. Nothing reaches the guest without a
+# fresh assertion bound to that exact request, and a shell script cannot sign
+# one — so the harness drives the gate with a software passkey.
+( cd "$REPO" && cargo build --release -p enclave-runtime --features testing \
+    --bin passkey-client ) 2>&1 | tail -2
+PASSKEY="$REPO/target/release/passkey-client"
+[[ -x "$PASSKEY" ]] || { echo "passkey-client did not build" >&2; exit 1; }
+# Must match S3FS_ENROLLMENT_TOKEN in the emulator image.
+ENROLLMENT_TOKEN="qemu-e2e-enrollment-token"
+ENROLLMENT_TOKEN_2="qemu-e2e-enrollment-token-2"
+# Two identities, each with its own passkey file, so the harness can show that
+# one tenant cannot see another's data.
+signed()  { "$PASSKEY" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/alice.json" "$@"; }
+signed2() { "$PASSKEY" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/bob.json"   "$@"; }
 
 # ---------------------------------------------------------------------------
 # The store the enclave will mount.
@@ -172,6 +203,12 @@ echo "gvproxy listening on host vsock port 1024"
 # Boot.
 # ---------------------------------------------------------------------------
 say "booting the enclave"
+
+# /dev/kvm is handed to the container, but qemu still picks its own accelerator
+# unless told; a silent fall back to TCG leaves the guest kernel unable to
+# calibrate its TSC and the boot stalls there past any timeout. That is what
+# made this harness fail roughly half its runs while the runtime under test was
+# fine, so the accelerator is named rather than hoped for.
 docker run --rm -d --name e2e-qemu \
     --device /dev/kvm \
     --network none \
@@ -180,11 +217,10 @@ docker run --rm -d --name e2e-qemu \
     "$IMAGE" \
     qemu-system-x86_64 \
         -M nitro-enclave,vsock=chr0,id=e2e \
+        -accel kvm -cpu host \
         -kernel /eif/s3fs-qemu.eif \
         -chardev socket,id=chr0,path=/run/vsock/vhost.socket \
         -m 3G -smp 2 -nographic -no-reboot >/dev/null
-pids+=(0)  # placeholder; the container is cleaned up by name
-
 docker logs -f e2e-qemu > "$CONSOLE" 2>&1 &
 
 # The runtime colourises its logs, so escape sequences land between a field
@@ -237,14 +273,29 @@ done
 # ---------------------------------------------------------------------------
 # The assertions.
 # ---------------------------------------------------------------------------
-say "1/5  the filesystem is mounted over gvproxy"
-first="$(curl -sk --max-time 20 "https://127.0.0.1:$HTTPS_PORT/counter")" || fail "no answer from the guest"
-second="$(curl -sk --max-time 20 "https://127.0.0.1:$HTTPS_PORT/counter")" || fail "no answer from the guest"
+say "1/6  the guest is unreachable without a passkey assertion"
+# The rule, at the front because everything after it depends on it holding:
+# nothing reaches the guest without a fresh assertion bound to that request.
+for path in / /counter /memory; do
+    code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 \
+        "https://127.0.0.1:$HTTPS_PORT$path")"
+    [[ "$code" == "401" ]] \
+        || fail "$path answered $code without an assertion; the gate is not wired up"
+done
+echo "unauthenticated requests refused: 401"
+
+say "2/6  a passkey enrols and its signed requests reach the guest"
+rm -f "$RUNDIR/alice.json" "$RUNDIR/bob.json"
+signed enrol --token "$ENROLLMENT_TOKEN" >/dev/null \
+    || fail "enrollment failed; is S3FS_ENROLLMENT_TOKEN set in the image?"
+
+first="$(signed get --path /counter)" || fail "no answer from the guest"
+second="$(signed get --path /counter)" || fail "no answer from the guest"
 echo "counter: $first then $second"
 [[ "${second//[^0-9]/}" -eq $(( ${first//[^0-9]/} + 1 )) ]] \
     || fail "the counter did not advance ($first → $second); writes are not reaching MinIO"
 
-say "2/5  the attestation binds this connection's certificate"
+say "3/6  the attestation binds this connection's certificate"
 "$ATTEST" \
     --url "https://127.0.0.1:$HTTPS_PORT/enclave/attestation" \
     --unsigned-emulator \
@@ -255,7 +306,7 @@ say "2/5  the attestation binds this connection's certificate"
 grep -q "binding    the attested certificate" "$RUNDIR/attest.log" \
     || fail "the document did not bind the certificate this connection was served"
 
-say "3/5  the attested PCR0 is the one the build produced"
+say "4/6  the attested PCR0 is the one the build produced"
 # `nitro-attest --pcr0` already enforced this, so reaching here means it held.
 # Printing both is what makes the claim checkable by eye rather than taken on
 # trust from an exit code.
@@ -263,30 +314,73 @@ echo "build:    $EXPECTED_PCR0"
 echo "attested: $(grep -oE '^PCR0 +[0-9a-f]+' "$RUNDIR/attest.log" | awk '{print $2}')"
 
 # ---------------------------------------------------------------------------
-# 4/5 — one instance per request, and work nobody asked for.
+# 5/6 — one instance per request, and one approval per operation.
 # ---------------------------------------------------------------------------
-say "4/5  no two requests share an instance"
+say "5/6  a tenant keeps its instance, and no two tenants share one"
 
-# `/memory` counts in the guest's linear memory and writes nowhere. A fresh
-# instance has fresh memory, so it can only ever answer 1. Any other answer
-# means two requests reached the same instance — and the boundary between two
-# clients has moved out of the runtime and into guest code.
-m1="$(curl -sk --max-time 20 "https://127.0.0.1:$HTTPS_PORT/memory")"
-m2="$(curl -sk --max-time 20 "https://127.0.0.1:$HTTPS_PORT/memory")"
-echo "memory: $m1 then $m2"
-[[ "${m1//[^0-9]/}" -eq 1 && "${m2//[^0-9]/}" -eq 1 ]] \
-    || fail "two requests shared an instance ($m1, $m2)"
+# `/memory` counts in the guest's linear memory and writes nowhere. What it
+# answers is the whole per-tenant model in one number.
+#
+# The image runs with warm instances, so the *same* tenant asking twice must
+# see the count rise — that is the instance being kept. A *different* tenant
+# must see 1, because the boundary between two clients is a `Store` and not
+# anything the guest does. An earlier version of this leg asserted the
+# opposite, having been written before warm instances existed; it contradicted
+# the image it was testing.
+m1="$(signed get --path /memory)"
+m2="$(signed get --path /memory)"
+echo "alice memory: $m1 then $m2"
+[[ "${m2//[^0-9]/}" -eq $(( ${m1//[^0-9]/} + 1 )) ]] \
+    || fail "a tenant's instance was not kept between its requests ($m1, $m2)"
+
+signed2 enrol --token "$ENROLLMENT_TOKEN_2" >/dev/null \
+    || fail "the second enrollment failed"
+b1="$(signed2 get --path /memory)"
+echo "bob memory: $b1"
+[[ "${b1//[^0-9]/}" -eq 1 ]] \
+    || fail "a second tenant landed in the first tenant's instance ($b1)"
+
+# And their storage is separate too: the same path, different contents.
+signed  post --path /files/who.txt --body "alice" >/dev/null || fail "alice could not write"
+signed2 post --path /files/who.txt --body "bob"   >/dev/null || fail "bob could not write"
+a_sees="$(signed  get --path /files/who.txt)"
+b_sees="$(signed2 get --path /files/who.txt)"
+echo "alice reads: $a_sees / bob reads: $b_sees"
+[[ "$a_sees" == "alice" && "$b_sees" == "bob" ]] \
+    || fail "one tenant read another's file (alice=$a_sees bob=$b_sees)"
+
+say "5b/6 an approval for one payload does not authorize another"
+# The property the whole binding exists for. An assertion issued for one body,
+# sent with a different one, must be refused — and the substituted body must
+# never reach the filesystem.
+sub="$(signed substitute --path /files/e2e.txt \
+        --approved "approved" --sent "substituted" | head -1)"
+[[ "$sub" == "401" ]] || fail "a substituted body was authorized (status $sub)"
+if signed get --path /files/e2e.txt >/dev/null 2>&1; then
+    fail "the substituted body reached the filesystem"
+fi
+echo "substituted body refused: 401, and nothing was written"
 
 # ---------------------------------------------------------------------------
-# 5/5 — the boot machine, across a restart.
+# 6/6 — the boot machine, across a restart.
 # ---------------------------------------------------------------------------
 # The first boot found an empty store and created a filesystem. That used to be
 # what happened for *any* store that answered "nothing", including one whose
 # contents had been hidden. The second boot has to recognise the state as its
 # own and resume — which is only possible if the receipt the first boot wrote
 # verifies against the state now present.
-say "5/5  a second boot resumes rather than starting over"
-plain | grep -q 'mode=Genesis' || fail "the first boot should have been a genesis"
+say "6/6  a second boot resumes rather than starting over"
+
+# `docker logs -f` fills the console file asynchronously, so a single grep can
+# run before the line it is looking for has been written — the assertions above
+# reach the enclave over the network and do not wait for its console. Poll,
+# with a bound, the way the readiness check above already does.
+genesis=""
+for _ in $(seq 60); do
+    plain | grep -q 'mode=Genesis' && { genesis=1; break; }
+    sleep 1
+done
+[[ -n "$genesis" ]] || fail "the first boot should have been a genesis"
 
 docker rm -f e2e-qemu >/dev/null 2>&1 || true
 sleep 2
@@ -300,6 +394,7 @@ docker run --rm -d --name e2e-qemu-resume \
     "$IMAGE" \
     qemu-system-x86_64 \
         -M nitro-enclave,vsock=chr0,id=e2e \
+        -accel kvm -cpu host \
         -kernel /eif/s3fs-qemu.eif \
         -chardev socket,id=chr0,path=/run/vsock/vhost.socket \
         -m 3G -smp 2 -nographic -no-reboot >/dev/null
@@ -343,7 +438,11 @@ cat <<EOF
   filesystem mounted over vsock through gvproxy, writes durable in MinIO
   TLS terminated in the enclave, certificate hash bound into the document
   the document's PCR0 matches the reproducible build
-  no two requests shared a guest instance
+  the guest was unreachable without a passkey assertion
+  a passkey enrolled and its signed requests were served
+  an approval for one payload did not authorize another
+  a tenant kept its warm instance, and no two tenants shared one
+  one tenant could not read another's file
   genesis wrote an attested state origin, and a restart resumed it
 
 NOT proven here. QEMU's emulated NSM does not sign attestation documents, so

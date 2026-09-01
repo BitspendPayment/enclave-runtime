@@ -28,6 +28,16 @@
   region = "eu-west-2";
 
   # Domains for the serving certificate. Empty means a self-signed one, which
-  # a client verifying attestation accepts and a browser does not.
+  # a client verifying attestation accepts and a platform authenticator does
+  # not — so a deployment that authenticates needs a real one here.
   tlsDomains = [ ];
+
+  # The domain passkeys are scoped to, and the origin assertions must claim.
+  #
+  # Must be one of `tlsDomains`: a passkey is bound to a domain, and an
+  # assertion carries the origin the page was served from, compared exactly.
+  # Baked into the image, so PCR0 records which relying party an enclave will
+  # accept assertions for — a client can verify that before trusting it with a
+  # key.
+  rpId = "CHANGE-ME.example.com";
 }

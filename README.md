@@ -626,29 +626,85 @@ persist — for a cosigner, the nonce ledger before anything else — goes to th
 filesystem, where it is Merkle-anchored, attested and still there after a
 restart.
 
-### Who is calling
+### Who is calling: a passkey, per request
 
-TLS client certificates are accepted but not *trusted*: there is no CA, and
-none is wanted. What the handshake proves is possession of a private key, and
-that is the whole claim — the runtime hashes the certificate's
-`SubjectPublicKeyInfo` and hands the guest the result:
+**No valid, fresh, single-use WebAuthn assertion bound to this exact request
+means the guest is never called.** No session, no cookie, no bearer token and
+no certificate authorizes a guest request by itself.
 
-```text
-  x-enclave-client: <hex sha256 of the client's SPKI>
+That rule is absolute because of what this thing is. A cosigner's whole value
+is that compromising the client is not enough — and a bearer credential the
+client holds is exactly a thing that can be stolen and replayed. An assertion
+cannot be, because the challenge it answers was issued for one operation and is
+destroyed when it is used.
+
+```console
+POST /auth/request/options     { credential_id, method, path, query, body_sha256 }
+        ↓                      runtime records what the challenge is for
+   Face ID / Touch ID
+        ↓
+POST /sign                     x-webauthn-challenge-id, x-webauthn-assertion
+        ↓                      runtime re-hashes the body it will forward
+   verified → tenant → guest
 ```
 
-Absent for a client that presented nothing, which is an ordinary outcome rather
-than an error. Present, it is the runtime's word and not the client's: the
-header is overwritten on every request before the guest sees it, so a client
-sending its own — once or ten times — cannot be believed.
+#### What is checked, and by whom
 
-With a fresh instance per request this is the *only* thing tying a request to
-its client's state in the store. There is no session, and nothing else the
-guest could key on.
+`webauthn-rs` verifies the assertion itself: `clientDataJSON` names
+`webauthn.get` and the challenge that was issued, the origin matches **exactly**,
+`rpIdHash` is this relying party, user *verification* happened rather than mere
+presence, and the signature checks out under the stored key.
 
-Hashing the public key rather than the certificate is what survives renewal. A
-client that re-issues around the same key is the same client to the guest, and
-its data does not vanish on the day its certificate expires.
+The runtime checks everything the protocol has no field for — that the
+challenge exists, has not expired and has not been used; that the credential is
+one it knows and has not revoked; and that **the request that arrived is the
+request the challenge was issued for**. Without that last one an approval for
+one transaction would authorize another, which for a cosigner is the whole
+attack.
+
+The body is buffered so its hash can be checked, bounded by
+`--max-request-body-bytes`, and the hash is taken from the bytes that will
+actually be forwarded — never from anything the client says about them.
+
+#### What a signature does and does not prove
+
+An authenticator displays nothing. The user approves *a prompt at a moment*,
+not a payload they read. "The user approved this exact operation" is precise
+only because the runtime chose the challenge, remembered what it was for, and
+will accept it for nothing else. The strength is in the binding, not the
+ceremony.
+
+#### The topology this implies
+
+The enclave serves nothing without an assertion, so it cannot serve the page
+that calls it. For a native mobile app that is clean — the app ships through
+the store. For a browser it is not: the HTML has to come from somewhere on the
+same origin, and if the enclave will not serve it the parent instance or a CDN
+must, and a malicious parent serving a malicious page defeats everything
+downstream. This design assumes a mobile client.
+
+#### Enrollment
+
+Registering a passkey creates a tenant, so it is gated by a single-use token an
+operator provisions (`--enrollment-token`). The token authorizes **creating a
+tenant and nothing else** — it cannot reach existing data, approve a
+transaction, or add a passkey to somebody else's account.
+
+That distinction carries weight, because inside an enclave the token arrives
+through the parent instance, which is the party the enclave exists to exclude.
+A parent that steals one can make a tenant of its own; it still cannot read
+anyone else's, because reading needs a passkey it does not hold. Enrollment
+gates resource creation; passkeys gate access.
+
+The tenant id is 32 bytes minted from the NSM, stored beside the credential —
+not derived from it, so one tenant can hold several passkeys.
+
+#### Limits
+
+Asking for a challenge is what makes a phone buzz, so it is rate-limited per
+credential. Not per address: the enclave sits behind gvproxy, so every client
+arrives from the same peer and an address limit would throttle everyone
+together and single nobody out.
 
 ### A directory per client
 
@@ -661,6 +717,10 @@ The identifier is derived, never stored: `HKDF(master, sha256(client SPKI))`.
 The same client lands on the same directory on every boot from nothing but the
 handshake, and without the master secret nobody can work out which directory is
 whose.
+
+Each client's guest is told which tenant it is serving through
+`x-enclave-tenant`, written by the runtime from the verified assertion and
+never read from the client.
 
 #### The separation is the runtime's, not the guest's
 
