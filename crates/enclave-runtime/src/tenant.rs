@@ -41,7 +41,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use s3fs_core::{Fs, FsError, Inode, MasterSecret};
+use s3fs_core::{Fs, FsError, Inode};
 
 /// The directory holding every tenant's subtree.
 const TENANTS_DIR: &str = "tenants";
@@ -69,58 +69,53 @@ pub struct TenantRoot {
 /// no mount, no key derivation for a second filesystem, and no root record to
 /// read — the costs the per-filesystem design would have paid on every cold
 /// client.
-pub async fn tenant_root(
-    fs: &Arc<Fs>,
-    master: &MasterSecret,
-    client: &[u8; 32],
-) -> Result<TenantRoot> {
-    let tenant_id = master
-        .derive_tenant_id(client)
-        .map_err(|e| anyhow::anyhow!(e))
-        .context("deriving the tenant id")?;
+/// Find or create a tenant's directory.
+///
+/// Registration mints an id and needs the directory for it; a request resolves
+/// an id from a verified assertion and needs the same. One function, so the two
+/// cannot disagree about where a tenant lives.
+///
+/// Cheap by construction: a lookup, and on first contact one `mkdir`. No mount,
+/// no key derivation, no root record to read.
+pub async fn tenant_root_by_id(fs: &Arc<Fs>, tenant_id: [u8; 16]) -> Result<TenantRoot> {
     let name = hex::encode(tenant_id);
     let root = fs.root();
+    let parent = ensure_dir(fs, &root, TENANTS_DIR).await?;
 
-    let parent = match fs.lookup_at(&root, TENANTS_DIR).await {
-        Ok(dir) => dir,
-        Err(FsError::NotFound) => match fs.mkdir(&root, TENANTS_DIR).await {
-            Ok(dir) => dir,
-            // Another client created it between the lookup and the mkdir.
+    // Looked up before it is created, so an arrival can be reported honestly:
+    // "new" means this runtime had never seen the tenant, which is worth a log
+    // line and, later, worth a policy.
+    let arrival = match fs.lookup_at(&parent, &name).await {
+        Ok(_) => Arrival::Returning,
+        Err(FsError::NotFound) => Arrival::New,
+        Err(e) => return Err(anyhow::anyhow!(e)).context("opening a tenant directory"),
+    };
+    let scope = ensure_dir(fs, &parent, &name).await?;
+    Ok(TenantRoot {
+        scope,
+        tenant_id,
+        arrival,
+    })
+}
+
+/// Open a directory, creating it if it is not there.
+///
+/// `AlreadyExists` is success, not failure: two requests racing to first
+/// contact both want the same directory, and whichever loses should find what
+/// the winner made rather than report a conflict nobody caused.
+pub async fn ensure_dir(fs: &Arc<Fs>, parent: &Arc<Inode>, name: &str) -> Result<Arc<Inode>> {
+    match fs.lookup_at(parent, name).await {
+        Ok(dir) => Ok(dir),
+        Err(FsError::NotFound) => match fs.mkdir(parent, name).await {
+            Ok(dir) => Ok(dir),
             Err(FsError::AlreadyExists) => fs
-                .lookup_at(&root, TENANTS_DIR)
+                .lookup_at(parent, name)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))
-                .context("opening the tenants directory")?,
-            Err(e) => return Err(anyhow::anyhow!(e)).context("creating the tenants directory"),
+                .with_context(|| format!("opening {name} after losing the race to create it")),
+            Err(e) => Err(anyhow::anyhow!(e)).with_context(|| format!("creating {name}")),
         },
-        Err(e) => return Err(anyhow::anyhow!(e)).context("opening the tenants directory"),
-    };
-
-    match fs.lookup_at(&parent, &name).await {
-        Ok(scope) => Ok(TenantRoot {
-            scope,
-            tenant_id,
-            arrival: Arrival::Returning,
-        }),
-        Err(FsError::NotFound) => {
-            let scope = match fs.mkdir(&parent, &name).await {
-                Ok(scope) => scope,
-                // Two first requests from one client raced. Either directory
-                // is the same directory; take whichever is there now.
-                Err(FsError::AlreadyExists) => fs
-                    .lookup_at(&parent, &name)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))
-                    .context("opening a tenant directory")?,
-                Err(e) => return Err(anyhow::anyhow!(e)).context("creating a tenant directory"),
-            };
-            Ok(TenantRoot {
-                scope,
-                tenant_id,
-                arrival: Arrival::New,
-            })
-        }
-        Err(e) => Err(anyhow::anyhow!(e)).context("opening a tenant directory"),
+        Err(e) => Err(anyhow::anyhow!(e)).with_context(|| format!("opening {name}")),
     }
 }
 
@@ -140,4 +135,93 @@ pub async fn tenants(fs: &Arc<Fs>) -> Result<Vec<String>> {
         .into_iter()
         .map(|e| e.name)
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use s3fs_core::backend::memory::MemoryBackend;
+    use s3fs_core::{Config, MasterSecret};
+
+    async fn shared_fs() -> Arc<Fs> {
+        let backend = Arc::new(MemoryBackend::new());
+        Fs::create(
+            backend.clone(),
+            backend,
+            &MasterSecret::from_bytes([7u8; 32]),
+            [0u8; 16],
+            Arc::new(Config::default()),
+        )
+        .await
+        .expect("the shared filesystem")
+    }
+
+    /// A returning client lands where it left its data. If this were not
+    /// stable their state would look lost on every request.
+    #[tokio::test]
+    async fn a_client_returns_to_the_same_directory() {
+        let fs = shared_fs().await;
+        let first = tenant_root_by_id(&fs, [0xab; 16]).await.unwrap();
+        let second = tenant_root_by_id(&fs, [0xab; 16]).await.unwrap();
+
+        assert_eq!(first.tenant_id, second.tenant_id);
+        assert_eq!(first.scope.objid(), second.scope.objid());
+        assert_eq!(first.arrival, Arrival::New);
+        assert_eq!(second.arrival, Arrival::Returning);
+    }
+
+    #[tokio::test]
+    async fn two_clients_get_two_directories() {
+        let fs = shared_fs().await;
+        let a = tenant_root_by_id(&fs, [0xaa; 16]).await.unwrap();
+        let b = tenant_root_by_id(&fs, [0xbb; 16]).await.unwrap();
+        assert_ne!(a.tenant_id, b.tenant_id);
+        assert_ne!(a.scope.objid(), b.scope.objid());
+    }
+
+    /// A registration and a later request must land in the same directory, or
+    /// a passkey would be registered against storage it could never reach.
+    #[tokio::test]
+    async fn registration_and_a_request_land_in_the_same_directory() {
+        let fs = shared_fs().await;
+        let at_registration = tenant_root_by_id(&fs, [0xcd; 16]).await.unwrap();
+        let at_request = tenant_root_by_id(&fs, [0xcd; 16]).await.unwrap();
+        assert_eq!(at_request.scope.objid(), at_registration.scope.objid());
+        assert_eq!(at_registration.arrival, Arrival::New);
+        assert_eq!(at_request.arrival, Arrival::Returning);
+    }
+
+    /// Losing the race to create a directory must not be an error: both
+    /// callers want the same directory.
+    #[tokio::test]
+    async fn ensure_dir_is_idempotent() {
+        let fs = shared_fs().await;
+        let root = fs.root();
+        let first = ensure_dir(&fs, &root, "runtime").await.unwrap();
+        let second = ensure_dir(&fs, &root, "runtime").await.unwrap();
+        assert_eq!(first.objid(), second.objid());
+    }
+
+    #[tokio::test]
+    async fn tenants_are_listed_and_none_is_not_an_error() {
+        let fs = shared_fs().await;
+        assert!(tenants(&fs).await.unwrap().is_empty());
+
+        let a = tenant_root_by_id(&fs, [0xaa; 16]).await.unwrap();
+        let b = tenant_root_by_id(&fs, [0xbb; 16]).await.unwrap();
+        let listed = tenants(&fs).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&hex::encode(a.tenant_id)));
+        assert!(listed.contains(&hex::encode(b.tenant_id)));
+    }
+
+    /// Tenant directories sit under one parent, and that parent is above every
+    /// tenant's scope — which is what keeps `/runtime/` unreachable from a
+    /// guest too.
+    #[tokio::test]
+    async fn a_tenant_directory_is_not_the_filesystem_root() {
+        let fs = shared_fs().await;
+        let t = tenant_root_by_id(&fs, [0xab; 16]).await.unwrap();
+        assert_ne!(t.scope.objid(), fs.root().objid());
+    }
 }

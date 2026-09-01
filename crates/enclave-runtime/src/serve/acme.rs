@@ -386,7 +386,11 @@ pub fn start(
         )
         .with_safe_default_protocol_versions()
         .context("selecting TLS protocol versions for ACME")?
-        .with_client_cert_verifier(crate::serve::client::AnyClientCertificate::new())
+        // No client certificates. Authentication is a WebAuthn assertion bound
+        // to one request — see `crate::auth` — and a certificate would be a
+        // second, weaker way to become a tenant that could not bind an
+        // approval to a transaction.
+        .with_no_client_auth()
         .with_cert_resolver(state.resolver()),
     );
     // The challenge config keeps no client auth: the CA validating

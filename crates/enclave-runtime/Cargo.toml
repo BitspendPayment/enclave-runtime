@@ -24,12 +24,28 @@ path = "src/lib.rs"
 name = "enclave-runtime"
 path = "src/main.rs"
 
-# No features. There used to be `aws` and `serve`, so a host embedding only the
-# `wasi:filesystem` bindings could skip the AWS SDK and hyper. With one
-# consumer that always wants both, they bought nothing and cost
-# `--features aws,s3fs-host/serve` on every command. The layer that is
-# genuinely reusable is `s3fs-core`, which still has no wasmtime dependency at
-# all.
+# The client half of the gate, for the QEMU harness. A shell script cannot sign
+# a WebAuthn assertion, and the harness's self-signed certificate means no real
+# platform authenticator would ever attest against it — so the e2e drives the
+# gate with this. Behind `testing`, because it can mint assertions.
+[[bin]]
+name = "passkey-client"
+path = "src/bin/passkey-client.rs"
+required-features = ["testing"]
+
+# One feature, and it is not about size. `testing` compiles
+# `auth::SoftwareAuthenticator`, which mints WebAuthn assertions — a forgery
+# tool. It is off by default so it cannot reach a production image, and on for
+# the QEMU harness, whose self-signed certificate means no real platform
+# authenticator will ever attest against it.
+#
+# There used to be `aws` and `serve` features too, so a host embedding only the
+# `wasi:filesystem` bindings could skip the AWS SDK and hyper. With one consumer
+# that always wants both, they bought nothing and cost
+# `--features aws,s3fs-host/serve` on every command.
+[features]
+default = []
+testing = []
 
 [dependencies]
 s3fs-core = { path = "../s3fs-core", features = ["aws"] }
@@ -56,6 +72,12 @@ http-body-util = "0.1"
 # aws-lc-rs, not ring: it is already the crypto stack for the block store's
 # AEAD, signatures and key derivation, and a second one would mean two
 # implementations of the same primitives inside one attested image.
+#
+# That argument has one accepted exception, below: `webauthn-rs` brings
+# `openssl` and `openssl-sys`, which is a second stack *with C bindings*, inside
+# the boundary PCR0 measures. It was taken knowingly, in exchange for not
+# writing assertion verification by hand on the authentication path. Left
+# unqualified this comment would contradict the manifest it is in.
 rustls         = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs", "tls12"] }
 # Already in the image via rustls, which parses every certificate it verifies.
 # Naming it here adds no code to the build — only the ability to ask for the
@@ -111,8 +133,15 @@ der = { version = "0.7", default-features = false, features = ["alloc", "oid", "
 # ciphertext, and nothing else.
 aws-sdk-kms = { version = "1.51.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
 aws-sdk-ssm = { version = "1.56.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+webauthn-rs = "0.5.5"
+serde_json = "1.0.151"
+serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
+# The integration suites drive the gate with a software passkey, which only
+# exists under `testing`. A dev-dependency on the crate itself is how a crate
+# turns a feature on for its own tests without turning it on for consumers.
+enclave-runtime = { path = ".", features = ["testing"] }
 # Checking that a generated certificate really parses as X.509.
 x509-parser = "0.18"
 nitro-nsm = { path = "../nitro-nsm", features = ["testing"] }

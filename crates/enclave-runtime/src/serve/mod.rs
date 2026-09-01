@@ -24,7 +24,7 @@ pub mod pool;
 pub mod tls;
 
 pub use acme::{AcmeConfig, CertificateSlot, SealedAcmeCache};
-pub use client::{AnyClientCertificate, ClientIdentity, X_ENCLAVE_CLIENT};
+pub use client::{apply_tenant, X_ENCLAVE_TENANT};
 pub use endpoints::{EnclaveEndpoints, ENCLAVE_PREFIX};
 pub use http::{serve_component, GuestInstance, ServeConfig, ServeHandle, Server, Tenancy};
 pub use pool::{Checkout, LiveTenant, PoolLimits, Slot, TenantPool};

@@ -68,7 +68,7 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
         // client's.
         ("GET", "/whoami") => Ok(text(
             StatusCode::OK,
-            match req.headers().get("x-enclave-client") {
+            match req.headers().get("x-enclave-tenant") {
                 Some(v) => format!("{}\n", v.to_str().unwrap_or("(not utf-8)")),
                 None => "(anonymous)\n".to_string(),
             },
@@ -102,7 +102,8 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
         // here rather than in a test fixture: it is the one behaviour a host
         // cannot provoke from the outside, and without it the runtime's
         // watchdog has nothing to be tested against.
-        ("GET", "/hang") => {
+        ("GET", "/hang") =>
+        {
             #[allow(clippy::empty_loop)]
             loop {
                 std::hint::spin_loop();

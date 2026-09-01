@@ -30,6 +30,7 @@
 //! release gated on an NSM attestation document is a new implementation of one
 //! trait, not a change to any of the above.
 
+pub mod auth;
 pub mod boot;
 pub mod clock;
 pub mod env;
@@ -45,6 +46,12 @@ pub mod state;
 pub mod tenant;
 pub mod wasi;
 
+#[cfg(any(test, feature = "testing"))]
+pub use auth::SoftwareAuthenticator;
+pub use auth::{
+    build_relying_party, AuthEndpoints, ChallengeStore, FilesystemCredentials, Gate, RateLimiter,
+    AUTH_PREFIX, DEFAULT_CAPACITY,
+};
 pub use boot::{authorise_successor, boot, BootConfig, BootMode, Booted, ReceiptTrust};
 pub use clock::{open_clock, ClockSource, HostClock, PtpClock, TrustedClock, DEFAULT_PTP_DEVICE};
 pub use env::GuestEnvPolicy;
@@ -63,10 +70,10 @@ pub use run::{
     EXIT_RUNTIME_FAILURE,
 };
 pub use serve::{
-    serve_component, AcmeConfig, AnyClientCertificate, CertificateSlot, ClientIdentity,
-    EgressPolicy, EnclaveEndpoints, GuestInstance, PoolLimits, SealedAcmeCache, ServeConfig,
-    ServeHandle, Server, Tenancy, TenantPool, TlsIdentity, TlsMode, X_ENCLAVE_CLIENT,
+    apply_tenant, serve_component, AcmeConfig, CertificateSlot, EgressPolicy, EnclaveEndpoints,
+    GuestInstance, PoolLimits, SealedAcmeCache, ServeConfig, ServeHandle, Server, Tenancy,
+    TenantPool, TlsIdentity, TlsMode, X_ENCLAVE_TENANT,
 };
 pub use state::State;
-pub use tenant::{tenant_root, tenants, Arrival, TenantRoot};
+pub use tenant::{tenant_root_by_id, tenants, Arrival, TenantRoot};
 pub use wasi::{add_filesystem_to_linker, S3FsCtxView, S3WasiView};

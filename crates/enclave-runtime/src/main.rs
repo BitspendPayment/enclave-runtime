@@ -304,6 +304,57 @@ struct Cli {
     #[arg(long, env = "S3FS_MAX_REQUESTS_PER_INSTANCE", default_value_t = 10_000)]
     max_requests_per_instance: u64,
 
+    /// The WebAuthn relying-party id — the domain passkeys are scoped to.
+    ///
+    /// Setting it, with `--webauthn-origin`, is what turns authentication on:
+    /// **every request that could reach the guest then needs a fresh assertion
+    /// bound to exactly that request.** Left unset the runtime serves the guest
+    /// to anyone who can open a connection, which is a development and QEMU
+    /// arrangement and is warned about at startup.
+    ///
+    /// Must match the domain the app is scoped to, and production needs
+    /// browser-trusted TLS on it — see `--tls acme`. Baked into the image, so
+    /// PCR0 records which relying party an enclave will accept assertions for.
+    #[arg(long, env = "S3FS_WEBAUTHN_RP_ID")]
+    webauthn_rp_id: Option<String>,
+
+    /// The exact origin assertions must claim, e.g. `https://cosigner.example.com`.
+    ///
+    /// Compared exactly, not by suffix: a page on another origin must not be
+    /// able to borrow a user's passkey for this one.
+    #[arg(long, env = "S3FS_WEBAUTHN_ORIGIN")]
+    webauthn_origin: Option<String>,
+
+    /// Seconds a challenge is good for.
+    ///
+    /// Long enough for a person to look at a prompt and present a finger,
+    /// short enough that a captured assertion is stale before it can be used.
+    #[arg(long, env = "S3FS_CHALLENGE_TTL_SECS", default_value_t = 60)]
+    challenge_ttl_secs: u64,
+
+    /// Largest request body the runtime will buffer, in bytes.
+    ///
+    /// The body is buffered because the assertion commits to its hash, so this
+    /// bounds what an unauthenticated caller can make the runtime allocate.
+    #[arg(long, env = "S3FS_MAX_REQUEST_BODY_BYTES", default_value_t = 1024 * 1024)]
+    max_request_body_bytes: usize,
+
+    /// Single-use enrollment tokens, seeded at boot if not already there.
+    /// Repeatable, or comma-separated.
+    ///
+    /// It authorizes **creating a tenant** and nothing else: it cannot reach
+    /// an existing tenant's data, approve a transaction, or add a passkey to
+    /// somebody else's account. That matters because inside an enclave this
+    /// value reaches the runtime through the parent instance — the party the
+    /// enclave exists to exclude. A parent that steals it can make a tenant of
+    /// its own; it still cannot read anyone else's.
+    #[arg(
+        long = "enrollment-token",
+        env = "S3FS_ENROLLMENT_TOKEN",
+        value_delimiter = ','
+    )]
+    enrollment_tokens: Vec<String>,
+
     /// Authorise a successor enclave image, by PCR0, then exit.
     ///
     /// Run against the *outgoing* image. It extends PCR31 with the successor's
@@ -623,12 +674,53 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
                     max_tenants = limits.max_tenants,
                     "serving each client its own directory of the filesystem"
                 );
-                Some(std::sync::Arc::new(enclave_runtime::Tenancy::new(
-                    booted.master.clone(),
-                    limits,
-                )))
+                Some(std::sync::Arc::new(enclave_runtime::Tenancy::new(limits)))
             } else {
                 None
+            };
+
+            // WebAuthn, when the deployment named a relying party. Both the
+            // id and the origin or neither: a gate with no origin to compare
+            // against would accept assertions from any page that could reach
+            // it.
+            let authentication = match (&cli.webauthn_rp_id, &cli.webauthn_origin) {
+                (Some(rp_id), Some(origin)) => {
+                    let credentials = std::sync::Arc::new(
+                        enclave_runtime::FilesystemCredentials::new(fs.clone()),
+                    );
+                    let gate = std::sync::Arc::new(enclave_runtime::Gate::new(
+                        enclave_runtime::build_relying_party(rp_id, origin)?,
+                        enclave_runtime::ChallengeStore::new(
+                            Duration::from_secs(cli.challenge_ttl_secs),
+                            enclave_runtime::DEFAULT_CAPACITY,
+                        ),
+                        credentials.clone(),
+                        cli.max_request_body_bytes,
+                    ));
+                    let auth = std::sync::Arc::new(enclave_runtime::AuthEndpoints::new(
+                        gate.clone(),
+                        credentials,
+                        fs.clone(),
+                        entropy.clone(),
+                    ));
+                    for token in &cli.enrollment_tokens {
+                        auth.enrollment().seed(token).await?;
+                    }
+                    if !cli.enrollment_tokens.is_empty() {
+                        tracing::info!(
+                            tokens = cli.enrollment_tokens.len(),
+                            "enrollment tokens are available"
+                        );
+                    }
+                    tracing::info!(rp_id, origin, "requiring a passkey assertion per request");
+                    Some((auth, gate))
+                }
+                (None, None) => None,
+                _ => anyhow::bail!(
+                    "--webauthn-rp-id and --webauthn-origin must be given together. A gate \
+                     with no origin to compare against would accept an assertion from any \
+                     page that could reach it."
+                ),
             };
 
             let guest = GuestEnvironment::new(fs, clock, entropy, &env, &cli.guest_args)?;
@@ -643,6 +735,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
                     attestation,
                     request_timeout: Duration::from_secs(cli.request_timeout_secs),
                     tenancy,
+                    authentication,
                 },
             )
             .await?;

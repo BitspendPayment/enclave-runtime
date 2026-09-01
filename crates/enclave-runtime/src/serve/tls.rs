@@ -78,7 +78,11 @@ impl TlsIdentity {
         // health check with no certificate still completes the handshake and
         // arrives without an identity. Requiring one here would break every
         // ordinary client and the ACME challenge with them.
-        .with_client_cert_verifier(crate::serve::client::AnyClientCertificate::new())
+        // No client certificates. Authentication is a WebAuthn assertion bound
+        // to one request — see `crate::auth` — and a certificate would be a
+        // second, weaker way to become a tenant that could not bind an
+        // approval to a transaction.
+        .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("building the TLS configuration")?;
 

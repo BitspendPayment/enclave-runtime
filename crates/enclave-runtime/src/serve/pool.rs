@@ -130,7 +130,7 @@ pub struct TenantPool<I> {
     /// await: everything under it is a hash lookup and an `Arc` clone. The
     /// *per-tenant* lock is the async one, and it is a different lock for a
     /// different job.
-    slots: Mutex<HashMap<[u8; 32], Arc<Slot<I>>>>,
+    slots: Mutex<HashMap<[u8; 16], Arc<Slot<I>>>>,
     limits: PoolLimits,
     started: Instant,
 }
@@ -159,11 +159,11 @@ impl<I> TenantPool<I> {
     /// what makes two simultaneous first requests from one client produce
     /// **one** filesystem — they find the same slot, and the second waits on
     /// the lock the first is holding rather than racing it into a second mount.
-    pub fn checkout(&self, client: &[u8; 32]) -> Checkout<I> {
+    pub fn checkout(&self, tenant: &[u8; 16]) -> Checkout<I> {
         let now = self.now();
         let mut slots = self.slots.lock().expect("tenant pool mutex poisoned");
 
-        if let Some(slot) = slots.get(client) {
+        if let Some(slot) = slots.get(tenant) {
             slot.last_used.store(now, Ordering::Release);
             slot.in_flight.fetch_add(1, Ordering::Release);
             return Checkout { slot: slot.clone() };
@@ -174,7 +174,7 @@ impl<I> TenantPool<I> {
 
         let slot = Arc::new(Slot::new(now));
         slot.in_flight.fetch_add(1, Ordering::Release);
-        slots.insert(*client, slot.clone());
+        slots.insert(*tenant, slot.clone());
         Checkout { slot }
     }
 
@@ -184,7 +184,7 @@ impl<I> TenantPool<I> {
     /// holding the `Arc` keeps working and the filesystem unmounts when it
     /// finishes. So eviction can never pull a filesystem out from under a call
     /// in progress — it only stops future requests finding it.
-    fn evict_while_full(&self, slots: &mut HashMap<[u8; 32], Arc<Slot<I>>>, now: u64) {
+    fn evict_while_full(&self, slots: &mut HashMap<[u8; 16], Arc<Slot<I>>>, now: u64) {
         let idle_ms = self.limits.idle_timeout.as_millis() as u64;
         slots.retain(|_, slot| {
             slot.in_flight.load(Ordering::Acquire) > 0
@@ -238,7 +238,7 @@ mod tests {
     #[tokio::test]
     async fn a_client_returns_to_the_same_slot() {
         let pool = pool(8);
-        let client = [0xab; 32];
+        let client = [0xab; 16];
 
         {
             let first = pool.checkout(&client);
@@ -252,8 +252,8 @@ mod tests {
     #[tokio::test]
     async fn two_clients_get_two_slots() {
         let pool = pool(8);
-        let a = pool.checkout(&[0xaa; 32]);
-        let b = pool.checkout(&[0xbb; 32]);
+        let a = pool.checkout(&[0xaa; 16]);
+        let b = pool.checkout(&[0xbb; 16]);
         assert_eq!(pool.len(), 2);
         assert!(
             !Arc::ptr_eq(a.slot(), b.slot()),
@@ -266,8 +266,8 @@ mod tests {
     #[tokio::test]
     async fn one_client_does_not_block_another() {
         let pool = pool(8);
-        let a = pool.checkout(&[0xaa; 32]);
-        let b = pool.checkout(&[0xbb; 32]);
+        let a = pool.checkout(&[0xaa; 16]);
+        let b = pool.checkout(&[0xbb; 16]);
 
         let held = a.slot().tenant().lock().await;
         // B proceeds while A's lock is held, and needs no timeout to do it.
@@ -281,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn a_client_is_serialised_against_itself() {
         let pool = pool(8);
-        let client = [0xab; 32];
+        let client = [0xab; 16];
         let first = pool.checkout(&client);
         let second = pool.checkout(&client);
         assert!(Arc::ptr_eq(first.slot(), second.slot()));
@@ -298,7 +298,7 @@ mod tests {
     async fn the_pool_stays_within_its_cap() {
         let pool = pool(4);
         for i in 0..32u8 {
-            let mut client = [0u8; 32];
+            let mut client = [0u8; 16];
             client[0] = i;
             drop(pool.checkout(&client));
         }
@@ -310,15 +310,15 @@ mod tests {
     #[tokio::test]
     async fn a_busy_tenant_is_never_evicted() {
         let pool = pool(2);
-        let busy = pool.checkout(&[0xff; 32]);
+        let busy = pool.checkout(&[0xff; 16]);
 
         for i in 0..16u8 {
-            let mut client = [0u8; 32];
+            let mut client = [0u8; 16];
             client[0] = i;
             drop(pool.checkout(&client));
         }
 
-        let again = pool.checkout(&[0xff; 32]);
+        let again = pool.checkout(&[0xff; 16]);
         assert!(
             Arc::ptr_eq(busy.slot(), again.slot()),
             "a slot in use was evicted and rebuilt"
@@ -329,11 +329,11 @@ mod tests {
     #[tokio::test]
     async fn finishing_a_request_makes_a_tenant_evictable_again() {
         let pool = pool(2);
-        let client = [0xff; 32];
+        let client = [0xff; 16];
         drop(pool.checkout(&client));
 
         for i in 0..8u8 {
-            let mut other = [0u8; 32];
+            let mut other = [0u8; 16];
             other[0] = i;
             drop(pool.checkout(&other));
         }

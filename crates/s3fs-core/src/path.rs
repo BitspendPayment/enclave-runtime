@@ -307,8 +307,8 @@ mod tests {
     fn rejects_total_key_too_long() {
         // Build a path where each segment is valid but the total exceeds 1024.
         let seg = "a".repeat(MAX_SEGMENT_LEN); // 255
-        let path = std::iter::repeat(seg.as_str())
-            .take(5) // 5*255 + 4 separators = 1279 > 1024
+                                               // 5*255 + 4 separators = 1279 > 1024
+        let path = std::iter::repeat_n(seg.as_str(), 5)
             .collect::<Vec<_>>()
             .join("/");
         assert!(matches!(

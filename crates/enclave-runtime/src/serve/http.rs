@@ -28,17 +28,17 @@ use wasmtime_wasi_http::p2::bindings::ProxyPre;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 use wasmtime_wasi_http::p2::WasiHttpView;
 
+use crate::auth::{AuthEndpoints, Gate};
 use crate::linker::build_linker;
 use crate::run::GuestEnvironment;
 use crate::serve::acme::CertificateSlot;
-use crate::serve::client::ClientIdentity;
+use crate::serve::client::apply_tenant;
 use crate::serve::endpoints::EnclaveEndpoints;
 use crate::serve::pool::{LiveTenant, PoolLimits, TenantPool};
 use crate::serve::tls::TlsIdentity;
 use crate::state::State;
-use crate::tenant::tenant_root;
+use crate::tenant::tenant_root_by_id;
 use nitro_nsm::Nsm;
-use s3fs_core::MasterSecret;
 
 /// How the guest is served.
 #[derive(Debug)]
@@ -67,6 +67,12 @@ pub struct ServeConfig {
     /// Give each authenticated client their own filesystem. `None` keeps the
     /// original model: one filesystem, a fresh instance per request.
     pub tenancy: Option<Arc<Tenancy>>,
+    /// `/auth/*` and the gate every other request must pass.
+    ///
+    /// `None` serves the guest to anyone who can open a connection. That is a
+    /// development and QEMU arrangement, and [`serve_component`] says so
+    /// loudly at startup rather than leaving it to be noticed.
+    pub authentication: Option<(Arc<AuthEndpoints>, Arc<Gate>)>,
 }
 
 impl Default for ServeConfig {
@@ -95,6 +101,7 @@ impl Default for ServeConfig {
             // time, which a guest may have been relying on — so it is asked
             // for, never inherited.
             tenancy: None,
+            authentication: None,
         }
     }
 }
@@ -149,7 +156,6 @@ pub struct ServeHandle {
 /// guest calls `/` — plus a warm instance and a lock.
 pub struct Tenancy {
     pool: TenantPool<GuestInstance>,
-    master: MasterSecret,
 }
 
 impl std::fmt::Debug for Tenancy {
@@ -161,10 +167,9 @@ impl std::fmt::Debug for Tenancy {
 }
 
 impl Tenancy {
-    pub fn new(master: MasterSecret, limits: PoolLimits) -> Self {
+    pub fn new(limits: PoolLimits) -> Self {
         Tenancy {
             pool: TenantPool::new(limits),
-            master,
         }
     }
 
@@ -279,18 +284,21 @@ impl ServeHandle {
     /// reached over: with TLS terminated upstream of here the connection is
     /// plaintext, but the guest must be told `https` or it will build wrong
     /// absolute URLs and set wrong cookie flags.
+    ///
     /// Generic over the request body rather than taking
     /// `hyper::body::Incoming`, which cannot be constructed outside a real
     /// connection — the whole dispatch path would be untestable without a
     /// listening socket.
-    /// `client` is required rather than defaulted, so every caller has to
-    /// answer the question. `None` is a real answer — an unauthenticated
-    /// connection — but it has to be given, not inherited by omission.
+    ///
+    /// `tenant` is required rather than defaulted, so every caller has to
+    /// answer the question. It is **not** a way around the gate: with one
+    /// configured, [`serve_connection`] verifies an assertion before it gets
+    /// here and there is no path that reaches a guest without one.
     pub async fn handle<B>(
         &self,
         scheme: Scheme,
         mut req: hyper::Request<B>,
-        client: Option<&ClientIdentity>,
+        tenant: Option<&[u8; 16]>,
     ) -> Result<hyper::Response<HyperOutgoingBody>>
     where
         B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
@@ -300,11 +308,7 @@ impl ServeHandle {
         // `new_incoming_request`, which copies the header map into the guest
         // verbatim. This is the only ingress, so this is the only place the
         // header can be made trustworthy.
-        //
-        // Note it cannot be done in `EgressPolicy::is_forbidden_header`: that
-        // hook runs *inside* `new_incoming_request`, after injection, so it
-        // could only delete the header — silently, with no error anywhere.
-        ClientIdentity::apply_to(client, &mut req);
+        apply_tenant(tenant, &mut req);
 
         let permit = self
             .limit
@@ -313,14 +317,12 @@ impl ServeHandle {
             .await
             .context("request limiter closed")?;
 
-        // A client with a proven identity and a deployment that asked for
-        // tenancy gets their own filesystem. Everyone else — including every
-        // anonymous caller — gets the original path: a fresh instance over the
-        // runtime's own filesystem, occupying no slot that a real client could
-        // otherwise have had.
-        match (&self.tenancy, client) {
-            (Some(tenancy), Some(client)) => {
-                self.in_tenant(tenancy.clone(), client.key(), permit, scheme, req)
+        // A resolved tenant, in a deployment that asked for tenancy, gets its
+        // own directory. Without either it is a fresh instance over the
+        // runtime's own filesystem.
+        match (&self.tenancy, tenant) {
+            (Some(tenancy), Some(tenant)) => {
+                self.in_tenant(tenancy.clone(), *tenant, permit, scheme, req)
                     .await
             }
             _ => self.in_fresh_instance(permit, scheme, req).await,
@@ -338,7 +340,7 @@ impl ServeHandle {
     async fn in_tenant<B>(
         &self,
         tenancy: Arc<Tenancy>,
-        client: &[u8; 32],
+        tenant_id: [u8; 16],
         permit: tokio::sync::OwnedSemaphorePermit,
         scheme: Scheme,
         req: hyper::Request<B>,
@@ -350,7 +352,7 @@ impl ServeHandle {
         // Checked out before the lock is taken, so the eviction sweep can see
         // this tenant is busy and leave it alone. The guard releases that mark
         // however the request ends.
-        let checkout = tenancy.pool.checkout(client);
+        let checkout = tenancy.pool.checkout(&tenant_id);
         // Owned, so it can move into the task below and outlive this function.
         let mut guard = checkout.slot().tenant().clone().lock_owned().await;
 
@@ -358,9 +360,8 @@ impl ServeHandle {
             // First use of this slot, under the lock — so two simultaneous
             // first requests from one client resolve to one directory, the
             // second waiting here rather than racing the first.
-            let opened = tenant_root(self.guest.fs(), &tenancy.master, client).await?;
+            let opened = tenant_root_by_id(self.guest.fs(), tenant_id).await?;
             tracing::info!(
-                client = %hex::encode(&client[..8]),
                 tenant = %hex::encode(opened.tenant_id),
                 arrival = ?opened.arrival,
                 "tenant directory ready"
@@ -560,14 +561,23 @@ impl ServeHandle {
     }
 }
 
-/// The identity a completed handshake proved, if the client presented one.
-///
-/// Client authentication is optional, so `None` is an ordinary outcome — a
-/// browser, `curl`, or a health check. It is not an error; it is a connection
-/// that gets whatever an unauthenticated caller is allowed.
-fn peer_identity(conn: &rustls::ServerConnection) -> Option<ClientIdentity> {
-    let leaf = conn.peer_certificates()?.first()?;
-    ClientIdentity::from_certificate(leaf)
+/// A fixed body, in the shape the guest dispatch wants.
+fn full(bytes: bytes::Bytes) -> HyperOutgoingBody {
+    use http_body_util::BodyExt;
+    http_body_util::Full::new(bytes)
+        .map_err(|e: std::convert::Infallible| match e {})
+        .boxed_unsync()
+}
+
+/// A refusal, in one sentence and no detail.
+fn refused(status: hyper::StatusCode, detail: &str) -> hyper::Response<HyperOutgoingBody> {
+    hyper::Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(full(bytes::Bytes::from(
+            serde_json::json!({ "error": detail }).to_string(),
+        )))
+        .expect("response is well formed")
 }
 
 /// Serve one connection, whatever it is wrapped in.
@@ -583,33 +593,99 @@ async fn serve_connection<S>(
     io: S,
     guest: Arc<ServeHandle>,
     endpoints: Option<Arc<EnclaveEndpoints>>,
+    auth: Option<Arc<AuthEndpoints>>,
+    gate: Option<Arc<Gate>>,
     scheme: Scheme,
-    client: Option<ClientIdentity>,
 ) -> std::result::Result<(), hyper::Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-        let guest = guest.clone();
-        let endpoints = endpoints.clone();
-        let scheme = scheme.clone();
-        // Cloned per request because the closure is `Fn` — it runs again for
-        // every request on a kept-alive connection.
-        let client = client.clone();
-        async move {
-            // The runtime's own paths are checked first and are not
-            // forwardable: a guest able to answer under `/enclave/` could serve
-            // any attestation it liked.
-            if let Some(endpoints) = &endpoints {
+    let service = hyper::service::service_fn(
+        move |mut req: hyper::Request<hyper::body::Incoming>| {
+            let guest = guest.clone();
+            let endpoints = endpoints.clone();
+            let auth = auth.clone();
+            let gate = gate.clone();
+            // Cloned per request because the closure is `Fn` — it runs again for
+            // every request on a kept-alive connection.
+            let scheme = scheme.clone();
+            async move {
+                let method = req.method().clone();
                 let path = req.uri().path().to_string();
                 let query = req.uri().query().map(str::to_string);
-                if let Some(response) = endpoints.handle(&path, query.as_deref()).await {
-                    return Ok::<_, anyhow::Error>(response);
+
+                // The runtime's own paths are checked first and are not
+                // forwardable: a guest able to answer under `/enclave/` could serve
+                // any attestation it liked, and one able to answer under `/auth/`
+                // could hand out its own challenges and verify its own assertions,
+                // which is the same as having none.
+                if let Some(endpoints) = &endpoints {
+                    if let Some(response) = endpoints.handle(&path, query.as_deref()).await {
+                        return Ok::<_, anyhow::Error>(response);
+                    }
                 }
+                if let Some(auth) = &auth {
+                    if path.starts_with(crate::auth::AUTH_PREFIX) {
+                        // `/auth/*` bodies are small and bounded by the endpoints
+                        // themselves; they are read here because the routes take
+                        // bytes rather than a stream.
+                        let body = match http_body_util::BodyExt::collect(req.into_body()).await {
+                            Ok(collected) => collected.to_bytes(),
+                            Err(e) => {
+                                tracing::debug!(error = %e, "reading an auth request body");
+                                return Ok(refused(
+                                    hyper::StatusCode::BAD_REQUEST,
+                                    "malformed request",
+                                ));
+                            }
+                        };
+                        if let Some(response) = auth.handle(&method, &path, &body).await {
+                            return Ok(response);
+                        }
+                        return Ok(refused(hyper::StatusCode::NOT_FOUND, "no such endpoint"));
+                    }
+                }
+
+                // Everything else is the guest, and **nothing reaches the guest
+                // without a verified assertion bound to exactly this request.**
+                // With no gate configured the runtime is unauthenticated by
+                // deliberate choice — development, and the QEMU harness.
+                let tenant = match &gate {
+                    Some(gate) => match gate.verify(&mut req).await {
+                        Ok(verified) => {
+                            // The body was consumed to hash it, so the request is
+                            // rebuilt around exactly the bytes that were approved.
+                            let mut rebuilt = hyper::Request::builder()
+                                .method(req.method().clone())
+                                .uri(req.uri().clone());
+                            for (name, value) in req.headers() {
+                                if !crate::auth::AUTH_HEADERS
+                                    .iter()
+                                    .any(|h| name.as_str() == *h)
+                                {
+                                    rebuilt = rebuilt.header(name, value);
+                                }
+                            }
+                            let body = full(verified.body);
+                            let rebuilt = rebuilt.body(body).expect("request is well formed");
+                            return guest
+                                .handle(scheme, rebuilt, Some(&verified.tenant_id))
+                                .await;
+                        }
+                        Err(denied) => {
+                            // Logged in full, answered in one sentence: which check
+                            // failed is the runtime's business, and telling a
+                            // caller would tell them which guess to refine.
+                            tracing::info!(%path, reason = %denied, "refused an unauthenticated request");
+                            return Ok(refused(denied.status(), denied.public_message()));
+                        }
+                    },
+                    None => None,
+                };
+                guest.handle(scheme, req, tenant.as_ref()).await
             }
-            guest.handle(scheme, req, client.as_ref()).await
-        }
-    });
+        },
+    );
 
     http1::Builder::new()
         .keep_alive(true)
@@ -626,6 +702,13 @@ where
 pub struct Server {
     guest: Arc<ServeHandle>,
     endpoints: Option<Arc<EnclaveEndpoints>>,
+    /// `/auth/*`, and the gate every other request must pass.
+    ///
+    /// Both or neither: routes that issue challenges nobody checks would be
+    /// worse than no routes at all, and a gate with no way to get a challenge
+    /// would refuse everything forever.
+    auth: Option<Arc<AuthEndpoints>>,
+    gate: Option<Arc<Gate>>,
     tls: Option<Tls>,
     addr: SocketAddr,
 }
@@ -648,9 +731,18 @@ impl Server {
         Server {
             guest: Arc::new(guest),
             endpoints: None,
+            auth: None,
+            gate: None,
             tls: None,
             addr,
         }
+    }
+
+    /// Require a verified assertion for everything the guest could see.
+    pub fn with_authentication(mut self, auth: Arc<AuthEndpoints>, gate: Arc<Gate>) -> Self {
+        self.auth = Some(auth);
+        self.gate = Some(gate);
+        self
     }
 
     pub fn with_endpoints(mut self, endpoints: Arc<EnclaveEndpoints>) -> Self {
@@ -697,6 +789,8 @@ impl Server {
             let (client, peer) = listener.accept().await.context("accepting connection")?;
             let guest = self.guest.clone();
             let endpoints = self.endpoints.clone();
+            let auth = self.auth.clone();
+            let gate = self.gate.clone();
             let tls = tls.clone();
             // `Scheme` is not `Copy`, and the service closure is `Fn` — it may
             // run per request on a kept-alive connection, so it needs its own.
@@ -712,8 +806,7 @@ impl Server {
                         let acceptor = tokio_rustls::TlsAcceptor::from(config.clone());
                         match acceptor.accept(client).await {
                             Ok(stream) => {
-                                let client = peer_identity(stream.get_ref().1);
-                                serve_connection(stream, guest, endpoints, scheme, client).await
+                                serve_connection(stream, guest, endpoints, auth, gate, scheme).await
                             }
                             Err(e) => {
                                 // Routine: scanners, health checks and clients
@@ -761,8 +854,7 @@ impl Server {
 
                         match handshake.into_stream(config.clone()).await {
                             Ok(stream) => {
-                                let client = peer_identity(stream.get_ref().1);
-                                serve_connection(stream, guest, endpoints, scheme, client).await
+                                serve_connection(stream, guest, endpoints, auth, gate, scheme).await
                             }
                             Err(e) => {
                                 // Every handshake lands here until the first
@@ -776,7 +868,7 @@ impl Server {
                     // No TLS, so no certificate and no identity. Whatever the
                     // client says about itself is discarded, same as any other
                     // unauthenticated connection.
-                    None => serve_connection(client, guest, endpoints, scheme, None).await,
+                    None => serve_connection(client, guest, endpoints, auth, gate, scheme).await,
                 };
                 if let Err(e) = result {
                     tracing::debug!(%peer, error = %e, "connection ended");
@@ -807,6 +899,14 @@ pub async fn serve_component(
     handle.verify_instantiates().await?;
 
     let mut server = Server::new(handle, config.addr);
+    match config.authentication {
+        Some((auth, gate)) => server = server.with_authentication(auth, gate),
+        None => tracing::warn!(
+            "serving with NO authentication: every request reaches the guest without a \
+             WebAuthn assertion. Set --webauthn-rp-id and --webauthn-origin for anything \
+             that is not a development run."
+        ),
+    }
 
     // The slot the attestation endpoint reads. Fixed for a self-signed
     // certificate; updated by the ACME client on issue and on every renewal,

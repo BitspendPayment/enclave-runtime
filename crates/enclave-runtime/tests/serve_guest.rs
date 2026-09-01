@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use enclave_runtime::{ClientIdentity, GuestEnvironment, HostClock, ServeHandle};
+use enclave_runtime::{GuestEnvironment, HostClock, ServeHandle};
 use http_body_util::{BodyExt, Full};
 use s3fs_core::backend::memory::MemoryBackend;
 use s3fs_core::{Config, Fs, MasterSecret};
@@ -92,12 +92,8 @@ async fn handle_for_with(env: &[(String, String)], concurrency: usize) -> ServeH
     handle_over_with(fs, env, concurrency).await
 }
 
-async fn get_as(
-    handle: &ServeHandle,
-    path: &str,
-    client: Option<&ClientIdentity>,
-) -> (u16, String) {
-    request_as(handle, "GET", path, &[], client).await
+async fn get_as(handle: &ServeHandle, path: &str, tenant: Option<&[u8; 16]>) -> (u16, String) {
+    request_as(handle, "GET", path, &[], tenant).await
 }
 
 async fn request_as(
@@ -105,7 +101,7 @@ async fn request_as(
     method: &str,
     path: &str,
     body_bytes: &[u8],
-    client: Option<&ClientIdentity>,
+    tenant: Option<&[u8; 16]>,
 ) -> (u16, String) {
     let req = hyper::Request::builder()
         .method(method)
@@ -113,7 +109,7 @@ async fn request_as(
         .body(body(body_bytes))
         .expect("well-formed request");
     let resp = handle
-        .handle(Scheme::Http, req, client)
+        .handle(Scheme::Http, req, tenant)
         .await
         .expect("guest handled the request");
     let status = resp.status().as_u16();
@@ -377,21 +373,20 @@ async fn a_trap_dies_with_its_request() {
 // The client identity the guest is told about.
 // ---------------------------------------------------------------------------
 
-/// A real certificate, because an identity is now the public key inside one.
-fn identity(name: &str) -> ClientIdentity {
-    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
-    let cert = rcgen::CertificateParams::new(vec![name.to_string()])
-        .unwrap()
-        .self_signed(&key)
-        .unwrap();
-    ClientIdentity::from_certificate(cert.der()).expect("a certificate we just made parses")
+/// A tenant id, as the gate would have resolved one.
+///
+/// These tests exercise what happens *after* authentication — isolation,
+/// warmth, concurrency — so they take the tenant as given. That the tenant can
+/// only come from a verified assertion is the gate's own business, and
+/// `auth::gate` tests it directly.
+fn identity(name: &str) -> [u8; 16] {
+    let full = nitro_attestation::sha256(name.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&full[..16]);
+    id
 }
 
-async fn whoami(
-    handle: &ServeHandle,
-    client: Option<&ClientIdentity>,
-    forged: Option<&str>,
-) -> String {
+async fn whoami(handle: &ServeHandle, tenant: Option<&[u8; 16]>, forged: Option<&str>) -> String {
     let mut builder = hyper::Request::builder()
         .method("GET")
         .uri("http://enclave.test/whoami");
@@ -405,7 +400,7 @@ async fn whoami(
     }
     let req = builder.body(body(b"")).expect("well-formed request");
     let resp = handle
-        .handle(Scheme::Http, req, client)
+        .handle(Scheme::Http, req, tenant)
         .await
         .expect("guest handled the request");
     let collected = resp.into_body().collect().await.expect("collecting body");
@@ -417,13 +412,10 @@ async fn whoami(
 /// The runtime's word reaches the guest.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn the_guest_is_told_who_is_calling() {
+async fn the_guest_is_told_which_tenant_is_calling() {
     let handle = handle_for(&[]).await;
     let id = identity("a-client");
-    assert_eq!(
-        whoami(&handle, Some(&id), None).await,
-        hex::encode(id.key())
-    );
+    assert_eq!(whoami(&handle, Some(&id), None).await, hex::encode(id));
 }
 
 /// The forgery. A client sending the header itself must not be believed, and
@@ -432,14 +424,14 @@ async fn the_guest_is_told_who_is_calling() {
 /// attacker's.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn a_client_cannot_forge_its_own_identity() {
+async fn a_client_cannot_forge_its_own_tenant() {
     let handle = handle_for(&[]).await;
     let real = identity("the-real-client");
-    let stolen = hex::encode(identity("someone-else").key());
+    let stolen = hex::encode(identity("someone-else"));
 
     assert_eq!(
         whoami(&handle, Some(&real), Some(&stolen)).await,
-        hex::encode(real.key()),
+        hex::encode(real),
         "a client-supplied header was believed"
     );
 }
@@ -448,9 +440,9 @@ async fn a_client_cannot_forge_its_own_identity() {
 /// client's own header must be removed rather than passed through.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn an_unauthenticated_client_reaches_the_guest_as_anonymous() {
+async fn an_unauthenticated_request_reaches_the_guest_as_anonymous() {
     let handle = handle_for(&[]).await;
-    let stolen = hex::encode(identity("someone-else").key());
+    let stolen = hex::encode(identity("someone-else"));
 
     assert_eq!(
         whoami(&handle, None, Some(&stolen)).await,
@@ -467,10 +459,7 @@ async fn an_unauthenticated_client_reaches_the_guest_as_anonymous() {
 /// one shared filesystem.
 async fn tenanted(concurrency: usize) -> ServeHandle {
     let handle = handle_for_with(&[], concurrency).await;
-    let tenancy = enclave_runtime::Tenancy::new(
-        MasterSecret::from_bytes([7u8; 32]),
-        enclave_runtime::PoolLimits::default(),
-    );
+    let tenancy = enclave_runtime::Tenancy::new(enclave_runtime::PoolLimits::default());
     handle.with_tenancy(Arc::new(tenancy))
 }
 
@@ -709,11 +698,7 @@ async fn a_tenant_cannot_escape_its_directory_even_with_a_hostile_guest() {
 
     // Bob has something worth stealing, at a path Alice can name exactly.
     request_as(&handle, "POST", "/files/secret.txt", b"bob's", Some(&bob)).await;
-    let bob_id = hex::encode(
-        MasterSecret::from_bytes([7u8; 32])
-            .derive_tenant_id(bob.key())
-            .unwrap(),
-    );
+    let bob_id = hex::encode(bob);
 
     for attempt in [
         format!("/tenants/{bob_id}/http-example/secret.txt"),

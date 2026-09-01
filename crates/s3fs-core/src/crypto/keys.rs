@@ -34,22 +34,12 @@ use crate::errors::{FsError, FsResult};
 const INFO_BLOCK: &[u8] = b"s3fs/block/v1";
 const INFO_ROOTSIGN: &[u8] = b"s3fs/rootsign/v1";
 const INFO_DIRHASH: &[u8] = b"s3fs/dirhash/v1";
-/// Derives a tenant identifier — see [`MasterSecret::derive_tenant_id`].
-/// Separate from the key labels above because its output is an *identifier*,
-/// not key material, and the two must not be confusable.
-///
-/// The string keeps its original spelling while the constant does not. A label
-/// is an on-disk constant: every tenant's directory name is a function of it,
-/// so changing it to match a rename would silently move all of them. The `/v1`
-/// is there for changes that mean something.
-const INFO_TENANT_ID: &[u8] = b"s3fs/tenant-fsid/v1";
 /// Seals the runtime's own secrets — the ACME account key and the TLS
 /// certificate's private key — which live outside the filesystem.
 ///
-/// Outside, because the guest's preopen is the filesystem *root*: anything
-/// stored there is readable by the guest, and a guest that could read the TLS
-/// private key could impersonate the enclave to every client. A separate label
-/// keeps that material cryptographically distinct from block data as well as
+/// Outside, because a tenant's guest is confined to its own directory but the
+/// runtime's own material must be unreachable from *any* of them. A separate
+/// label keeps it cryptographically distinct from block data as well as
 /// physically separate.
 const INFO_RUNTIME_SEAL: &[u8] = b"s3fs/runtime-seal/v1";
 
@@ -91,31 +81,6 @@ impl MasterSecret {
                 .map_err(|_| FsError::Invalid("master key is not valid hex"))?;
         }
         Ok(MasterSecret(out))
-    }
-
-    /// A stable name for one tenant, derived rather than assigned.
-    ///
-    /// `tenant` is whatever names the tenant — for the enclave runtime, the
-    /// SHA-256 of a client's TLS public key, which the handshake proves and
-    /// nothing else can forge.
-    ///
-    /// **Derived** so it need never be stored or looked up: the same tenant
-    /// resolves to the same name on every boot, from nothing but the
-    /// handshake, with no registry to keep in step.
-    ///
-    /// **Through the master secret** so the name is not the client's identity
-    /// wearing a different hat. The tenant's data is separated by the
-    /// capability layer, not by this — the name is only a directory name — but
-    /// a directory name reaches places the encrypted tree does not: an enclave
-    /// console the parent instance reads, and anything that lists tenants. A
-    /// name an outsider cannot compute from a certificate keeps client
-    /// identity inside the boundary that is supposed to hold it.
-    ///
-    /// Not a secret, and nothing derives keys from it.
-    pub fn derive_tenant_id(&self, tenant: &[u8]) -> FsResult<[u8; 16]> {
-        let mut out = [0u8; 16];
-        hkdf(self, tenant, INFO_TENANT_ID, &mut out)?;
-        Ok(out)
     }
 
     /// Generate a fresh random secret. Used when formatting a new filesystem
@@ -334,75 +299,5 @@ mod tests {
         let km = KeyMaterial::derive(&m, [0u8; 16]).unwrap();
         let s = format!("{km:?}");
         assert!(!s.contains(&hex16(km.dir_hash_key())));
-    }
-}
-
-#[cfg(test)]
-mod tenant_tests {
-    use super::*;
-
-    fn master(b: u8) -> MasterSecret {
-        MasterSecret::from_bytes([b; 32])
-    }
-
-    /// The property the whole scheme rests on: a tenant resolves to the same
-    /// name on every boot, from the handshake and nothing stored. If this were
-    /// not stable, a returning client would arrive at an empty directory and
-    /// their state would look lost.
-    #[test]
-    fn a_tenant_resolves_to_the_same_name_every_time() {
-        let m = master(1);
-        let tenant = [0xab; 32];
-        assert_eq!(
-            m.derive_tenant_id(&tenant).unwrap(),
-            m.derive_tenant_id(&tenant).unwrap()
-        );
-    }
-
-    #[test]
-    fn two_tenants_never_share_a_name() {
-        let m = master(1);
-        assert_ne!(
-            m.derive_tenant_id(&[0xab; 32]).unwrap(),
-            m.derive_tenant_id(&[0xac; 32]).unwrap()
-        );
-    }
-
-    /// A different master secret is a different deployment. The same client
-    /// against staging and production must not land on the same identifier.
-    #[test]
-    fn the_master_secret_separates_deployments() {
-        let tenant = [0xab; 32];
-        assert_ne!(
-            master(1).derive_tenant_id(&tenant).unwrap(),
-            master(2).derive_tenant_id(&tenant).unwrap()
-        );
-    }
-
-    /// Derived, not copied. Someone holding a client's certificate knows the
-    /// tenant bytes; without the master secret that must tell them nothing
-    /// about which name is that client's.
-    #[test]
-    fn the_identifier_does_not_leak_the_tenant() {
-        let tenant = [0xab; 32];
-        let id = master(1).derive_tenant_id(&tenant).unwrap();
-        assert_ne!(id, tenant[..16]);
-        assert_ne!(id, tenant[16..]);
-        assert!(!tenant.windows(16).any(|w| w == id));
-    }
-
-    /// An identifier is not key material, and the labels are what keep the two
-    /// apart. Same secret, same salt, different purpose — the outputs must be
-    /// unrelated, or a value published in a root record would say something
-    /// about a key that never leaves memory.
-    #[test]
-    fn the_label_separates_an_identifier_from_a_key() {
-        let m = master(1);
-        let salt = [0xab; 32];
-        let mut as_id = [0u8; 16];
-        let mut as_key = [0u8; 16];
-        hkdf(&m, &salt, INFO_TENANT_ID, &mut as_id).unwrap();
-        hkdf(&m, &salt, INFO_BLOCK, &mut as_key).unwrap();
-        assert_ne!(as_id, as_key);
     }
 }

@@ -86,9 +86,9 @@ pub struct Booted {
     /// The recovered master secret.
     ///
     /// Returned rather than dropped because per-client filesystems derive
-    /// their identifiers from it — see [`s3fs_core::MasterSecret::derive_tenant_id`]
-    /// — and there is nowhere else to get it: the runtime's own `KeyMaterial`
-    /// holds only what was derived *for* the runtime filesystem.
+    /// their key material from it, and there is nowhere else to get it: the
+    /// runtime's own `KeyMaterial` holds only what was derived *for* the
+    /// runtime filesystem.
     ///
     /// It zeroizes on drop and never prints. It is already resident in this
     /// process either way; what this changes is that it stays reachable, and

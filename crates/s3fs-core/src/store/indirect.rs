@@ -49,7 +49,7 @@ fn entry_at(block: &[u8], slot: u64) -> FsResult<BlkPtr> {
 
 /// Decode a whole indirect block into its pointer array.
 fn decode_entries(block: &[u8]) -> FsResult<Vec<BlkPtr>> {
-    if block.len() % BLKPTR_LEN != 0 {
+    if !block.len().is_multiple_of(BLKPTR_LEN) {
         return Err(FsError::Integrity(
             "indirect block length is not a multiple of the pointer size",
         ));
