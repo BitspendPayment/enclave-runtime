@@ -252,6 +252,20 @@ struct Cli {
     #[arg(long, env = "S3FS_REQUEST_TIMEOUT_SECS", default_value_t = 30)]
     request_timeout_secs: u64,
 
+    /// Seconds one S3 request may take, before the SDK's retries.
+    ///
+    /// Its own setting rather than a reuse of `--request-timeout-secs`, which
+    /// bounds how long a *guest* may take: tuning how long a guest may think
+    /// should not silently change how long a slab read may take, and the two
+    /// have no reason to move together.
+    ///
+    /// It has to be a setting at all because an enclave has no shell. Thirty
+    /// seconds is a guess, and a slow endpoint or a large slab is exactly the
+    /// case where a guess is wrong — with the symptom being a mount that never
+    /// returns rather than an error that names S3.
+    #[arg(long, env = "S3FS_S3_TIMEOUT_SECS", default_value_t = 30)]
+    s3_timeout_secs: u64,
+
     #[arg(long, env = "S3FS_GUEST_LOG_GROUP")]
     guest_log_group: Option<String>,
 
@@ -487,7 +501,7 @@ impl Cli {
             fs_id: enclave_runtime::parse_fs_id(&self.fs_id)?,
             min_root_seq: self.min_root_seq,
             skip_bucket_probe: self.skip_bucket_probe,
-            request_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(self.s3_timeout_secs),
         })
     }
 
@@ -1005,6 +1019,29 @@ mod tests {
         let mut full = vec!["enclave-runtime", "--master-key-source", "static"];
         full.extend_from_slice(args);
         Cli::try_parse_from(full).expect("parse")
+    }
+
+    /// The S3 timeout is its own setting, and reaches the mount config. It
+    /// used to be hardcoded here *and* ignored by the backend, so neither half
+    /// of the path worked.
+    #[test]
+    fn the_s3_timeout_is_configurable_and_separate_from_the_guest_one() {
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--s3-timeout-secs",
+            "9",
+            "--request-timeout-secs",
+            "45",
+        ]);
+        assert_eq!(
+            cli.mount_config().expect("valid").request_timeout,
+            Duration::from_secs(9)
+        );
+        // Changing the guest deadline must not move the S3 one.
+        assert_eq!(cli.request_timeout_secs, 45);
     }
 
     /// Console-only is the default, and takes no client and no credentials.

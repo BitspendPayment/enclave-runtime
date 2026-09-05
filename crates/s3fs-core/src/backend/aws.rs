@@ -119,7 +119,26 @@ impl AwsS3Backend {
         let mut conf_builder = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(Region::new(config.region.clone()))
-            .force_path_style(config.force_path_style);
+            .force_path_style(config.force_path_style)
+            // `request_timeout` was stored on this config and never applied.
+            // The SDK's defaults give a connect timeout and **no operation
+            // timeout**, so a read that stalls after the connection is
+            // established hangs forever — and inside an enclave that hangs
+            // whatever called it: a mount, a commit, or a guest holding its
+            // tenant's lock open across a response body. Nothing above can
+            // rescue it either, because a task parked in a host future
+            // executes no wasm and so is invisible to the epoch watchdog.
+            //
+            // Per attempt, with the SDK's retries on top, which is what this
+            // field's own documentation describes. The overall ceiling is three
+            // times that — the standard retry policy's attempt count — so a
+            // pathological endpoint cannot stretch one operation without limit.
+            .timeout_config(
+                aws_smithy_types::timeout::TimeoutConfig::builder()
+                    .operation_attempt_timeout(config.request_timeout)
+                    .operation_timeout(config.request_timeout * 3)
+                    .build(),
+            );
         if let Some(ep) = &config.endpoint {
             conf_builder = conf_builder.endpoint_url(ep);
         }
@@ -708,5 +727,41 @@ where
         SdkError::DispatchFailure(_) => FsError::Network(format!("{e:?}")),
         SdkError::ResponseError(_) => FsError::Io(format!("{e:?}")),
         _ => FsError::Io(format!("{e:?}")),
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    /// The bug this guards: the field existed, was defaulted, was threaded
+    /// through two layers of config — and was never handed to the SDK. Asserted
+    /// on the built client rather than on our own struct, because our struct
+    /// held the right value the whole time it was being ignored.
+    #[tokio::test]
+    async fn the_request_timeout_reaches_the_client() {
+        let mut config = AwsS3BackendConfig::new("bucket", "us-east-1");
+        config.request_timeout = Duration::from_secs(7);
+        config.endpoint = Some("http://127.0.0.1:1".into());
+
+        let backend = AwsS3Backend::connect_unchecked(config)
+            .await
+            .expect("building a client does no I/O");
+        let timeouts = backend
+            .client()
+            .config()
+            .timeout_config()
+            .expect("the SDK was given no timeout configuration at all");
+
+        assert_eq!(
+            timeouts.operation_attempt_timeout(),
+            Some(Duration::from_secs(7)),
+            "one attempt is unbounded"
+        );
+        assert_eq!(
+            timeouts.operation_timeout(),
+            Some(Duration::from_secs(21)),
+            "the operation as a whole is unbounded"
+        );
     }
 }
