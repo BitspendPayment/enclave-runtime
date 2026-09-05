@@ -76,3 +76,9 @@ variable "ingress_cidrs" {
   default     = ["0.0.0.0/0"]
   description = "Who may reach :443. Open by default because the endpoint is meant to be public and its TLS terminates inside the enclave."
 }
+
+variable "guest_log_retention_days" {
+  description = "How long to keep guest stdout/stderr. The contents are chosen by the guest, so this is a cost bound as much as a policy."
+  type        = number
+  default     = 30
+}

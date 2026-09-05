@@ -226,6 +226,12 @@ docker logs -f e2e-qemu > "$CONSOLE" 2>&1 &
 # The runtime colourises its logs, so escape sequences land between a field
 # name and its value — `addr<esc>[0m<esc>[2m=` — and a grep for "addr=" simply
 # never matches. Everything that reads a console goes through this.
+# Read through process substitution, never `plain | grep -q`. `grep -q` exits on
+# its first match and closes the pipe; the `sed` upstream then dies of SIGPIPE,
+# and under `set -o pipefail` that makes the whole pipeline report failure even
+# though the pattern matched. It bites in proportion to how much of the file is
+# left unread, so a pattern early in this console fails while a later one passes
+# — which is exactly how it was found.
 plain_of() { sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$1" 2>/dev/null; }
 plain() { plain_of "$CONSOLE"; }
 
@@ -248,8 +254,8 @@ for _ in $(seq "$TIMEOUT"); do
     # "serving " with the bound address, not the earlier "serving guest" —
     # that one is logged before the listener exists and racing it produces a
     # connection-refused that looks like a networking fault.
-    if plain | grep -qE "serving +addr="; then ready=1; break; fi
-    plain | grep -qE "Kernel panic|failed to start the guest" && fail "the enclave died during boot"
+    if grep -qE "serving +addr=" <(plain); then ready=1; break; fi
+    grep -qE "Kernel panic|failed to start the guest" <(plain) && fail "the enclave died during boot"
     sleep 1
 done
 [[ -n "$ready" ]] || fail "the enclave never started serving within ${TIMEOUT}s"
@@ -273,7 +279,7 @@ done
 # ---------------------------------------------------------------------------
 # The assertions.
 # ---------------------------------------------------------------------------
-say "1/6  the guest is unreachable without a passkey assertion"
+say "1/7  the guest is unreachable without a passkey assertion"
 # The rule, at the front because everything after it depends on it holding:
 # nothing reaches the guest without a fresh assertion bound to that request.
 for path in / /counter /memory; do
@@ -284,7 +290,7 @@ for path in / /counter /memory; do
 done
 echo "unauthenticated requests refused: 401"
 
-say "2/6  a passkey enrols and its signed requests reach the guest"
+say "2/7  a passkey enrols and its signed requests reach the guest"
 rm -f "$RUNDIR/alice.json" "$RUNDIR/bob.json"
 signed enrol --token "$ENROLLMENT_TOKEN" >/dev/null \
     || fail "enrollment failed; is S3FS_ENROLLMENT_TOKEN set in the image?"
@@ -295,7 +301,7 @@ echo "counter: $first then $second"
 [[ "${second//[^0-9]/}" -eq $(( ${first//[^0-9]/} + 1 )) ]] \
     || fail "the counter did not advance ($first → $second); writes are not reaching MinIO"
 
-say "3/6  the attestation binds this connection's certificate"
+say "3/7  the attestation binds this connection's certificate"
 "$ATTEST" \
     --url "https://127.0.0.1:$HTTPS_PORT/enclave/attestation" \
     --unsigned-emulator \
@@ -306,7 +312,7 @@ say "3/6  the attestation binds this connection's certificate"
 grep -q "binding    the attested certificate" "$RUNDIR/attest.log" \
     || fail "the document did not bind the certificate this connection was served"
 
-say "4/6  the attested PCR0 is the one the build produced"
+say "4/7  the attested PCR0 is the one the build produced"
 # `nitro-attest --pcr0` already enforced this, so reaching here means it held.
 # Printing both is what makes the claim checkable by eye rather than taken on
 # trust from an exit code.
@@ -316,7 +322,7 @@ echo "attested: $(grep -oE '^PCR0 +[0-9a-f]+' "$RUNDIR/attest.log" | awk '{print
 # ---------------------------------------------------------------------------
 # 5/6 — one instance per request, and one approval per operation.
 # ---------------------------------------------------------------------------
-say "5/6  a tenant keeps its instance, and no two tenants share one"
+say "5/7  a tenant keeps its instance, and no two tenants share one"
 
 # `/memory` counts in the guest's linear memory and writes nowhere. What it
 # answers is the whole per-tenant model in one number.
@@ -349,7 +355,7 @@ echo "alice reads: $a_sees / bob reads: $b_sees"
 [[ "$a_sees" == "alice" && "$b_sees" == "bob" ]] \
     || fail "one tenant read another's file (alice=$a_sees bob=$b_sees)"
 
-say "5b/6 an approval for one payload does not authorize another"
+say "5b/7 an approval for one payload does not authorize another"
 # The property the whole binding exists for. An assertion issued for one body,
 # sent with a different one, must be refused — and the substituted body must
 # never reach the filesystem.
@@ -362,6 +368,74 @@ fi
 echo "substituted body refused: 401, and nothing was written"
 
 # ---------------------------------------------------------------------------
+# 5c/7 — guest output, in a real enclave.
+# ---------------------------------------------------------------------------
+# The guest's stdout and stderr are no longer inherited: the runtime frames them
+# into lines and emits them as its own structured events. Unit tests prove the
+# framing and integration tests prove the wiring; only here is it running inside
+# the enclave, on the console the parent actually reads.
+#
+# What matters is that guest text arrives *marked as guest text*. It is chosen
+# by the guest, so it must never be mistakable for something the runtime said.
+say "5c/7 guest output reaches the console tagged as untrusted"
+signed get --path /log >/dev/null || fail "the guest refused to log"
+
+for _ in $(seq 30); do
+    grep -q 'guest output' <(plain) && break
+    sleep 1
+done
+
+# Two guest writes joined into one line, and CRLF normalised.
+grep -q 'guest_message="first line"' <(plain) \
+    || fail "two guest writes were not joined into one line"
+grep -q 'guest_message="windows"' <(plain) \
+    || fail "CRLF was not normalised"
+# A blank line the guest wrote is still a record.
+grep -q 'guest_message=""' <(plain) \
+    || fail "the guest's empty line was dropped"
+
+# The distinction the design rests on, kept all the way to the console.
+grep -q 'guest_stream="stdout".*guest_message="first line"' <(plain) \
+    || fail "guest stdout was not tagged as stdout"
+grep -q 'guest_stream="stderr".*guest_message="on stderr"' <(plain) \
+    || fail "guest stderr was not tagged as stderr"
+
+# Untrusted text must be *visibly* untrusted, not merely filterable. Runtime
+# events name a module in this runtime; guest output names `guest`, and nothing
+# a guest writes can change which target its line carries.
+if plain | grep 'guest output' | grep -qv ' guest: guest output'; then
+    echo "--- offending lines ---" >&2
+    plain | grep 'guest output' | grep -v ' guest: guest output' | head -5 >&2
+    fail "a guest line reached the console without the guest target"
+fi
+# Guest text is one quoted, escaped field value. It was not always: naming the
+# field `message` collided with the event's own message and printed guest bytes
+# bare in the structured part of the line, where `truncated=true` from a guest
+# rendered as a field nobody set. This is that fix, held in place.
+if plain | grep 'guest output' | grep -qvE 'guest_message="'; then
+    fail "guest output reached the console outside a quoted field"
+fi
+
+grep -q 'enclave_runtime::' <(plain) \
+    || fail "no runtime event carried a module target to be distinguished from"
+if plain | grep 'enclave_runtime::' | grep -q ' guest: '; then
+    fail "a runtime event carried the guest target"
+fi
+
+# The guest's last line had no terminator. It is emitted when the stream object
+# is dropped, which is a moment or two after the response — so this polls
+# rather than assuming, the same way the readiness check does.
+tail_seen=""
+for _ in $(seq 30); do
+    grep -q 'guest_message="no trailing newline"' <(plain) && { tail_seen=1; break; }
+    sleep 1
+done
+[[ -n "$tail_seen" ]] || fail "the guest's unterminated last line never arrived"
+
+echo "guest output arrived framed, tagged by stream, and marked as guest"
+
+
+# ---------------------------------------------------------------------------
 # 6/6 — the boot machine, across a restart.
 # ---------------------------------------------------------------------------
 # The first boot found an empty store and created a filesystem. That used to be
@@ -369,7 +443,7 @@ echo "substituted body refused: 401, and nothing was written"
 # contents had been hidden. The second boot has to recognise the state as its
 # own and resume — which is only possible if the receipt the first boot wrote
 # verifies against the state now present.
-say "6/6  a second boot resumes rather than starting over"
+say "6/7  a second boot resumes rather than starting over"
 
 # `docker logs -f` fills the console file asynchronously, so a single grep can
 # run before the line it is looking for has been written — the assertions above
@@ -377,7 +451,7 @@ say "6/6  a second boot resumes rather than starting over"
 # with a bound, the way the readiness check above already does.
 genesis=""
 for _ in $(seq 60); do
-    plain | grep -q 'mode=Genesis' && { genesis=1; break; }
+    grep -q 'mode=Genesis' <(plain) && { genesis=1; break; }
     sleep 1
 done
 [[ -n "$genesis" ]] || fail "the first boot should have been a genesis"
@@ -402,8 +476,8 @@ docker logs -f e2e-qemu-resume > "$RESUME_CONSOLE" 2>&1 &
 
 resumed=""
 for _ in $(seq "$TIMEOUT"); do
-    plain_of "$RESUME_CONSOLE" | grep -q "state origin established" && { resumed=1; break; }
-    plain_of "$RESUME_CONSOLE" | grep -qE "Kernel panic|failed to start the guest" && break
+    grep -q "state origin established" <(plain_of "$RESUME_CONSOLE") && { resumed=1; break; }
+    grep -qE "Kernel panic|failed to start the guest" <(plain_of "$RESUME_CONSOLE") && break
     sleep 1
 done
 if [[ -z "$resumed" ]]; then
@@ -414,7 +488,7 @@ if [[ -z "$resumed" ]]; then
 fi
 
 plain_of "$RESUME_CONSOLE" | grep -E "state origin established" | tail -1
-if ! plain_of "$RESUME_CONSOLE" | grep -q "mode=Resume"; then
+if ! grep -q "mode=Resume" <(plain_of "$RESUME_CONSOLE"); then
     echo "FAIL: the second boot did not resume — it should not have created anything" >&2
     plain_of "$RESUME_CONSOLE" | grep -E "mode=|refus" | tail -5 >&2
     docker rm -f e2e-qemu-resume >/dev/null 2>&1 || true
@@ -443,7 +517,13 @@ cat <<EOF
   an approval for one payload did not authorize another
   a tenant kept its warm instance, and no two tenants shared one
   one tenant could not read another's file
+  guest stdout and stderr arrived framed and marked as untrusted
   genesis wrote an attested state origin, and a restart resumed it
+
+Guest logging is proven only as far as the console, in leg 5c. The enclave can
+also ship guest output to CloudWatch, and nothing here exercises that: this
+harness has no AWS account and no route to one, so the log group is left unset
+and no client is built. That hop needs a real deployment, like the KMS path.
 
 NOT proven here. QEMU's emulated NSM does not sign attestation documents, so
 no signature and no certificate chain were checked — only the contents the

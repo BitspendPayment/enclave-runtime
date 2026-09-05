@@ -16,14 +16,16 @@
 //! no way to enumerate what has been registered, so no unit test can prove
 //! this list is complete.
 //!
-//! Two things mitigate it, and both are load-bearing:
+//! What mitigates it is that `wasmtime-wasi` is pinned to an exact version, so
+//! the list cannot change under us without someone editing a manifest. If you
+//! bump it, diff this function against the upstream one.
 //!
-//! 1. `wasmtime-wasi` is pinned to an exact version, so the list cannot change
-//!    under us without someone editing a manifest.
-//! 2. CI runs `examples/guest-smoke`, which imports the full `wasi:cli`
-//!    command world. A missing interface fails that job.
-//!
-//! If you bump `wasmtime-wasi`, diff this function against the upstream one.
+//! There used to be a second mitigation — CI ran a `wasi:cli/command` guest
+//! that imported the full command world, so a missing interface failed that
+//! job. It went with the command runner. The runtime serves `wasi:http/proxy`
+//! and nothing else now, so the full `wasi:cli` surface is registered because
+//! a proxy guest may still reach for parts of it, not because anything
+//! requires all of it.
 
 use wasmtime::component::{HasData, Linker, ResourceTable};
 use wasmtime::Result;

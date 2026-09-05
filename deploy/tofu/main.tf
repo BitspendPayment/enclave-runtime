@@ -175,6 +175,64 @@ resource "aws_iam_role_policy" "buckets" {
   policy = data.aws_iam_policy_document.buckets.json
 }
 
+# ---------------------------------------------------------------------------
+# Guest logs
+# ---------------------------------------------------------------------------
+
+# For building log ARNs by hand — see the policy below.
+data "aws_caller_identity" "current" {}
+
+# Created here, not by the enclave. The enclave holds `logs:PutLogEvents` and
+# nothing more, so a compromised or misconfigured image cannot create log
+# groups — and a typo in the group name fails its boot loudly instead of
+# quietly filling a new group nobody is watching.
+resource "aws_cloudwatch_log_group" "guest" {
+  name = "/${local.name}/guest"
+
+  # Set deliberately. Left unset these never expire, and the contents are
+  # attacker-controlled: whatever a guest chose to write to stdout. An
+  # unbounded retention on unbounded input is an unbounded bill.
+  retention_in_days = var.guest_log_retention_days
+
+  tags = local.tags
+}
+
+resource "aws_cloudwatch_log_stream" "guest" {
+  name           = "guest"
+  log_group_name = aws_cloudwatch_log_group.guest.name
+}
+
+# This is the **parent instance's** role, and it is the identity that will make
+# the call. The enclave is not an IAM principal and has none of its own: it has
+# no NIC, so its SDK reaches IMDS through gvproxy on this instance and receives
+# these credentials. When the enclave gets an attested identity of its own,
+# this statement moves there and the parent stops being able to write to the
+# stream at all.
+data "aws_iam_policy_document" "guest_logs" {
+  statement {
+    sid     = "WriteGuestLogs"
+    effect  = "Allow"
+    actions = ["logs:PutLogEvents"]
+    # The one stream, not the group and not `*`. Nothing here needs to create
+    # a group, a stream, or write to anyone else's.
+    #
+    # Built from components rather than from `aws_cloudwatch_log_group.arn`,
+    # which is inconsistent about carrying a trailing `:*`. Appending to it
+    # would silently produce an ARN matching nothing — and the symptom is an
+    # `AccessDeniedException`, which this runtime treats as a deployment
+    # mistake and refuses to boot on. Worth the extra interpolation.
+    resources = [
+      "arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:${aws_cloudwatch_log_group.guest.name}:log-stream:${aws_cloudwatch_log_stream.guest.name}",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "guest_logs" {
+  name   = "${local.name}-guest-logs"
+  role   = aws_iam_role.parent.id
+  policy = data.aws_iam_policy_document.guest_logs.json
+}
+
 # For a shell without opening port 22.
 resource "aws_iam_role_policy_attachment" "ssm" {
   role       = aws_iam_role.parent.name
@@ -223,6 +281,21 @@ resource "aws_instance" "parent" {
   metadata_options {
     http_tokens   = "required" # IMDSv2
     http_endpoint = "enabled"
+
+    # UNVERIFIED PRODUCTION DEPENDENCY. Nothing in this repository proves that
+    # an enclave can actually reach IMDS: the QEMU harness has no instance
+    # metadata service to reach, so gvproxy's handling of 169.254.169.254 has
+    # never been exercised. Every AWS call the enclave makes — S3, KMS, SSM and
+    # now CloudWatch — rests on it. Validate IMDSv2 credential resolution on
+    # Nitro hardware before production; if gvproxy routes rather than proxies,
+    # this must be 2, and the symptom is calls failing in a way that reads like
+    # missing credentials rather than like a network fault.
+    #
+    # One hop is right *if* gvproxy proxies — it terminates the enclave's
+    # connection here and opens its own, so the request originates on this
+    # instance. Stated rather than defaulted, because the value is a deployment
+    # decision and not an incidental.
+    http_put_response_hop_limit = 1
   }
 
   # Configuration the image cannot know: which buckets, and which domain the

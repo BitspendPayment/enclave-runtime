@@ -38,27 +38,26 @@ fn body(bytes: &[u8]) -> HyperOutgoingBody {
 /// One filesystem, one compiled guest, many requests — the arrangement the
 /// runtime actually uses.
 async fn handle_for(env: &[(String, String)]) -> ServeHandle {
-    handle_for_with(env, 1).await
+    handle_for_with(env).await
 }
 
-/// A handle over a filesystem that already exists, at a chosen concurrency.
+/// A handle over a filesystem that already exists.
 ///
 /// Separated so a test can build a *second* handle over the first one's
-/// storage — the only way to ask what survives a restart — and so the
-/// per-client tests can raise the limit. Tenancy only means anything above 1:
-/// the limit is a global admission cap, and at 1 every client still queues
-/// behind every other whatever the per-client locks say.
-async fn handle_over_with(
-    fs: Arc<Fs>,
-    env: &[(String, String)],
-    concurrency: usize,
-) -> ServeHandle {
+/// storage — the only way to ask what survives a restart.
+async fn handle_over_with(fs: Arc<Fs>, env: &[(String, String)]) -> ServeHandle {
+    // Detached deliberately: the collector runs for as long as this
+    // environment can send, which is what a test wants. Production drains it
+    // explicitly instead.
+    let (logs, _collector) =
+        enclave_runtime::guest_io::start(std::sync::Arc::new(enclave_runtime::TracingLogSink));
     let guest = GuestEnvironment::new(
         fs,
         Box::new(HostClock),
         Arc::new(nitro_nsm::fake::FakeNsm::new()),
         env,
         &[],
+        logs,
     )
     .expect("building the guest environment");
 
@@ -71,11 +70,11 @@ async fn handle_over_with(
     });
 
     let engine = ServeHandle::engine_with_watchdog().expect("engine");
-    ServeHandle::new(&engine, &bytes, guest, concurrency).expect("preparing the guest")
+    ServeHandle::new(&engine, &bytes, guest).expect("preparing the guest")
 }
 
-/// A runtime filesystem plus a handle, at a chosen concurrency.
-async fn handle_for_with(env: &[(String, String)], concurrency: usize) -> ServeHandle {
+/// A runtime filesystem plus a handle.
+async fn handle_for_with(env: &[(String, String)]) -> ServeHandle {
     let backend = Arc::new(MemoryBackend::new());
     // `create`, not `mount`: mounting stopped formatting an empty store when
     // the boot machine landed, because a store that answers "nothing" is now a
@@ -89,7 +88,7 @@ async fn handle_for_with(env: &[(String, String)], concurrency: usize) -> ServeH
     )
     .await
     .expect("creating the memory-backed filesystem");
-    handle_over_with(fs, env, concurrency).await
+    handle_over_with(fs, env).await
 }
 
 async fn get_as(handle: &ServeHandle, path: &str, tenant: Option<&[u8; 16]>) -> (u16, String) {
@@ -245,9 +244,9 @@ async fn the_linker_denies_guest_egress() {
 ///
 /// Without a watchdog this is not a slow request, it is a permanent one: the
 /// `oneshot::Sender` lives in the `Store`, the `Store` was moved into the
-/// spawned task, so `receiver.await` can never resolve, the concurrency permit
-/// is never released, and at the default of one request in flight the server
-/// is finished for the life of the process.
+/// spawned task, so `receiver.await` can never resolve and the tenant's lock is
+/// never released — which would finish that tenant for the life of the process,
+/// though not anybody else's.
 ///
 /// The assertions are ordered accordingly — the second one is the point. The
 /// first only shows the request gave up; the second shows the *server* did not.
@@ -457,8 +456,8 @@ async fn an_unauthenticated_request_reaches_the_guest_as_anonymous() {
 
 /// A handle that gives every authenticated client their own directory of the
 /// one shared filesystem.
-async fn tenanted(concurrency: usize) -> ServeHandle {
-    let handle = handle_for_with(&[], concurrency).await;
+async fn tenanted() -> ServeHandle {
+    let handle = handle_for_with(&[]).await;
     let tenancy = enclave_runtime::Tenancy::new(enclave_runtime::PoolLimits::default());
     handle.with_tenancy(Arc::new(tenancy))
 }
@@ -468,7 +467,7 @@ async fn tenanted(concurrency: usize) -> ServeHandle {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn a_client_keeps_their_own_directory_and_instance() {
-    let handle = tenanted(4).await;
+    let handle = tenanted().await;
     let client = identity("a-client");
 
     for expected in 1..=3 {
@@ -493,7 +492,7 @@ async fn a_client_keeps_their_own_directory_and_instance() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn two_clients_never_see_each_others_data() {
-    let handle = tenanted(4).await;
+    let handle = tenanted().await;
     let alice = identity("alice");
     let bob = identity("bob");
 
@@ -523,7 +522,7 @@ async fn two_clients_never_see_each_others_data() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn two_clients_never_share_an_instance() {
-    let handle = tenanted(4).await;
+    let handle = tenanted().await;
     let alice = identity("alice");
     let bob = identity("bob");
 
@@ -543,7 +542,7 @@ async fn two_clients_never_share_an_instance() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn an_anonymous_caller_gets_no_tenant() {
-    let handle = tenanted(4).await;
+    let handle = tenanted().await;
     for _ in 0..3 {
         let (status, body) = get_as(&handle, "/memory", None).await;
         assert_eq!(status, 200);
@@ -556,7 +555,7 @@ async fn an_anonymous_caller_gets_no_tenant() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn a_trap_is_contained_to_one_client() {
-    let handle = tenanted(4)
+    let handle = tenanted()
         .await
         .with_timeout(std::time::Duration::from_secs(3));
 
@@ -599,7 +598,7 @@ async fn a_trap_is_contained_to_one_client() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn a_trap_keeps_the_clients_data() {
-    let handle = tenanted(4)
+    let handle = tenanted()
         .await
         .with_timeout(std::time::Duration::from_secs(3));
     let alice = identity("alice");
@@ -641,7 +640,7 @@ async fn a_trap_keeps_the_clients_data() {
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn one_client_does_not_wait_for_another() {
     let handle = Arc::new(
-        tenanted(4)
+        tenanted()
             .await
             .with_timeout(std::time::Duration::from_secs(3)),
     );
@@ -692,7 +691,7 @@ async fn one_client_does_not_wait_for_another() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn a_tenant_cannot_escape_its_directory_even_with_a_hostile_guest() {
-    let handle = tenanted(4).await;
+    let handle = tenanted().await;
     let alice = identity("alice");
     let bob = identity("bob");
 

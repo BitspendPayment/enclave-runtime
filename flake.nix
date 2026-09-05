@@ -258,7 +258,6 @@
           # it execs resolves through the same closure.
           PATH = "${busybox}/bin:/usr/local/bin";
           S3FS_GUEST_PATH = "/guest.wasm";
-          S3FS_MODE = "serve";
           S3FS_HTTP_LISTEN = "0.0.0.0:443";
           # ACME, not self-signed: a platform authenticator will not attest
           # against a certificate a browser does not trust, so a self-signed one
@@ -294,6 +293,14 @@
           # the deployment, since they name resources this repository does not
           # own.
           S3FS_MASTER_KEY_SOURCE = "kms";
+
+          # Guest stdout and stderr go to CloudWatch as well as the console.
+          # The enclave calls PutLogEvents itself, over the same path it uses
+          # for S3 and KMS, so TLS terminates inside and the parent carries
+          # ciphertext. The group and stream are created by Terraform; this
+          # runtime holds `logs:PutLogEvents` and cannot make them.
+          S3FS_GUEST_LOG_GROUP = deployment.guestLogGroup;
+          S3FS_GUEST_LOG_STREAM = deployment.guestLogStream;
 
           # Every request that could reach the guest needs a fresh WebAuthn
           # assertion bound to exactly that request. Without an RP id the
@@ -354,8 +361,6 @@
             # certificates. Concurrency has to rise with it or every client
             # still queues behind every other and the per-client locks buy
             # nothing.
-            S3FS_WARM_INSTANCES = "1";
-            S3FS_HTTP_CONCURRENCY = "8";
             # And it cannot use KMS at all, for the same reason: KMS verifies
             # the attestation document carrying the enclave's recipient public
             # key, and will not accept one that is unsigned. So the emulator
@@ -373,6 +378,13 @@
             # with a software passkey that does not care who signed the
             # certificate.
             S3FS_TLS = "self-signed";
+            # Off. Inherited from the production image, and there is no AWS
+            # here to send to: the harness's credentials are MinIO's, which
+            # CloudWatch would reject. Empty means off — the same shape as the
+            # TLS override above, and the reason `guest_log_config` treats an
+            # empty setting as unset rather than as a typo.
+            S3FS_GUEST_LOG_GROUP = "";
+            S3FS_GUEST_LOG_STREAM = "";
             # The gate, with a relying party the harness can drive. A platform
             # authenticator would refuse this self-signed certificate, so the
             # e2e exercises the gate with the software passkey the `testing`

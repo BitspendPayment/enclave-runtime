@@ -115,7 +115,7 @@ clap        = { version = "4", features = ["derive", "env"] }
 anyhow      = { workspace = true }
 async-trait = { workspace = true }
 bytes       = { workspace = true }
-tokio       = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "signal", "net", "io-util"] }
+tokio       = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "signal", "net", "io-util", "time"] }
 tracing     = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # CiphertextForRecipient — what KMS returns when the response is encrypted to
@@ -133,11 +133,33 @@ der = { version = "0.7", default-features = false, features = ["alloc", "oid", "
 # ciphertext, and nothing else.
 aws-sdk-kms = { version = "1.51.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
 aws-sdk-ssm = { version = "1.56.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+# Guest stdout and stderr, out to CloudWatch Logs from inside the enclave.
+#
+# Yes, this puts an AWS SDK inside the boundary PCR0 measures — but KMS, SSM and
+# S3 are already here, for the same reason: an enclave with no network of its
+# own still calls AWS over gvproxy. It brings no new crypto stack; kms and ssm
+# already pull `rustls`, which is what the ban above is actually about.
+aws-sdk-cloudwatchlogs = { version = "1.131.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+# The default credential chain, which resolves through gvproxy to the parent
+# instance's IMDS. Named explicitly rather than relied on as a fallback, so it
+# is obvious *which* identity guest logs are written with.
+aws-config = { workspace = true, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
 webauthn-rs = "0.5.5"
 serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
+# `StaticReplayClient`: canned HTTP responses for the CloudWatch client, so the
+# tests assert the request that is actually serialised rather than a mock of
+# one. A dev-dependency, so none of it reaches the image. It is already in the
+# tree as a transitive dependency of the SDK — naming it here adds no code to
+# the build, only the ability to ask for its test utilities.
+aws-smithy-http-client = { version = "1", features = ["test-util"] }
+# `start_paused`: a timeout test should not spend the timeout.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+aws-smithy-types = { workspace = true }
+# Building canned HTTP requests/responses for the replay client.
+http = "1"
 # The integration suites drive the gate with a software passkey, which only
 # exists under `testing`. A dev-dependency on the crate itself is how a crate
 # turns a feature on for its own tests without turning it on for consumers.

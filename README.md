@@ -27,9 +27,8 @@ Four workspace crates plus example guests:
 | [`nitro-nsm`](crates/nitro-nsm/) | `/dev/nsm`: entropy and attestation requests. Its own crate so it links into a small static binary for an enclave image. |
 | [`nitro-attestation`](crates/nitro-attestation/) | Parses and verifies attestation documents, and the `nitro-attest` client. Depends on nothing else here — a verifier has no `/dev/nsm` and is often not Linux. |
 | [`enclave-runtime`](crates/enclave-runtime/) | Everything above the engine: `wasi:filesystem@0.2.x`, the linker, the guest-environment policy, the vsock tap device, TLS termination and the attestation endpoints — plus the binary that ties them together. A library beside the binary so integration tests can reach it. |
-| [`examples/guest-smoke`](examples/guest-smoke/) | Minimal guest, no C toolchain needed. Exercises write / patch / rename / read_dir and the environment policy; run twice it proves durability. |
-| [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Needs wasi-sdk. |
-| [`examples/guest-fsdemo`](examples/guest-fsdemo/) | The original smaller SQLite demo. |
+| [`examples/guest-http`](examples/guest-http/) | The guest the serving path is tested against: reads and writes the filesystem, and is deliberately stateful so a second request proves the first one's writes committed. |
+| [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Runs on request; needs wasi-sdk to build. |
 
 **Test coverage:** 502 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the attestation binding. There are no cargo features to select: `cargo test --workspace` runs everything; 23 of those tests skip themselves without MinIO or enclave hardware.
 
@@ -47,16 +46,11 @@ aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 \
 aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 \
   s3api create-bucket --bucket demo-roots
 
-# 2. Build the example guest (requires wasi-sdk for bundled SQLite)
-curl -sLO https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
-mkdir -p ~/wasi-sdk && tar xf wasi-sdk-25.0-x86_64-linux.tar.gz -C ~/wasi-sdk --strip-components=1
-cd examples/guest-fsdemo
-CC_wasm32_wasip2=$HOME/wasi-sdk/bin/clang \
-AR_wasm32_wasip2=$HOME/wasi-sdk/bin/ar \
-CFLAGS_wasm32_wasip2="--sysroot=$HOME/wasi-sdk/share/wasi-sysroot -DSQLITE_THREADSAFE=0 -DHAVE_USLEEP=1" \
-  cargo build --release --target wasm32-wasip2
+# 2. Build the example guest. No C toolchain needed — guest-http is std-only.
+cd examples/guest-http
+cargo build --release --target wasm32-wasip2
 
-# 3. Build the runtime and execute the guest
+# 3. Build the runtime and serve the guest
 cd ../..
 cargo build --release -p enclave-runtime --features aws
 ./target/release/enclave-runtime \
@@ -69,8 +63,13 @@ cargo build --release -p enclave-runtime --features aws
   --secret-access-key minioadmin \
   --force-path-style \
   --master-key 0000000000000000000000000000000000000000000000000000000000000001 \
-  --guest-path examples/guest-fsdemo/target/wasm32-wasip2/release/guest-fsdemo.wasm
-# → prints "OK"
+  --tls off \
+  --http-listen 127.0.0.1:8080 \
+  --guest-path examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm
+
+# then, from another shell:
+curl localhost:8080/           # what this guest is
+curl localhost:8080/counter    # increments, and persists across requests
 ```
 
 `--no-inherit-env` matters outside an enclave. The default is to pass this
@@ -159,6 +158,13 @@ page-granular random I/O, rewriting a rollback journal every transaction, and
 then telling us via `PRAGMA integrity_check` whether the bytes came back
 correct. [`examples/guest-sqlite`](examples/guest-sqlite/) exercises it and
 prints the table below.
+
+It is a `wasi:http/proxy` guest like any other — the runtime serves that world
+and no other — so the workload is asked for with a request rather than run as a
+process: `GET /` runs every phase and answers `OK` or `FAIL: …`, while the
+timings go to the guest's stdout and reach you through the runtime's own log
+records. The workload is not idempotent; it builds on what the last run left,
+which is the point when checking durability across restarts.
 
 ### Two pragmas you must set
 
@@ -589,7 +595,7 @@ with a test, not a consequence of which crate features happened to be on.
 
 ```console
 $ (cd examples/guest-http && cargo build --release --target wasm32-wasip2)
-$ S3FS_MODE=serve S3FS_TLS=off S3FS_HTTP_LISTEN=127.0.0.1:8080 \
+$ S3FS_TLS=off S3FS_HTTP_LISTEN=127.0.0.1:8080 \
   S3FS_GUEST_PATH=examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm \
   ./target/release/enclave-runtime
 $ curl localhost:8080/counter    # 1
@@ -605,8 +611,11 @@ WASI has no `fcntl` and therefore no file locking — two instances over one
 database would each believe they had it alone, and fail in a way that looks
 like corruption rather than contention.
 
-So `--http-concurrency` defaults to `1`. Raise it for a guest that keeps no
-cross-request state in the filesystem.
+So concurrency is **per tenant**: one active guest request for each resolved
+tenant identity, and different tenants running at the same time. SQLite's
+exclusive lock is safe because a tenant's database is only ever opened by that
+tenant's one in-flight request. There is no global ceiling to raise — two
+tenants have nothing to queue on.
 
 ### One instance per request
 
@@ -708,10 +717,10 @@ together and single nobody out.
 
 ### A directory per client
 
-`--warm-instances` gives every authenticated client its own corner of the
-filesystem. There is still **one** mounted filesystem, one block cache and one
-transaction stream; what is per-client is a directory under `/tenants/<id>/`, a
-warm guest instance, and a lock.
+Every authenticated client gets its own corner of the filesystem. There is
+still **one** mounted filesystem, one block cache and one transaction stream;
+what is per-client is a directory under `/tenants/<id>/`, a warm guest
+instance, and a lock.
 
 The identifier is derived, never stored: `HKDF(master, sha256(client SPKI))`.
 The same client lands on the same directory on every boot from nothing but the
@@ -747,23 +756,33 @@ A client costs a directory — no mount, no second key derivation, no signed roo
 record to read, no extra cache. That is why this is worth doing with one
 filesystem rather than many.
 
-What it does change is concurrency. Today one request runs at a time, globally.
-With this on, a client is serialised against *itself* and nobody else, which is
-what makes a nonce reservation safe while letting two clients' guests run at
-once. Their **commits still queue**, though: one filesystem means one
-transaction lock, so the gain is in guest execution and reads rather than in
-writes. And any guest invariant that quietly relied on global serialisation now
-breaks — which is why this is opt-in, and why PCR0 records it.
+What it changes is concurrency. A client is serialised against *itself* and
+nobody else, which is what makes a nonce reservation safe while letting two
+clients' guests run at once. Their **commits still queue**, though: one
+filesystem means one transaction lock, so the gain is in guest execution and
+reads rather than in writes.
+
+This is the model, not an option: a guest is written for it.
 
 ```console
-$ S3FS_WARM_INSTANCES=1 S3FS_HTTP_CONCURRENCY=8 S3FS_MAX_TENANTS=64 \
-  ... enclave-runtime
+$ S3FS_MAX_TENANTS=64 ... enclave-runtime
 ```
+
+The lock a tenant holds is released when its guest **finishes** — body
+included, not when its headers appear — so a tenant's next request waits for
+the previous one to be genuinely done. A slow reader therefore occupies its own
+tenant's slot and nobody else's.
+
+**Callers with no resolved tenant share one slot.** Without a gate configured,
+or on a path that does not identify itself, there is no identity to separate
+requests by — so they serialise against each other over the runtime's own
+filesystem. Unbounded would let anyone with a socket multiply wasm linear
+memories, which is exactly the exhaustion the per-tenant lock prevents for
+callers who *are* identified.
 
 `--max-tenants` bounds warm *instances*, each of which costs a wasm linear
 memory; past it the least recently used idle client is dropped, and one serving
-a request is never evicted. Raise `--http-concurrency` alongside it, or every
-client still queues behind every other whatever the per-client locks say.
+a request is never evicted.
 
 #### Why there is no separate register
 
@@ -874,6 +893,146 @@ not satisfy a later nonce.
 reach; the path from a signed order to a served certificate is written and
 unexercised. Chain validation to the AWS Nitro root is likewise hardware-only,
 since QEMU signs with a key it generates.
+
+
+## Guest output
+
+A guest's `stdout` and `stderr` are not inherited from the enclave process.
+They are custom WASI streams that frame what the guest writes into lines and
+hand them to the runtime's logging pipeline, tagged with the stream they came
+from:
+
+```
+guest write ──▶ line framing ──▶ bounded queue ──▶ collector ──▶ sink
+                (per stream)     (drops when       (one task)    └─ tracing
+                                  full)                          └─ future: vsock
+```
+
+Records arrive as structured `tracing` events under the target `guest`, with
+`guest_stream` set to `stdout` or `stderr` and the text in a quoted, escaped
+`guest_message` field — quoted because guest bytes must not be able to render
+as fields the runtime never set:
+
+```
+INFO guest: guest output guest_stream="stdout" truncated=false guest_message="first line"
+WARN guest: guest output guest_stream="stderr" truncated=false guest_message="on stderr"
+INFO enclave_runtime::mount: mounted mode="genesis" root_seq=0 …
+```
+
+`stderr` is emitted at `warn` and `stdout` at `info` — which stream was written
+to, not what the text means. **No severity is inferred from guest content**, or
+a guest could pick its own log level.
+
+**Guest logs are attacker-controlled data.** Everything on this path was chosen
+by the guest, including text shaped exactly like the runtime's own log lines.
+The two are separable only by the tracing target, which a guest cannot
+influence, and guest text never reaches an event name or target — only a field
+value. The console prints targets for exactly this reason: guest lines say
+`guest`, everything else names a module in the runtime, so an operator reading
+the console can see which lines are untrusted rather than having to know a
+filter. `RUST_LOG=guest=warn` narrows or silences guest output independently.
+**A guest log is not an audit record** and must never be read as one.
+
+**Logging is best-effort and lossy under pressure.** A guest write never waits
+on a log destination, so the queue is bounded and records are dropped when it
+is full. The guest still sees a successful write: congestion is a host concern
+and must not become a guest-visible failure, let alone a stall. Drops are
+counted and reported in aggregate on an interval — never one warning per
+dropped write, which would hand a guest an amplification primitive against the
+log it is congesting.
+
+What that guarantees, and what it does not:
+
+| | |
+|---|---|
+| Bounded memory | 1024 queued records, each ≤ 16 KiB, plus one partial line ≤ 16 KiB per open stream. A guest writing a gigabyte without a newline costs 16 KiB and a truncation flag. |
+| No stall | A sink that never returns cannot delay a guest write, and cannot hold up shutdown beyond a fixed 2-second drain. |
+| No delivery guarantee | Output is lost when the queue fills, and anything still queued is lost if the enclave stops abruptly. |
+| Lines, not bytes | Partial writes are joined; `\r\n` is normalised; invalid UTF-8 is replaced lossily rather than dropped; a final unterminated line is emitted when the stream closes. |
+| Truncation is explicit | A record longer than 16 KiB is cut and carries `truncated = true`. |
+
+`stdin` is closed rather than inherited. An enclave has no console to read from,
+so an inherited `stdin` offered a guest nothing but a handle on whatever the
+parent had attached to the process.
+
+Delivery beyond this process — batching over vsock to a parent-side agent, and
+from there to CloudWatch — sits behind the `GuestLogSink` trait and is not
+built. When it is, note that an ordinary relay through the parent can read,
+drop, reorder and forge records: TLS from the parent to CloudWatch is not
+confidentiality *from the parent*. Authenticity would need sequence numbers and
+a MAC or signature generated inside the enclave; confidentiality would need
+records encrypted to a log consumer's key before they leave.
+
+### Sending guest logs to CloudWatch
+
+Guest output can go to CloudWatch Logs as well as the console. Set the group and
+stream — both must already exist:
+
+```bash
+enclave-runtime --mode serve \
+  --guest-log-group /my-enclave-production/guest \
+  --guest-log-stream guest
+```
+
+`deploy/tofu` creates them and grants the role `logs:PutLogEvents` on that one
+stream. The enclave cannot create a group or a stream, deliberately: a typo
+fails its boot loudly rather than quietly filling a group nobody watches.
+
+**The enclave calls CloudWatch itself.** It already calls S3, KMS and SSM the
+same way — over the tap device and gvproxy — so relaying logs through a
+parent-side process would add a wire format, a transport and a second binary to
+reach a service this runtime can already reach. It would also be worse: a relay
+reads the plaintext.
+
+Credentials come from the SDK's default chain. The enclave has no NIC, but its
+egress is NATed by gvproxy through the parent, where `169.254.169.254` is
+reachable — so the chain resolves to the **parent instance's role**. That is why
+the production image sets no keys.
+
+| | |
+|---|---|
+| Never delays a request | A guest write never touches the network. `emit` stamps and enqueues; only the forwarder waits on AWS. |
+| Bounded | 4096 queued records, then 16 pending batches. Beyond that output is dropped and counted. |
+| Drops from both ends | The record queue drops what is *arriving* — `emit` must return in constant time. The batch deque drops the *oldest* — when CloudWatch has been away that long, recent output is what matters. |
+| Retries | Own backoff, 250 ms to 30 s, with the SDK's retries disabled so the two do not compound. A refused batch is retried, not discarded. |
+| Gives up loudly | A refusal that cannot heal — the stream is gone, or the role lacks the permission — stops the boot rather than retrying forever. |
+| No delivery guarantee | Records older than an hour are dropped; so are events CloudWatch rejects inside a 200 response. Both are counted. Anything queued is lost if the enclave stops abruptly. |
+
+Each event is JSON — `{"source":"guest","stream":"stdout","truncated":false,
+"message":"…"}` — so guest text is a **field value** and cannot invent structure
+a log query would attribute to the runtime. The runtime's own boot marker
+carries `source:"runtime"` and the image PCR0, which is what says who is writing
+to a stream that every boot shares.
+
+**What the parent can still do.** TLS terminates inside the enclave against the
+image's own CA bundle, so the parent cannot read or alter records in flight. It
+*can* block or delay them — it carries the packets and answers DNS — and it
+*can* forge records out of band, because the credentials are its own instance
+role and it can write to the same stream itself. Closing that needs a distinct,
+attested identity for the enclave, which does not exist yet. And the content was
+never trustworthy anyway: a guest chose the text. **These are operational
+records, not an audit trail.**
+
+The cost, stated plainly: a CloudWatch SDK is now inside the boundary PCR0
+measures. It brings no new crypto stack — KMS and SSM already pull `rustls` —
+but it is more code in the attested image, in exchange for logs the parent
+cannot read.
+
+**Unverified production dependency.** Nothing here proves an enclave can reach
+IMDS. The QEMU harness has no metadata service, so gvproxy's handling of
+`169.254.169.254` has never been exercised — and *every* AWS call the enclave
+makes depends on it, not only logging. IMDSv2 credential resolution and a real
+`PutLogEvents` are to be validated on Nitro hardware before production, beside
+the KMS tests in the same category.
+
+The code is built to survive that being wrong. Connection failures, unresolved
+credentials and expired tokens are all classified **transient**: they are
+retried with backoff, counted, and never stop the enclave. Only
+`ResourceNotFoundException` and `AccessDeniedException` are final, because only
+those name a mistake waiting cannot fix. The startup handshake is bounded, so a
+credential path that stalls costs guest logs and never the listener — if
+gvproxy turns out not to forward IMDS, this degrades to console-only logging
+rather than to an enclave that will not serve.
 
 
 ## Building from source

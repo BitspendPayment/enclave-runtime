@@ -34,29 +34,14 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use enclave_runtime::{
-    open_clock, open_entropy, read_component, run_component, serve_component, AcmeConfig,
-    ClockSource, GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, NetworkConfig,
-    NetworkMode, RandomSource, ReceiptTrust, ServeConfig, TlsIdentity, TlsMode,
-    DEFAULT_GVFORWARDER, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
+    open_clock, open_entropy, read_component, serve_component, AcmeConfig, ClockSource,
+    GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, NetworkConfig, NetworkMode,
+    RandomSource, ReceiptTrust, ServeConfig, TlsIdentity, TlsMode, DEFAULT_GVFORWARDER,
+    DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
 /// Where the guest lives inside the enclave image.
 const DEFAULT_GUEST_PATH: &str = "/enclave/guest.wasm";
-
-/// Whether the guest is run to completion or serves requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Command,
-    Serve,
-}
-
-fn parse_mode(s: &str) -> Result<Mode, String> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "command" | "run" => Ok(Mode::Command),
-        "serve" | "http" => Ok(Mode::Serve),
-        other => Err(format!("unknown mode {other:?}; expected command or serve")),
-    }
-}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -267,21 +252,21 @@ struct Cli {
     #[arg(long, env = "S3FS_REQUEST_TIMEOUT_SECS", default_value_t = 30)]
     request_timeout_secs: u64,
 
-    /// Give each authenticated client their own filesystem and warm instance.
+    #[arg(long, env = "S3FS_GUEST_LOG_GROUP")]
+    guest_log_group: Option<String>,
+
+    /// The stream within `--guest-log-group`. Required alongside it.
+    #[arg(long, env = "S3FS_GUEST_LOG_STREAM")]
+    guest_log_stream: Option<String>,
+
+    /// Point the CloudWatch client somewhere else. For tests.
     ///
-    /// Off by default, and the reason is not caution about the feature but
-    /// about what it changes around it. Today one request runs at a time,
-    /// globally. With this on, a client is serialised against **itself** and
-    /// nobody else — two clients execute guest code simultaneously, over
-    /// separate filesystems with separate transaction locks. Any guest
-    /// invariant that quietly relied on global serialisation breaks, silently.
-    ///
-    /// Raise `--http-concurrency` alongside it: at 1 every client still queues
-    /// behind every other whatever the per-client locks say.
-    ///
-    /// Baked into the image, so PCR0 records which model an enclave runs.
-    #[arg(long, env = "S3FS_WARM_INSTANCES", value_parser = enclave_runtime::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
-    warm_instances: bool,
+    /// A downgrade path, and worth naming as one: aimed at an `http://`
+    /// endpoint it hands guest output to whatever is listening, in clear. That
+    /// is tolerable only because this is baked into the image, so PCR0 records
+    /// which was built.
+    #[arg(long, env = "S3FS_GUEST_LOG_ENDPOINT")]
+    guest_log_endpoint: Option<String>,
 
     /// Clients kept warm at once.
     ///
@@ -370,16 +355,6 @@ struct Cli {
     #[arg(long, alias = "clock-check")]
     self_check: bool,
 
-    /// What kind of guest this is.
-    ///
-    /// `command` runs a `wasi:cli/command` guest once and exits with its code.
-    /// `serve` expects a `wasi:http/proxy` guest and answers HTTP until
-    /// stopped. The two are different component worlds, so a guest built for
-    /// one will not instantiate under the other.
-    #[arg(long, env = "S3FS_MODE", default_value = "command",
-          value_parser = parse_mode)]
-    mode: Mode,
-
     /// Address to serve on in `serve` mode.
     ///
     /// Binds every interface by default because inside an enclave the only
@@ -387,15 +362,6 @@ struct Cli {
     /// there would answer nobody.
     #[arg(long, env = "S3FS_HTTP_LISTEN", default_value = "0.0.0.0:8080")]
     http_listen: SocketAddr,
-
-    /// Requests allowed inside the guest at once.
-    ///
-    /// One by default. The filesystem is safe to share, but a guest is not
-    /// necessarily safe to run twice over the same data — SQLite on WASI has
-    /// to hold `locking_mode=EXCLUSIVE`, because WASI has no `fcntl` and so no
-    /// file locking. Raise it for a guest that keeps no cross-request state.
-    #[arg(long, env = "S3FS_HTTP_CONCURRENCY", default_value_t = 1)]
-    http_concurrency: usize,
 
     /// Where the serving certificate comes from.
     ///
@@ -468,6 +434,44 @@ struct Cli {
 }
 
 impl Cli {
+    /// Where guest output goes, beyond the console.
+    ///
+    /// A group without a stream is refused here rather than at the first write:
+    /// it needs no I/O to know it is wrong, and the same discipline as
+    /// `--webauthn-rp-id`/`--webauthn-origin`. Everything that *does* need the
+    /// network is decided at startup instead, where a transient failure can be
+    /// told apart from a mistake.
+    fn guest_log_config(&self) -> Result<Option<enclave_runtime::CloudWatchConfig>> {
+        // Empty means off, not malformed. The image environment is layered —
+        // the QEMU image inherits production's and overrides what it cannot
+        // use — and setting a variable to "" is how that layer says "not this
+        // one". Treating it as a typo would make the override impossible.
+        let group = self
+            .guest_log_group
+            .as_deref()
+            .map(str::trim)
+            .filter(|g| !g.is_empty());
+        let stream = self
+            .guest_log_stream
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match (group, stream) {
+            (None, None) => Ok(None),
+            (Some(group), Some(stream)) => Ok(Some(enclave_runtime::CloudWatchConfig {
+                log_group: group.to_string(),
+                log_stream: stream.to_string(),
+                region: self.region.clone(),
+                endpoint: self.guest_log_endpoint.clone(),
+            })),
+            _ => anyhow::bail!(
+                "--guest-log-group and --guest-log-stream must be given together. \
+                 This runtime holds `logs:PutLogEvents` and nothing more, so it cannot \
+                 create a stream it was not told the name of."
+            ),
+        }
+    }
+
     fn mount_config(&self) -> Result<MountConfig> {
         Ok(MountConfig {
             bucket: self.bucket.clone(),
@@ -530,11 +534,6 @@ async fn main() -> std::process::ExitCode {
             exit_code(outcome.exit_code())
         }
         Err(e) => {
-            // A failure before the guest ever started: the filesystem would
-            // not mount, or the component would not compile. Distinct from a
-            // guest crash, because the responses differ — an integrity or
-            // rollback failure here is a security event, not a bug in the
-            // guest.
             tracing::error!(
                 error = format!("{e:#}"),
                 "runtime failed to start the guest"
@@ -617,133 +616,234 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
 
     let env = cli.env_policy().build()?;
 
-    match cli.mode {
-        Mode::Command => {
-            tracing::info!(
-                variables = env.len(),
-                args = cli.guest_args.len(),
-                "running guest"
-            );
-            run_component(fs, clock, entropy, &component, &env, &cli.guest_args).await
-        }
-        Mode::Serve => {
-            let (tls, acme) = match cli.tls {
-                TlsMode::Off => (None, None),
-                TlsMode::SelfSigned => (Some(TlsIdentity::self_signed(&cli.tls_domains)?), None),
-                TlsMode::Acme => {
-                    let acme = enclave_runtime::serve::acme::start(
-                        &AcmeConfig {
-                            domains: cli.tls_domains.clone(),
-                            contacts: cli.acme_contacts.clone(),
-                            directory: cli.acme_directory.clone(),
-                            prefix: mounted.bucket_prefix.clone(),
-                        },
-                        mounted.data.clone(),
-                        mounted.keys.clone(),
-                    )?;
-                    (None, Some(acme))
-                }
-            };
-            tracing::info!(
-                variables = env.len(),
-                listen = %cli.http_listen,
-                tls = ?cli.tls,
-                "serving guest"
-            );
-
-            let attestation = cli.attestation.then(|| entropy.clone());
-
-            // Per-client views of the one filesystem, when the deployment
-            // asked for them. Each client's guest sees its own directory as
-            // `/`; the mount, the block cache and the transaction stream are
-            // shared, so a client costs a directory rather than a mount.
-            let tenancy = if cli.warm_instances {
-                if cli.http_concurrency <= 1 {
-                    tracing::warn!(
-                        "warm instances are on but --http-concurrency is 1, so every client \
-                         still queues behind every other. Raise it, or the per-client locks \
-                         buy nothing."
-                    );
-                }
-                let limits = enclave_runtime::PoolLimits {
-                    max_tenants: cli.max_tenants,
-                    idle_timeout: Duration::from_secs(cli.tenant_idle_secs),
-                    max_requests_per_instance: cli.max_requests_per_instance,
-                };
-                tracing::info!(
-                    max_tenants = limits.max_tenants,
-                    "serving each client its own directory of the filesystem"
-                );
-                Some(std::sync::Arc::new(enclave_runtime::Tenancy::new(limits)))
-            } else {
-                None
-            };
-
-            // WebAuthn, when the deployment named a relying party. Both the
-            // id and the origin or neither: a gate with no origin to compare
-            // against would accept assertions from any page that could reach
-            // it.
-            let authentication = match (&cli.webauthn_rp_id, &cli.webauthn_origin) {
-                (Some(rp_id), Some(origin)) => {
-                    let credentials = std::sync::Arc::new(
-                        enclave_runtime::FilesystemCredentials::new(fs.clone()),
-                    );
-                    let gate = std::sync::Arc::new(enclave_runtime::Gate::new(
-                        enclave_runtime::build_relying_party(rp_id, origin)?,
-                        enclave_runtime::ChallengeStore::new(
-                            Duration::from_secs(cli.challenge_ttl_secs),
-                            enclave_runtime::DEFAULT_CAPACITY,
-                        ),
-                        credentials.clone(),
-                        cli.max_request_body_bytes,
-                    ));
-                    let auth = std::sync::Arc::new(enclave_runtime::AuthEndpoints::new(
-                        gate.clone(),
-                        credentials,
-                        fs.clone(),
-                        entropy.clone(),
-                    ));
-                    for token in &cli.enrollment_tokens {
-                        auth.enrollment().seed(token).await?;
-                    }
-                    if !cli.enrollment_tokens.is_empty() {
-                        tracing::info!(
-                            tokens = cli.enrollment_tokens.len(),
-                            "enrollment tokens are available"
-                        );
-                    }
-                    tracing::info!(rp_id, origin, "requiring a passkey assertion per request");
-                    Some((auth, gate))
-                }
-                (None, None) => None,
-                _ => anyhow::bail!(
-                    "--webauthn-rp-id and --webauthn-origin must be given together. A gate \
-                     with no origin to compare against would accept an assertion from any \
-                     page that could reach it."
-                ),
-            };
-
-            let guest = GuestEnvironment::new(fs, clock, entropy, &env, &cli.guest_args)?;
-            serve_component(
-                &component,
-                guest,
-                ServeConfig {
-                    addr: cli.http_listen,
-                    concurrency: cli.http_concurrency,
-                    tls,
-                    acme,
-                    attestation,
-                    request_timeout: Duration::from_secs(cli.request_timeout_secs),
-                    tenancy,
-                    authentication,
+    let (tls, acme) = match cli.tls {
+        TlsMode::Off => (None, None),
+        TlsMode::SelfSigned => (Some(TlsIdentity::self_signed(&cli.tls_domains)?), None),
+        TlsMode::Acme => {
+            let acme = enclave_runtime::serve::acme::start(
+                &AcmeConfig {
+                    domains: cli.tls_domains.clone(),
+                    contacts: cli.acme_contacts.clone(),
+                    directory: cli.acme_directory.clone(),
+                    prefix: mounted.bucket_prefix.clone(),
                 },
+                mounted.data.clone(),
+                mounted.keys.clone(),
+            )?;
+            (None, Some(acme))
+        }
+    };
+    tracing::info!(
+        variables = env.len(),
+        listen = %cli.http_listen,
+        tls = ?cli.tls,
+        "serving guest"
+    );
+
+    let attestation = cli.attestation.then(|| entropy.clone());
+
+    // Per-client views of the one filesystem. Each client's guest sees
+    // its own directory as `/`; the mount, the block cache and the
+    // transaction stream are shared, so a client costs a directory
+    // rather than a mount.
+    //
+    // A client is serialised against itself and nobody else, so two
+    // clients can execute guest code at the same time. A guest is
+    // written for that; it is not a deployment decision.
+    let tenancy = {
+        let limits = enclave_runtime::PoolLimits {
+            max_tenants: cli.max_tenants,
+            idle_timeout: Duration::from_secs(cli.tenant_idle_secs),
+            max_requests_per_instance: cli.max_requests_per_instance,
+        };
+        tracing::info!(
+            max_tenants = limits.max_tenants,
+            "serving each client its own directory of the filesystem"
+        );
+        Some(std::sync::Arc::new(enclave_runtime::Tenancy::new(limits)))
+    };
+
+    // WebAuthn, when the deployment named a relying party. Both the
+    // id and the origin or neither: a gate with no origin to compare
+    // against would accept assertions from any page that could reach
+    // it.
+    let authentication = match (&cli.webauthn_rp_id, &cli.webauthn_origin) {
+        (Some(rp_id), Some(origin)) => {
+            let credentials =
+                std::sync::Arc::new(enclave_runtime::FilesystemCredentials::new(fs.clone()));
+            let gate = std::sync::Arc::new(enclave_runtime::Gate::new(
+                enclave_runtime::build_relying_party(rp_id, origin)?,
+                enclave_runtime::ChallengeStore::new(
+                    Duration::from_secs(cli.challenge_ttl_secs),
+                    enclave_runtime::DEFAULT_CAPACITY,
+                ),
+                credentials.clone(),
+                cli.max_request_body_bytes,
+            ));
+            let auth = std::sync::Arc::new(enclave_runtime::AuthEndpoints::new(
+                gate.clone(),
+                credentials,
+                fs.clone(),
+                entropy.clone(),
+            ));
+            for token in &cli.enrollment_tokens {
+                auth.enrollment().seed(token).await?;
+            }
+            if !cli.enrollment_tokens.is_empty() {
+                tracing::info!(
+                    tokens = cli.enrollment_tokens.len(),
+                    "enrollment tokens are available"
+                );
+            }
+            tracing::info!(rp_id, origin, "requiring a passkey assertion per request");
+            Some((auth, gate))
+        }
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "--webauthn-rp-id and --webauthn-origin must be given together. A gate \
+             with no origin to compare against would accept an assertion from any \
+             page that could reach it."
+        ),
+    };
+
+    // The console always, and CloudWatch alongside it when configured.
+    // Additive on purpose: the console is often the only thing working
+    // while a deployment is being brought up, and the destination that
+    // needs the network is exactly the part that may not be.
+    //
+    // TracingLogSink first, so console output is never queued behind
+    // the network sink.
+    let mut sinks: Vec<std::sync::Arc<dyn enclave_runtime::GuestLogSink>> =
+        vec![std::sync::Arc::new(enclave_runtime::TracingLogSink)];
+    let mut log_forwarder = None;
+
+    if let Some(config) = cli.guest_log_config()? {
+        // Which image is writing to this stream. A fixed stream name is
+        // shared by every boot and every image, so without this nothing
+        // in it says which enclave produced which line.
+        let image = attestation
+            .as_ref()
+            .and_then(|nsm| match nsm.describe_pcr(0) {
+                Ok(pcr) => Some(hex::encode(pcr.value)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not read PCR0 for the guest log stream");
+                    None
+                }
+            });
+
+        // Bounded, like everything else on this path. Building the
+        // client resolves a credential provider, and that reaches IMDS
+        // through gvproxy — a path this deployment has not verified. A
+        // logging client must never be what decides whether the enclave
+        // binds its listener.
+        let destination: Option<std::sync::Arc<dyn enclave_runtime::LogDestination>> =
+            match tokio::time::timeout(
+                enclave_runtime::STARTUP_PROBE_TIMEOUT,
+                enclave_runtime::CloudWatchDestination::connect(&config),
             )
-            .await?;
-            // `serve_component` only returns on error; reaching here means the
-            // accept loop stopped, which is not a guest exit.
-            Ok(enclave_runtime::GuestOutcome::Failed)
+            .await
+            {
+                Ok(destination) => Some(std::sync::Arc::new(destination)),
+                Err(_) => {
+                    tracing::error!(
+                        timeout = ?enclave_runtime::STARTUP_PROBE_TIMEOUT,
+                        log_group = %config.log_group,
+                        "could not build a CloudWatch client in time; guest output \
+                         stays on the console only. Check that the enclave can reach \
+                         IMDS through gvproxy."
+                    );
+                    None
+                }
+            };
+
+        // The boot marker is the probe. A definitive refusal — the
+        // stream is not there, or this identity may not write to it —
+        // stops the boot: it is a deployment mistake, and discovering
+        // it only from a console line that was meant to be shipped off
+        // the box would mean running blind indefinitely. Anything
+        // transient does not stop the boot, because CloudWatch having a
+        // bad day must not be a cosigner outage.
+        if let Some(destination) = destination {
+            // Carried to the forwarder when the probe did not manage to
+            // write it, so a stream that recovers still ends up saying
+            // which image is writing to it. `None` once it is written.
+            let mut marker = None;
+            match enclave_runtime::open_guest_log_stream(
+                &destination,
+                image.as_deref(),
+                &config.region,
+            )
+            .await
+            {
+                Ok(()) => tracing::info!(
+                    log_group = %config.log_group,
+                    log_stream = %config.log_stream,
+                    image = image.as_deref().unwrap_or("(unknown)"),
+                    "guest output is going to CloudWatch"
+                ),
+                Err(enclave_runtime::PutError::Definitive(e)) => anyhow::bail!(
+                    "guest logging is configured for {}/{} but that destination refused \
+                 us: {e}. The log group and stream must exist and this enclave's \
+                 credentials must carry logs:PutLogEvents for them. Leave \
+                 --guest-log-group unset for console-only logging.",
+                    config.log_group,
+                    config.log_stream,
+                ),
+                Err(enclave_runtime::PutError::Transient(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        log_group = %config.log_group,
+                        "could not reach CloudWatch at startup; guest logs will retry"
+                    );
+                    marker = Some(enclave_runtime::guest_log_boot_marker(
+                        image.as_deref(),
+                        &config.region,
+                    ));
+                }
+            }
+
+            let (sink, forwarder) = enclave_runtime::start_guest_log_forwarder(destination, marker);
+            sinks.push(std::sync::Arc::new(sink));
+            log_forwarder = Some(forwarder);
         }
     }
+
+    // Before the listener binds, so no request can produce guest output
+    // before there is a task consuming it. Held for the server's
+    // lifetime and drained explicitly below.
+    let (guest_logs, log_collector) = enclave_runtime::guest_io::start(std::sync::Arc::new(
+        enclave_runtime::FanOutSink::new(sinks),
+    ));
+
+    let guest = GuestEnvironment::new(fs, clock, entropy, &env, &cli.guest_args, guest_logs)?;
+    let served = serve_component(
+        &component,
+        guest,
+        ServeConfig {
+            addr: cli.http_listen,
+            tls,
+            acme,
+            attestation,
+            request_timeout: Duration::from_secs(cli.request_timeout_secs),
+            tenancy,
+            authentication,
+        },
+    )
+    .await;
+    // Drained whether the accept loop stopped cleanly or failed, and
+    // on a bounded deadline — a log that will not flush must not be
+    // what keeps an enclave from stopping.
+    log_collector.shutdown().await;
+    // After the collector, so records it was still holding reach the
+    // forwarder before the forwarder is asked to flush. Both deadlines
+    // are bounded; neither can hold the enclave open.
+    if let Some(forwarder) = log_forwarder {
+        forwarder.shutdown().await;
+    }
+    served?;
+    // `serve_component` only returns on error; reaching here means the
+    // accept loop stopped, which is not a guest exit.
+    Ok(enclave_runtime::GuestOutcome::Failed)
 }
 
 /// Print what the configured clock actually reports.
@@ -808,7 +908,18 @@ fn init_tracing() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with_target(false)
+        // Targets are shown, and that is not cosmetic. The console carries the
+        // runtime's own events *and* whatever a guest chose to write, and the
+        // target is the one thing separating them that a guest cannot
+        // influence — see `enclave_runtime::guest_io`. Guest lines say
+        // `guest`; everything else names a module in this runtime. Hiding it
+        // was right when every line was the runtime's own; it stopped being
+        // right when untrusted text started sharing the same console.
+        //
+        // `RUST_LOG=guest=warn` filters guest output independently either way,
+        // but an operator reading the console should not have to know that to
+        // tell which lines are trustworthy.
+        .with_target(true)
         .compact()
         .init();
 }
@@ -894,6 +1005,88 @@ mod tests {
         let mut full = vec!["enclave-runtime", "--master-key-source", "static"];
         full.extend_from_slice(args);
         Cli::try_parse_from(full).expect("parse")
+    }
+
+    /// Console-only is the default, and takes no client and no credentials.
+    #[test]
+    fn guest_logging_is_console_only_unless_configured() {
+        let cli = cli_from(&["--bucket", "b", "--master-key", &"aa".repeat(32)]);
+        assert!(cli.guest_log_config().expect("valid").is_none());
+    }
+
+    /// An empty setting means off, not malformed.
+    ///
+    /// The image environment is layered: the QEMU image inherits production's
+    /// and sets what it cannot use to "". Treating that as a typo made the
+    /// harness enclave refuse to boot, which is how this rule was learned.
+    #[test]
+    fn an_empty_setting_turns_guest_logging_off() {
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--guest-log-group",
+            "",
+            "--guest-log-stream",
+            "",
+        ]);
+        assert!(
+            cli.guest_log_config()
+                .expect("empty is off, not an error")
+                .is_none(),
+            "an empty group should mean console-only"
+        );
+    }
+
+    /// Half a destination is a typo, and knowable without touching the network.
+    #[test]
+    fn a_log_group_without_a_stream_is_refused() {
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--guest-log-group",
+            "/enclave/guest",
+        ]);
+        let error = cli.guest_log_config().unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("--guest-log-stream"), "{message}");
+
+        // And the other way round.
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--guest-log-stream",
+            "guest",
+        ]);
+        assert!(cli.guest_log_config().is_err());
+    }
+
+    #[test]
+    fn a_configured_destination_carries_the_settings_through() {
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--region",
+            "eu-west-2",
+            "--guest-log-group",
+            "/enclave/guest",
+            "--guest-log-stream",
+            "guest",
+            "--guest-log-endpoint",
+            "http://127.0.0.1:4566",
+        ]);
+        let config = cli.guest_log_config().expect("valid").expect("configured");
+        assert_eq!(config.log_group, "/enclave/guest");
+        assert_eq!(config.log_stream, "guest");
+        assert_eq!(config.region, "eu-west-2");
+        assert_eq!(config.endpoint.as_deref(), Some("http://127.0.0.1:4566"));
     }
 
     #[test]
@@ -1043,15 +1236,6 @@ mod tests {
             "arn:aws:kms:eu-west-2:1:key/a",
         ])
         .contains("--master-key-parameter"));
-    }
-
-    /// Warm instances are off unless a deployment asks. Turning them on
-    /// changes what two clients may do at the same time, so it must be a
-    /// decision rather than a default — and PCR0 records it.
-    #[test]
-    fn per_client_filesystems_are_opt_in() {
-        assert!(!cli_from(&["--bucket", "b"]).warm_instances);
-        assert!(cli_from(&["--bucket", "b", "--warm-instances"]).warm_instances);
     }
 
     /// Warm clients are bounded by default. Each costs a wasm linear memory,

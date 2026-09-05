@@ -21,22 +21,44 @@
 //! `locking_mode=EXCLUSIVE` because there is no `fcntl` locking under WASI,
 //! and nothing else has the database open anyway.
 //!
-//! Prints `OK` and exits 0 when every phase passes and `integrity_check`
-//! returns `ok`; prints `FAIL: …` and exits 1 otherwise.
+//! Answers `OK` when every phase passes and `integrity_check` returns `ok`,
+//! and `FAIL: …` otherwise.
+//!
+//! ## Why this is an HTTP guest
+//!
+//! The workload below is unchanged — it is still a `wasi:cli`-shaped batch of
+//! phases — but the runtime serves `wasi:http/proxy` and nothing else, so the
+//! way to ask for it is a request rather than a process. `GET /` runs it once
+//! and reports the verdict; the timing table goes to stdout, which the runtime
+//! frames into its own log records rather than a terminal.
+//!
+//! One consequence worth knowing: the workload is not idempotent. It builds
+//! its tables, so a second request against the same filesystem starts from
+//! what the first left. That is the point when checking durability across
+//! restarts, and a surprise if you expect a fresh database per request.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::time::Instant;
+use wstd::http::{Body, Error, Request, Response, StatusCode};
 
 const DB_PATH: &str = "/sqlite/bench.db";
 
-fn main() {
-    match run() {
-        Ok(()) => println!("OK"),
+#[wstd::http_server]
+async fn main(_req: Request<Body>) -> Result<Response<Body>, Error> {
+    // The verdict is the body; the phase timings are stdout, and reach an
+    // operator through the runtime's guest log pipeline.
+    let (status, verdict) = match run() {
+        Ok(()) => (StatusCode::OK, "OK\n".to_string()),
         Err(e) => {
             println!("FAIL: {e}");
-            std::process::exit(1);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("FAIL: {e}\n"))
         }
-    }
+    };
+    Ok(Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(verdict.into())
+        .expect("response is well formed"))
 }
 
 /// Time a phase and report it in the benchmark table.

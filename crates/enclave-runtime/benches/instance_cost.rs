@@ -81,17 +81,23 @@ async fn handle() -> ServeHandle {
     .await
     .expect("creating the memory-backed filesystem");
 
+    // Detached deliberately: the collector runs for as long as this
+    // environment can send, which is what a test wants. Production drains it
+    // explicitly instead.
+    let (logs, _collector) =
+        enclave_runtime::guest_io::start(std::sync::Arc::new(enclave_runtime::TracingLogSink));
     let guest = GuestEnvironment::new(
         fs,
         Box::new(HostClock),
         Arc::new(nitro_nsm::fake::FakeNsm::new()),
         &[],
         &[],
+        logs,
     )
     .expect("guest environment");
 
     let engine = ServeHandle::engine_with_watchdog().expect("engine");
-    ServeHandle::new(&engine, &component_bytes(), guest, 1).expect("preparing the guest")
+    ServeHandle::new(&engine, &component_bytes(), guest).expect("preparing the guest")
 }
 
 fn body() -> HyperOutgoingBody {

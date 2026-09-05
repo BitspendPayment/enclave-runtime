@@ -19,7 +19,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use hyper::server::conn::http1;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 use wasmtime::component::{Component, InstancePre};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi_http::io::TokioIo;
@@ -45,8 +44,6 @@ use nitro_nsm::Nsm;
 pub struct ServeConfig {
     /// Address to accept on.
     pub addr: SocketAddr,
-    /// Requests allowed inside the guest at once. See [`ServeConfig::default`].
-    pub concurrency: usize,
     /// Certificate to terminate TLS with. `None` serves plaintext.
     pub tls: Option<TlsIdentity>,
     /// A running ACME client, instead of a fixed certificate.
@@ -60,9 +57,9 @@ pub struct ServeConfig {
     pub attestation: Option<Arc<dyn Nsm>>,
     /// How long a guest may take to produce a response head.
     ///
-    /// A guest that neither returns nor sets a response otherwise hangs the
-    /// request forever, and at `concurrency: 1` that is the whole server. See
-    /// [`EPOCH_TICK`].
+    /// A guest that neither returns nor sets a response otherwise hangs that
+    /// tenant forever — and only that tenant, since nothing else queues behind
+    /// it. See [`EPOCH_TICK`].
     pub request_timeout: Duration,
     /// Give each authenticated client their own filesystem. `None` keeps the
     /// original model: one filesystem, a fresh instance per request.
@@ -92,7 +89,6 @@ impl Default for ServeConfig {
     fn default() -> Self {
         ServeConfig {
             addr: ([0, 0, 0, 0], 8080).into(),
-            concurrency: 1,
             tls: None,
             acme: None,
             attestation: None,
@@ -136,7 +132,14 @@ pub struct GuestInstance {
 pub struct ServeHandle {
     pre: ProxyPre<State>,
     guest: Arc<GuestEnvironment>,
-    limit: Arc<Semaphore>,
+    /// One request at a time for callers with no resolved tenant.
+    ///
+    /// There is no identity to separate them by, so they are treated as one:
+    /// anonymous requests serialise against each other and against nothing
+    /// else. Unbounded would let anyone with a socket multiply wasm linear
+    /// memories, which is the same exhaustion a per-tenant lock prevents for
+    /// everybody who *is* identified.
+    anonymous: Arc<tokio::sync::Mutex<()>>,
     /// Ceiling on producing a response head. See [`ServeHandle::watchdog`].
     timeout: Duration,
     /// Per-client filesystems, when the deployment asked for them.
@@ -208,12 +211,7 @@ impl ServeHandle {
         Ok(engine)
     }
 
-    pub fn new(
-        engine: &Engine,
-        component_bytes: &[u8],
-        guest: GuestEnvironment,
-        concurrency: usize,
-    ) -> Result<Self> {
+    pub fn new(engine: &Engine, component_bytes: &[u8], guest: GuestEnvironment) -> Result<Self> {
         let component = Component::new(engine, component_bytes)
             .map_err(|e| anyhow::anyhow!(e.to_string()))
             .context("compiling guest component")?;
@@ -234,7 +232,7 @@ impl ServeHandle {
         Ok(ServeHandle {
             pre,
             guest: Arc::new(guest),
-            limit: Arc::new(Semaphore::new(concurrency.max(1))),
+            anonymous: Arc::new(tokio::sync::Mutex::new(())),
             timeout: DEFAULT_REQUEST_TIMEOUT,
             tenancy: None,
         })
@@ -310,22 +308,24 @@ impl ServeHandle {
         // header can be made trustworthy.
         apply_tenant(tenant, &mut req);
 
-        let permit = self
-            .limit
-            .clone()
-            .acquire_owned()
-            .await
-            .context("request limiter closed")?;
-
-        // A resolved tenant, in a deployment that asked for tenancy, gets its
-        // own directory. Without either it is a fresh instance over the
-        // runtime's own filesystem.
+        // Concurrency is per tenant, and the lock that enforces it is taken
+        // inside each arm — the per-tenant mutex for an identified caller, one
+        // shared lock for the rest. There is no global ceiling: two tenants
+        // have nothing to queue on, which is the whole point of giving them
+        // separate directories and separate instances.
+        //
+        // Either lock is held until the guest task finishes, body included, so
+        // a tenant's second request waits for its first to be genuinely done
+        // rather than merely to have produced headers.
         match (&self.tenancy, tenant) {
             (Some(tenancy), Some(tenant)) => {
-                self.in_tenant(tenancy.clone(), *tenant, permit, scheme, req)
-                    .await
+                self.in_tenant(tenancy.clone(), *tenant, scheme, req).await
             }
-            _ => self.in_fresh_instance(permit, scheme, req).await,
+            // No tenant resolved. Either the deployment configured no gate, or
+            // the caller reached a path that does not identify itself — and
+            // with no identity there is nothing to separate them by, so they
+            // share one lock and one filesystem: the runtime's own.
+            _ => self.in_fresh_instance(scheme, req).await,
         }
     }
 
@@ -341,7 +341,6 @@ impl ServeHandle {
         &self,
         tenancy: Arc<Tenancy>,
         tenant_id: [u8; 16],
-        permit: tokio::sync::OwnedSemaphorePermit,
         scheme: Scheme,
         req: hyper::Request<B>,
     ) -> Result<hyper::Response<HyperOutgoingBody>>
@@ -403,9 +402,12 @@ impl ServeHandle {
             .new_response_outparam(sender)?;
 
         let task = tokio::task::spawn(async move {
-            // Moved in so the lock outlives the response head: a pooled store
-            // must not be handed to the next request until this call has
-            // finished writing its body.
+            // Moved in so the lock outlives the response head. A pooled store
+            // must not be handed to this tenant's next request until the call
+            // has finished writing its body — which is also what makes "one
+            // active request per tenant" true rather than "one set of headers
+            // at a time". Released when this future completes, fails, or is
+            // aborted.
             let mut guard = guard;
             let _checkout = checkout;
             let tenant = guard.as_mut().expect("held across the call");
@@ -429,7 +431,7 @@ impl ServeHandle {
             result
         });
 
-        self.await_head(task, receiver, permit).await
+        await_head(self.timeout, task, receiver).await
     }
 
     /// Build an instance whose guest sees `scope` as `/`.
@@ -452,7 +454,6 @@ impl ServeHandle {
     /// when the request ends — so nothing survives but what was committed.
     async fn in_fresh_instance<B>(
         &self,
-        permit: tokio::sync::OwnedSemaphorePermit,
         scheme: Scheme,
         req: hyper::Request<B>,
     ) -> Result<hyper::Response<HyperOutgoingBody>>
@@ -460,6 +461,11 @@ impl ServeHandle {
         B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
         B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
     {
+        // Anonymous callers are one identity, so they queue behind each other.
+        // Taken before the store is built: an instance is a wasm linear memory,
+        // and building one per waiting request is the exhaustion this prevents.
+        let anonymous = self.anonymous.clone().lock_owned().await;
+
         let mut store = Store::new(self.pre.engine(), self.guest.new_state()?);
         store.set_epoch_deadline(self.watchdog());
         let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -468,8 +474,10 @@ impl ServeHandle {
         let pre = self.pre.clone();
 
         // The guest runs in its own task so it can keep streaming a body after
-        // the status line and headers have gone out.
+        // the status line and headers have gone out. The lock goes with it, so
+        // it is held for the whole call rather than released at the head.
         let task = tokio::task::spawn(async move {
+            let _anonymous = anonymous;
             let proxy = pre.instantiate_async(&mut store).await?;
             proxy
                 .wasi_http_incoming_handler()
@@ -477,7 +485,7 @@ impl ServeHandle {
                 .await
         });
 
-        self.await_head(task, receiver, permit).await
+        await_head(self.timeout, task, receiver).await
     }
 
     /// Prove the guest instantiates, before a single request depends on it.
@@ -507,56 +515,60 @@ impl ServeHandle {
         // that outlived this call would be an instance two requests could
         // share, which is the whole thing this design refuses.
     }
+}
 
-    /// Wait for the guest to produce a response head, or give up on it.
-    ///
-    /// `permit` is held for the duration and released on return — which is when
-    /// the head is ready, not when the body has finished. That is deliberate:
-    /// the body streams from the task afterwards, and holding the permit until
-    /// it drained would make a slow reader block the next request.
-    async fn await_head(
-        &self,
-        task: tokio::task::JoinHandle<wasmtime::Result<()>>,
-        receiver: tokio::sync::oneshot::Receiver<
-            std::result::Result<
-                hyper::Response<HyperOutgoingBody>,
-                wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
-            >,
+/// Wait for the response head, and leave the guest task to finish the body.
+///
+/// Returns as soon as the guest has set a response. Deliberately: the body may
+/// still be streaming out of the task, and hyper cannot read it until this
+/// returns — waiting for the task here would deadlock body delivery.
+///
+/// **The permit is not here.** It lives in the spawned task, so a slot is freed
+/// when the guest is genuinely finished — or when its task fails or is aborted
+/// — rather than when its headers happened to appear. A free function rather
+/// than a method because that lifetime is worth testing on its own, without an
+/// engine and a compiled component to build a `ServeHandle` around.
+async fn await_head(
+    timeout: Duration,
+    task: tokio::task::JoinHandle<wasmtime::Result<()>>,
+    receiver: tokio::sync::oneshot::Receiver<
+        std::result::Result<
+            hyper::Response<HyperOutgoingBody>,
+            wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
         >,
-        permit: tokio::sync::OwnedSemaphorePermit,
-    ) -> Result<hyper::Response<HyperOutgoingBody>> {
-        let _permit = permit;
+    >,
+) -> Result<hyper::Response<HyperOutgoingBody>> {
+    let waited = match tokio::time::timeout(timeout, receiver).await {
+        Ok(waited) => waited,
+        Err(_) => {
+            // Nothing arrived in time. The epoch should already have
+            // trapped a spinning guest — see `watchdog` — so reaching here
+            // means the guest is parked somewhere the epoch cannot see,
+            // which is exactly where `abort` does work.
+            // Aborting drops the task's locals, and the permit is one of
+            // them — so an abandoned guest frees its slot rather than
+            // holding it for the life of the process.
+            task.abort();
+            anyhow::bail!("guest did not produce a response within {timeout:?}; abandoned");
+        }
+    };
 
-        let waited = match tokio::time::timeout(self.timeout, receiver).await {
-            Ok(waited) => waited,
-            Err(_) => {
-                // Nothing arrived in time. The epoch should already have
-                // trapped a spinning guest — see `watchdog` — so reaching here
-                // means the guest is parked somewhere the epoch cannot see,
-                // which is exactly where `abort` does work.
-                task.abort();
-                anyhow::bail!(
-                    "guest did not produce a response within {:?}; abandoned",
-                    self.timeout
-                );
-            }
-        };
-
-        match waited {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(e)) => Err(e.into()),
-            // The sender dropped with the `Store`, so the guest returned or
-            // trapped without setting a response. Whatever the task says is
-            // the real error; "never set a response" alone would send someone
-            // looking in the wrong place.
-            Err(_) => match task.await {
+    match waited {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(e.into()),
+        // The sender dropped with the `Store`, so the guest returned or
+        // trapped without setting a response. Whatever the task says is
+        // the real error; "never set a response" alone would send someone
+        // looking in the wrong place.
+        Err(_) => {
+            match task.await {
                 Ok(Ok(())) => {
                     anyhow::bail!("guest returned without calling response-outparam::set")
                 }
                 Ok(Err(e)) => Err(anyhow::anyhow!(e.to_string())
                     .context("guest failed before setting a response")),
                 Err(e) => Err(anyhow::Error::from(e).context("guest task panicked")),
-            },
+            }
         }
     }
 }
@@ -888,8 +900,8 @@ pub async fn serve_component(
     // wasmtime 44 enables async at the engine level when the `async` feature
     // is on; `Config::async_support` is a no-op. Same as `run_component`.
     let engine = ServeHandle::engine_with_watchdog()?;
-    let mut handle = ServeHandle::new(&engine, component_bytes, guest, config.concurrency)?
-        .with_timeout(config.request_timeout);
+    let mut handle =
+        ServeHandle::new(&engine, component_bytes, guest)?.with_timeout(config.request_timeout);
     if let Some(tenancy) = &config.tenancy {
         handle = handle.with_tenancy(tenancy.clone());
     }
@@ -946,4 +958,178 @@ pub async fn serve_component(
     }
 
     server.run().await
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    type HeadResult = std::result::Result<
+        hyper::Response<HyperOutgoingBody>,
+        wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
+    >;
+
+    fn head() -> HeadResult {
+        Ok(hyper::Response::new(full(bytes::Bytes::from_static(
+            b"body",
+        ))))
+    }
+
+    /// A guest task, as the dispatch paths build one: it holds `lock` for the
+    /// whole call, sets a response head part way through, and finishes only
+    /// when told to.
+    fn guest_task<L: Send + 'static>(
+        lock: L,
+        set_head: oneshot::Sender<HeadResult>,
+        finish: oneshot::Receiver<()>,
+    ) -> tokio::task::JoinHandle<wasmtime::Result<()>> {
+        tokio::task::spawn(async move {
+            let _lock = lock;
+            let _ = set_head.send(head());
+            let _ = finish.await;
+            Ok(())
+        })
+    }
+
+    /// The property the whole design rests on: a tenant's second request waits
+    /// for its first to be *finished*, not merely to have produced headers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_tenant_serialises_against_itself() {
+        let tenant = Arc::new(tokio::sync::Mutex::new(()));
+        let held = tenant.clone().lock_owned().await;
+        let (set_head, receiver) = oneshot::channel();
+        let (finish, finished) = oneshot::channel();
+        let task = guest_task(held, set_head, finished);
+
+        // The head is out, and the guest is still writing its body.
+        await_head(Duration::from_secs(5), task, receiver)
+            .await
+            .expect("head");
+
+        let second = tenant.clone().lock_owned();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), second)
+                .await
+                .is_err(),
+            "a second request for this tenant started while the first was still running"
+        );
+
+        let _ = finish.send(());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), tenant.clone().lock_owned())
+                .await
+                .is_ok(),
+            "the tenant's lock was not released when its guest finished"
+        );
+    }
+
+    /// And the other half: two tenants have nothing to queue on. This is what
+    /// the removed global semaphore used to prevent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_tenants_run_at_the_same_time() {
+        let alice = Arc::new(tokio::sync::Mutex::new(()));
+        let bob = Arc::new(tokio::sync::Mutex::new(()));
+
+        let (alice_head, alice_receiver) = oneshot::channel();
+        let (alice_finish, alice_finished) = oneshot::channel();
+        let alice_task = guest_task(alice.clone().lock_owned().await, alice_head, alice_finished);
+        await_head(Duration::from_secs(5), alice_task, alice_receiver)
+            .await
+            .expect("alice's head");
+
+        // Alice is mid-body. Bob must not be waiting on her.
+        let (bob_head, bob_receiver) = oneshot::channel();
+        let (bob_finish, bob_finished) = oneshot::channel();
+        let bob_lock = tokio::time::timeout(Duration::from_millis(100), bob.clone().lock_owned())
+            .await
+            .expect("bob queued behind alice");
+        let bob_task = guest_task(bob_lock, bob_head, bob_finished);
+        let bob_response = tokio::time::timeout(
+            Duration::from_secs(5),
+            await_head(Duration::from_secs(5), bob_task, bob_receiver),
+        )
+        .await
+        .expect("bob's head did not arrive while alice was running")
+        .expect("bob's head");
+        assert_eq!(bob_response.status(), 200);
+
+        let _ = alice_finish.send(());
+        let _ = bob_finish.send(());
+    }
+
+    /// Callers with no resolved tenant are one identity, so they queue behind
+    /// each other rather than multiplying wasm instances.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anonymous_callers_share_one_slot() {
+        let anonymous = Arc::new(tokio::sync::Mutex::new(()));
+        let held = anonymous.clone().lock_owned().await;
+        let (set_head, receiver) = oneshot::channel();
+        let (finish, finished) = oneshot::channel();
+        let task = guest_task(held, set_head, finished);
+        await_head(Duration::from_secs(5), task, receiver)
+            .await
+            .expect("head");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), anonymous.clone().lock_owned())
+                .await
+                .is_err(),
+            "a second anonymous request ran alongside the first"
+        );
+        let _ = finish.send(());
+    }
+
+    /// A guest that never answers is aborted, and abort drops the task's
+    /// locals — so an abandoned request must not hold its tenant's lock
+    /// forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abandoned_guest_releases_its_tenant() {
+        let tenant = Arc::new(tokio::sync::Mutex::new(()));
+        let held = tenant.clone().lock_owned().await;
+        let (_set_head, receiver) = oneshot::channel::<HeadResult>();
+
+        let task = tokio::task::spawn(async move {
+            let _lock = held;
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+
+        let error = await_head(Duration::from_millis(50), task, receiver)
+            .await
+            .expect_err("a guest that never answers should be abandoned");
+        assert!(format!("{error:#}").contains("abandoned"), "{error:#}");
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), tenant.clone().lock_owned())
+                .await
+                .is_ok(),
+            "an abandoned guest kept its tenant's lock"
+        );
+    }
+
+    /// A guest that fails without setting a response still releases its lock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_guest_releases_its_tenant() {
+        let tenant = Arc::new(tokio::sync::Mutex::new(()));
+        let held = tenant.clone().lock_owned().await;
+        let (set_head, receiver) = oneshot::channel::<HeadResult>();
+
+        let task = tokio::task::spawn(async move {
+            let _lock = held;
+            drop(set_head);
+            Err(wasmtime::Error::msg("guest trapped"))
+        });
+
+        let error = await_head(Duration::from_secs(5), task, receiver)
+            .await
+            .expect_err("a trap without a response is an error");
+        assert!(format!("{error:#}").contains("guest trapped"), "{error:#}");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), tenant.clone().lock_owned())
+                .await
+                .is_ok(),
+            "a failed guest kept its tenant's lock"
+        );
+    }
 }

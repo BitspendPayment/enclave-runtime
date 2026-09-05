@@ -126,6 +126,10 @@ jobs:
       # rollback journal created and unlinked per transaction, VACUUM rewriting
       # the whole file, and PRAGMA integrity_check to say whether the bytes came
       # back correct. Also prints the benchmark table.
+      # The runtime serves `wasi:http/proxy` and nothing else, so the workload
+      # is asked for with a request rather than run as a process. TLS off and
+      # no relying party configured: this job is about SQLite over the block
+      # store, not about the gate, which `serve-http` covers.
       - name: run the SQLite workload
         env:
           SQLITE_SCALE: "20000"
@@ -138,78 +142,31 @@ jobs:
           AWS_SECRET_ACCESS_KEY: minioadmin
           AWS_REGION: us-east-1
           S3FS_GUEST_PATH: examples/guest-sqlite/target/wasm32-wasip2/release/guest-sqlite.wasm
+          S3FS_TLS: "off"
+          S3FS_HTTP_LISTEN: 127.0.0.1:8080
         run: |
           set -euo pipefail
-          out=$(./target/release/enclave-runtime)
+          ./target/release/enclave-runtime > runtime.log 2>&1 &
+          runtime=$!
+          trap 'kill "$runtime" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 60); do
+            curl -sf -o /dev/null http://127.0.0.1:8080/ && break
+            kill -0 "$runtime" 2>/dev/null || { echo "the runtime exited:"; cat runtime.log; exit 1; }
+            sleep 1
+          done
+
+          # No --max-time: the workload is a long request by design, and the
+          # runtime's own --request-timeout is what bounds it.
+          out=$(curl -sf http://127.0.0.1:8080/)
           echo "$out"
           echo "$out" | grep -qx OK
+
+          # The timing table went to the guest's stdout, which the runtime
+          # frames into its own log records.
+          echo "--- runtime log ---"
+          cat runtime.log
 
       - name: stop MinIO
         if: always()
         run: docker rm -f ci-minio-sql || true
-
-  guest-e2e:
-    name: End-to-end (guest + MinIO)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
-
-      # No wasi-sdk needed: guest-smoke is std-only, so this runs on every
-      # push rather than only where a C toolchain has been installed.
-      - name: build the guest
-        working-directory: examples/guest-smoke
-        run: cargo build --release --target wasm32-wasip2
-
-      - name: build enclave-runtime
-        run: cargo build --release -p enclave-runtime
-
-      - name: start MinIO
-        run: |
-          docker run -d --rm --name ci-minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
-          for i in $(seq 1 60); do
-            curl -sf http://127.0.0.1:9000/minio/health/ready && break
-            sleep 1
-          done
-          docker run --rm --network host --entrypoint sh minio/mc -c "
-            mc alias set m http://127.0.0.1:9000 minioadmin minioadmin
-            mc mb m/e2e-data
-            mc mb --with-lock m/e2e-roots"
-
-      # Twice, against the same buckets. The guest counts its own runs from a
-      # file it wrote, so a second run printing 'run 2' is proof that commits
-      # reached the store and the anchor chain was picked back up — not that
-      # the filesystem was silently reformatted.
-      - name: run the guest twice
-        env:
-          S3FS_MASTER_KEY: "00000000000000000000000000000000000000000000000000000000000000ab"
-          S3FS_BUCKET: e2e-data
-          S3FS_ROOTS_BUCKET: e2e-roots
-          S3FS_ENDPOINT: http://127.0.0.1:9000
-          S3FS_FORCE_PATH_STYLE: "1"
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          AWS_REGION: us-east-1
-          S3FS_GUEST_PATH: examples/guest-smoke/target/wasm32-wasip2/release/guest-smoke.wasm
-          SMOKE_MARKER: from-ci
-        run: |
-          set -euo pipefail
-          out1=$(./target/release/enclave-runtime)
-          echo "$out1"
-          echo "$out1" | grep -qx OK
-          echo "$out1" | grep -qx "run 1"
-          echo "$out1" | grep -q "SMOKE_MARKER=from-ci"
-
-          out2=$(./target/release/enclave-runtime)
-          echo "$out2"
-          echo "$out2" | grep -qx OK
-          echo "$out2" | grep -qx "run 2"   # durability across mounts
-
-      - name: stop MinIO
-        if: always()
-        run: docker rm -f ci-minio || true

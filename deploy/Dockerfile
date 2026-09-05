@@ -29,9 +29,9 @@ COPY . .
 RUN rustup target add wasm32-wasip2 \
  && cargo build --release -p enclave-runtime
 
-# The guest. Swap this for your own component; guest-smoke is the example that
+# The guest. Swap this for your own component; guest-http is the example that
 # needs no C toolchain.
-RUN cd examples/guest-smoke && cargo build --release --target wasm32-wasip2
+RUN cd examples/guest-http && cargo build --release --target wasm32-wasip2
 
 # ---- the tap forwarder ------------------------------------------------------
 # An enclave has no NIC, so nothing that speaks TCP works until this turns the
@@ -57,7 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /src/target/release/enclave-runtime /usr/local/bin/enclave-runtime
 COPY --from=gvforwarder /gvforwarder /usr/local/bin/gvforwarder
-COPY --from=build /src/examples/guest-smoke/target/wasm32-wasip2/release/guest-smoke.wasm \
+COPY --from=build /src/examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm \
                   /enclave/guest.wasm
 
 # Deployment configuration. Every setting also has a flag, but inside an
@@ -78,7 +78,6 @@ ENV S3FS_NETWORK=gvproxy
 # Serve the guest over HTTPS, terminated here. A certificate generated inside
 # the enclave, with its hash signed into the attestation document, is what lets
 # a client prove its session ends in *this* code rather than in the parent.
-ENV S3FS_MODE=serve
 ENV S3FS_HTTP_LISTEN=0.0.0.0:443
 ENV S3FS_TLS=self-signed
 # ENV S3FS_TLS=acme                       # browser-trusted, needs a real domain

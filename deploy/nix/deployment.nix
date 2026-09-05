@@ -40,4 +40,16 @@
   # accept assertions for — a client can verify that before trusting it with a
   # key.
   rpId = "CHANGE-ME.example.com";
+
+  # Where guest stdout and stderr go, on top of the enclave console.
+  #
+  # Both must already exist — `deploy/tofu` creates them, and the enclave holds
+  # `logs:PutLogEvents` and nothing more, so it cannot create them itself. They
+  # are baked into the image and therefore measured by PCR0, which is why a
+  # client can tell from an attestation where an enclave ships guest output.
+  #
+  # The group must match `aws_cloudwatch_log_group.guest` in `deploy/tofu`,
+  # which names it "/${name_prefix}-${environment}/guest".
+  guestLogGroup = "/CHANGE-ME-production/guest";
+  guestLogStream = "guest";
 }

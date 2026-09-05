@@ -75,7 +75,12 @@ async fn start() -> Harness {
         auth.enrollment().seed(token).await.expect("seeding");
     }
 
-    let guest = GuestEnvironment::new(fs, Box::new(HostClock), entropy, &[], &[])
+    // Detached deliberately: the collector runs for as long as this
+    // environment can send, which is what a test wants. Production drains it
+    // explicitly instead.
+    let (logs, _collector) =
+        enclave_runtime::guest_io::start(std::sync::Arc::new(enclave_runtime::TracingLogSink));
+    let guest = GuestEnvironment::new(fs, Box::new(HostClock), entropy, &[], &[], logs)
         .expect("guest environment");
     let tls = TlsIdentity::self_signed(&[RP_ID.to_string()]).expect("tls identity");
 
@@ -89,7 +94,6 @@ async fn start() -> Harness {
             guest,
             ServeConfig {
                 addr,
-                concurrency: 4,
                 tls: Some(tls),
                 acme: None,
                 attestation: None,

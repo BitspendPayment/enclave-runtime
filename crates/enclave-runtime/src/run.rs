@@ -1,42 +1,33 @@
-//! Compiling a guest component, running it, and reporting what happened.
+//! Reading a guest component, and the environment every instance is built from.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use s3fs_core::Fs;
-use wasmtime::component::Component;
-use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::clock::{TrustedClock, WallClockAdapter};
-use crate::linker::build_linker;
+use crate::guest_io::GuestLogs;
 use crate::random::GuestRandom;
 use crate::state::State;
 use nitro_nsm::Nsm;
 
-/// Exit code for a guest that trapped.
-pub const EXIT_GUEST_TRAPPED: i32 = 70;
 /// Exit code for a failure before the guest ever started — the filesystem
 /// would not mount, or the component would not compile.
 pub const EXIT_RUNTIME_FAILURE: i32 = 71;
 
-/// How a guest run ended.
+/// How the runtime ended.
 ///
-/// Distinguishing these matters for a deployment target: the parent instance
-/// reads the enclave's exit status, and "the guest exited 3", "the guest
-/// trapped", and "the filesystem refused to mount" call for different
-/// responses. The last is a security event, not a bug in the guest.
+/// The parent instance reads the enclave's exit status, and "it stopped
+/// serving" and "the filesystem refused to mount" call for different
+/// responses. The second is a security event, not a bug in the guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestOutcome {
-    /// `wasi:cli/run.run()` returned `Ok`.
+    /// The runtime did what it was asked and stopped.
     Success,
-    /// `wasi:cli/run.run()` returned `Err`.
+    /// It stopped for a reason it could report.
     Failed,
-    /// The guest called `exit(n)`.
-    Exited(i32),
-    /// The guest trapped.
-    Trapped,
 }
 
 impl GuestOutcome {
@@ -44,8 +35,6 @@ impl GuestOutcome {
         match self {
             GuestOutcome::Success => 0,
             GuestOutcome::Failed => 1,
-            GuestOutcome::Exited(code) => code,
-            GuestOutcome::Trapped => EXIT_GUEST_TRAPPED,
         }
     }
 
@@ -81,15 +70,25 @@ pub struct GuestEnvironment {
     entropy: Arc<dyn Nsm>,
     env: Vec<(String, String)>,
     args: Vec<String>,
+    /// Where the guest's stdout and stderr go. Shared by every instance this
+    /// environment builds, so however many guests run, their output meets one
+    /// bounded queue and one collector.
+    logs: GuestLogs,
 }
 
 impl GuestEnvironment {
+    /// `logs` is required rather than defaulted, so every caller has to answer
+    /// the question of where guest output goes. There is no arrangement in
+    /// which it is inherited by omission — that was the previous behaviour,
+    /// and it put untrusted guest text straight onto the enclave console with
+    /// nothing marking it as untrusted.
     pub fn new(
         fs: Arc<Fs>,
         clock: Box<dyn TrustedClock>,
         entropy: Arc<dyn Nsm>,
         env: &[(String, String)],
         args: &[String],
+        logs: GuestLogs,
     ) -> Result<Self> {
         Ok(GuestEnvironment {
             fs,
@@ -100,6 +99,7 @@ impl GuestEnvironment {
             entropy,
             env: env.to_vec(),
             args: args.to_vec(),
+            logs,
         })
     }
 
@@ -116,7 +116,18 @@ impl GuestEnvironment {
     /// enforced by the resolver rather than by anything the guest does.
     pub fn new_state_scoped(&self, scope: Arc<s3fs_core::Inode>) -> Result<State> {
         let mut wasi = WasiCtxBuilder::new();
-        wasi.inherit_stdio();
+        // Closed, not inherited. An enclave has no console to read from, so an
+        // inherited stdin offered a guest nothing but a handle on whatever the
+        // parent had attached to this process. Stated rather than left to the
+        // builder's default, because "the guest cannot read stdin" is a
+        // decision and not an accident.
+        wasi.stdin(tokio::io::empty());
+        // Never `inherit_stdio`. Guest output is untrusted, attacker-chosen
+        // text; on the enclave's own stdout it would be indistinguishable from
+        // the runtime's log lines. These carry it into `crate::guest_io`
+        // instead, tagged by stream and marked as guest-produced.
+        wasi.stdout(self.logs.stdout());
+        wasi.stderr(self.logs.stderr());
         wasi.envs(&self.env);
         wasi.args(&self.args);
         wasi.wall_clock(SharedWallClock(self.clock.clone()));
@@ -142,95 +153,19 @@ impl GuestEnvironment {
     }
 }
 
-/// Compile and run a `wasi:cli/command` component against `fs`.
-///
-/// `clock` backs `wasi:clocks/wall-clock` and `set-times`' "now". The monotonic
-/// clock is left on `wasmtime-wasi`'s default: it backs timer subscriptions, so
-/// it must be cheap, and it must never step backwards — which a clock
-/// disciplined by an external source can.
-///
-/// `entropy` backs `wasi:random/random`. `wasi:random/insecure` keeps
-/// `wasmtime-wasi`'s generator — it is explicitly not cryptographic, and making
-/// it cost a device round trip would be perverse — but its seed is drawn from
-/// `entropy` once so it is not deterministic across runs.
-pub async fn run_component(
-    fs: Arc<Fs>,
-    clock: Box<dyn TrustedClock>,
-    entropy: Arc<dyn Nsm>,
-    component_bytes: &[u8],
-    env: &[(String, String)],
-    args: &[String],
-) -> Result<GuestOutcome> {
-    // wasmtime 44 enables async at the engine level when the `async` feature is
-    // on; `Config::async_support` is a no-op.
-    let engine = Engine::new(&wasmtime::Config::new())?;
-    let linker = build_linker(&engine).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-
-    let component = Component::new(&engine, component_bytes)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))
-        .context("compiling guest component")?;
-
-    let guest = GuestEnvironment::new(fs, clock, entropy, env, args)?;
-    let mut store = Store::new(&engine, guest.new_state()?);
-
-    let command =
-        wasmtime_wasi::p2::bindings::Command::instantiate_async(&mut store, &component, &linker)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))
-            .context("instantiating wasi:cli/command component")?;
-
-    match command.wasi_cli_run().call_run(&mut store).await {
-        Ok(Ok(())) => Ok(GuestOutcome::Success),
-        Ok(Err(())) => Ok(GuestOutcome::Failed),
-        Err(e) => Ok(classify_run_error(&e)),
-    }
-}
-
-/// A guest calling `exit(n)` reaches us as a trap carrying `I32Exit`. Without
-/// unwrapping it, a deliberate non-zero exit is indistinguishable from a crash
-/// and the guest's own status code is lost.
-fn classify_run_error(err: &wasmtime::Error) -> GuestOutcome {
-    match err.downcast_ref::<wasmtime_wasi::I32Exit>() {
-        Some(exit) => GuestOutcome::Exited(exit.0),
-        None => {
-            tracing::error!(error = %err, "guest trapped");
-            GuestOutcome::Trapped
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A failure before the guest ever started is not the same as the runtime
+    /// stopping, and the parent reads the difference off the exit status.
     #[test]
     fn exit_codes_distinguish_the_outcomes() {
         assert_eq!(GuestOutcome::Success.exit_code(), 0);
         assert_eq!(GuestOutcome::Failed.exit_code(), 1);
-        assert_eq!(GuestOutcome::Exited(3).exit_code(), 3);
-        assert_eq!(GuestOutcome::Trapped.exit_code(), EXIT_GUEST_TRAPPED);
-        assert_ne!(EXIT_GUEST_TRAPPED, EXIT_RUNTIME_FAILURE);
-    }
-
-    #[test]
-    fn only_success_counts_as_success() {
         assert!(GuestOutcome::Success.is_success());
         assert!(!GuestOutcome::Failed.is_success());
-        assert!(!GuestOutcome::Trapped.is_success());
-        assert!(!GuestOutcome::Exited(1).is_success());
-        // A guest that exits zero explicitly did succeed.
-        assert!(GuestOutcome::Exited(0).is_success());
-    }
-
-    /// The distinction the mapping exists to preserve: a deliberate `exit(n)`
-    /// must not be reported as a crash.
-    #[test]
-    fn a_deliberate_exit_is_not_a_trap() {
-        let err = wasmtime::Error::from(wasmtime_wasi::I32Exit(3));
-        assert_eq!(classify_run_error(&err), GuestOutcome::Exited(3));
-
-        let err = wasmtime::Error::msg("unreachable executed");
-        assert_eq!(classify_run_error(&err), GuestOutcome::Trapped);
+        assert_ne!(EXIT_RUNTIME_FAILURE, GuestOutcome::Failed.exit_code());
     }
 
     #[test]

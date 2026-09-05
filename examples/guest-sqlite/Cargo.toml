@@ -16,9 +16,11 @@ path = "src/main.rs"
 # is a far harsher test than any hand-written workload. Building it needs
 # wasi-sdk — see the README.
 rusqlite = { version = "0.32", features = ["bundled", "blob"] }
+# Supplies the `http_server` attribute that makes this a component exporting
+# `wasi:http/incoming-handler` — the only world the runtime serves.
+wstd = "0.6"
 
 [profile.release]
 opt-level = "s"
 lto = true
 codegen-units = 1
-panic = "abort"

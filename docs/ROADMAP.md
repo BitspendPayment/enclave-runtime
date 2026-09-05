@@ -70,6 +70,15 @@ exist:
   ([aws.rs](../crates/s3fs-core/src/backend/aws.rs)), so a KMS-attested
   session token expires mid-run with no recovery. Needs a refresh path.
 
+**3c. Prove the enclave can reach IMDS.** The runtime's AWS clients resolve
+credentials through the SDK's default chain, which reaches `169.254.169.254` on
+the parent by way of gvproxy. Nothing exercises that: the QEMU harness has no
+metadata service, so the path is assumed rather than tested, and S3, KMS, SSM
+and CloudWatch all rest on it. Validate IMDSv2 resolution on Nitro hardware, and
+settle `http_put_response_hop_limit` (`deploy/tofu/main.tf`) — 1 if gvproxy
+proxies, 2 if it routes. The failure mode is misleading: calls fail as though
+credentials were missing rather than as though the network were broken.
+
 **3b. Cover the clock.** The guest's wall clock now comes from `/dev/ptp0`
 (see the README), but two things remain. The Object Lock retention deadline in
 [`RootStore::root_retention`](../crates/s3fs-core/src/store/root.rs) still uses

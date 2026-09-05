@@ -98,6 +98,32 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
                 )),
             }
         }
+        // Known values on both streams, for the runtime's guest-logging
+        // tests. Every case the line framer has to get right is here, written
+        // the way a guest would actually write it: a line built from two
+        // `print!`s, a blank line, CRLF, bytes that are not UTF-8, something
+        // on stderr, and a final line with no terminator at all.
+        //
+        // Flushed explicitly. Rust's stdout is line buffered and a component's
+        // `handle` returning is not process exit, so without this the tail
+        // would sit in the guest's own buffer and never reach the host.
+        ("GET", "/log") => {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(b"first ");
+            let _ = out.write_all(b"line\n");
+            let _ = out.write_all(b"\n");
+            let _ = out.write_all(b"windows\r\n");
+            let _ = out.write_all(b"invalid \xff\xfe bytes\n");
+            let _ = out.write_all(b"no trailing newline");
+            let _ = out.flush();
+
+            let mut err = std::io::stderr();
+            let _ = err.write_all(b"on stderr\n");
+            let _ = err.flush();
+
+            Ok(text(StatusCode::OK, "logged\n".to_string()))
+        }
         // A guest that never returns and never sets a response. Deliberately
         // here rather than in a test fixture: it is the one behaviour a host
         // cannot provoke from the outside, and without it the runtime's

@@ -227,9 +227,18 @@ pub fn open_key_source(
     }
 }
 
-/// Static credentials rather than the default chain, for the same reason
-/// [`s3fs_core::backend::aws`] uses them: inside an enclave there is no IMDS to
-/// walk to, and a client that quietly tried would hang rather than fail.
+/// Static credentials **when they are supplied**, and the default chain
+/// otherwise.
+///
+/// The earlier version of this comment said an enclave has no IMDS to walk to.
+/// That is wrong, and it misled real work: an enclave has no NIC of its own,
+/// but its egress is NATed by gvproxy through the parent, where
+/// `169.254.169.254` is perfectly reachable — so the default chain resolves to
+/// the **parent instance's role**. That is how production runs, since the
+/// production image sets no keys.
+///
+/// Explicit keys are for development and the QEMU harness, where the endpoint
+/// is MinIO and there is no instance role to borrow.
 fn kms_client(config: &MasterKeyConfig) -> aws_sdk_kms::Client {
     use aws_sdk_kms::config::{BehaviorVersion, Credentials, Region};
     let mut builder = aws_sdk_kms::Config::builder()

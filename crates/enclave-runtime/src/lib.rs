@@ -35,6 +35,7 @@ pub mod boot;
 pub mod clock;
 pub mod env;
 pub mod flag;
+pub mod guest_io;
 pub mod keys;
 pub mod linker;
 pub mod mount;
@@ -56,6 +57,15 @@ pub use boot::{authorise_successor, boot, BootConfig, BootMode, Booted, ReceiptT
 pub use clock::{open_clock, ClockSource, HostClock, PtpClock, TrustedClock, DEFAULT_PTP_DEVICE};
 pub use env::GuestEnvPolicy;
 pub use flag::parse_bool_flag;
+pub use guest_io::cloudwatch::{
+    boot_marker as guest_log_boot_marker, open_stream as open_guest_log_stream,
+    start as start_guest_log_forwarder, CloudWatchConfig, CloudWatchDestination, CloudWatchLogSink,
+    LogDestination, LogForwarder, PutError, PutOutcome, STARTUP_PROBE_TIMEOUT,
+};
+pub use guest_io::{
+    FanOutSink, GuestLogCollector, GuestLogRecord, GuestLogSink, GuestLogs, GuestStream,
+    TracingLogSink, GUEST_LOG_TARGET,
+};
 pub use keys::{
     open_key_source, KeyPointer, KmsAttestedKey, KmsKeyConfig, MasterKeyConfig, MasterKeySource,
     MasterKeySourceKind, SealedKey, StaticKey,
@@ -65,10 +75,7 @@ pub use mount::{connect, create, mount_existing, parse_fs_id, Backends, MountCon
 pub use net::{bring_up, Network, NetworkConfig, NetworkMode, DEFAULT_GVFORWARDER};
 pub use nitro_nsm::{Nsm, NsmDevice, DEFAULT_NSM_DEVICE};
 pub use random::{open_entropy, GuestRandom, HostEntropy, RandomSource};
-pub use run::{
-    read_component, run_component, GuestEnvironment, GuestOutcome, EXIT_GUEST_TRAPPED,
-    EXIT_RUNTIME_FAILURE,
-};
+pub use run::{read_component, GuestEnvironment, GuestOutcome, EXIT_RUNTIME_FAILURE};
 pub use serve::{
     apply_tenant, serve_component, AcmeConfig, CertificateSlot, EgressPolicy, EnclaveEndpoints,
     GuestInstance, PoolLimits, SealedAcmeCache, ServeConfig, ServeHandle, Server, Tenancy,
