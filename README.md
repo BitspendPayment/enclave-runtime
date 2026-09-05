@@ -26,11 +26,11 @@ Four workspace crates plus example guests:
 | [`s3fs-core`](crates/s3fs-core/) | The engine. `Backend` trait with in-memory and AWS S3 backends; a copy-on-write block store (`store::*`) with encrypted blocks, an indirect-block tree, a dnode array, and the transaction-group commit protocol; POSIX semantics on top (`Fs`). **Zero wasmtime dependency** — usable from any host. |
 | [`nitro-nsm`](crates/nitro-nsm/) | `/dev/nsm`: entropy and attestation requests. Its own crate so it links into a small static binary for an enclave image. |
 | [`nitro-attestation`](crates/nitro-attestation/) | Parses and verifies attestation documents, and the `nitro-attest` client. Depends on nothing else here — a verifier has no `/dev/nsm` and is often not Linux. |
-| [`enclave-runtime`](crates/enclave-runtime/) | Everything above the engine: `wasi:filesystem@0.2.x`, the linker, the guest-environment policy, the vsock tap device, TLS termination and the attestation endpoints — plus the binary that ties them together. A library beside the binary so integration tests can reach it. |
+| [`enclave-runtime`](crates/enclave-runtime/) | Everything above the engine: `wasi:filesystem@0.2.x`, the linker, the guest-environment policy, the vsock tap device, TLS termination and per-response attestation — plus the binary that ties them together. A library beside the binary so integration tests can reach it. |
 | [`examples/guest-http`](examples/guest-http/) | The guest the serving path is tested against: reads and writes the filesystem, and is deliberately stateful so a second request proves the first one's writes committed. |
 | [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Runs on request; needs wasi-sdk to build. |
 
-**Test coverage:** 502 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the attestation binding. There are no cargo features to select: `cargo test --workspace` runs everything; 23 of those tests skip themselves without MinIO or enclave hardware.
+**Test coverage:** `cargo test --workspace` runs 648 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the per-response attestation binding. A further 52 skip themselves without MinIO, enclave hardware, or a `wasm32-wasip2` build of the example guest; reach those with `--features testing -- --include-ignored`, which is also what gives the TLS suites a self-signed certificate to serve, since a production build has no way to mint one.
 
 ## Quick start: run a Wasm guest against MinIO
 
@@ -64,12 +64,15 @@ cargo build --release -p enclave-runtime --features aws
   --force-path-style \
   --master-key 0000000000000000000000000000000000000000000000000000000000000001 \
   --tls off \
+  --attestation false \
   --http-listen 127.0.0.1:8080 \
   --guest-path examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm
 
-# then, from another shell:
-curl localhost:8080/           # what this guest is
-curl localhost:8080/counter    # increments, and persists across requests
+# then, from another shell. Every request carries a nonce, whether or not
+# this deployment attests — so a client behaves the same either way:
+nonce() { openssl rand 20 | basenc --base64url | tr -d '='; }
+curl -H "x-enclave-nonce: $(nonce)" localhost:8080/           # what this guest is
+curl -H "x-enclave-nonce: $(nonce)" localhost:8080/counter    # increments, and persists
 ```
 
 `--no-inherit-env` matters outside an enclave. The default is to pass this
@@ -595,11 +598,12 @@ with a test, not a consequence of which crate features happened to be on.
 
 ```console
 $ (cd examples/guest-http && cargo build --release --target wasm32-wasip2)
-$ S3FS_TLS=off S3FS_HTTP_LISTEN=127.0.0.1:8080 \
+$ S3FS_TLS=off S3FS_ATTESTATION=false S3FS_HTTP_LISTEN=127.0.0.1:8080 \
   S3FS_GUEST_PATH=examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm \
   ./target/release/enclave-runtime
-$ curl localhost:8080/counter    # 1
-$ curl localhost:8080/counter    # 2 — committed to the block store
+$ nonce() { openssl rand 20 | basenc --base64url | tr -d '='; }
+$ curl -H "x-enclave-nonce: $(nonce)" localhost:8080/counter    # 1
+$ curl -H "x-enclave-nonce: $(nonce)" localhost:8080/counter    # 2 — committed
 ```
 
 ### Requests run one at a time by default
@@ -799,14 +803,21 @@ request is served. The filesystem is the register.
 
 ### The attestation binding
 
-The TLS key is generated inside the enclave and never leaves it. Its
-certificate's hash goes into the attestation document, so a client can tie the
-connection it holds to the code it attested:
+The TLS key is generated inside the enclave and never leaves it. **Every
+response carries a fresh attestation document** binding a nonce the client
+chose and the SHA-256 of the certificate *that connection* was served, so a
+client ties the connection in its hand to the code it attested without a second
+round trip.
 
-| Endpoint | |
+| Header | |
 |---|---|
-| `GET /enclave/attestation?nonce=<hex>` | base64 COSE_Sign1, `no-store` |
-| `GET /enclave/config` | PCR0 and the two hashes, nothing secret |
+| `x-enclave-nonce` | request. base64url, no padding; 8–64 bytes decoded. **Required on every request**, whether or not the runtime attests — so a client behaves the same either way and a deployment cannot quietly stop attesting. Missing or malformed is a 400, before the guest is invoked. |
+| `x-enclave-attestation` | response. base64 COSE_Sign1. Runtime-owned: it is `insert`ed, never appended, so a guest that sets it is overwritten. The response is also forced to `cache-control: no-store` — a cached document is a replayed one. |
+
+Every response gets one: the guest's, `/enclave/config`, an auth exchange, and
+a gate refusal alike. The document is generated *before* the request is routed,
+because it binds nothing the guest produces; if the NSM refuses, the request
+fails with a 503 and the guest is never invoked.
 
 `user_data` follows nitriding's layout — two multihash-prefixed SHA-256
 digests, 68 bytes:
@@ -817,16 +828,15 @@ digests, 68 bytes:
 
 The certificate hash ties the TLS session to the document; the guest hash says
 which application was behind it. `/enclave/` is reserved and checked before the
-guest sees a request — a guest that could answer there could serve any
-attestation it liked. The nonce is **required**: a document without one cannot
-be shown to be fresh, and serving one on demand invites exactly the replay the
-nonce exists to prevent.
+guest sees a request — a guest that could answer there could describe the
+enclave however it liked. `GET /enclave/config` reports the same two hashes and
+PCR0 in plain text.
 
 Verify an endpoint with one command:
 
 ```console
-$ nitro-attest --url https://enclave.example/enclave/attestation \
-      --pcr0 8cac35ce… --guest ./guest.wasm
+$ nitro-attest --url https://enclave.example --pcr0 8cac35ce… \
+      --guest ./guest.wasm
 module     i-0abc…-enc0123…
 PCR0       8cac35ce…
 chain      verified to the AWS Nitro root
@@ -842,13 +852,71 @@ genuine one and serve it over its own TLS session. With it, the only party who
 could have produced the document is the one holding the private key for the
 connection in hand.
 
-### Certificates: self-signed or Let's Encrypt
+#### The connection, not the process
+
+The document binds the certificate **this connection** was served, not whatever
+certificate the runtime happens to hold now. Those differ across an ACME
+renewal, and a client on an older connection being told the newer hash would
+read as an attack when nothing was wrong.
+
+So a connection loads its serving identity — config and leaf together — once,
+at accept time, and keeps it for its life. TLS session resumption is disabled
+for the same reason: rustls calls the certificate resolver while processing
+every ClientHello but sends a certificate only on a full handshake, so on a
+resumed connection "the certificate this connection is using" would not be a
+well-defined thing to sign. The cost is one handshake signature per connection,
+which is nothing beside the per-request one below.
+
+#### What this does not prove
+
+- **Nothing about the response body.** The document is generated before the
+  guest runs and binds only the nonce and the certificate. It is a fresh
+  enclave-to-TLS binding, *not* an independently signed receipt for what the
+  guest said.
+- **Nothing before the request was sent.** By the time the client sees the
+  proof, its request is already inside the enclave. A client that must verify
+  *first* sends a nonced `GET /enclave/config` — no passkey, no guest — checks
+  the document, and reuses **the same connection** for its real request. That
+  is stronger than a separate attestation endpoint could be, since the binding
+  is per-connection rather than per-process.
+- **Not verifiable from a browser page.** The check requires the client's own
+  peer certificate, and ordinary JavaScript cannot read it. This is for native
+  clients and `nitro-attest`.
+- The client has to do its part, and the runtime cannot make it: a CSPRNG nonce
+  per request, a comparison against the nonce it sent, and treating a *missing*
+  header as a failure. Without the last of those, stripping the header
+  downgrades every client that does not check.
+
+#### Cost and limits
+
+A document is an ECDSA P-384 signature on the NSM, so attestation is now a
+**per-request** cost and NSM availability a per-request dependency. At most
+four are in flight at once, on `spawn_blocking` so the ioctl never occupies a
+Tokio worker; that bound is also the runtime's throughput ceiling. The
+per-signature cost on real Nitro hardware is **not yet measured** — it is one
+of the things the first hardware run has to report.
+
+The header is checked once at startup against a 16 KiB ceiling, and the runtime
+refuses to boot if a document does not fit. Against the test chain a whole
+response head measures **2.4 KiB**; a real AWS document carries a longer CA
+bundle, so expect **6–8 KiB**. Servers do not limit response headers here —
+hyper imposes none and HTTP/1.1 is the only protocol compiled — so the
+constraint is entirely the client's. **Configure at least 32 KiB.** Node is the
+binding case at 16 KiB for the *whole* head by default (`--max-http-header-size`).
+
+### Certificates
 
 | `--tls` | |
 |---|---|
-| `self-signed` *(default)* | Generated at startup. Browsers refuse it; attestation-verifying clients do not care, because the binding proves more than a CA signature does. |
-| `acme` | Let's Encrypt over **TLS-ALPN-01**, on the same :443 already forwarded. Needs `--tls-domain` and outbound network. |
+| `acme` *(default)* | Let's Encrypt over **TLS-ALPN-01**, on the same :443 already forwarded. Needs `--tls-domain` and outbound network. |
 | `off` | Plaintext. Inside an enclave this hands every request to the parent. |
+
+There is no self-signed mode in any build, and asking for one is refused with a
+reason rather than "expected one of …". A certificate the operator can mint is
+one they can mint for an impostor too, so it cannot tell this enclave apart
+from something impersonating it. A deployment with no public CA points
+`--acme-directory` at a private one instead — which is exactly what the QEMU
+end-to-end does, against a Pebble on the host.
 
 Let's Encrypt buys browser compatibility, not trust. The operator controls the
 domain and could obtain their own certificate for it and terminate TLS
@@ -884,15 +952,19 @@ certificates.
 ### What is verified, and what is not
 
 Covered on every push: the dispatch path against a real component over the
-in-memory backend, and a real TLS connection whose attestation document is
-checked to bind the certificate from the handshake — including the failures,
-where a substituted certificate breaks the binding and an earlier document does
-not satisfy a later nonce.
+in-memory backend, and a real TLS connection whose response header is checked
+to bind the certificate from the handshake — including the failures, where a
+substituted certificate breaks the binding, an earlier document does not
+satisfy a later nonce, a guest cannot overwrite the proof header, and a
+connection open across a certificate renewal keeps binding the certificate it
+was actually served.
 
-**Not covered:** a successful ACME issuance. That needs a CA and a domain it can
-reach; the path from a signed order to a served certificate is written and
-unexercised. Chain validation to the AWS Nitro root is likewise hardware-only,
-since QEMU signs with a key it generates.
+**Not covered on every push:** ACME issuance, which needs a CA and a reachable
+name. The QEMU end-to-end covers it against a local Pebble — order, challenge,
+finalize, and the served chain verified against the CA's root — so what remains
+untested is Let's Encrypt's own behaviour: its rate limits, its real chain, and
+renewal timing. Chain validation to the AWS Nitro root is likewise
+hardware-only, since QEMU signs with a key it generates.
 
 
 ## Guest output
@@ -1125,21 +1197,46 @@ built static, so both ends of the vsock share a pin and can't drift.
 ### The end-to-end
 
 [`deploy/qemu-nitro/run-e2e.sh`](deploy/qemu-nitro/run-e2e.sh) boots the image
-under QEMU's `nitro-enclave` machine with a real gvproxy, and asserts three
-things that had never been checked together:
+under QEMU's `nitro-enclave` machine with a real gvproxy, and asserts what had
+never been checked together:
 
 ```
-1/3  the filesystem is mounted over gvproxy    counter: 1 then 2
-2/3  the attestation binds this connection     binding    the attested
-                                               certificate is the one
-                                               serving this connection
-3/3  the attested PCR0 is the build's          build:    b3edc9c9…
-                                               attested: b3edc9c9…
+1/7  the guest is unreachable without a passkey    401 on /, /counter, /memory
+2/7  a passkey enrols, and writes reach MinIO      counter: 1 then 2
+3/7  the attestation binds this connection         binding    the attested
+                                                   certificate is the one
+                                                   serving this connection
+3b/7 a signed guest request carries its own proof  binding    …
+4/7  the attested PCR0 is the build's              build:    b3edc9c9…
+                                                   attested: b3edc9c9…
+5/7  a tenant keeps its instance; none are shared  alice 1,2 · bob 1
+5b/7 an approval for one payload authorizes no other
+5c/7 guest output reaches the console, tagged untrusted
+6/7  a second boot resumes rather than starting over
 ```
+
+Leg 3 verifies the probe route the way a client would before sending anything;
+leg 3b takes the document off the response to a real, passkey-signed guest
+request — the case a separate attestation endpoint could never cover.
 
 The enclave gets an address by DHCP over the emulated vsock, mounts the
-Merkle-anchored filesystem from MinIO on the host through gvproxy, terminates
-TLS with a certificate generated inside itself, and serves the guest.
+Merkle-anchored filesystem from MinIO on the host through gvproxy, obtains a
+certificate over ACME, and serves the guest.
+
+**The certificate is real ACME, not a shortcut.** A [Pebble](https://github.com/letsencrypt/pebble)
+runs beside MinIO as the CA, and the enclave walks the whole path against it:
+directory, account, order, TLS-ALPN-01 challenge, finalize, and the result
+sealed into the block store. The challenge arrives inbound on the same port
+the service uses — gvproxy forwards :443 into the enclave, and Pebble is told
+to resolve `enclave.test` to that forward — which is the arrangement production
+runs. The harness then verifies the served chain against Pebble's published
+root, so "the CA issued this" is checked rather than assumed.
+
+This replaced a self-signed certificate, and the reason is worth stating: the
+old image proved a TLS mode a production build could not even parse. The only
+test-shaped concession left is `S3FS_ACME_CA`, which points the enclave at
+Pebble's root for the directory's own HTTPS — a flag a production binary does
+not have.
 
 **What it does not prove.** QEMU's emulated NSM does not sign attestation
 documents — its source says *"we don't actually sign the data, so we use -1 as

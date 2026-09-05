@@ -89,8 +89,7 @@
         version = "0.1.0";
         src = workspaceSrc;
         # `--bin` so crane builds the binary rather than also the library's
-        # test targets. The crate has no features to select: it is one crate
-        # with one shape.
+        # test targets.
         cargoExtraArgs = "--locked -p enclave-runtime --bin enclave-runtime";
         # The workspace has integration tests needing a built wasm guest and a
         # running MinIO. `nix flake check` runs the unit tests instead.
@@ -232,6 +231,24 @@
 
       # What both the production and emulator images are made of. Only the
       # environment differs between them.
+      # The same runtime, built with `testing`, for the QEMU emulator only.
+      #
+      # It exists for one reason: the emulator has no domain and no CA it can
+      # reach, so it cannot obtain an ACME certificate — and the production
+      # binary refuses to serve anything else. `testing` restores
+      # `--tls self-signed` and, with it, `rcgen`.
+      #
+      # This is a **different binary with a different PCR0**, which is the point:
+      # nothing here can be mistaken for the production image, and the e2e
+      # asserts its PCR0 against its own build rather than a published one. The
+      # production image contains no certificate generator at all.
+      enclave-runtime-testing = craneLib.buildPackage (runtimeArgs // {
+        pname = "enclave-runtime-testing";
+        cargoArtifacts = runtimeDeps;
+        cargoExtraArgs =
+          "--locked -p enclave-runtime --bin enclave-runtime --features testing";
+      });
+
       runtimeImage = {
         name = "s3fs";
         payload = {
@@ -349,6 +366,16 @@
         # The credentials here are test values in a test image; nothing that
         # matters is protected by them.
         eif-qemu = callEif (runtimeImage // {
+          payload = runtimeImage.payload // {
+            "enclave-runtime" = "${enclave-runtime-testing}/bin/enclave-runtime";
+            # Pebble's ACME API is served under a certificate no public root
+            # signed, so its root ships *inside* the image and is covered by
+            # PCR0 like every other piece of configuration. A test root in a
+            # test image: the production EIF has no such file, and the
+            # production binary has no flag that would read one.
+            "pebble-ca.pem" = ./deploy/qemu-nitro/pebble/ca.pem;
+          };
+          closureRoots = [ enclave-runtime-testing busybox pkgs.cacert ];
           name = "s3fs-qemu";
           env = runtimeImage.env // {
             S3FS_CLOCK_SOURCE = "host";
@@ -367,17 +394,24 @@
             # keeps the development key source. PCR0 differs between the two
             # images, so a client can tell which it is talking to.
             S3FS_MASTER_KEY_SOURCE = "static";
-            # Self-signed, overriding production's ACME. There is no real
-            # domain here and nothing publicly reachable for Let's Encrypt to
-            # validate, so an ACME order fails forever on an empty identifier
-            # and no certificate is ever issued — which stalls every handshake
-            # rather than failing loudly. That is how this was found.
+            # Real ACME, against a Pebble running on the host — the same code
+            # path production takes, which is the whole reason to prefer it.
             #
-            # It costs nothing that matters here: browser trust is what a
-            # *platform authenticator* needs, and the harness drives the gate
-            # with a software passkey that does not care who signed the
-            # certificate.
-            S3FS_TLS = "self-signed";
+            # This image used to serve a self-signed certificate, because there
+            # is no public domain here and nothing Let's Encrypt could reach, so
+            # an order failed forever and stalled every handshake rather than
+            # failing loudly. The consequence was worse than the workaround: the
+            # e2e proved a TLS mode a production build cannot even parse. Pebble
+            # removes the reason, so the mode went with it.
+            #
+            # `enclave.test` resolves, inside the Pebble container, to the host
+            # loopback where gvproxy forwards :443 into this enclave — so the
+            # TLS-ALPN-01 challenge arrives on the same port the service uses,
+            # which is exactly the arrangement production runs.
+            S3FS_TLS = "acme";
+            S3FS_TLS_DOMAINS = "enclave.test";
+            S3FS_ACME_DIRECTORY = "https://192.168.127.254:14000/dir";
+            S3FS_ACME_CA = "/pebble-ca.pem";
             # Off. Inherited from the production image, and there is no AWS
             # here to send to: the harness's credentials are MinIO's, which
             # CloudWatch would reject. Empty means off — the same shape as the

@@ -31,10 +31,10 @@ use crate::auth::{AuthEndpoints, Gate};
 use crate::linker::build_linker;
 use crate::run::GuestEnvironment;
 use crate::serve::acme::CertificateSlot;
+use crate::serve::attest::{nonce_from_headers, ResponseAttestor};
 use crate::serve::client::apply_tenant;
 use crate::serve::endpoints::EnclaveEndpoints;
 use crate::serve::pool::{LiveTenant, PoolLimits, TenantPool};
-use crate::serve::tls::TlsIdentity;
 use crate::state::State;
 use crate::tenant::tenant_root_by_id;
 use nitro_nsm::Nsm;
@@ -44,11 +44,17 @@ use nitro_nsm::Nsm;
 pub struct ServeConfig {
     /// Address to accept on.
     pub addr: SocketAddr,
-    /// Certificate to terminate TLS with. `None` serves plaintext.
-    pub tls: Option<TlsIdentity>,
+    /// Where TLS connections take their serving identity. `None` serves
+    /// plaintext.
+    ///
+    /// A renewal is a `set()` on it. Connections already established keep the
+    /// identity they loaded, which is the property per-response attestation
+    /// depends on and the only way to exercise it without driving a real ACME
+    /// order.
+    pub certificate: Option<CertificateSlot>,
     /// A running ACME client, instead of a fixed certificate.
     pub acme: Option<crate::serve::acme::Acme>,
-    /// NSM to answer `/enclave/attestation` from.
+    /// NSM to sign each response's attestation document.
     ///
     /// Only useful alongside `tls`: the document binds the serving
     /// certificate, and without one there is nothing to bind. Supplying it
@@ -89,7 +95,7 @@ impl Default for ServeConfig {
     fn default() -> Self {
         ServeConfig {
             addr: ([0, 0, 0, 0], 8080).into(),
-            tls: None,
+            certificate: None,
             acme: None,
             attestation: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -573,6 +579,25 @@ async fn await_head(
     }
 }
 
+/// Refuse a resumed session, and say so.
+///
+/// Serving configs disable resumption (see `serve::tls`), so this should be
+/// unreachable — it is here because the alternative to being unreachable is
+/// attesting a certificate the connection was never authenticated under, and
+/// that failure would be silent. A loud refusal is the cheaper mistake.
+fn resumed<S>(stream: &tokio_rustls::server::TlsStream<S>, peer: SocketAddr) -> bool {
+    let (_, connection) = stream.get_ref();
+    if connection.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
+        tracing::error!(
+            %peer,
+            "refusing a resumed TLS session: the certificate it was authenticated \
+             under cannot be established, so nothing about it can be attested"
+        );
+        return true;
+    }
+    false
+}
+
 /// A fixed body, in the shape the guest dispatch wants.
 fn full(bytes: bytes::Bytes) -> HyperOutgoingBody {
     use http_body_util::BodyExt;
@@ -601,108 +626,208 @@ fn refused(status: hyper::StatusCode, detail: &str) -> hyper::Response<HyperOutg
 /// The service closure is built here rather than by the caller because it must
 /// capture `client`, and `client` does not exist until the handshake has
 /// completed.
-async fn serve_connection<S>(
-    io: S,
+/// Everything a connection needs that is the same for every connection.
+///
+/// Grouped because the per-connection values — the certificate this handshake
+/// presented — are the interesting ones, and a signature where they are lost
+/// among six process-wide `Arc`s hides that.
+#[derive(Clone)]
+pub struct Routes {
     guest: Arc<ServeHandle>,
     endpoints: Option<Arc<EnclaveEndpoints>>,
     auth: Option<Arc<AuthEndpoints>>,
     gate: Option<Arc<Gate>>,
+    attestor: Option<Arc<ResponseAttestor>>,
     scheme: Scheme,
+}
+
+async fn serve_connection<S>(
+    io: S,
+    routes: Routes,
+    // The leaf this connection's handshake actually presented, loaded once at
+    // accept time. `None` for plaintext.
+    certificate: Option<Vec<u8>>,
 ) -> std::result::Result<(), hyper::Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let service = hyper::service::service_fn(
-        move |mut req: hyper::Request<hyper::body::Incoming>| {
-            let guest = guest.clone();
-            let endpoints = endpoints.clone();
-            let auth = auth.clone();
-            let gate = gate.clone();
-            // Cloned per request because the closure is `Fn` — it runs again for
-            // every request on a kept-alive connection.
-            let scheme = scheme.clone();
-            async move {
-                let method = req.method().clone();
-                let path = req.uri().path().to_string();
-                let query = req.uri().query().map(str::to_string);
-
-                // The runtime's own paths are checked first and are not
-                // forwardable: a guest able to answer under `/enclave/` could serve
-                // any attestation it liked, and one able to answer under `/auth/`
-                // could hand out its own challenges and verify its own assertions,
-                // which is the same as having none.
-                if let Some(endpoints) = &endpoints {
-                    if let Some(response) = endpoints.handle(&path, query.as_deref()).await {
-                        return Ok::<_, anyhow::Error>(response);
-                    }
+    let Routes {
+        guest,
+        endpoints,
+        auth,
+        gate,
+        attestor,
+        scheme,
+    } = routes;
+    let certificate = certificate.map(Arc::new);
+    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let guest = guest.clone();
+        let endpoints = endpoints.clone();
+        let auth = auth.clone();
+        let gate = gate.clone();
+        let attestor = attestor.clone();
+        let certificate = certificate.clone();
+        // Cloned per request because the closure is `Fn` — it runs again for
+        // every request on a kept-alive connection.
+        let scheme = scheme.clone();
+        async move {
+            // One place, before the router, so the rule covers the guest,
+            // `/auth/*`, `/enclave/*` and every refusal alike — and so a
+            // request without a nonce reaches none of them.
+            // Required whether or not this deployment attests. A client then
+            // behaves identically either way, and a deployment cannot silently
+            // stop attesting without its clients noticing — which is the
+            // failure a client can least afford to miss.
+            let nonce = match nonce_from_headers(req.headers()) {
+                Ok(nonce) => nonce,
+                Err(e) => {
+                    // No document on this one: there is no nonce to bind, and
+                    // one the runtime chose would prove nothing.
+                    tracing::debug!(reason = %e, "refused a request with no usable nonce");
+                    return Ok::<_, anyhow::Error>(refused(
+                        hyper::StatusCode::BAD_REQUEST,
+                        &e.to_string(),
+                    ));
                 }
-                if let Some(auth) = &auth {
-                    if path.starts_with(crate::auth::AUTH_PREFIX) {
-                        // `/auth/*` bodies are small and bounded by the endpoints
-                        // themselves; they are read here because the routes take
-                        // bytes rather than a stream.
-                        let body = match http_body_util::BodyExt::collect(req.into_body()).await {
-                            Ok(collected) => collected.to_bytes(),
-                            Err(e) => {
-                                tracing::debug!(error = %e, "reading an auth request body");
-                                return Ok(refused(
-                                    hyper::StatusCode::BAD_REQUEST,
-                                    "malformed request",
-                                ));
-                            }
-                        };
-                        if let Some(response) = auth.handle(&method, &path, &body).await {
+            };
+
+            // Generated before the request is routed, not after the
+            // response exists: it binds the nonce and the connection's
+            // certificate, neither of which depends on what the guest says.
+            // Doing it here means a failure refuses before the guest runs,
+            // rather than stranding a half-produced response.
+            let document = match &attestor {
+                Some(attestor) => {
+                    match attestor
+                        .document(certificate.as_ref().map(|c| c.as_slice()), &nonce)
+                        .await
+                    {
+                        Ok(document) => Some(document),
+                        Err(e) => {
+                            // 503, not a dropped connection. A bare reset
+                            // is indistinguishable to a client from a
+                            // network fault or an interceptor, and this is
+                            // the one signal that says "this enclave will
+                            // not vouch for itself".
+                            tracing::error!(error = %e, "could not attest a response");
+                            let mut response = refused(
+                                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                                "this response could not be attested",
+                            );
+                            response.headers_mut().insert(
+                                hyper::header::CONNECTION,
+                                hyper::header::HeaderValue::from_static("close"),
+                            );
                             return Ok(response);
                         }
-                        return Ok(refused(hyper::StatusCode::NOT_FOUND, "no such endpoint"));
                     }
                 }
+                None => None,
+            };
 
-                // Everything else is the guest, and **nothing reaches the guest
-                // without a verified assertion bound to exactly this request.**
-                // With no gate configured the runtime is unauthenticated by
-                // deliberate choice — development, and the QEMU harness.
-                let tenant = match &gate {
-                    Some(gate) => match gate.verify(&mut req).await {
-                        Ok(verified) => {
-                            // The body was consumed to hash it, so the request is
-                            // rebuilt around exactly the bytes that were approved.
-                            let mut rebuilt = hyper::Request::builder()
-                                .method(req.method().clone())
-                                .uri(req.uri().clone());
-                            for (name, value) in req.headers() {
-                                if !crate::auth::AUTH_HEADERS
-                                    .iter()
-                                    .any(|h| name.as_str() == *h)
-                                {
-                                    rebuilt = rebuilt.header(name, value);
-                                }
-                            }
-                            let body = full(verified.body);
-                            let rebuilt = rebuilt.body(body).expect("request is well formed");
-                            return guest
-                                .handle(scheme, rebuilt, Some(&verified.tenant_id))
-                                .await;
-                        }
-                        Err(denied) => {
-                            // Logged in full, answered in one sentence: which check
-                            // failed is the runtime's business, and telling a
-                            // caller would tell them which guess to refine.
-                            tracing::info!(%path, reason = %denied, "refused an unauthenticated request");
-                            return Ok(refused(denied.status(), denied.public_message()));
-                        }
-                    },
-                    None => None,
-                };
-                guest.handle(scheme, req, tenant.as_ref()).await
+            let mut response = route(req, guest, endpoints, auth, gate, scheme).await?;
+            if let Some(document) = document {
+                crate::serve::attest::attach(&mut response, document);
             }
-        },
-    );
+            Ok(response)
+        }
+    });
 
     http1::Builder::new()
         .keep_alive(true)
         .serve_connection(TokioIo::new(io), service)
         .await
+}
+
+/// Everything that decides what a response *is*, with attestation stripped out.
+///
+/// A separate function so the closure above has exactly one exit: that is what
+/// makes "no response leaves unattested" and "a guest cannot own the header"
+/// single facts rather than five places to audit.
+async fn route(
+    mut req: hyper::Request<hyper::body::Incoming>,
+    guest: Arc<ServeHandle>,
+    endpoints: Option<Arc<EnclaveEndpoints>>,
+    auth: Option<Arc<AuthEndpoints>>,
+    gate: Option<Arc<Gate>>,
+    scheme: Scheme,
+) -> Result<hyper::Response<HyperOutgoingBody>> {
+    {
+        {
+            let method = req.method().clone();
+            let path = req.uri().path().to_string();
+
+            // The runtime's own paths are checked first and are not
+            // forwardable: a guest able to answer under `/enclave/` could serve
+            // any attestation it liked, and one able to answer under `/auth/`
+            // could hand out its own challenges and verify its own assertions,
+            // which is the same as having none.
+            if let Some(endpoints) = &endpoints {
+                if let Some(response) = endpoints.handle(&path).await {
+                    return Ok::<_, anyhow::Error>(response);
+                }
+            }
+            if let Some(auth) = &auth {
+                if path.starts_with(crate::auth::AUTH_PREFIX) {
+                    // `/auth/*` bodies are small and bounded by the endpoints
+                    // themselves; they are read here because the routes take
+                    // bytes rather than a stream.
+                    let body = match http_body_util::BodyExt::collect(req.into_body()).await {
+                        Ok(collected) => collected.to_bytes(),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "reading an auth request body");
+                            return Ok(refused(
+                                hyper::StatusCode::BAD_REQUEST,
+                                "malformed request",
+                            ));
+                        }
+                    };
+                    if let Some(response) = auth.handle(&method, &path, &body).await {
+                        return Ok(response);
+                    }
+                    return Ok(refused(hyper::StatusCode::NOT_FOUND, "no such endpoint"));
+                }
+            }
+
+            // Everything else is the guest, and **nothing reaches the guest
+            // without a verified assertion bound to exactly this request.**
+            // With no gate configured the runtime is unauthenticated by
+            // deliberate choice — development, and the QEMU harness.
+            let tenant = match &gate {
+                Some(gate) => match gate.verify(&mut req).await {
+                    Ok(verified) => {
+                        // The body was consumed to hash it, so the request is
+                        // rebuilt around exactly the bytes that were approved.
+                        let mut rebuilt = hyper::Request::builder()
+                            .method(req.method().clone())
+                            .uri(req.uri().clone());
+                        for (name, value) in req.headers() {
+                            if !crate::auth::AUTH_HEADERS
+                                .iter()
+                                .any(|h| name.as_str() == *h)
+                            {
+                                rebuilt = rebuilt.header(name, value);
+                            }
+                        }
+                        let body = full(verified.body);
+                        let rebuilt = rebuilt.body(body).expect("request is well formed");
+                        return guest
+                            .handle(scheme, rebuilt, Some(&verified.tenant_id))
+                            .await;
+                    }
+                    Err(denied) => {
+                        // Logged in full, answered in one sentence: which check
+                        // failed is the runtime's business, and telling a
+                        // caller would tell them which guess to refine.
+                        tracing::info!(%path, reason = %denied, "refused an unauthenticated request");
+                        return Ok(refused(denied.status(), denied.public_message()));
+                    }
+                },
+                None => None,
+            };
+            guest.handle(scheme, req, tenant.as_ref()).await
+        }
+    }
 }
 
 /// The accept loop: TLS if configured, `/enclave/*` to the runtime, the rest
@@ -714,6 +839,9 @@ where
 pub struct Server {
     guest: Arc<ServeHandle>,
     endpoints: Option<Arc<EnclaveEndpoints>>,
+    /// Produces the per-response proof. `None` leaves the runtime behaving
+    /// exactly as it did before attestation existed, nonce included.
+    attestor: Option<Arc<ResponseAttestor>>,
     /// `/auth/*`, and the gate every other request must pass.
     ///
     /// Both or neither: routes that issue challenges nobody checks would be
@@ -722,20 +850,33 @@ pub struct Server {
     auth: Option<Arc<AuthEndpoints>>,
     gate: Option<Arc<Gate>>,
     tls: Option<Tls>,
+    /// Fired once the listener is accepting. ACME waits on it before placing
+    /// an order, because the challenge is a connection inbound to this socket.
+    listening: Option<Arc<tokio::sync::Notify>>,
     addr: SocketAddr,
 }
 
 /// How TLS is terminated.
-enum Tls {
-    /// A certificate fixed at startup.
-    Fixed(Arc<rustls::ServerConfig>),
-    /// Two configurations, chosen per connection from the ClientHello: a
-    /// TLS-ALPN-01 validation connection is answered on this same port, which
-    /// is the reason that challenge type was chosen.
-    Acme {
-        config: Arc<rustls::ServerConfig>,
-        challenge: Arc<rustls::ServerConfig>,
-    },
+///
+/// One shape, not one per certificate source. Every connection loads one
+/// identity from `slot` — a configuration and the leaf it presents — and keeps
+/// it for its life. That is what makes "the certificate this connection is
+/// using" answerable: rustls offers no way to ask a live connection, so the
+/// pairing is arranged at accept time instead of discovered later.
+///
+/// ACME differs only by having a second configuration to offer, so it is a
+/// field rather than a variant. As two variants this logic was written twice,
+/// which is two places to keep the load-once-and-refuse-resumption discipline
+/// and one place to eventually get it wrong.
+struct Tls {
+    /// Where a connection takes its serving identity. Replaced on an ACME
+    /// renewal — and by the renewal test, which is the point: a connection that
+    /// already loaded one keeps it.
+    slot: CertificateSlot,
+    /// ACME only. The ClientHello chooses: a TLS-ALPN-01 validation connection
+    /// is answered on this same port, which is the reason that challenge type
+    /// was chosen.
+    challenge: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Server {
@@ -743,9 +884,11 @@ impl Server {
         Server {
             guest: Arc::new(guest),
             endpoints: None,
+            attestor: None,
             auth: None,
             gate: None,
             tls: None,
+            listening: None,
             addr,
         }
     }
@@ -762,16 +905,25 @@ impl Server {
         self
     }
 
-    pub fn with_tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
-        self.tls = Some(Tls::Fixed(config));
+    pub fn with_attestor(mut self, attestor: Arc<ResponseAttestor>) -> Self {
+        self.attestor = Some(attestor);
+        self
+    }
+
+    pub fn with_tls(mut self, certificate: CertificateSlot) -> Self {
+        self.tls = Some(Tls {
+            slot: certificate,
+            challenge: None,
+        });
         self
     }
 
     pub fn with_acme(mut self, acme: &crate::serve::acme::Acme) -> Self {
-        self.tls = Some(Tls::Acme {
-            config: acme.server_config.clone(),
-            challenge: acme.challenge_config.clone(),
+        self.tls = Some(Tls {
+            slot: acme.certificate.clone(),
+            challenge: Some(acme.challenge_config.clone()),
         });
+        self.listening = Some(acme.listening.clone());
         self
     }
 
@@ -787,6 +939,13 @@ impl Server {
             "serving"
         );
 
+        // Only now may ACME order. Until this point a validation connection
+        // would have found nothing listening, which the CA counts as a failed
+        // authorization rather than as "try again in a moment".
+        if let Some(listening) = &self.listening {
+            listening.notify_one();
+        }
+
         // What the *client* used. With TLS terminated here the guest is still
         // told `https`, or it would build wrong absolute URLs and set wrong
         // cookie flags.
@@ -799,14 +958,17 @@ impl Server {
 
         loop {
             let (client, peer) = listener.accept().await.context("accepting connection")?;
-            let guest = self.guest.clone();
-            let endpoints = self.endpoints.clone();
-            let auth = self.auth.clone();
-            let gate = self.gate.clone();
+            let routes = Routes {
+                guest: self.guest.clone(),
+                endpoints: self.endpoints.clone(),
+                auth: self.auth.clone(),
+                gate: self.gate.clone(),
+                attestor: self.attestor.clone(),
+                // `Scheme` is not `Copy`, and the service closure is `Fn` — it
+                // may run per request on a kept-alive connection.
+                scheme: scheme.clone(),
+            };
             let tls = tls.clone();
-            // `Scheme` is not `Copy`, and the service closure is `Fn` — it may
-            // run per request on a kept-alive connection, so it needs its own.
-            let scheme = scheme.clone();
 
             tokio::task::spawn(async move {
                 // The service closure is built *inside* each arm below, after
@@ -814,24 +976,11 @@ impl Server {
                 // peer's certificate exists. Built out here — as it was — the
                 // connection's identity could never reach a request.
                 let result = match tls.as_deref() {
-                    Some(Tls::Fixed(config)) => {
-                        let acceptor = tokio_rustls::TlsAcceptor::from(config.clone());
-                        match acceptor.accept(client).await {
-                            Ok(stream) => {
-                                serve_connection(stream, guest, endpoints, auth, gate, scheme).await
-                            }
-                            Err(e) => {
-                                // Routine: scanners, health checks and clients
-                                // that reject a self-signed certificate all
-                                // land here. Not worth a warning each time.
-                                tracing::debug!(%peer, error = %e, "TLS handshake failed");
-                                return;
-                            }
-                        }
-                    }
-                    Some(Tls::Acme { config, challenge }) => {
-                        // The ClientHello decides which configuration to use,
-                        // so the challenge and the real service share a port.
+                    Some(Tls { slot, challenge }) => {
+                        // The ClientHello is read before any configuration is
+                        // chosen, because under ACME it decides which one: a
+                        // validation connection and the real service share this
+                        // port, which is the reason TLS-ALPN-01 was chosen.
                         let handshake =
                             match tokio_rustls::LazyConfigAcceptor::new(Default::default(), client)
                                 .await
@@ -843,35 +992,55 @@ impl Server {
                                 }
                             };
 
-                        if rustls_acme::is_tls_alpn_challenge(&handshake.client_hello()) {
-                            // A validation connection carries no HTTP. The
-                            // handshake itself is the proof; completing it and
-                            // closing is the whole exchange.
-                            tracing::info!(%peer, "answering a TLS-ALPN-01 challenge");
-                            match handshake.into_stream(challenge.clone()).await {
-                                Ok(mut tls) => {
-                                    use tokio::io::AsyncWriteExt;
-                                    let _ = tls.shutdown().await;
+                        if let Some(challenge) = challenge {
+                            if rustls_acme::is_tls_alpn_challenge(&handshake.client_hello()) {
+                                // A validation connection carries no HTTP. The
+                                // handshake itself is the proof; completing it
+                                // and closing is the whole exchange.
+                                tracing::info!(%peer, "answering a TLS-ALPN-01 challenge");
+                                match handshake.into_stream(challenge.clone()).await {
+                                    Ok(mut tls) => {
+                                        use tokio::io::AsyncWriteExt;
+                                        let _ = tls.shutdown().await;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            %peer, error = %e,
+                                            "the ACME challenge handshake failed; \
+                                             issuance will not complete"
+                                        );
+                                    }
                                 }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        %peer, error = %e,
-                                        "the ACME challenge handshake failed; \
-                                         issuance will not complete"
-                                    );
-                                }
+                                return;
                             }
-                            return;
                         }
 
-                        match handshake.into_stream(config.clone()).await {
+                        // Loaded once, and after the challenge check so a
+                        // validation connection is still answered before any
+                        // certificate exists. Everything this connection is
+                        // told about its certificate comes from this value.
+                        let Some(identity) = slot.get() else {
+                            tracing::debug!(%peer, "no certificate to serve with yet");
+                            return;
+                        };
+                        match handshake.into_stream(identity.config.clone()).await {
                             Ok(stream) => {
-                                serve_connection(stream, guest, endpoints, auth, gate, scheme).await
+                                if resumed(&stream, peer) {
+                                    return;
+                                }
+                                serve_connection(
+                                    stream,
+                                    routes,
+                                    Some(identity.certificate_der.clone()),
+                                )
+                                .await
                             }
                             Err(e) => {
-                                // Every handshake lands here until the first
-                                // certificate arrives, which is the expected
-                                // state while an order is in flight.
+                                // Routine: scanners, health checks, and clients
+                                // that reject the certificate. Under ACME every
+                                // handshake lands here until the first order
+                                // completes, which is the expected state while
+                                // one is in flight.
                                 tracing::debug!(%peer, error = %e, "TLS handshake failed");
                                 return;
                             }
@@ -880,7 +1049,7 @@ impl Server {
                     // No TLS, so no certificate and no identity. Whatever the
                     // client says about itself is discarded, same as any other
                     // unauthenticated connection.
-                    None => serve_connection(client, guest, endpoints, auth, gate, scheme).await,
+                    None => serve_connection(client, routes, None).await,
                 };
                 if let Err(e) = result {
                     tracing::debug!(%peer, error = %e, "connection ended");
@@ -895,7 +1064,7 @@ impl Server {
 pub async fn serve_component(
     component_bytes: &[u8],
     guest: GuestEnvironment,
-    config: ServeConfig,
+    mut config: ServeConfig,
 ) -> Result<()> {
     // wasmtime 44 enables async at the engine level when the `async` feature
     // is on; `Config::async_support` is a no-op. Same as `run_component`.
@@ -920,11 +1089,12 @@ pub async fn serve_component(
         ),
     }
 
-    // The slot the attestation endpoint reads. Fixed for a self-signed
-    // certificate; updated by the ACME client on issue and on every renewal,
-    // so a document always binds the certificate actually being presented.
-    let certificate = match (&config.tls, &config.acme) {
-        (Some(tls), _) => Some(CertificateSlot::fixed(tls.certificate_der.clone())),
+    // Where a connection loads its serving identity at accept time. Fixed for a
+    // self-signed certificate; replaced by the ACME client on issue and on
+    // every renewal — but a connection that already loaded one keeps it, which
+    // is what makes "the certificate this connection was served" answerable.
+    let certificate = match (config.certificate.take(), &config.acme) {
+        (Some(slot), _) => Some(slot),
         (None, Some(acme)) => Some(acme.certificate.clone()),
         (None, None) => None,
     };
@@ -932,15 +1102,37 @@ pub async fn serve_component(
     match (&certificate, &config.attestation) {
         (Some(slot), attestation) => {
             if let Some(nsm) = attestation {
-                // Fails here if the device will not attest — before a single
-                // request is served.
                 let endpoints = EnclaveEndpoints::new(nsm.clone(), slot.clone(), component_bytes)?;
                 server = server.with_endpoints(Arc::new(endpoints));
+
+                // Every response carries a proof, so the device is now on the
+                // path of every request rather than one endpoint.
+                let attestor = Arc::new(ResponseAttestor::new(nsm.clone(), component_bytes));
+
+                // Checked once, here, with the largest nonce a client may send.
+                // A document too large for a header is a property of this
+                // deployment's certificate chain, and a runtime that cannot
+                // attest its responses should refuse to start rather than
+                // refuse every request. This is also the first call to the
+                // device, so an NSM that will not answer is found now.
+                match attestor.verify_fits().await {
+                    Ok(bytes) => {
+                        tracing::info!(document_header_bytes = bytes, "attesting every response")
+                    }
+                    Err(e) => anyhow::bail!(
+                        "this runtime cannot attest its responses: {e}. Every request would \
+                         be refused, so it will not start."
+                    ),
+                }
+                server = server.with_attestor(attestor);
             }
-            server = match (&config.tls, &config.acme) {
-                (Some(tls), _) => server.with_tls(tls.config.clone()),
-                (None, Some(acme)) => server.with_acme(acme),
-                (None, None) => unreachable!("a certificate slot exists only with TLS or ACME"),
+
+            // ACME owns its own slot and needs the challenge configuration
+            // alongside it; a fixed certificate is served straight from the
+            // slot built above.
+            server = match &config.acme {
+                Some(acme) => server.with_acme(acme),
+                None => server.with_tls(slot.clone()),
             };
         }
         (None, Some(_)) => {

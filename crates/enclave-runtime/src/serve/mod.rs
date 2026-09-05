@@ -17,6 +17,7 @@
 //! ```
 
 pub mod acme;
+pub mod attest;
 pub mod client;
 pub mod endpoints;
 mod http;

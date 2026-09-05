@@ -27,9 +27,11 @@
 
   region = "eu-west-2";
 
-  # Domains for the serving certificate. Empty means a self-signed one, which
-  # a client verifying attestation accepts and a platform authenticator does
-  # not — so a deployment that authenticates needs a real one here.
+  # Domains for the serving certificate. Required, and not only for browsers:
+  # the runtime obtains its certificate over ACME and nothing else, so an empty
+  # list means no certificate and no HTTPS at all. A platform authenticator
+  # also refuses to attest against a certificate a browser does not trust, so a
+  # deployment that authenticates needs a real domain here.
   tlsDomains = [ ];
 
   # The domain passkeys are scoped to, and the origin assertions must claim.

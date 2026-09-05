@@ -1,15 +1,17 @@
 //! `nitro-attest` — check that an HTTPS endpoint is the enclave you think.
 //!
 //! ```console
-//! $ nitro-attest --url https://enclave.example/enclave/attestation \
-//!       --pcr0 8cac35ce… --guest ./guest.wasm
+//! $ nitro-attest --url https://enclave.example --pcr0 8cac35ce… \
+//!       --guest ./guest.wasm
 //! ```
 //!
 //! The check that matters is the last one, and it is the reason this tool
 //! exists rather than `curl | openssl`:
 //!
 //! 1. Open a TLS connection and keep the certificate the server presented.
-//! 2. Ask for an attestation document, quoting a freshly generated nonce.
+//! 2. Make an ordinary request, quoting a freshly generated nonce in
+//!    `x-enclave-nonce`. Every response carries a document in
+//!    `x-enclave-attestation`; there is no separate attestation endpoint.
 //! 3. Verify the document's signature and its chain to the AWS Nitro root.
 //! 4. Check the document's `user_data` contains **the hash of that same
 //!    certificate**.
@@ -33,15 +35,22 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use base64::Engine as _;
 use nitro_attestation::{
     AttestationHashes, Expectations, Trust, Verified, VerifyOptions, AWS_NITRO_ROOT_G1_PEM,
 };
 
+/// The request header carrying the client's nonce, base64url without padding.
+const NONCE_HEADER: &str = "x-enclave-nonce";
+/// The response header carrying the document, base64.
+const ATTESTATION_HEADER: &str = "x-enclave-attestation";
+
 #[derive(Parser, Debug)]
 #[command(version, about = "Verify an AWS Nitro Enclaves attestation document")]
 struct Cli {
-    /// Attestation endpoint to query, e.g.
-    /// `https://enclave.example/enclave/attestation`.
+    /// URL to request, e.g. `https://enclave.example`. Any route works —
+    /// every response carries a document — and the path defaults to
+    /// `/enclave/config`, which needs neither a passkey nor the guest.
     #[arg(long, conflicts_with = "document")]
     url: Option<String>,
 
@@ -49,6 +58,17 @@ struct Cli {
     /// COSE_Sign1; the encoding is detected.
     #[arg(long, conflicts_with = "url")]
     document: Option<std::path::PathBuf>,
+
+    /// DER of the certificate the connection that produced `--document` was
+    /// served. Without it a document read from a file proves nothing about any
+    /// connection, because there is no connection in hand to bind it to.
+    #[arg(long, requires = "document")]
+    peer_certificate: Option<std::path::PathBuf>,
+
+    /// The nonce that request sent, hex. Only for `--document`: a fetched
+    /// document is checked against a nonce this tool generated itself.
+    #[arg(long, requires = "document")]
+    nonce: Option<String>,
 
     /// Required PCR0, hex. Pins which enclave image is running.
     #[arg(long)]
@@ -112,7 +132,14 @@ fn run() -> Result<()> {
         }
         (_, Some(path)) => {
             let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-            (decode_document(&raw)?, None)
+            let certificate = match &cli.peer_certificate {
+                Some(path) => Some(
+                    std::fs::read(path)
+                        .with_context(|| format!("reading {}", path.display()))?,
+                ),
+                None => None,
+            };
+            (decode_document(&raw)?, certificate)
         }
         _ => bail!("pass --url or --document"),
     };
@@ -147,10 +174,17 @@ fn run() -> Result<()> {
         max_age: Some(Duration::from_secs(cli.max_age)),
         ..Default::default()
     };
-    if cli.url.is_some() {
-        // Only meaningful for a document we fetched: a file has no nonce we
-        // chose, so demanding one would fail every time.
-        expectations.nonce = Some(nonce.clone());
+    match (&cli.url, &cli.nonce) {
+        // A document we fetched must quote the nonce this process generated.
+        (Some(_), _) => expectations.nonce = Some(nonce.clone()),
+        // A document from a file can only be held to a nonce the caller says
+        // its request sent. Without one there is nothing to compare, and the
+        // document could be any age the clock allows.
+        (None, Some(hex)) => {
+            expectations.nonce =
+                Some(hex::decode(hex.trim()).context("--nonce is not hex")?)
+        }
+        (None, None) => {}
     }
     if let Some(pcr0) = &cli.pcr0 {
         expectations = expectations.pcr0(hex::decode(pcr0.trim()).context("--pcr0 is not hex")?);
@@ -291,11 +325,11 @@ fn fetch(url: &str, nonce: &[u8]) -> Result<Fetched> {
         .with_context(|| format!("connecting to {host}:{port}"))?;
     let mut tls = rustls::Stream::new(&mut client, &mut socket);
 
-    let separator = if path.contains('?') { '&' } else { '?' };
     let request = format!(
-        "GET {path}{separator}nonce={} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\n{}: {}\r\nConnection: close\r\n\
          User-Agent: nitro-attest\r\n\r\n",
-        hex::encode(nonce)
+        NONCE_HEADER,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce)
     );
     tls.write_all(request.as_bytes())
         .context("sending the request")?;
@@ -315,16 +349,29 @@ fn fetch(url: &str, nonce: &[u8]) -> Result<Fetched> {
         .context("the server presented no certificate")?
         .to_vec();
 
-    let (status, body) = split_response(&response)?;
-    if status != 200 {
-        bail!(
-            "endpoint answered HTTP {status}: {}",
-            String::from_utf8_lossy(&body).trim()
-        );
-    }
+    let (status, head, body) = split_response(&response)?;
+
+    // The document rides on the response, whatever the response says. A
+    // refusal is attested too — a client that only trusted 200s could be
+    // steered by an unattested 401 into believing the enclave was down.
+    let encoded = head
+        .lines()
+        .find(|l| {
+            l.to_ascii_lowercase()
+                .starts_with(&format!("{ATTESTATION_HEADER}:"))
+        })
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string())
+        .with_context(|| {
+            format!(
+                "no {ATTESTATION_HEADER} header on the HTTP {status} response — \
+                 attestation is disabled, or something else is answering: {}",
+                String::from_utf8_lossy(&body).trim()
+            )
+        })?;
 
     Ok(Fetched {
-        document: decode_document(&body)?,
+        document: decode_document(encoded.as_bytes())?,
         certificate,
     })
 }
@@ -335,7 +382,9 @@ fn split_url(url: &str) -> Result<(String, u16, String)> {
         .context("--url must start with https://")?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+        // The cheap probe route: no gate, no guest, and its response carries a
+        // document for this connection like any other.
+        None => (rest, "/enclave/config"),
     };
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().context("invalid port")?),
@@ -344,7 +393,7 @@ fn split_url(url: &str) -> Result<(String, u16, String)> {
     Ok((host, port, path.to_string()))
 }
 
-fn split_response(response: &[u8]) -> Result<(u16, Vec<u8>)> {
+fn split_response(response: &[u8]) -> Result<(u16, String, Vec<u8>)> {
     let split = response
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -366,7 +415,7 @@ fn split_response(response: &[u8]) -> Result<(u16, Vec<u8>)> {
     } else {
         body.to_vec()
     };
-    Ok((status, body))
+    Ok((status, head.to_string(), body))
 }
 
 /// Decode `Transfer-Encoding: chunked`.

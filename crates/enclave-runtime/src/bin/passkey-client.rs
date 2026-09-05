@@ -23,7 +23,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -52,6 +52,14 @@ struct Cli {
     /// The origin assertions must claim. Defaults to `https://<rp-id>`.
     #[arg(long)]
     origin: Option<String>,
+
+    /// Write each response's proof into this directory: `document.b64`, the
+    /// `certificate.der` this connection was served, and the `nonce.hex` the
+    /// request sent. Three files is what `nitro-attest --document
+    /// --peer-certificate --nonce` needs to check the binding for a request
+    /// this client signed — which it cannot make for itself.
+    #[arg(long)]
+    dump_proof: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -304,9 +312,14 @@ fn request(
         TcpStream::connect(&authority).with_context(|| format!("connecting to {authority}"))?;
     let mut tls = rustls::Stream::new(&mut connection, &mut socket);
 
+    // Every request carries a nonce. The runtime refuses without one whether or
+    // not it attests, so a client that omits it reaches nothing.
+    let nonce = fresh_nonce();
     let mut request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
+         x-enclave-nonce: {}\r\nContent-Length: {}\r\n",
         cli.rp_id,
+        encode_nonce(&nonce),
         body.len()
     );
     for (name, value) in headers {
@@ -330,6 +343,10 @@ fn request(
         .context("no status line")?
         .parse()?;
 
+    if let Some(dir) = &cli.dump_proof {
+        dump_proof(dir, &head, &nonce, &connection)?;
+    }
+
     let rest = &raw[split + 4..];
     let body = if head
         .to_ascii_lowercase()
@@ -340,6 +357,51 @@ fn request(
         rest.to_vec()
     };
     Ok((status, String::from_utf8_lossy(&body).to_string()))
+}
+
+/// A fresh nonce for one request.
+///
+/// From the OS, because a nonce a third party can predict is not a nonce. This
+/// client does not verify the document it gets back — `nitro-attest` is the
+/// tool that verifies, and this one is about the gate — but sending a real one
+/// keeps the harness honest about what a client must do, and `--dump-proof`
+/// hands the pieces to something that does check.
+fn fresh_nonce() -> [u8; 20] {
+    let mut nonce = [0u8; 20];
+    getrandom::fill(&mut nonce).expect("the OS has entropy");
+    nonce
+}
+
+fn encode_nonce(nonce: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce)
+}
+
+/// The three things a verifier needs and cannot recover after the fact: what
+/// the enclave signed, which certificate this connection was actually served,
+/// and which nonce was asked for.
+fn dump_proof(
+    dir: &Path,
+    head: &str,
+    nonce: &[u8],
+    connection: &rustls::ClientConnection,
+) -> Result<()> {
+    let document = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("x-enclave-attestation:"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim())
+        .context("the response carried no x-enclave-attestation header")?;
+    let certificate = connection
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .context("the server presented no certificate")?;
+
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::write(dir.join("document.b64"), document)?;
+    std::fs::write(dir.join("certificate.der"), certificate.as_ref())?;
+    std::fs::write(dir.join("nonce.hex"), hex::encode(nonce))?;
+    Ok(())
 }
 
 fn dechunk(body: &[u8]) -> Vec<u8> {

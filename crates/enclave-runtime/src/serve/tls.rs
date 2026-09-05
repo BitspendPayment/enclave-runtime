@@ -74,10 +74,6 @@ impl TlsIdentity {
         )
         .with_safe_default_protocol_versions()
         .context("selecting TLS protocol versions")?
-        // Client authentication is *offered*, not required: a browser or a
-        // health check with no certificate still completes the handshake and
-        // arrives without an identity. Requiring one here would break every
-        // ordinary client and the ACME challenge with them.
         // No client certificates. Authentication is a WebAuthn assertion bound
         // to one request — see `crate::auth` — and a certificate would be a
         // second, weaker way to become a tenant that could not bind an
@@ -85,6 +81,27 @@ impl TlsIdentity {
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("building the TLS configuration")?;
+
+        // No session resumption. This is what makes "the certificate this
+        // connection is using" a well-defined thing to attest.
+        //
+        // rustls calls the certificate resolver while processing every
+        // ClientHello, but sends a Certificate message **only on a full
+        // handshake** (`server/tls13.rs`, gated on `full_handshake`). A resumed
+        // session is authenticated by whatever the client cached from its
+        // original handshake — so after an ACME renewal a resumed connection is
+        // running on the old certificate while the server has the new one in
+        // hand. Attesting the current certificate there would name one the
+        // client's session was never authenticated under: a false binding, in
+        // exactly the case per-response attestation exists to get right.
+        //
+        // rustls exposes no way to ask which certificate an earlier session
+        // used, so the only correct answer is to have no earlier session. The
+        // cost is one handshake signature per connection, which is nothing
+        // beside the per-response attestation this enables.
+        let mut config = config;
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
 
         Ok(TlsIdentity {
             certificate_der: leaf,
@@ -94,11 +111,18 @@ impl TlsIdentity {
 
     /// Generate a self-signed certificate for `domains`.
     ///
-    /// Browsers will refuse it, which is what Let's Encrypt is for. A client
-    /// that verifies attestation does not care: the binding proves more than a
-    /// CA signature does, so this is a complete story for anything speaking to
-    /// the enclave programmatically, and the only story available under QEMU
-    /// or on a host with no public DNS name.
+    /// **Not available in a production build.** The runtime serves ACME-issued
+    /// certificates and nothing else: a certificate the runtime minted for
+    /// itself is one an operator can mint too, so it cannot distinguish this
+    /// enclave from a process impersonating it — the attestation binding is
+    /// what carries that weight, and it binds whatever certificate is being
+    /// served, including one that was forged.
+    ///
+    /// It survives behind `testing` because the test harnesses and the QEMU
+    /// emulator have no domain and no reachable CA. A binary built without that
+    /// feature refuses `--tls self-signed` outright rather than quietly
+    /// generating one, and `rcgen` is not in it at all.
+    #[cfg(any(test, feature = "testing"))]
     pub fn self_signed(domains: &[String]) -> Result<Self> {
         let names: Vec<String> = if domains.is_empty() {
             vec!["localhost".to_string()]
@@ -132,8 +156,6 @@ pub enum TlsMode {
     /// Plaintext HTTP. Development, and behind a trusted terminator only —
     /// which inside an enclave means nowhere.
     Off,
-    /// Generate a certificate at startup. Trusted through attestation, not PKI.
-    SelfSigned,
     /// Obtain one from an ACME provider over TLS-ALPN-01.
     Acme,
 }
@@ -142,11 +164,20 @@ impl TlsMode {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" | "none" | "plaintext" => Ok(TlsMode::Off),
-            "self-signed" | "selfsigned" => Ok(TlsMode::SelfSigned),
+            // Named explicitly so a deployment that asks for it is told why it
+            // cannot have it, rather than "expected one of …". No build has
+            // this mode, testing included: the QEMU harness was the last user
+            // and it now runs a real ACME order against a local Pebble, which
+            // is the path production takes.
+            "self-signed" | "selfsigned" => Err(
+                "this runtime serves ACME-issued certificates only. A self-signed \
+                 certificate is one an operator can mint too, so it cannot tell this \
+                 enclave apart from something impersonating it. Use --tls acme, \
+                 pointing --acme-directory at a test CA if there is no public one."
+                    .to_string(),
+            ),
             "acme" | "letsencrypt" => Ok(TlsMode::Acme),
-            other => Err(format!(
-                "expected one of off, self-signed, acme; got {other:?}"
-            )),
+            other => Err(format!("expected one of off, acme; got {other:?}")),
         }
     }
 }
@@ -183,9 +214,18 @@ mod tests {
     #[test]
     fn modes_parse_the_documented_values() {
         assert_eq!(TlsMode::parse("off"), Ok(TlsMode::Off));
-        assert_eq!(TlsMode::parse("self-signed"), Ok(TlsMode::SelfSigned));
         assert_eq!(TlsMode::parse("ACME"), Ok(TlsMode::Acme));
         assert!(TlsMode::parse("maybe").is_err());
+    }
+
+    /// No build serves a certificate it minted itself, and the refusal says
+    /// what to do instead — a runtime that answered "expected one of off, acme"
+    /// would leave an operator guessing at a decision that was deliberate.
+    #[test]
+    fn a_self_signed_deployment_is_refused_with_a_reason() {
+        let err = TlsMode::parse("self-signed").unwrap_err();
+        assert!(err.contains("ACME-issued certificates only"), "{err}");
+        assert!(err.contains("--acme-directory"), "{err}");
     }
 
     #[test]

@@ -94,7 +94,7 @@ async fn start() -> Harness {
             guest,
             ServeConfig {
                 addr,
-                tls: Some(tls),
+                certificate: Some(enclave_runtime::CertificateSlot::fixed(Arc::new(tls))),
                 acme: None,
                 attestation: None,
                 request_timeout: std::time::Duration::from_secs(30),
@@ -115,6 +115,19 @@ async fn start() -> Harness {
 }
 
 /// One request over TLS, with whatever headers the caller wants.
+/// A distinct nonce per request, base64url and unpadded.
+///
+/// Distinct rather than random: these tests need only that no two requests
+/// share one. A real client uses a CSPRNG.
+fn fresh_nonce() -> String {
+    use base64::Engine as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let mut nonce = vec![0x5au8; 20];
+    nonce[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce)
+}
+
 async fn https(
     addr: std::net::SocketAddr,
     method: &str,
@@ -136,9 +149,13 @@ async fn https(
     let socket = tokio::net::TcpStream::connect(addr).await.expect("connect");
     let mut stream = connector.connect(name, socket).await.expect("handshake");
 
+    // Every request carries a nonce, whether or not the deployment attests —
+    // this harness runs with `attestation: None` and must still send one, which
+    // is the point of that rule: a client behaves the same either way.
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {RP_ID}\r\nConnection: close\r\n\
-         Content-Length: {}\r\n",
+         x-enclave-nonce: {}\r\nContent-Length: {}\r\n",
+        fresh_nonce(),
         body.len()
     );
     for (name, value) in headers {

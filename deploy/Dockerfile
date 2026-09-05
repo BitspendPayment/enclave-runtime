@@ -79,9 +79,11 @@ ENV S3FS_NETWORK=gvproxy
 # the enclave, with its hash signed into the attestation document, is what lets
 # a client prove its session ends in *this* code rather than in the parent.
 ENV S3FS_HTTP_LISTEN=0.0.0.0:443
-ENV S3FS_TLS=self-signed
-# ENV S3FS_TLS=acme                       # browser-trusted, needs a real domain
-# ENV S3FS_TLS_DOMAINS=enclave.example.com
+# ACME, and only ACME. A self-signed certificate is one an operator can mint
+# too, so it cannot tell this enclave apart from something impersonating it —
+# the runtime refuses the setting rather than generating one.
+ENV S3FS_TLS=acme
+ENV S3FS_TLS_DOMAINS=enclave.example.com
 # ENV S3FS_BUCKET=prod-data
 # ENV S3FS_ROOTS_BUCKET=prod-roots        # Object Lock COMPLIANCE lives here
 # ENV AWS_REGION=eu-west-2

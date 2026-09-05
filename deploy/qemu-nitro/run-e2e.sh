@@ -13,7 +13,7 @@
 #           expose :8443 → 192.168.127.2:443 ──▶ rustls :443
 #   vhost-device-vsock --forward-cid 1
 #   heartbeat.py :9000  ───────────────────────▶ init's boot heartbeat
-#   nitro-attest ──────────────────────────────▶ /enclave/attestation
+#   nitro-attest ──────────────────────────────▶ x-enclave-attestation
 #
 # What it proves, in order of how much it cost to get here:
 #
@@ -21,7 +21,8 @@
 #      printed. The measurement a client would pin is the measurement the
 #      reproducible build claimed.
 #   2. user_data binds the certificate from this connection's own handshake,
-#      so the TLS session terminates in the attested enclave.
+#      so the TLS session terminates in the attested enclave. Every response
+#      carries this, including a passkey-signed request to the guest.
 #   3. The guest's counter advances, so writes crossed gvproxy to MinIO and
 #      came back — the filesystem really is mounted over the emulated vsock.
 #
@@ -44,8 +45,14 @@ IMAGE="${QEMU_IMAGE:-s3fs-qemu-nitro:latest}"
 TIMEOUT="${TIMEOUT:-240}"
 CONSOLE="$RUNDIR/console.log"
 
-# Host-side port that gvproxy forwards into the enclave's :443.
+# Host-side port that gvproxy forwards into the enclave's :443. Pebble also
+# validates the TLS-ALPN-01 challenge against it, so it is both the service
+# port and the challenge port — as it is in production, where both are 443.
 HTTPS_PORT="${HTTPS_PORT:-8443}"
+
+# The ACME test CA. Pinned by digest: this image supplies the issuance path the
+# e2e claims to prove, and "latest" would let that claim change under us.
+PEBBLE_IMAGE="${PEBBLE_IMAGE:-ghcr.io/letsencrypt/pebble@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199}"
 
 say() { printf '\n== %s ==\n' "$*"; }
 
@@ -53,6 +60,18 @@ say() { printf '\n== %s ==\n' "$*"; }
 # Preconditions, each with the fix rather than just the symptom.
 # ---------------------------------------------------------------------------
 command -v nix >/dev/null || { echo "nix is not on PATH; see deploy/nix/README.md" >&2; exit 1; }
+
+# Flakes copy only what git tracks, so an untracked file is invisible to the
+# build no matter that it is right there on disk. The failure lands deep inside
+# the EIF derivation as a bare "cp: cannot stat", naming a store path that does
+# not contain it — true, and useless. Checked here instead.
+for f in ca.pem cert.pem key.pem; do
+    git -C "$REPO" ls-files --error-unmatch "deploy/qemu-nitro/pebble/$f" >/dev/null 2>&1 || {
+        echo "deploy/qemu-nitro/pebble/$f is not tracked by git, so nix cannot see it." >&2
+        echo "  git add deploy/qemu-nitro/pebble/" >&2
+        exit 1
+    }
+done
 [[ -e /dev/kvm ]] || { echo "no /dev/kvm — the nitro-enclave machine needs KVM" >&2; exit 1; }
 [[ -e /dev/vsock ]] || {
     echo "no /dev/vsock — the host needs: sudo modprobe vsock_loopback" >&2
@@ -87,7 +106,7 @@ cleanup() {
         # shellcheck disable=SC2086
         kill $remaining 2>/dev/null || true
     fi
-    docker rm -f e2e-minio e2e-qemu e2e-qemu-resume >/dev/null 2>&1 || true
+    docker rm -f e2e-minio e2e-pebble e2e-qemu e2e-qemu-resume >/dev/null 2>&1 || true
     return 0
 }
 
@@ -199,6 +218,65 @@ for _ in $(seq 50); do [[ -S "$RUNDIR/network.sock" ]] && break; sleep 0.1; done
 [[ -S "$RUNDIR/network.sock" ]] || { echo "gvproxy never opened its API socket:" >&2; cat "$RUNDIR/gvproxy.log" >&2; exit 1; }
 echo "gvproxy listening on host vsock port 1024"
 
+# The CA. Pebble is a real RFC 8555 server, so the enclave runs the same
+# issuance path it runs against Let's Encrypt: directory, account, order,
+# TLS-ALPN-01 challenge, finalize, and a certificate sealed into the cache.
+#
+# `--network host` because two things must reach it: the enclave, which dials
+# gvproxy's host address 192.168.127.254:14000, and this script on loopback.
+# `--add-host` is what makes the challenge work — Pebble resolves the
+# identifier `enclave.test` to the loopback address where gvproxy forwards
+# :443 into the enclave, so validation arrives on the port the service uses.
+#
+# Two knobs are turned off because they exist to make clients prove they retry,
+# and a flaky CA here would read as a flaky runtime: PEBBLE_VA_NOSLEEP skips a
+# random pre-validation delay, PEBBLE_WFE_NONCEREJECT the deliberate 5% bad
+# nonce. rustls-acme handles both; this harness is not the place to find out.
+say "starting Pebble, the ACME test CA"
+docker rm -f e2e-pebble >/dev/null 2>&1 || true
+cat > "$RUNDIR/pebble-config.json" <<EOF
+{
+  "pebble": {
+    "listenAddress": "0.0.0.0:14000",
+    "managementListenAddress": "0.0.0.0:15000",
+    "certificate": "/pebble/cert.pem",
+    "privateKey": "/pebble/key.pem",
+    "httpPort": 80,
+    "tlsPort": $HTTPS_PORT,
+    "ocspResponderURL": "",
+    "externalAccountBindingRequired": false
+  }
+}
+EOF
+docker run -d --rm --name e2e-pebble \
+    --network host \
+    --add-host "enclave.test:127.0.0.1" \
+    -e PEBBLE_VA_NOSLEEP=1 \
+    -e PEBBLE_WFE_NONCEREJECT=0 \
+    -v "$REPO/deploy/qemu-nitro/pebble:/pebble:ro" \
+    -v "$RUNDIR/pebble-config.json:/pebble-config.json:ro" \
+    "$PEBBLE_IMAGE" -config /pebble-config.json >/dev/null \
+    || { echo "Pebble did not start" >&2; exit 1; }
+
+for _ in $(seq 60); do
+    curl -sk --max-time 2 "https://127.0.0.1:14000/dir" >/dev/null 2>&1 && break
+    sleep 1
+done
+curl -sk --max-time 5 "https://127.0.0.1:14000/dir" >/dev/null 2>&1 \
+    || { echo "Pebble never answered:" >&2; docker logs e2e-pebble 2>&1 | tail -20 >&2; exit 1; }
+echo "Pebble serving its directory on :14000, validating :$HTTPS_PORT"
+
+# Before the enclave boots, not after. The enclave starts its ACME order as
+# soon as it has a network, and the challenge is a connection *inbound* to
+# :443 — so if this forward does not exist yet, the first order fails and the
+# harness waits out a retry backoff for no reason.
+say "forwarding :$HTTPS_PORT into the enclave"
+curl -sf --unix-socket "$RUNDIR/network.sock" \
+    http://localhost/services/forwarder/expose \
+    -X POST -H 'Content-Type: application/json' \
+    -d "{\"local\":\":${HTTPS_PORT}\",\"remote\":\"192.168.127.2:443\"}" \
+    || { echo "gvproxy refused to forward :$HTTPS_PORT" >&2; exit 1; }
+
 # ---------------------------------------------------------------------------
 # Boot.
 # ---------------------------------------------------------------------------
@@ -264,17 +342,55 @@ plain | grep -E "enclave networking is up|mounted |serving +addr=" | tail -3
 
 # Forward a host port into the enclave. Done after boot so the enclave can be
 # restarted without restarting the proxy.
-say "forwarding :$HTTPS_PORT into the enclave"
-curl -sf --unix-socket "$RUNDIR/network.sock" \
-    http://localhost/services/forwarder/expose \
-    -X POST -H 'Content-Type: application/json' \
-    -d "{\"local\":\":${HTTPS_PORT}\",\"remote\":\"192.168.127.2:443\"}" \
-    || fail "gvproxy refused to forward :$HTTPS_PORT"
-
-for _ in $(seq 30); do
-    curl -sk --max-time 2 "https://127.0.0.1:$HTTPS_PORT/" >/dev/null 2>&1 && break
+# The forward was set up before boot; what remains is to wait for the
+# certificate. Nothing answers HTTPS until an ACME order completes — directory,
+# account, order, challenge, finalize — so this loop is the issuance path
+# finishing, not just a process starting.
+say "waiting for Pebble to issue the serving certificate"
+issued=""
+for _ in $(seq 90); do
+    if curl -sk --max-time 2 "https://127.0.0.1:$HTTPS_PORT/" >/dev/null 2>&1; then
+        issued=yes
+        break
+    fi
     sleep 1
 done
+[[ -n "$issued" ]] || {
+    echo "no certificate was ever issued; the ACME path did not complete" >&2
+    echo "--- pebble ---" >&2;  docker logs e2e-pebble 2>&1 | tail -30 >&2
+    echo "--- console ---" >&2; plain | grep -i acme | tail -30 >&2
+    exit 1
+}
+echo "the enclave is serving a certificate it obtained over ACME"
+
+# And it is genuinely the CA's, not something the enclave minted for itself.
+# Pebble publishes the issuing chain on its management port, so this verifies
+# the served chain against that root the way any PKI client would — which is
+# the part a self-signed image could never test.
+curl -sk --max-time 5 "https://127.0.0.1:15000/roots/0" > "$RUNDIR/pebble-root.pem" \
+    || { echo "could not fetch Pebble's root" >&2; exit 1; }
+curl -sk --max-time 5 "https://127.0.0.1:15000/intermediates/0" > "$RUNDIR/pebble-int.pem" \
+    || { echo "could not fetch Pebble's intermediate" >&2; exit 1; }
+echo | openssl s_client -connect "127.0.0.1:$HTTPS_PORT" -servername enclave.test -showcerts \
+    2>/dev/null | sed -n '/BEGIN CERT/,/END CERT/p' > "$RUNDIR/served-chain.pem"
+[[ -s "$RUNDIR/served-chain.pem" ]] || { echo "the enclave presented no certificate" >&2; exit 1; }
+
+openssl verify -CAfile "$RUNDIR/pebble-root.pem" -untrusted "$RUNDIR/pebble-int.pem" \
+    "$RUNDIR/served-chain.pem" \
+    || { echo "the served certificate does not chain to the CA that issued it" >&2; exit 1; }
+
+# The name, from the SAN rather than the subject: an ACME certificate carries
+# no CN at all — identity lives in subjectAltName — so printing the subject
+# would print an empty string and look like a bug.
+names="$(openssl x509 -in "$RUNDIR/served-chain.pem" -noout -ext subjectAltName \
+    | tail -n +2 | tr -d ' ')"
+issuer="$(openssl x509 -in "$RUNDIR/served-chain.pem" -noout -issuer)"
+echo "served for $names"
+echo "issued by $issuer"
+[[ "$names" == *enclave.test* ]] \
+    || { echo "the certificate is not for enclave.test: $names" >&2; exit 1; }
+[[ "$issuer" == *Pebble* ]] \
+    || { echo "the certificate was not issued by Pebble: $issuer" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # The assertions.
@@ -282,13 +398,26 @@ done
 say "1/7  the guest is unreachable without a passkey assertion"
 # The rule, at the front because everything after it depends on it holding:
 # nothing reaches the guest without a fresh assertion bound to that request.
+#
+# The nonce is sent so the *gate* is what refuses. Every request needs one,
+# and it is checked before routing — so without it these would be 400s, and
+# this leg would pass while proving nothing about the gate.
+nonce() { openssl rand 20 | basenc --base64url | tr -d '='; }
 for path in / /counter /memory; do
     code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 \
+        -H "x-enclave-nonce: $(nonce)" \
         "https://127.0.0.1:$HTTPS_PORT$path")"
     [[ "$code" == "401" ]] \
         || fail "$path answered $code without an assertion; the gate is not wired up"
 done
 echo "unauthenticated requests refused: 401"
+
+# And a request with no nonce at all never reaches the gate either.
+code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 \
+    "https://127.0.0.1:$HTTPS_PORT/counter")"
+[[ "$code" == "400" ]] \
+    || fail "a request with no nonce answered $code; it should be refused before routing"
+echo "un-nonced requests refused: 400"
 
 say "2/7  a passkey enrols and its signed requests reach the guest"
 rm -f "$RUNDIR/alice.json" "$RUNDIR/bob.json"
@@ -302,8 +431,12 @@ echo "counter: $first then $second"
     || fail "the counter did not advance ($first → $second); writes are not reaching MinIO"
 
 say "3/7  the attestation binds this connection's certificate"
+# There is no attestation endpoint: the document rides on an ordinary
+# response, in `x-enclave-attestation`. `/enclave/config` is the probe route —
+# no passkey, no guest — so this is the check a client makes *before* it sends
+# anything, on the connection it then goes on to use.
 "$ATTEST" \
-    --url "https://127.0.0.1:$HTTPS_PORT/enclave/attestation" \
+    --url "https://127.0.0.1:$HTTPS_PORT/enclave/config" \
     --unsigned-emulator \
     --pcr0 "$EXPECTED_PCR0" \
     | tee "$RUNDIR/attest.log" \
@@ -311,6 +444,29 @@ say "3/7  the attestation binds this connection's certificate"
 
 grep -q "binding    the attested certificate" "$RUNDIR/attest.log" \
     || fail "the document did not bind the certificate this connection was served"
+
+say "3b/7 a signed guest request carries its own proof"
+# The case the old endpoint could never cover: the response to a real,
+# passkey-signed request to the guest. `--dump-proof` keeps the three things a
+# verifier cannot recover afterwards — the document, the certificate this
+# connection was served, and the nonce that request sent.
+rm -rf "$RUNDIR/proof"
+signed --dump-proof "$RUNDIR/proof" get --path /counter >/dev/null \
+    || fail "the signed request failed"
+[[ -s "$RUNDIR/proof/document.b64" ]] \
+    || fail "the guest's response carried no attestation document"
+
+"$ATTEST" \
+    --document "$RUNDIR/proof/document.b64" \
+    --peer-certificate "$RUNDIR/proof/certificate.der" \
+    --nonce "$(cat "$RUNDIR/proof/nonce.hex")" \
+    --unsigned-emulator \
+    --pcr0 "$EXPECTED_PCR0" \
+    | tee "$RUNDIR/attest-guest.log" \
+    || fail "the guest response's document did not verify"
+
+grep -q "binding    the attested certificate" "$RUNDIR/attest-guest.log" \
+    || fail "the guest response's document did not bind that connection's certificate"
 
 say "4/7  the attested PCR0 is the one the build produced"
 # `nitro-attest --pcr0` already enforced this, so reaching here means it held.
@@ -380,10 +536,23 @@ echo "substituted body refused: 401, and nothing was written"
 say "5c/7 guest output reaches the console tagged as untrusted"
 signed get --path /log >/dev/null || fail "the guest refused to log"
 
+# Wait for the guest's *last* line, not its first.
+#
+# `docker logs` fills this console asynchronously, so "some guest output has
+# arrived" says nothing about the rest of it — and every assertion below is
+# about a line the guest wrote later. Waiting on the first line and then
+# grepping for the third is a race that passes on a quiet machine and fails on
+# a busy one, which is how it was found.
+#
+# The unterminated tail is last: it is emitted when the stream object drops,
+# after the response, and after stderr was flushed during the request. Once it
+# is here, everything else already is.
+tail_seen=""
 for _ in $(seq 30); do
-    grep -q 'guest output' <(plain) && break
+    grep -q 'guest_message="no trailing newline"' <(plain) && { tail_seen=1; break; }
     sleep 1
 done
+[[ -n "$tail_seen" ]] || fail "the guest's unterminated last line never arrived"
 
 # Two guest writes joined into one line, and CRLF normalised.
 grep -q 'guest_message="first line"' <(plain) \
@@ -421,16 +590,6 @@ grep -q 'enclave_runtime::' <(plain) \
 if plain | grep 'enclave_runtime::' | grep -q ' guest: '; then
     fail "a runtime event carried the guest target"
 fi
-
-# The guest's last line had no terminator. It is emitted when the stream object
-# is dropped, which is a moment or two after the response — so this polls
-# rather than assuming, the same way the readiness check does.
-tail_seen=""
-for _ in $(seq 30); do
-    grep -q 'guest_message="no trailing newline"' <(plain) && { tail_seen=1; break; }
-    sleep 1
-done
-[[ -n "$tail_seen" ]] || fail "the guest's unterminated last line never arrived"
 
 echo "guest output arrived framed, tagged by stream, and marked as guest"
 
@@ -510,7 +669,9 @@ cat <<EOF
 
 == PASS ==
   filesystem mounted over vsock through gvproxy, writes durable in MinIO
+  the serving certificate was obtained over real ACME and chains to the CA
   TLS terminated in the enclave, certificate hash bound into the document
+  every response carried its own document, the guest's signed request included
   the document's PCR0 matches the reproducible build
   the guest was unreachable without a passkey assertion
   a passkey enrolled and its signed requests were served

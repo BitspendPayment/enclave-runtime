@@ -17,6 +17,10 @@ path = "src/main.rs"
 # `std`: file access goes through `wasi:filesystem`, which the runtime backs
 # with the block store.
 wstd = "0.6"
+# For `/trickle`, whose body is a stream rather than a buffer: `wstd`'s
+# `Body::from_stream` takes a `futures_lite::Stream`, and `unfold` is the
+# shortest way to write one without a generator.
+futures-lite = "2"
 
 [profile.release]
 opt-level = "s"

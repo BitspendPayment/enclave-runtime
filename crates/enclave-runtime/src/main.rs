@@ -36,8 +36,8 @@ use clap::Parser;
 use enclave_runtime::{
     open_clock, open_entropy, read_component, serve_component, AcmeConfig, ClockSource,
     GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, NetworkConfig, NetworkMode,
-    RandomSource, ReceiptTrust, ServeConfig, TlsIdentity, TlsMode, DEFAULT_GVFORWARDER,
-    DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
+    RandomSource, ReceiptTrust, ServeConfig, TlsMode, DEFAULT_GVFORWARDER, DEFAULT_NSM_DEVICE,
+    DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
 /// Where the guest lives inside the enclave image.
@@ -379,18 +379,19 @@ struct Cli {
 
     /// Where the serving certificate comes from.
     ///
-    /// `self-signed` generates one at startup, inside the enclave. Browsers
-    /// reject it; a client verifying attestation does not care, because the
-    /// document binds the certificate to a specific enclave image — a stronger
-    /// statement than any CA makes.
-    ///
-    /// `acme` obtains a browser-trusted certificate from Let's Encrypt over
-    /// TLS-ALPN-01, on the same port. It needs `--acme-domain` and outbound
-    /// network.
+    /// `acme`, the default, obtains one from Let's Encrypt over TLS-ALPN-01 on
+    /// the same port. It needs `--tls-domain` and outbound network. The key is
+    /// generated inside the enclave and never leaves it; what the CA signs is
+    /// what every response's attestation document binds.
     ///
     /// `off` serves plaintext. Inside an enclave that hands every request to
     /// the parent instance, which is the party this design excludes.
-    #[arg(long, env = "S3FS_TLS", default_value = "self-signed",
+    ///
+    /// There is deliberately no self-signed mode at all: a certificate an
+    /// operator can mint is one they can mint for an impostor too, and it buys
+    /// nothing the attestation binding does not already give. A deployment with
+    /// no public CA points `--acme-directory` at a private one instead.
+    #[arg(long, env = "S3FS_TLS", default_value = "acme",
           value_parser = TlsMode::parse)]
     tls: TlsMode,
 
@@ -414,6 +415,18 @@ struct Cli {
     #[arg(long, env = "S3FS_ACME_DIRECTORY")]
     acme_directory: Option<String>,
 
+    /// PEM trust root for the ACME directory's own HTTPS certificate.
+    ///
+    /// **Only in a `testing` build.** A real CA serves its API under a
+    /// publicly-trusted certificate and needs nothing here; a test CA like
+    /// Pebble does not, so the QEMU harness supplies its root. A production
+    /// enclave has no such flag, because one that took issuance orders from a
+    /// CA of the operator's choosing would be a different trust model than the
+    /// one this image claims.
+    #[cfg(any(test, feature = "testing"))]
+    #[arg(long, env = "S3FS_ACME_CA")]
+    acme_ca: Option<PathBuf>,
+
     /// How the enclave reaches the network.
     ///
     /// `gvproxy` runs the tap forwarder against the parent's gvproxy, which is
@@ -433,7 +446,7 @@ struct Cli {
     #[arg(long, env = "S3FS_GVFORWARDER", default_value = DEFAULT_GVFORWARDER)]
     gvforwarder: PathBuf,
 
-    /// Serve `/enclave/attestation` and `/enclave/config`.
+    /// Attest every response, and serve `/enclave/config`.
     ///
     /// On by default: an enclave nobody can verify is an enclave for nothing.
     /// Turning it off is for running the same image outside one, where the NSM
@@ -630,22 +643,42 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
 
     let env = cli.env_policy().build()?;
 
-    let (tls, acme) = match cli.tls {
-        TlsMode::Off => (None, None),
-        TlsMode::SelfSigned => (Some(TlsIdentity::self_signed(&cli.tls_domains)?), None),
-        TlsMode::Acme => {
-            let acme = enclave_runtime::serve::acme::start(
-                &AcmeConfig {
-                    domains: cli.tls_domains.clone(),
-                    contacts: cli.acme_contacts.clone(),
-                    directory: cli.acme_directory.clone(),
-                    prefix: mounted.bucket_prefix.clone(),
-                },
-                mounted.data.clone(),
-                mounted.keys.clone(),
-            )?;
-            (None, Some(acme))
+    /// The ACME directory's trust root, if this build can have one.
+    ///
+    /// Two definitions rather than a runtime branch: a production binary has no
+    /// `--acme-ca` field to read, so the public roots are not something a
+    /// deployment can talk it out of.
+    #[cfg(any(test, feature = "testing"))]
+    fn acme_directory_ca(cli: &Cli) -> anyhow::Result<Option<Vec<u8>>> {
+        match &cli.acme_ca {
+            Some(path) => Ok(Some(anyhow::Context::with_context(
+                std::fs::read(path),
+                || format!("reading the ACME directory trust root {}", path.display()),
+            )?)),
+            None => Ok(None),
         }
+    }
+
+    #[cfg(not(any(test, feature = "testing")))]
+    fn acme_directory_ca(_cli: &Cli) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    // One certificate source, or none. There is no third: a certificate the
+    // runtime minted for itself would be one an operator could mint too.
+    let acme = match cli.tls {
+        TlsMode::Off => None,
+        TlsMode::Acme => Some(enclave_runtime::serve::acme::start(
+            &AcmeConfig {
+                domains: cli.tls_domains.clone(),
+                contacts: cli.acme_contacts.clone(),
+                directory: cli.acme_directory.clone(),
+                directory_ca: acme_directory_ca(&cli)?,
+                prefix: mounted.bucket_prefix.clone(),
+            },
+            mounted.data.clone(),
+            mounted.keys.clone(),
+        )?),
     };
     tracing::info!(
         variables = env.len(),
@@ -835,7 +868,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         guest,
         ServeConfig {
             addr: cli.http_listen,
-            tls,
+            certificate: None,
             acme,
             attestation,
             request_timeout: Duration::from_secs(cli.request_timeout_secs),

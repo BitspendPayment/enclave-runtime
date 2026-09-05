@@ -124,6 +124,41 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
 
             Ok(text(StatusCode::OK, "logged\n".to_string()))
         }
+        // A guest doing its best to own the runtime's proof header. The
+        // runtime must overwrite all of these, or a guest could tell a client
+        // whatever it liked about the enclave it is running in.
+        ("GET", "/forge-attestation") => {
+            let mut response = Response::builder().status(StatusCode::OK);
+            for forged in ["forged-one", "forged-two", "forged-three"] {
+                response = response.header("x-enclave-attestation", forged);
+            }
+            Ok(response
+                .header("cache-control", "public, max-age=3600")
+                .header("content-type", "text/plain; charset=utf-8")
+                .body("tried\n".to_string().into())
+                .expect("response is well formed"))
+        }
+        // A body that arrives in pieces, with a pause between them. The
+        // runtime must send the response head — attestation header and all —
+        // as soon as the guest sets it, and not wait for the body to finish.
+        // Without a deliberate pause here that property is a race the test
+        // could win by accident.
+        ("GET", "/trickle") => {
+            let stream = futures_lite::stream::unfold(0u32, |n| async move {
+                if n >= 3 {
+                    return None;
+                }
+                if n > 0 {
+                    wstd::task::sleep(std::time::Duration::from_millis(150).into()).await;
+                }
+                Some((format!("chunk-{n}\n"), n + 1))
+            });
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(Body::from_stream(stream))
+                .expect("response is well formed"))
+        }
         // A guest that never returns and never sets a response. Deliberately
         // here rather than in a test fixture: it is the one behaviour a host
         // cannot provoke from the outside, and without it the runtime's
@@ -160,7 +195,8 @@ fn banner() -> String {
     out.push_str("GET  /counter          increment and return a persisted counter\n");
     out.push_str("GET  /env              environment the runtime policy allowed\n");
     out.push_str("POST /files/<name>     write a file\n");
-    out.push_str("GET  /files/<name>     read it back\n\n");
+    out.push_str("GET  /files/<name>     read it back\n");
+    out.push_str("GET  /trickle          a body sent in pieces, with pauses\n\n");
     match fs::read_dir(STATE_DIR) {
         Ok(entries) => {
             let _ = writeln!(out, "files: {}", entries.count());

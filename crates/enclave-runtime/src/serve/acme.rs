@@ -39,50 +39,67 @@
 
 use std::sync::{Arc, RwLock};
 
+use crate::serve::tls::TlsIdentity;
 use anyhow::{Context, Result};
 use s3fs_core::backend::{Backend, PutBlobInput};
 use s3fs_core::crypto::KeyMaterial;
 use s3fs_core::FsError;
 
-/// The certificate currently being served.
+/// The identity currently being served — a rustls config and the leaf that
+/// config presents, together.
 ///
 /// A shared slot rather than a fixed value because ACME issues asynchronously
 /// and renews later: the certificate at boot is not necessarily the one in use
-/// an hour on. The attestation endpoint reads through this so a renewal
-/// changes what gets bound, instead of quietly attesting a certificate that is
-/// no longer being presented.
+/// an hour on.
+///
+/// **The pair is the point.** A connection loads one identity and gets both the
+/// configuration it hands to rustls and the certificate that configuration will
+/// present, indivisibly. Holding only the leaf — as this did — meant the
+/// certificate a connection was attested with came from a global read at
+/// response time, which during a renewal is a different certificate from the
+/// one the handshake used. There is no rustls API to ask a live connection
+/// which certificate it was served, so the answer has to be arranged rather
+/// than discovered.
 #[derive(Debug, Clone, Default)]
-pub struct CertificateSlot(Arc<RwLock<Option<Vec<u8>>>>);
+pub struct CertificateSlot(Arc<RwLock<Option<Arc<TlsIdentity>>>>);
 
 impl CertificateSlot {
-    /// A slot holding a certificate that will never change.
-    pub fn fixed(leaf_der: Vec<u8>) -> Self {
-        CertificateSlot(Arc::new(RwLock::new(Some(leaf_der))))
+    /// A slot holding an identity that will never change.
+    pub fn fixed(identity: Arc<TlsIdentity>) -> Self {
+        CertificateSlot(Arc::new(RwLock::new(Some(identity))))
     }
 
     pub fn empty() -> Self {
         CertificateSlot::default()
     }
 
-    pub fn set(&self, leaf_der: Vec<u8>) {
+    pub fn set(&self, identity: Arc<TlsIdentity>) {
         let changed = {
             let mut slot = self.0.write().expect("certificate slot poisoned");
-            let changed = slot.as_deref() != Some(leaf_der.as_slice());
-            *slot = Some(leaf_der);
+            let changed = slot.as_ref().map(|i| i.certificate_der.as_slice())
+                != Some(identity.certificate_der.as_slice());
+            *slot = Some(identity);
             changed
         };
         if changed {
-            if let Some(der) = self.get() {
+            if let Some(der) = self.leaf() {
                 tracing::info!(
                     certificate_sha256 = %hex::encode(nitro_attestation::sha256(&der)),
-                    "serving certificate changed; attestation will bind the new one"
+                    "serving certificate changed; new connections will use it"
                 );
             }
         }
     }
 
-    pub fn get(&self) -> Option<Vec<u8>> {
+    /// The identity a connection should be served with. Load this **once** per
+    /// connection and keep it: reading again later can give a different answer.
+    pub fn get(&self) -> Option<Arc<TlsIdentity>> {
         self.0.read().expect("certificate slot poisoned").clone()
+    }
+
+    /// The leaf of whatever is current, for reporting only.
+    pub fn leaf(&self) -> Option<Vec<u8>> {
+        self.get().map(|i| i.certificate_der.clone())
     }
 }
 
@@ -169,38 +186,63 @@ impl SealedAcmeCache {
     /// and the first must never be published, which is why the whole blob is
     /// sealed.
     fn publish_leaf(&self, pem: &[u8]) {
-        match leaf_from_pem(pem) {
-            Ok(der) => self.certificate.set(der),
+        match identity_from_pem(pem) {
+            Ok(identity) => self.certificate.set(Arc::new(identity)),
             Err(e) => tracing::error!(
                 error = %e,
-                "could not read the leaf out of the ACME certificate; \
-                 attestation cannot bind a certificate it cannot identify"
+                "could not build a serving identity from the ACME certificate; \
+                 connections will keep using the previous one"
             ),
         }
     }
 }
 
+/// Build a complete serving identity from rustls-acme's cached blob.
+///
+/// The layout is fixed by `AcmeState::parse_cert`: the PKCS#8 private key
+/// first, then the chain, leaf first. Taking both halves here is what lets the
+/// runtime serve from its own configuration rather than from rustls-acme's
+/// resolver — which matters because the resolver is updated before the cache
+/// is written, so anything reading the cache would lag what is being served.
+/// Serving from the same value we attest removes the divergence rather than
+/// narrowing it.
+pub fn identity_from_pem(pem: &[u8]) -> Result<TlsIdentity> {
+    let blocks = pem_blocks(pem)?;
+    let (key, chain) = blocks.split_first().context("ACME blob is empty")?;
+    if chain.is_empty() {
+        anyhow::bail!("ACME blob has no certificate after the private key");
+    }
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key.clone().into());
+    TlsIdentity::from_chain(chain.to_vec(), key)
+        .context("building a serving configuration from the ACME certificate")
+}
+
+/// Every PEM block's DER, in order.
+///
+/// Delegated to a real PEM parser rather than split on `-----\n`. Only the
+/// private key half of rustls-acme's blob is written by rustls-acme; the
+/// certificate half is the ACME directory's HTTP response body verbatim
+/// (`rustls_acme::state` concatenates the two), so its line endings are the
+/// CA's choice. A hand-rolled split on LF drops every CRLF block *without
+/// erroring*, which turned a valid issuance into an empty serving slot — and,
+/// where a blob mixed the two, into a chain quietly missing its intermediate.
+fn pem_blocks(pem: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let blocks = pem::parse_many(pem).context("ACME blob is not valid PEM")?;
+    Ok(blocks
+        .into_iter()
+        .map(|block| block.into_contents())
+        .collect())
+}
+
 /// Second PEM block of rustls-acme's cached blob.
 pub fn leaf_from_pem(pem: &[u8]) -> Result<Vec<u8>> {
-    let text = std::str::from_utf8(pem).context("ACME cache blob is not UTF-8")?;
-    let mut blocks = text
-        .split("-----BEGIN ")
-        .skip(1)
-        .filter_map(|block| block.split_once("-----\n"))
-        .map(|(_label, body)| body.split("-----END").next().unwrap_or(""));
-
+    let mut blocks = pem_blocks(pem)?.into_iter();
     let _private_key = blocks
         .next()
         .context("ACME blob has no private key block")?;
-    let leaf = blocks
+    blocks
         .next()
-        .context("ACME blob has no certificate after the private key")?;
-
-    use base64::Engine;
-    let compact: String = leaf.split_whitespace().collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(compact)
-        .context("leaf certificate is not valid base64")
+        .context("ACME blob has no certificate after the private key")
 }
 
 /// AES-256-GCM with the object key as associated data.
@@ -323,6 +365,15 @@ pub struct AcmeConfig {
     /// staging or a local Pebble for testing, since production's rate limits
     /// are low and per-domain.
     pub directory: Option<String>,
+    /// PEM trust root for the directory's *own* HTTPS certificate.
+    ///
+    /// `None` uses the public roots rustls-acme is built with, which is what
+    /// any real CA needs. A test CA like Pebble serves its API under a
+    /// certificate no public root signed, so its root has to be supplied — and
+    /// only a `testing` build can supply one, because a production enclave that
+    /// would take issuance orders from a CA of the operator's choosing is not
+    /// one this runtime offers.
+    pub directory_ca: Option<Vec<u8>>,
     /// Key prefix for the sealed cache objects.
     pub prefix: String,
 }
@@ -330,12 +381,25 @@ pub struct AcmeConfig {
 /// A running ACME client: the two TLS configurations it needs, and the slot it
 /// publishes each certificate to.
 pub struct Acme {
-    /// For ordinary connections, resolving to the issued certificate.
-    pub server_config: Arc<rustls::ServerConfig>,
     /// For TLS-ALPN-01 validation connections, which carry no HTTP at all —
     /// the handshake *is* the proof, and the connection is then closed.
     pub challenge_config: Arc<rustls::ServerConfig>,
+    /// Where each issued certificate is published, and where every connection
+    /// takes its serving identity.
+    ///
+    /// Deliberately not rustls-acme's own resolver: `process_cert` deploys a
+    /// renewed certificate to the resolver *before* the cache callback that
+    /// would publish it here, so serving from one while attesting the other
+    /// would attest a certificate the connection was never served.
     pub certificate: CertificateSlot,
+    /// Fired once the listener is accepting, releasing the first order.
+    ///
+    /// A challenge is a connection *inbound* to :443, so ordering before the
+    /// socket exists guarantees the first attempt fails. Against Pebble that
+    /// costs a retry; against Let's Encrypt it spends one of five failed
+    /// validations per hour on every boot, and a crash-looping enclave would
+    /// lock itself out of issuance.
+    pub listening: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for Acme {
@@ -350,8 +414,8 @@ impl std::fmt::Debug for Acme {
 /// exists: issuance needs a round trip to the CA and an inbound challenge
 /// connection, so blocking here would mean an enclave that cannot start until
 /// the network the parent provides is already working. Until a certificate
-/// arrives, TLS handshakes fail and `/enclave/attestation` answers 503 —
-/// which is honest, where serving an unbound document would not be.
+/// arrives, TLS handshakes fail — which is honest, where serving a document
+/// bound to a certificate nobody was served would not be.
 pub fn start(
     config: &AcmeConfig,
     backend: Arc<dyn Backend>,
@@ -373,40 +437,61 @@ pub fn start(
         Some(url) => acme.directory(url),
         None => acme.directory_lets_encrypt(true),
     };
+    // Only when a root was supplied. Left alone, rustls-acme keeps the public
+    // roots it was compiled with, so the ordinary path gains no new trust and
+    // no new dependency.
+    if let Some(pem) = &config.directory_ca {
+        let mut roots = rustls::RootCertStore::empty();
+        for der in pem_blocks(pem).context("reading the ACME directory's trust root")? {
+            roots
+                .add(rustls::pki_types::CertificateDer::from(der))
+                .context("the ACME directory's trust root is not a usable certificate")?;
+        }
+        anyhow::ensure!(
+            !roots.is_empty(),
+            "the ACME directory trust root contains no certificates"
+        );
+        tracing::warn!(
+            certificates = roots.len(),
+            "trusting a private root for the ACME directory; this is a test configuration"
+        );
+        acme = acme.client_tls_config(Arc::new(
+            rustls::ClientConfig::builder_with_provider(
+                rustls::crypto::aws_lc_rs::default_provider().into(),
+            )
+            .with_safe_default_protocol_versions()
+            .context("selecting TLS protocol versions for the ACME client")?
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        ));
+    }
 
     let state = acme.state();
-    // Built here rather than taken from `state.default_rustls_config()`, which
-    // hardcodes `with_no_client_auth()`. Without this the ACME path would
-    // silently never see a client certificate — the identity plumbing would be
-    // present, correct, and dead. `state.resolver()` is the supported way to
-    // supply the ACME certificate to a configuration you own.
-    let server_config = Arc::new(
-        rustls::ServerConfig::builder_with_provider(
-            rustls::crypto::aws_lc_rs::default_provider().into(),
-        )
-        .with_safe_default_protocol_versions()
-        .context("selecting TLS protocol versions for ACME")?
-        // No client certificates. Authentication is a WebAuthn assertion bound
-        // to one request — see `crate::auth` — and a certificate would be a
-        // second, weaker way to become a tenant that could not bind an
-        // approval to a transaction.
-        .with_no_client_auth()
-        .with_cert_resolver(state.resolver()),
-    );
     // The challenge config keeps no client auth: the CA validating
     // TLS-ALPN-01 presents no certificate, and asking for one would be noise
     // on the one handshake that must not fail.
     let challenge_config = state.challenge_rustls_config();
     let mut state = state;
 
+    let listening = Arc::new(tokio::sync::Notify::new());
+    let wait_for_listener = listening.clone();
+
     tracing::info!(
         domains = ?config.domains,
         directory = %config.directory.as_deref().unwrap_or("Let's Encrypt production"),
-        "starting ACME; the certificate arrives asynchronously"
+        "ACME is configured; ordering starts once the listener is up"
     );
 
     tokio::spawn(async move {
         use futures::StreamExt;
+        // Nothing is ordered until something can answer the challenge. The CA
+        // validates by connecting *in* on :443, so an order placed before the
+        // listener exists is an order that fails — reliably, on every boot.
+        //
+        // `Notify` and not a flag: it keeps a permit if the server binds first,
+        // so this cannot miss the signal by being slow to start.
+        wait_for_listener.notified().await;
+        tracing::info!("the listener is up; ordering a certificate");
         loop {
             match state.next().await {
                 Some(Ok(ok)) => tracing::info!(event = ?ok, "ACME"),
@@ -424,9 +509,9 @@ pub fn start(
     });
 
     Ok(Acme {
-        server_config,
         challenge_config,
         certificate,
+        listening,
     })
 }
 
@@ -533,6 +618,63 @@ mod tests {
         assert_eq!(leaf_from_pem(pem.as_bytes()).unwrap(), leaf_der);
     }
 
+    /// PEM is line-ending agnostic, and this blob is not all ours to format.
+    ///
+    /// rustls-acme concatenates its own LF private key with the ACME
+    /// directory's response body verbatim, so a CA that emits CRLF produces a
+    /// blob the runtime must still read. Splitting on `-----\n` dropped those
+    /// blocks silently: issuance succeeded, the serving slot stayed empty, and
+    /// the enclave answered no HTTPS at all.
+    #[test]
+    fn a_crlf_certificate_is_read_like_any_other() {
+        let key_der = vec![9u8; 8];
+        let leaf_der = vec![4u8; 12];
+        let block = |label: &str, der: &[u8], eol: &str| {
+            use base64::Engine;
+            let body = base64::engine::general_purpose::STANDARD.encode(der);
+            format!("-----BEGIN {label}-----{eol}{body}{eol}-----END {label}-----{eol}")
+        };
+
+        for eol in ["\n", "\r\n"] {
+            let blob = format!(
+                "{}{}",
+                block("PRIVATE KEY", &key_der, eol),
+                block("CERTIFICATE", &leaf_der, eol)
+            );
+            assert_eq!(
+                pem_blocks(blob.as_bytes()).unwrap(),
+                vec![key_der.clone(), leaf_der.clone()],
+                "line ending {eol:?} must not change what is read"
+            );
+            assert_eq!(leaf_from_pem(blob.as_bytes()).unwrap(), leaf_der);
+        }
+    }
+
+    /// The quiet one: a chain that mixes endings must not lose a link.
+    ///
+    /// A dropped intermediate still parses and still serves, so nothing fails
+    /// until a client that needed it rejects the chain.
+    #[test]
+    fn a_chain_mixing_line_endings_keeps_every_link() {
+        use base64::Engine;
+        let der = |b: u8| vec![b; 10];
+        let block = |label: &str, d: &[u8], eol: &str| {
+            let body = base64::engine::general_purpose::STANDARD.encode(d);
+            format!("-----BEGIN {label}-----{eol}{body}{eol}-----END {label}-----{eol}")
+        };
+        let blob = format!(
+            "{}{}{}",
+            block("PRIVATE KEY", &der(1), "\n"),
+            block("CERTIFICATE", &der(2), "\n"),
+            block("CERTIFICATE", &der(3), "\r\n"),
+        );
+        assert_eq!(
+            pem_blocks(blob.as_bytes()).unwrap(),
+            vec![der(1), der(2), der(3)],
+            "the CRLF intermediate was dropped"
+        );
+    }
+
     #[test]
     fn a_blob_without_a_certificate_is_an_error() {
         let pem = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
@@ -541,11 +683,42 @@ mod tests {
 
     #[test]
     fn a_slot_reports_what_was_last_set() {
+        let first = Arc::new(TlsIdentity::self_signed(&["first.test".into()]).expect("first"));
+        let renewed =
+            Arc::new(TlsIdentity::self_signed(&["renewed.test".into()]).expect("renewed"));
+
         let slot = CertificateSlot::empty();
         assert!(slot.get().is_none());
-        slot.set(b"first".to_vec());
-        assert_eq!(slot.get().as_deref(), Some(&b"first"[..]));
-        slot.set(b"renewed".to_vec());
-        assert_eq!(slot.get().as_deref(), Some(&b"renewed"[..]));
+        assert!(slot.leaf().is_none());
+
+        slot.set(first.clone());
+        assert_eq!(slot.leaf(), Some(first.certificate_der.clone()));
+
+        slot.set(renewed.clone());
+        assert_eq!(slot.leaf(), Some(renewed.certificate_der.clone()));
+    }
+
+    /// The property the whole slot exists for: an identity taken out of it is a
+    /// configuration *and* the leaf that configuration presents, so a
+    /// connection served from one can be attested with the other. Reading them
+    /// separately is what let a renewal attest a certificate the connection was
+    /// never served.
+    #[test]
+    fn an_identity_pairs_a_config_with_the_leaf_it_presents() {
+        let identity = Arc::new(TlsIdentity::self_signed(&["paired.test".into()]).expect("built"));
+        let slot = CertificateSlot::fixed(identity.clone());
+
+        let loaded = slot.get().expect("an identity");
+        assert_eq!(loaded.certificate_der, identity.certificate_der);
+        assert!(Arc::ptr_eq(&loaded.config, &identity.config));
+
+        // A renewal replaces the pair; a connection holding the old one is
+        // unaffected, which is the case that matters.
+        let renewed = Arc::new(TlsIdentity::self_signed(&["renewed.test".into()]).expect("built"));
+        slot.set(renewed);
+        assert_eq!(
+            loaded.certificate_der, identity.certificate_der,
+            "a loaded identity must not change under a renewal"
+        );
     }
 }
