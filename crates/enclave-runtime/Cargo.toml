@@ -185,6 +185,16 @@ hyper-util = { version = "0.1", default-features = false, features = ["client", 
 # and feed it one gRPC frame at a time — which is the only way to observe the
 # guest answering before the client has finished asking.
 tokio-stream = "0.1"
+# A real gRPC client, so the guest's framing is checked against an
+# implementation that did not come from this repository. Hand-rolled framing on
+# both ends would only prove the two halves agree with each other.
+#
+# Dev-only, and it has to be: `tonic` does not build for wasm32-wasip2, which
+# is why the *guest* frames gRPC by hand in the first place.
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tower = { version = "0.5", features = ["util"] }
 # The integration suites drive the gate with a software passkey, which only
 # exists under `testing`. A dev-dependency on the crate itself is how a crate
 # turns a feature on for its own tests without turning it on for consumers.

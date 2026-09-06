@@ -71,6 +71,13 @@ jobs:
       - name: bidirectional gRPC streaming
         run: cargo test -p enclave-runtime --test serve_grpc -- --include-ignored
 
+      # The same guest driven by tonic over TLS, so the guest's hand-written
+      # framing is checked against an implementation from outside this repo —
+      # and the attestation is verified from the initial metadata before the
+      # client sends anything.
+      - name: gRPC on the wire, with a real client
+        run: cargo test -p enclave-runtime --test serve_grpc_wire -- --include-ignored
+
       - name: build the verifier CLI
         run: cargo build -p nitro-attestation --features cli
 

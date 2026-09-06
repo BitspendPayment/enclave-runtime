@@ -142,5 +142,8 @@ guest runs.
   guest needing to emit unsolicited frames while blocked on a read would need
   more.
 - **Per-message authorization is designed, not built.** See above.
+- **`grpc-timeout` is forwarded, never enforced.** The runtime's deadlines are
+  its own so a client cannot lengthen them by asking; interpreting a client's
+  deadline is the guest's, because only the guest knows what its work is worth.
 - **HTTP/1.1 trailers need a `Trailer:` header** or hyper drops them silently.
   The guest sets one. HTTP/2 needs no such thing.
