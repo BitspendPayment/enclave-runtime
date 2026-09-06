@@ -163,6 +163,32 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
         // here rather than in a test fixture: it is the one behaviour a host
         // cannot provoke from the outside, and without it the runtime's
         // watchdog has nothing to be tested against.
+        // Ten chunks over ~2s: long enough that any sane head timeout has
+        // passed several times over while the stream is still healthy. The
+        // watchdog must judge this by the bytes it is moving, not by how long
+        // it has been running — `/hang` is the case that must still die.
+        ("GET", "/slow-stream") => {
+            let stream = futures_lite::stream::unfold(0u32, |n| async move {
+                if n >= 10 {
+                    return None;
+                }
+                wstd::task::sleep(std::time::Duration::from_millis(200).into()).await;
+                Some((format!("tick-{n}\n"), n + 1))
+            });
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(Body::from_stream(stream))
+                .expect("response is well formed"))
+        }
+        // Parked in a *host* call, not spinning. The epoch cannot see this —
+        // there is no wasm executing to interrupt — so it is the case
+        // `await_head`'s abort exists for, and the only way to reach that path
+        // from a test. `/hang` is its opposite: wasm the epoch must stop.
+        ("GET", "/park") => {
+            wstd::task::sleep(std::time::Duration::from_secs(30).into()).await;
+            Ok(text(StatusCode::OK, "woke\n".to_string()))
+        }
         ("GET", "/hang") =>
         {
             #[allow(clippy::empty_loop)]

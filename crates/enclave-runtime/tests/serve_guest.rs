@@ -486,6 +486,121 @@ async fn a_client_keeps_their_own_directory_and_instance() {
     }
 }
 
+/// A stream that is still moving bytes outlives the head timeout.
+///
+/// The epoch deadline is a fixed budget of wall clock, and until the watchdog
+/// learned to ask *why* a call was still running, that budget was the ceiling
+/// on a stream's life: `/slow-stream` sends for ~2s and would be trapped part
+/// way through by any timeout shorter than itself. Nothing about it is
+/// unhealthy — the head went out at once and every chunk since has been read.
+///
+/// The timeout here is deliberately far shorter than the stream, so passing
+/// this cannot be an accident of timing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn a_streaming_guest_outlives_the_request_timeout() {
+    let handle = handle_for_with(&[])
+        .await
+        .with_timeout(std::time::Duration::from_millis(400));
+
+    let started = std::time::Instant::now();
+    let (status, body) = get(&handle, "/slow-stream").await;
+    let took = started.elapsed();
+
+    assert_eq!(status, 200, "body: {body}");
+    assert_eq!(
+        body,
+        (0..10).map(|n| format!("tick-{n}\n")).collect::<String>(),
+        "the stream was cut short"
+    );
+    assert!(
+        took > std::time::Duration::from_millis(400),
+        "the stream finished inside the timeout, so it proves nothing: {took:?}"
+    );
+}
+
+/// And the other half, which is what makes the first half safe.
+///
+/// `/hang` spins in wasm without touching its body. It has no progress to show
+/// and must still die on the old schedule — otherwise "a stream may run long"
+/// would have become "anything may run forever", which is the trade the module
+/// doc on `watchdog` refuses to make.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn a_spinning_guest_is_still_interrupted() {
+    let handle = handle_for_with(&[])
+        .await
+        .with_timeout(std::time::Duration::from_secs(1));
+
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri("http://enclave.test/hang")
+        .body(body(&[]))
+        .expect("well-formed request");
+
+    let started = std::time::Instant::now();
+    let result = handle.handle(Scheme::Http, req, None).await;
+    let took = started.elapsed();
+
+    assert!(
+        result.is_err(),
+        "a spinning guest was allowed to keep running"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "the spinning guest was not stopped promptly: {took:?}"
+    );
+}
+
+/// An abandoned call must not leave its instance in the tenant's slot.
+///
+/// `/park` sleeps inside a host call, so there is no wasm executing for the
+/// epoch to interrupt and `await_head` reaches its `abort`. Abort drops the
+/// guest task *at its await*, which means nothing written after that await
+/// runs — so the slot can only be left clean by code that already owns the
+/// instance by then, not by a tidy-up that never executes.
+///
+/// `/memory` is the probe: it counts in the guest's linear memory, so a reused
+/// instance keeps counting and a rebuilt one starts over. Reading 2 here means
+/// the next caller for this client got a store whose previous `call_handle`
+/// was cancelled part-way through.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn an_abandoned_call_does_not_leave_its_instance_behind() {
+    let handle = tenanted()
+        .await
+        .with_timeout(std::time::Duration::from_millis(300));
+    let client = identity("a-parked-client");
+
+    let (_, first) = get_as(&handle, "/memory", Some(&client)).await;
+    assert_eq!(
+        first.trim(),
+        "1",
+        "the first request should start the count"
+    );
+
+    // Abandoned, not trapped: the guest is parked where the epoch cannot see
+    // it, which is the whole point of this route.
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri("http://enclave.test/park")
+        .body(body(&[]))
+        .expect("well-formed request");
+    let abandoned = handle.handle(Scheme::Http, req, Some(&client)).await;
+    assert!(
+        abandoned.is_err(),
+        "a guest parked past the timeout should have been abandoned"
+    );
+
+    let (status, after) = get_as(&handle, "/memory", Some(&client)).await;
+    assert_eq!(status, 200, "body: {after}");
+    assert_eq!(
+        after.trim(),
+        "1",
+        "the abandoned call's instance was handed to the next request"
+    );
+}
+
 /// **The isolation property.** Two clients write the same path and neither
 /// sees the other's value — because `/` means a different directory to each of
 /// them, and the resolver will not let either name the other's.

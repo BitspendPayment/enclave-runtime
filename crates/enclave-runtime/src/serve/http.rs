@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use hyper::server::conn::http1;
 use tokio::net::TcpListener;
 use wasmtime::component::{Component, InstancePre};
-use wasmtime::{Engine, Store};
+use wasmtime::{Engine, Store, UpdateDeadline};
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
@@ -35,6 +35,7 @@ use crate::serve::attest::{nonce_from_headers, ResponseAttestor};
 use crate::serve::client::apply_tenant;
 use crate::serve::endpoints::EnclaveEndpoints;
 use crate::serve::pool::{LiveTenant, PoolLimits, TenantPool};
+use crate::serve::progress::{Counting, StreamProgress};
 use crate::state::State;
 use crate::tenant::tenant_root_by_id;
 use nitro_nsm::Nsm;
@@ -116,6 +117,16 @@ impl Default for ServeConfig {
 /// request timeout.
 const EPOCH_TICK: Duration = Duration::from_millis(250);
 
+/// Consecutive silent epoch expiries before a call is judged a runaway.
+///
+/// This — not `request_timeout` — is what bounds how long a guest can burn a
+/// worker after its budget is spent, and it is deliberately independent of the
+/// budget: a deployment that allows generous head timeouts should not thereby
+/// allow generous spinning. Eight ticks is two seconds, long enough that a
+/// loaded machine delivering frames late is never mistaken for one delivering
+/// nothing, short enough that a genuine runaway is gone before it matters.
+const SILENT_TICKS_BEFORE_TRAP: u32 = 8;
+
 /// Default ceiling on producing a response head.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -127,6 +138,10 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct GuestInstance {
     store: Store<State>,
     proxy: wasmtime_wasi_http::p2::bindings::Proxy,
+    /// Shared with this store's epoch callback, which was installed once and
+    /// outlives every request the instance serves. Reset per call rather than
+    /// replaced, so the callback never holds a stale one.
+    progress: Arc<StreamProgress>,
 }
 
 /// A compiled guest plus the environment its instances are built from.
@@ -305,7 +320,7 @@ impl ServeHandle {
         tenant: Option<&[u8; 16]>,
     ) -> Result<hyper::Response<HyperOutgoingBody>>
     where
-        B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
+        B: hyper::body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
         B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
     {
         // Before anything else touches the request, and before it is handed to
@@ -351,7 +366,7 @@ impl ServeHandle {
         req: hyper::Request<B>,
     ) -> Result<hyper::Response<HyperOutgoingBody>>
     where
-        B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
+        B: hyper::body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
         B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
     {
         // Checked out before the lock is taken, so the eviction sweep can see
@@ -393,9 +408,15 @@ impl ServeHandle {
 
         let instance = tenant.instance.as_mut().expect("just built");
         // Reset every request: the epoch deadline is absolute, so a reused
-        // store would otherwise inherit whatever the last request left.
+        // store would otherwise inherit whatever the last request left. The
+        // same is true of the progress this call will be judged on.
         instance.store.set_epoch_deadline(self.watchdog());
+        instance.progress.reset();
+        let progress = instance.progress.clone();
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        // Wrapped before it becomes a guest resource, which is the last point
+        // the runtime holds it.
+        let req = req.map(|body| Counting::new(body, progress.clone()));
         let req = instance
             .store
             .data_mut()
@@ -417,27 +438,36 @@ impl ServeHandle {
             let mut guard = guard;
             let _checkout = checkout;
             let tenant = guard.as_mut().expect("held across the call");
-            let instance = tenant.instance.as_mut().expect("built before the call");
+            // Taken out of the slot for the duration, and put back only on a
+            // clean finish. Held *by reference* instead — as this once did —
+            // and an aborted call leaves the instance where it sits: `abort`
+            // drops this future at the await below, so nothing after it runs,
+            // and the next request for this tenant re-enters a store whose
+            // `call_handle` was cancelled part-way through. Ownership is what
+            // makes "an interrupted instance is never reused" true for the
+            // abort path and not only for the trap path, because a dropped
+            // future drops what it owns.
+            let mut instance = tenant.instance.take().expect("built before the call");
             let result = instance
                 .proxy
                 .wasi_http_incoming_handler()
                 .call_handle(&mut instance.store, req, out)
                 .await;
 
+            // One client's instance, and nothing else. The filesystem is
+            // shared and untouched; the next caller for this client gets a
+            // fresh instance over the same directory.
             if result.is_err() {
-                // One client's instance, and nothing else. The filesystem is
-                // shared and untouched; the next caller for this client gets a
-                // fresh instance over the same directory.
                 tracing::warn!("guest trapped; this client's instance will be rebuilt");
-                tenant.instance = None;
             } else if !instance.store.data().resources_settled() {
                 tracing::debug!("guest left resources behind; rebuilding its instance");
-                tenant.instance = None;
+            } else {
+                tenant.instance = Some(instance);
             }
             result
         });
 
-        await_head(self.timeout, task, receiver).await
+        await_head(self.timeout, task, receiver, progress).await
     }
 
     /// Build an instance whose guest sees `scope` as `/`.
@@ -446,14 +476,55 @@ impl ServeHandle {
     /// and the per-tenant path cannot drift in what a guest is handed.
     async fn instantiate(&self, scope: Arc<s3fs_core::Inode>) -> Result<GuestInstance> {
         let mut store = Store::new(self.pre.engine(), self.guest.new_state_scoped(scope)?);
+        let progress = Arc::new(StreamProgress::new());
         store.set_epoch_deadline(self.watchdog());
+        self.arm_watchdog(&mut store, progress.clone());
         let proxy = self
             .pre
             .instantiate_async(&mut store)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
             .context("instantiating the guest")?;
-        Ok(GuestInstance { store, proxy })
+        Ok(GuestInstance {
+            store,
+            proxy,
+            progress,
+        })
+    }
+
+    /// Let a call that is moving bytes outlive the budget; keep one that is not
+    /// on exactly the schedule it had before.
+    ///
+    /// The deadline set beside this is what a request/response call gets, and
+    /// for anything that finishes inside the timeout nothing here ever runs.
+    /// When it does expire, the question stops being "how long has this taken"
+    /// and becomes "is this still a conversation" — because a signing session
+    /// legitimately open for minutes and a guest spinning in a loop are
+    /// indistinguishable by elapsed time and obvious by traffic.
+    ///
+    /// `Yield` rather than `Continue`: extending alone leaves a guest that
+    /// makes progress *and* spins between frames with no await point for
+    /// `await_head`'s abort to land on. Yielding creates one every tick, which
+    /// costs a reschedule per [`EPOCH_TICK`] and keeps the abort path real.
+    ///
+    /// Note what this deliberately cannot see: a guest parked in a *host* call
+    /// executes no wasm, so no epoch check is reached and nothing here fires.
+    /// That gap is the idle supervisor's, not this one's.
+    fn arm_watchdog(&self, store: &mut Store<State>, progress: Arc<StreamProgress>) {
+        let silent = EPOCH_TICK * SILENT_TICKS_BEFORE_TRAP;
+        store.epoch_deadline_callback(move |_| {
+            // A single tick at a time once the budget is spent, so the
+            // question gets asked again promptly rather than handing out
+            // another full budget on one frame of evidence.
+            if progress.still_working(SILENT_TICKS_BEFORE_TRAP) {
+                Ok(UpdateDeadline::Yield(1))
+            } else {
+                Err(wasmtime::Error::msg(format!(
+                    "the guest ran {silent:?} past its budget without moving a byte \
+                     in either direction"
+                )))
+            }
+        });
     }
 
     /// The only dispatch path. A fresh store, a fresh instance, both dropped
@@ -464,7 +535,7 @@ impl ServeHandle {
         req: hyper::Request<B>,
     ) -> Result<hyper::Response<HyperOutgoingBody>>
     where
-        B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
+        B: hyper::body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
         B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
     {
         // Anonymous callers are one identity, so they queue behind each other.
@@ -473,8 +544,11 @@ impl ServeHandle {
         let anonymous = self.anonymous.clone().lock_owned().await;
 
         let mut store = Store::new(self.pre.engine(), self.guest.new_state()?);
+        let progress = Arc::new(StreamProgress::new());
         store.set_epoch_deadline(self.watchdog());
+        self.arm_watchdog(&mut store, progress.clone());
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        let req = req.map(|body| Counting::new(body, progress.clone()));
         let req = store.data_mut().http().new_incoming_request(scheme, req)?;
         let out = store.data_mut().http().new_response_outparam(sender)?;
         let pre = self.pre.clone();
@@ -491,7 +565,7 @@ impl ServeHandle {
                 .await
         });
 
-        await_head(self.timeout, task, receiver).await
+        await_head(self.timeout, task, receiver, progress).await
     }
 
     /// Prove the guest instantiates, before a single request depends on it.
@@ -543,6 +617,7 @@ async fn await_head(
             wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
         >,
     >,
+    progress: Arc<StreamProgress>,
 ) -> Result<hyper::Response<HyperOutgoingBody>> {
     let waited = match tokio::time::timeout(timeout, receiver).await {
         Ok(waited) => waited,
@@ -560,7 +635,18 @@ async fn await_head(
     };
 
     match waited {
-        Ok(Ok(resp)) => Ok(resp),
+        // Wrapped on the way out, which is the first point the runtime holds
+        // it again: from here the count follows what hyper actually drains,
+        // so a guest writing into a buffer nobody reads earns no extension.
+        Ok(Ok(resp)) => {
+            // From here `await_head` is out of the picture, so the watchdog may
+            // stop racing it and start judging silence on its merits.
+            progress.head_sent();
+            Ok(resp.map(|body| {
+                use http_body_util::BodyExt;
+                Counting::new(body, progress).boxed_unsync()
+            }))
+        }
         Ok(Err(e)) => Err(e.into()),
         // The sender dropped with the `Store`, so the guest returned or
         // trapped without setting a response. Whatever the task says is
@@ -1195,9 +1281,14 @@ mod concurrency_tests {
         let task = guest_task(held, set_head, finished);
 
         // The head is out, and the guest is still writing its body.
-        await_head(Duration::from_secs(5), task, receiver)
-            .await
-            .expect("head");
+        await_head(
+            Duration::from_secs(5),
+            task,
+            receiver,
+            Arc::new(StreamProgress::new()),
+        )
+        .await
+        .expect("head");
 
         let second = tenant.clone().lock_owned();
         assert!(
@@ -1226,9 +1317,14 @@ mod concurrency_tests {
         let (alice_head, alice_receiver) = oneshot::channel();
         let (alice_finish, alice_finished) = oneshot::channel();
         let alice_task = guest_task(alice.clone().lock_owned().await, alice_head, alice_finished);
-        await_head(Duration::from_secs(5), alice_task, alice_receiver)
-            .await
-            .expect("alice's head");
+        await_head(
+            Duration::from_secs(5),
+            alice_task,
+            alice_receiver,
+            Arc::new(StreamProgress::new()),
+        )
+        .await
+        .expect("alice's head");
 
         // Alice is mid-body. Bob must not be waiting on her.
         let (bob_head, bob_receiver) = oneshot::channel();
@@ -1239,7 +1335,12 @@ mod concurrency_tests {
         let bob_task = guest_task(bob_lock, bob_head, bob_finished);
         let bob_response = tokio::time::timeout(
             Duration::from_secs(5),
-            await_head(Duration::from_secs(5), bob_task, bob_receiver),
+            await_head(
+                Duration::from_secs(5),
+                bob_task,
+                bob_receiver,
+                Arc::new(StreamProgress::new()),
+            ),
         )
         .await
         .expect("bob's head did not arrive while alice was running")
@@ -1259,9 +1360,14 @@ mod concurrency_tests {
         let (set_head, receiver) = oneshot::channel();
         let (finish, finished) = oneshot::channel();
         let task = guest_task(held, set_head, finished);
-        await_head(Duration::from_secs(5), task, receiver)
-            .await
-            .expect("head");
+        await_head(
+            Duration::from_secs(5),
+            task,
+            receiver,
+            Arc::new(StreamProgress::new()),
+        )
+        .await
+        .expect("head");
 
         assert!(
             tokio::time::timeout(Duration::from_millis(100), anonymous.clone().lock_owned())
@@ -1287,9 +1393,14 @@ mod concurrency_tests {
             Ok(())
         });
 
-        let error = await_head(Duration::from_millis(50), task, receiver)
-            .await
-            .expect_err("a guest that never answers should be abandoned");
+        let error = await_head(
+            Duration::from_millis(50),
+            task,
+            receiver,
+            Arc::new(StreamProgress::new()),
+        )
+        .await
+        .expect_err("a guest that never answers should be abandoned");
         assert!(format!("{error:#}").contains("abandoned"), "{error:#}");
 
         assert!(
@@ -1313,9 +1424,14 @@ mod concurrency_tests {
             Err(wasmtime::Error::msg("guest trapped"))
         });
 
-        let error = await_head(Duration::from_secs(5), task, receiver)
-            .await
-            .expect_err("a trap without a response is an error");
+        let error = await_head(
+            Duration::from_secs(5),
+            task,
+            receiver,
+            Arc::new(StreamProgress::new()),
+        )
+        .await
+        .expect_err("a trap without a response is an error");
         assert!(format!("{error:#}").contains("guest trapped"), "{error:#}");
         assert!(
             tokio::time::timeout(Duration::from_secs(5), tenant.clone().lock_owned())

@@ -22,6 +22,7 @@ pub mod client;
 pub mod endpoints;
 mod http;
 pub mod pool;
+pub mod progress;
 pub mod tls;
 
 pub use acme::{AcmeConfig, CertificateSlot, SealedAcmeCache};
