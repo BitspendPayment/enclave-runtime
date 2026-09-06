@@ -258,3 +258,58 @@ async fn a_request_completes_over_h2() {
         "the guest answered something else over h2"
     );
 }
+
+/// A stream on an unauthenticated runtime is refused, not served.
+///
+/// Anonymous callers share one lock, so an anonymous stream would hold it for
+/// its whole life and starve every other anonymous caller — one client
+/// silencing the runtime by connecting to it. A deployment with no gate is a
+/// development arrangement and should not learn to depend on a shape that only
+/// works once identities exist.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn a_stream_is_refused_when_there_is_no_tenant_to_own_it() {
+    let addr = start().await;
+    let (stream, _) = connect(addr, &[b"h2"]).await;
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(stream),
+    )
+    .await
+    .expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = hyper::Request::builder()
+        .method("POST")
+        .uri("https://enclave.test/enclave.cosign.v1.SigningSession/Sign")
+        .header("x-enclave-nonce", nonce_header())
+        .header("x-enclave-stream", "open")
+        .body(Full::new(bytes::Bytes::new()))
+        .expect("well-formed request");
+
+    let resp = sender.send_request(req).await.expect("h2 request");
+    assert_eq!(
+        resp.status(),
+        403,
+        "an anonymous stream was allowed to take the shared lock"
+    );
+
+    // And an ordinary request on the same runtime is unaffected.
+    let ordinary = hyper::Request::builder()
+        .method("GET")
+        .uri("https://enclave.test/counter")
+        .header("x-enclave-nonce", nonce_header())
+        .body(Full::new(bytes::Bytes::new()))
+        .expect("well-formed request");
+    assert_eq!(
+        sender
+            .send_request(ordinary)
+            .await
+            .expect("h2 request")
+            .status(),
+        200,
+        "refusing streams broke ordinary requests"
+    );
+}

@@ -60,9 +60,35 @@ pub struct RequestBinding {
     /// `None` and `Some("")` are different: a challenge issued for `?a=1` must
     /// not be usable for a request with no query at all.
     pub query: Option<String>,
-    /// SHA-256 of the exact body bytes, recomputed by the runtime from what it
-    /// will forward — never taken from the client.
-    pub body_sha256: [u8; 32],
+    pub body: BodyBinding,
+}
+
+/// What an approval says about the body.
+///
+/// The distinction is the whole of what separates authorizing an operation
+/// from authorizing a channel, and it is an enum rather than an
+/// `Option<[u8; 32]>` so that neither can be mistaken for the other by
+/// anything that merely forgot to look.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyBinding {
+    /// SHA-256 of the exact bytes, recomputed by the runtime from what it will
+    /// forward — never taken from the client. **The only binding that
+    /// authorizes an operation**, because it is the only one that says which
+    /// operation.
+    Exact([u8; 32]),
+    /// Nothing at all about the body.
+    ///
+    /// Issued only for opening a bidirectional stream, where there is no body
+    /// yet to commit to: the messages are the body, and they do not exist when
+    /// the channel opens. It authorizes **opening one channel on this
+    /// method, path and query, and nothing else** — the same shape as an
+    /// enrollment token, which authorizes creating a tenant and nothing else.
+    ///
+    /// It approves no message that travels on the channel. Anything asking the
+    /// enclave to sign carries its own fresh, single-use assertion, inside the
+    /// stream. Treating an open channel as standing permission to sign is the
+    /// failure this split exists to prevent.
+    Unbound,
 }
 
 impl RequestBinding {
@@ -71,8 +97,27 @@ impl RequestBinding {
             method: method.to_ascii_uppercase(),
             path: path.to_string(),
             query: query.map(str::to_string),
-            body_sha256: nitro_attestation::sha256(body),
+            body: BodyBinding::Exact(nitro_attestation::sha256(body)),
         }
+    }
+
+    /// The only way to make an approval that commits to no body.
+    ///
+    /// Separate from [`RequestBinding::new`] deliberately: an unbound approval
+    /// is weaker than every other kind, so it should be impossible to produce
+    /// one by passing a different argument to the usual constructor.
+    pub fn stream_open(method: &str, path: &str, query: Option<&str>) -> Self {
+        RequestBinding {
+            method: method.to_ascii_uppercase(),
+            path: path.to_string(),
+            query: query.map(str::to_string),
+            body: BodyBinding::Unbound,
+        }
+    }
+
+    /// Whether this approval commits to a body, and so to an operation.
+    pub fn is_stream_open(&self) -> bool {
+        matches!(self.body, BodyBinding::Unbound)
     }
 }
 
@@ -186,7 +231,7 @@ mod tests {
     fn a_binding_normalises_the_method_and_hashes_the_body() {
         let b = RequestBinding::new("post", "/sign", None, b"x");
         assert_eq!(b.method, "POST", "method case must not decide a match");
-        assert_eq!(b.body_sha256, nitro_attestation::sha256(b"x"));
+        assert_eq!(b.body, BodyBinding::Exact(nitro_attestation::sha256(b"x")));
     }
 
     /// A query that is absent is not a query that is empty. Otherwise a
@@ -304,5 +349,40 @@ mod tests {
                 rp.begin_authentication().1,
             )
             .unwrap();
+    }
+
+    /// The refusal that costs nothing to maintain.
+    ///
+    /// A stream-open binding and an ordinary one are different values, so
+    /// neither can satisfy the other's comparison. No `if` enforces this and
+    /// none can be forgotten — which matters more than the check itself,
+    /// because the check is in `Gate::verify` and this is what makes it
+    /// impossible to weaken by accident there.
+    #[test]
+    fn a_stream_open_binding_never_equals_a_bound_one() {
+        let bound = RequestBinding::new("POST", "/sign", None, b"");
+        let open = RequestBinding::stream_open("POST", "/sign", None);
+        assert_ne!(bound, open);
+        assert!(open.is_stream_open());
+        assert!(!bound.is_stream_open());
+        // Including against the hash of the empty body, which is the one an
+        // unbound binding might plausibly be mistaken for.
+        assert_ne!(
+            open.body,
+            BodyBinding::Exact(nitro_attestation::sha256(b""))
+        );
+    }
+
+    /// It still pins the route, so an approval to open one channel is not an
+    /// approval to open a different one.
+    #[test]
+    fn a_stream_open_binding_still_pins_the_route() {
+        let sign = RequestBinding::stream_open("POST", "/Sign", None);
+        assert_ne!(sign, RequestBinding::stream_open("POST", "/Withdraw", None));
+        assert_ne!(sign, RequestBinding::stream_open("GET", "/Sign", None));
+        assert_ne!(
+            sign,
+            RequestBinding::stream_open("POST", "/Sign", Some("a=1"))
+        );
     }
 }

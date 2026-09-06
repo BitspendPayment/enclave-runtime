@@ -343,6 +343,42 @@ impl Harness {
         Self::request_with(method, path_and_query, body, &id, &assertion)
     }
 
+    /// A request carrying a *stream-open* assertion, with the header that says
+    /// so.
+    ///
+    /// `body` is whatever the client happens to send after the head; a stream
+    /// open commits to none of it, so passing something here is the point
+    /// rather than an oversight.
+    pub fn stream_request(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+    ) -> hyper::Request<http_body_util::Full<bytes::Bytes>> {
+        let (path, query) = match path_and_query.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (path_and_query, None),
+        };
+        let id = [9u8; 16];
+        let options = self
+            .gate
+            .issue(
+                id,
+                super::RequestBinding::stream_open(method, path, query),
+                std::slice::from_ref(&self.passkey),
+            )
+            .expect("issuing a stream-open challenge");
+        let assertion = self
+            .authenticator
+            .assert(&Relying::challenge_for(&options), ORIGIN);
+        let mut req = Self::request_with(method, path_and_query, body, &id, &assertion);
+        req.headers_mut().insert(
+            super::STREAM_HEADER,
+            hyper::header::HeaderValue::from_static("open"),
+        );
+        req
+    }
+
     /// A request carrying an assertion that was issued for something else.
     pub fn assertion_for(
         &self,

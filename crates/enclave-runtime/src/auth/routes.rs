@@ -85,6 +85,21 @@ struct RequestOptionsRequest {
     body_sha256: String,
 }
 
+/// What a stream-open challenge is issued for.
+///
+/// No `body_sha256`, and `deny_unknown_fields` so that sending one is a 400
+/// rather than a quiet no-op: a route that accepted a hash and ignored it
+/// would read as though the body were bound when it is not.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamOptionsRequest {
+    credential_id: String,
+    method: String,
+    path: String,
+    #[serde(default)]
+    query: Option<String>,
+}
+
 #[derive(Serialize)]
 struct RequestOptionsResponse {
     challenge_id: String,
@@ -177,6 +192,7 @@ impl AuthEndpoints {
             "register/options" => self.register_options(body).await,
             "register/verify" => self.register_verify(body).await,
             "request/options" => self.request_options(body).await,
+            "stream/options" => self.stream_options(body).await,
             other => problem(
                 hyper::StatusCode::NOT_FOUND,
                 &format!("no auth endpoint {other:?}"),
@@ -329,6 +345,95 @@ impl AuthEndpoints {
         )
     }
 
+    /// A challenge for opening a bidirectional stream.
+    ///
+    /// Everything here is `request_options` — the same rate limit on the same
+    /// key, because this also makes a phone buzz; the same indistinguishable
+    /// refusals; the same response shape — with one difference, which is the
+    /// entire point of the route existing separately.
+    ///
+    /// **The approval it issues commits to no body.** A stream's body is the
+    /// message sequence, and none of it exists when the channel opens, so
+    /// there is nothing to hash and nothing an approval could name. What the
+    /// person is approving is therefore *opening a channel to their guest*,
+    /// not any operation performed over it.
+    ///
+    /// The consequence has to be stated where it can be read rather than
+    /// inferred: this does not authorize signing. Every message that asks the
+    /// enclave to sign carries its own fresh, single-use assertion inside the
+    /// stream, and a design that let an open channel stand in for one would be
+    /// exactly the substitution the body hash exists to prevent — an approval
+    /// given once, spent on operations the person never saw. Enrollment tokens
+    /// have the same shape: they create a tenant and do nothing else.
+    ///
+    /// A separate route rather than a flag on `request/options` so that this
+    /// weaker approval cannot be produced by omitting a field.
+    async fn stream_options(
+        &self,
+        body: &[u8],
+    ) -> hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
+        let Ok(request) = serde_json::from_slice::<StreamOptionsRequest>(body) else {
+            return problem(hyper::StatusCode::BAD_REQUEST, "malformed request");
+        };
+        let Some(credential_id) = decode(&request.credential_id) else {
+            return problem(hyper::StatusCode::BAD_REQUEST, "malformed credential id");
+        };
+
+        if !self.challenges.allow(&credential_id) {
+            tracing::warn!(
+                credential = %hex::encode(&credential_id[..8.min(credential_id.len())]),
+                "rate-limited challenge requests"
+            );
+            return problem(
+                hyper::StatusCode::TOO_MANY_REQUESTS,
+                "too many challenge requests",
+            );
+        }
+
+        let record = match self.credentials_lookup(&credential_id).await {
+            Ok(Some(record)) if record.active => record,
+            Ok(_) => {
+                return problem(
+                    hyper::StatusCode::FORBIDDEN,
+                    "no challenge for that credential",
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "looking up a credential");
+                return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+            }
+        };
+
+        let Ok(id) = self.random_id() else {
+            return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+        };
+        let binding =
+            RequestBinding::stream_open(&request.method, &request.path, request.query.as_deref());
+        // Logged as its own event, so a stream-open approval is visible in the
+        // enclave's record as the distinct, weaker thing it is.
+        tracing::info!(
+            method = %binding.method,
+            path = %binding.path,
+            "issuing a stream-open challenge, which authorizes opening a channel only"
+        );
+        match self
+            .gate
+            .issue(id, binding, std::slice::from_ref(&record.passkey))
+        {
+            Ok(options) => json(
+                hyper::StatusCode::OK,
+                &RequestOptionsResponse {
+                    challenge_id: b64(&id),
+                    options,
+                },
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "issuing a stream-open challenge");
+                problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable")
+            }
+        }
+    }
+
     async fn request_options(
         &self,
         body: &[u8],
@@ -383,7 +488,7 @@ impl AuthEndpoints {
             method: request.method.to_ascii_uppercase(),
             path: request.path.clone(),
             query: request.query.clone(),
-            body_sha256: body_hash,
+            body: crate::auth::challenge::BodyBinding::Exact(body_hash),
         };
         match self
             .gate

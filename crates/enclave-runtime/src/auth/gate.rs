@@ -52,7 +52,21 @@ pub const ASSERTION_HEADER: &str = "x-webauthn-assertion";
 
 /// Every header the gate consumes. Stripped before the guest sees a request,
 /// so a guest can neither read a client's assertion nor forge one.
-pub const AUTH_HEADERS: [&str; 2] = [CHALLENGE_HEADER, ASSERTION_HEADER];
+/// Asks for a bidirectional stream rather than an ordinary request.
+///
+/// Runtime vocabulary, alongside `x-enclave-nonce` and `x-enclave-tenant`, and
+/// deliberately not `content-type: application/grpc` or a path prefix. The
+/// content type is application data the guest also reads, and two parties
+/// interpreting one field is where they come to disagree; a path prefix would
+/// bake a service name into a runtime that knows nothing about the guest's
+/// routes. This header is impossible to send by accident and trivial to set as
+/// gRPC call metadata.
+///
+/// It is not believed on its own. It must agree with the binding the challenge
+/// was issued under — see [`Gate::verify`].
+pub const STREAM_HEADER: &str = "x-enclave-stream";
+
+pub const AUTH_HEADERS: [&str; 3] = [CHALLENGE_HEADER, ASSERTION_HEADER, STREAM_HEADER];
 
 /// Ceiling on the assertion header. An assertion is a few hundred bytes; this
 /// is loose enough not to matter and tight enough that the header cannot be
@@ -72,7 +86,10 @@ pub struct Verified {
     /// The buffered body, to be forwarded. Returned rather than re-read
     /// because it has already been consumed to compute the hash, and reading
     /// it twice is not possible.
-    pub body: Bytes,
+    ///
+    /// `None` for a stream open, where there is no hash and so nothing was
+    /// read: the caller forwards the live body instead.
+    pub body: Option<Bytes>,
 }
 
 /// Why a request did not get past the gate.
@@ -245,27 +262,59 @@ impl Gate {
                 Denied::Malformed(format!("assertion is not a PublicKeyCredential: {e}"))
             })?;
 
-        // The body, before anything is decided about it, because the binding
-        // commits to its hash and the hash must be of what gets forwarded.
-        let body = self.buffer_body(req).await?;
-
-        // Consumed here, and consumed whatever happens next: an assertion that
-        // was offered and refused has still been seen by whoever sent it, and
-        // a second attempt at the same challenge buys them only attempts.
+        // Consumed before the body is touched, because the binding is what
+        // decides whether there is a body to read at all. Consumed whatever
+        // happens next, for the reason it always was: an assertion that was
+        // offered and refused has still been seen by whoever sent it, and a
+        // second attempt at the same challenge buys them only attempts.
+        //
+        // One consequence of consuming first: an oversized body now burns its
+        // challenge before it is refused, where before the refusal came first.
+        // That is the safer direction — the alternative lets a caller probe the
+        // size limit without ever spending an approval.
         let (issued_for, state) = self
             .challenges
             .consume(&challenge_id)
             .map_err(Denied::Challenge)?;
 
-        let arrived_as = RequestBinding::new(
-            req.method().as_str(),
-            req.uri().path(),
-            req.uri().query(),
-            &body,
-        );
-        if arrived_as != issued_for {
-            return Err(Denied::NotTheRequest);
-        }
+        // Two keys, and both must turn. The client's header alone cannot talk
+        // the runtime out of hashing a body, and an unbound approval alone
+        // cannot be spent on a request that arrived as an ordinary one.
+        let asked_for_stream = req.headers().contains_key(STREAM_HEADER);
+        let body = match (issued_for.is_stream_open(), asked_for_stream) {
+            // The ordinary path, unchanged: buffer, then compare the hash of
+            // the bytes that will actually be forwarded.
+            (false, false) => {
+                let bytes = self.buffer_body(req).await?;
+                let arrived_as = RequestBinding::new(
+                    req.method().as_str(),
+                    req.uri().path(),
+                    req.uri().query(),
+                    &bytes,
+                );
+                if arrived_as != issued_for {
+                    return Err(Denied::NotTheRequest);
+                }
+                Some(bytes)
+            }
+            // A stream open: the route is pinned, the body is not read, not
+            // hashed and not held.
+            (true, true) => {
+                let arrived_as = RequestBinding::stream_open(
+                    req.method().as_str(),
+                    req.uri().path(),
+                    req.uri().query(),
+                );
+                if arrived_as != issued_for {
+                    return Err(Denied::NotTheRequest);
+                }
+                None
+            }
+            // An approval offered for the other kind of request. Refused with
+            // the same message as everything else, so the mismatch teaches a
+            // caller nothing it could not have worked out itself.
+            _ => return Err(Denied::NotTheRequest),
+        };
 
         let record = self
             .credentials
@@ -377,7 +426,75 @@ mod tests {
         let verified = h.gate.verify(&mut req).await.expect("verifies");
         assert_eq!(verified.tenant_id, h.tenant_id);
         assert_eq!(verified.credential_id, h.authenticator.credential_id());
-        assert_eq!(&verified.body[..], b"pay alice");
+        assert_eq!(verified.body.as_deref(), Some(&b"pay alice"[..]));
+    }
+
+    /// A stream open is authorized, and its body is never read.
+    #[tokio::test]
+    async fn a_stream_open_assertion_opens_a_stream() {
+        let h = Harness::new();
+        let mut req = h.stream_request("POST", "/enclave.cosign.v1.SigningSession/Sign", b"");
+        let verified = h.gate.verify(&mut req).await.expect("verifies");
+        assert_eq!(verified.tenant_id, h.tenant_id);
+        assert!(
+            verified.body.is_none(),
+            "a stream open buffered a body it made no promise about"
+        );
+    }
+
+    /// **The substitution, in the direction this change could have opened.**
+    ///
+    /// A stream-open approval commits to no body, so if it could be spent on
+    /// an ordinary request it would authorize any payload at that route — the
+    /// exact attack the body hash exists to stop, reintroduced through a
+    /// weaker sibling. Refused because the bindings are different values, not
+    /// because anything remembered to check.
+    #[tokio::test]
+    async fn a_stream_open_assertion_cannot_authorize_an_ordinary_request() {
+        let h = Harness::new();
+        let mut req = h.stream_request("POST", "/sign", b"pay mallory 1 btc");
+        // The client drops the header and sends it as a normal request.
+        req.headers_mut().remove(STREAM_HEADER);
+        assert!(
+            matches!(h.gate.verify(&mut req).await, Err(Denied::NotTheRequest)),
+            "an approval that named no body authorized a body"
+        );
+    }
+
+    /// And the reverse: an ordinary approval cannot be escalated into a
+    /// channel by claiming one, which would turn a one-operation approval into
+    /// an open-ended session.
+    #[tokio::test]
+    async fn an_ordinary_assertion_cannot_open_a_stream() {
+        let h = Harness::new();
+        let mut req = h.signed_request("POST", "/sign", b"pay alice");
+        req.headers_mut().insert(
+            STREAM_HEADER,
+            hyper::header::HeaderValue::from_static("open"),
+        );
+        assert!(
+            matches!(h.gate.verify(&mut req).await, Err(Denied::NotTheRequest)),
+            "an approval for one operation was spent on an open channel"
+        );
+    }
+
+    /// A stream's body is never buffered, so the body limit cannot apply to it.
+    ///
+    /// This is the point of the whole split: an open-ended stream has no body
+    /// to hold, and holding one would be both wrong and unbounded. A body well
+    /// past the limit must pass here — where an ordinary request of the same
+    /// size is refused, which the test below it still asserts.
+    #[tokio::test]
+    async fn a_stream_open_body_is_never_buffered_and_so_never_too_large() {
+        let h = Harness::with_body_limit(1024);
+        let oversized = vec![0x41u8; 8 * 1024];
+        let mut req = h.stream_request("POST", "/stream", &oversized);
+        let verified = h
+            .gate
+            .verify(&mut req)
+            .await
+            .expect("a stream open must not be measured against the body limit");
+        assert!(verified.body.is_none());
     }
 
     /// The whole rule: nothing gets through without one.

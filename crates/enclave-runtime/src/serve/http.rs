@@ -885,6 +885,21 @@ async fn route(
                 }
             }
 
+            // A stream needs a tenant to belong to, and without a gate there
+            // is none. Anonymous callers all share one lock, so an anonymous
+            // stream would hold it for its whole life and starve every other
+            // anonymous caller — a single client silencing the runtime by
+            // connecting. Refused rather than bounded: an unauthenticated
+            // deployment is a development arrangement, and it should not learn
+            // to depend on a shape that only works when identities exist.
+            if gate.is_none() && req.headers().contains_key(crate::auth::STREAM_HEADER) {
+                tracing::info!(%path, "refused a stream on an unauthenticated runtime");
+                return Ok(refused(
+                    hyper::StatusCode::FORBIDDEN,
+                    "streams need an authenticated tenant",
+                ));
+            }
+
             // Everything else is the guest, and **nothing reaches the guest
             // without a verified assertion bound to exactly this request.**
             // With no gate configured the runtime is unauthenticated by
@@ -892,8 +907,11 @@ async fn route(
             let tenant = match &gate {
                 Some(gate) => match gate.verify(&mut req).await {
                     Ok(verified) => {
-                        // The body was consumed to hash it, so the request is
-                        // rebuilt around exactly the bytes that were approved.
+                        // Rebuilt either way, because the auth headers must not
+                        // reach the guest. What differs is the body: an
+                        // ordinary request carries exactly the bytes that were
+                        // hashed and approved, and a stream open carries the
+                        // client's live body, which was never read here.
                         let mut rebuilt = hyper::Request::builder()
                             .method(req.method().clone())
                             .uri(req.uri().clone());
@@ -905,7 +923,15 @@ async fn route(
                                 rebuilt = rebuilt.header(name, value);
                             }
                         }
-                        let body = full(verified.body);
+                        let body = match verified.body {
+                            Some(approved) => full(approved),
+                            None => {
+                                use http_body_util::BodyExt;
+                                req.into_body()
+                                    .map_err(wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::from)
+                                    .boxed_unsync()
+                            }
+                        };
                         let rebuilt = rebuilt.body(body).expect("request is well formed");
                         return guest
                             .handle(scheme, rebuilt, Some(&verified.tenant_id))

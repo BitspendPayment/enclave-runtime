@@ -45,11 +45,13 @@ pub mod testing;
 #[cfg(any(test, feature = "testing"))]
 pub use authenticator::SoftwareAuthenticator;
 pub use challenge::{
-    ChallengeError, ChallengeStore, RequestBinding, DEFAULT_CAPACITY, DEFAULT_TTL,
+    BodyBinding, ChallengeError, ChallengeStore, RequestBinding, DEFAULT_CAPACITY, DEFAULT_TTL,
 };
 pub use credential::{mint_tenant_id, FilesystemCredentials, StoredCredential};
 pub use enrollment::EnrollmentTokens;
-pub use gate::{CredentialRecord, CredentialStore, Denied, Gate, Verified, AUTH_HEADERS};
+pub use gate::{
+    CredentialRecord, CredentialStore, Denied, Gate, Verified, AUTH_HEADERS, STREAM_HEADER,
+};
 pub use ratelimit::RateLimiter;
 pub use routes::{AuthEndpoints, AUTH_PREFIX};
 
