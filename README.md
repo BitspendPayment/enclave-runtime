@@ -712,6 +712,21 @@ gates resource creation; passkeys gate access.
 The tenant id is 32 bytes minted from the NSM, stored beside the credential —
 not derived from it, so one tenant can hold several passkeys.
 
+#### Opening a stream
+
+A bidirectional stream cannot be approved the same way, and the reason is not a
+gap: its body **is** the message sequence, so there is no `body_sha256` to
+commit to when the channel opens. It gets its own weaker approval, from
+`/auth/stream/options`, which authorizes **opening one channel on one route and
+nothing else** — the same shape as an enrollment token, and for the same
+reason. It commits to no bytes, so it approves no operation.
+
+Every message inside the stream that asks the enclave to sign carries its own
+fresh, single-use assertion. An open channel is not standing permission to
+sign; treating it as one would be the substitution the body hash exists to
+prevent. See [docs/STREAMING.md](docs/STREAMING.md) for what a stream costs the
+tenant holding it, and what the runtime does not promise.
+
 #### Limits
 
 Asking for a challenge is what makes a phone buzz, so it is rate-limited per
