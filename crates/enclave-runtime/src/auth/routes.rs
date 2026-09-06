@@ -26,11 +26,11 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
 
-use super::challenge::RequestBinding;
 use super::credential::{FilesystemCredentials, StoredCredential};
 use super::enrollment::EnrollmentTokens;
 use super::gate::Gate;
 use super::ratelimit::RateLimiter;
+use super::token::InteractionScope;
 
 /// The prefix the guest can never see.
 pub const AUTH_PREFIX: &str = "/auth/";
@@ -67,7 +67,14 @@ struct RegisterVerifyResponse {
     credential_id: String,
 }
 
+/// What an interaction challenge is issued for.
+///
+/// `deny_unknown_fields` is load-bearing: this route used to take a
+/// `body_sha256`, and a client still sending one must be told that it means
+/// nothing now rather than have it quietly ignored. An approval that names a
+/// body it does not bind would be worse than one that never claimed to.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RequestOptionsRequest {
     /// Which passkey the client intends to use. The runtime allows exactly
     /// that one, so an assertion from any other credential fails even before
@@ -77,27 +84,25 @@ struct RequestOptionsRequest {
     path: String,
     #[serde(default)]
     query: Option<String>,
-    /// Base64url SHA-256 of the body the client intends to send.
-    ///
-    /// Advisory only. The runtime rehashes what actually arrives and compares
-    /// against the binding, so a client that lies here has bound its assertion
-    /// to a request it cannot then send.
-    body_sha256: String,
 }
 
-/// What a stream-open challenge is issued for.
-///
-/// No `body_sha256`, and `deny_unknown_fields` so that sending one is a 400
-/// rather than a quiet no-op: a route that accepted a hash and ignored it
-/// would read as though the body were bound when it is not.
+/// The assertion, coming back to be turned into a token.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StreamOptionsRequest {
-    credential_id: String,
-    method: String,
-    path: String,
-    #[serde(default)]
-    query: Option<String>,
+struct RequestVerifyRequest {
+    challenge_id: String,
+    /// Base64url of the `PublicKeyCredential` JSON `navigator.credentials.get()`
+    /// produced.
+    assertion: String,
+}
+
+/// The token, and how long it has to be spent.
+#[derive(Serialize)]
+struct TokenResponse {
+    token: String,
+    /// Seconds. This bounds the time to *start* an interaction, and is not how
+    /// long one may run once started.
+    expires_in_secs: u64,
 }
 
 #[derive(Serialize)]
@@ -192,7 +197,7 @@ impl AuthEndpoints {
             "register/options" => self.register_options(body).await,
             "register/verify" => self.register_verify(body).await,
             "request/options" => self.request_options(body).await,
-            "stream/options" => self.stream_options(body).await,
+            "request/verify" => self.request_verify(body).await,
             other => problem(
                 hyper::StatusCode::NOT_FOUND,
                 &format!("no auth endpoint {other:?}"),
@@ -345,93 +350,76 @@ impl AuthEndpoints {
         )
     }
 
-    /// A challenge for opening a bidirectional stream.
+    /// Turn a verified assertion into a token for one interaction.
     ///
-    /// Everything here is `request_options` — the same rate limit on the same
-    /// key, because this also makes a phone buzz; the same indistinguishable
-    /// refusals; the same response shape — with one difference, which is the
-    /// entire point of the route existing separately.
+    /// The second of the three trips a signed interaction takes, and it has to
+    /// be its own exchange: a passkey is a challenge-response, so the assertion
+    /// cannot exist until `request/options` has already answered. Named to
+    /// match `register/options` → `register/verify`, which is the same shape.
     ///
-    /// **The approval it issues commits to no body.** A stream's body is the
-    /// message sequence, and none of it exists when the channel opens, so
-    /// there is nothing to hash and nothing an approval could name. What the
-    /// person is approving is therefore *opening a channel to their guest*,
-    /// not any operation performed over it.
-    ///
-    /// The consequence has to be stated where it can be read rather than
-    /// inferred: this does not authorize signing. Every message that asks the
-    /// enclave to sign carries its own fresh, single-use assertion inside the
-    /// stream, and a design that let an open channel stand in for one would be
-    /// exactly the substitution the body hash exists to prevent — an approval
-    /// given once, spent on operations the person never saw. Enrollment tokens
-    /// have the same shape: they create a tenant and do nothing else.
-    ///
-    /// A separate route rather than a flag on `request/options` so that this
-    /// weaker approval cannot be produced by omitting a field.
-    async fn stream_options(
+    /// **What the token authorizes: one interaction at the method, path and
+    /// query the challenge was issued for.** It commits to no bytes. A person
+    /// approved *doing this thing*, not *sending these bytes*, and nothing here
+    /// should be described as approval of a payload.
+    async fn request_verify(
         &self,
         body: &[u8],
     ) -> hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
-        let Ok(request) = serde_json::from_slice::<StreamOptionsRequest>(body) else {
+        let Ok(request) = serde_json::from_slice::<RequestVerifyRequest>(body) else {
             return problem(hyper::StatusCode::BAD_REQUEST, "malformed request");
         };
-        let Some(credential_id) = decode(&request.credential_id) else {
-            return problem(hyper::StatusCode::BAD_REQUEST, "malformed credential id");
+        let Some(challenge_id) = decode_id(&request.challenge_id) else {
+            return problem(hyper::StatusCode::BAD_REQUEST, "malformed challenge id");
+        };
+        let Some(assertion_json) = decode(&request.assertion) else {
+            return problem(hyper::StatusCode::BAD_REQUEST, "malformed assertion");
+        };
+        let Ok(assertion) = serde_json::from_slice::<PublicKeyCredential>(&assertion_json) else {
+            return problem(hyper::StatusCode::BAD_REQUEST, "malformed assertion");
         };
 
-        if !self.challenges.allow(&credential_id) {
-            tracing::warn!(
-                credential = %hex::encode(&credential_id[..8.min(credential_id.len())]),
-                "rate-limited challenge requests"
-            );
-            return problem(
-                hyper::StatusCode::TOO_MANY_REQUESTS,
-                "too many challenge requests",
-            );
-        }
-
-        let record = match self.credentials_lookup(&credential_id).await {
-            Ok(Some(record)) if record.active => record,
-            Ok(_) => {
-                return problem(
-                    hyper::StatusCode::FORBIDDEN,
-                    "no challenge for that credential",
-                );
-            }
-            Err(e) => {
-                tracing::error!(error = format!("{e:#}"), "looking up a credential");
-                return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+        let who = match self.gate.authenticate(&challenge_id, &assertion).await {
+            Ok(who) => who,
+            Err(denied) => {
+                // Logged in full, answered in one sentence — the same rule the
+                // gate has always followed.
+                tracing::info!(reason = %denied, "refused an assertion");
+                return problem(denied.status(), denied.public_message());
             }
         };
 
-        let Ok(id) = self.random_id() else {
+        // Minted here, from the enclave's entropy, and held in exactly two
+        // places: this response, and a hash in the store.
+        let mut token = [0u8; 32];
+        if self.entropy.get_random(&mut token).is_err() {
             return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
-        };
-        let binding =
-            RequestBinding::stream_open(&request.method, &request.path, request.query.as_deref());
-        // Logged as its own event, so a stream-open approval is visible in the
-        // enclave's record as the distinct, weaker thing it is.
-        tracing::info!(
-            method = %binding.method,
-            path = %binding.path,
-            "issuing a stream-open challenge, which authorizes opening a channel only"
-        );
-        match self
-            .gate
-            .issue(id, binding, std::slice::from_ref(&record.passkey))
-        {
-            Ok(options) => json(
-                hyper::StatusCode::OK,
-                &RequestOptionsResponse {
-                    challenge_id: b64(&id),
-                    options,
-                },
-            ),
-            Err(e) => {
-                tracing::warn!(error = %e, "issuing a stream-open challenge");
-                problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable")
-            }
         }
+        let token = b64(&token);
+
+        let ttl = match self.gate.grant(token.as_bytes(), &who) {
+            Ok(ttl) => ttl,
+            Err(denied) => {
+                tracing::warn!(reason = %denied, "could not record an approval");
+                return problem(denied.status(), denied.public_message());
+            }
+        };
+
+        // The token itself is never logged. What identifies this event is the
+        // tenant it belongs to and the interaction it is good for.
+        tracing::info!(
+            tenant = %hex::encode(who.tenant_id),
+            method = %who.scope.method,
+            path = %who.scope.path,
+            "issued an interaction token"
+        );
+
+        json(
+            hyper::StatusCode::OK,
+            &TokenResponse {
+                token,
+                expires_in_secs: ttl.as_secs(),
+            },
+        )
     }
 
     async fn request_options(
@@ -444,12 +432,6 @@ impl AuthEndpoints {
         let Some(credential_id) = decode(&request.credential_id) else {
             return problem(hyper::StatusCode::BAD_REQUEST, "malformed credential id");
         };
-        let Some(body_hash) =
-            decode(&request.body_sha256).and_then(|h| <[u8; 32]>::try_from(h.as_slice()).ok())
-        else {
-            return problem(hyper::StatusCode::BAD_REQUEST, "malformed body hash");
-        };
-
         // Before the credential is even looked up, so a refusal costs nothing
         // and reveals nothing. This is the request that puts a biometric
         // prompt in front of a person, and it is the one an attacker would
@@ -484,15 +466,10 @@ impl AuthEndpoints {
         let Ok(id) = self.random_id() else {
             return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
         };
-        let binding = RequestBinding {
-            method: request.method.to_ascii_uppercase(),
-            path: request.path.clone(),
-            query: request.query.clone(),
-            body: crate::auth::challenge::BodyBinding::Exact(body_hash),
-        };
+        let scope = InteractionScope::new(&request.method, &request.path, request.query.as_deref());
         match self
             .gate
-            .issue(id, binding, std::slice::from_ref(&record.passkey))
+            .issue(id, scope, std::slice::from_ref(&record.passkey))
         {
             Ok(options) => json(
                 hyper::StatusCode::OK,
@@ -595,7 +572,10 @@ mod tests {
             Relying::new().webauthn,
             ChallengeStore::new(DEFAULT_TTL, DEFAULT_CAPACITY),
             credentials.clone(),
-            64 * 1024,
+            super::super::TokenStore::new(
+                std::time::Duration::from_secs(60),
+                super::super::token::DEFAULT_CAPACITY,
+            ),
         ));
         let entropy: Arc<dyn nitro_nsm::Nsm> = Arc::new(nitro_nsm::fake::FakeNsm::new());
         let endpoints = AuthEndpoints::new(gate, credentials.clone(), fs.clone(), entropy);
@@ -771,7 +751,6 @@ mod tests {
                 "credential_id": b64.encode(auth.credential_id()),
                 "method": "POST",
                 "path": "/sign",
-                "body_sha256": b64.encode(nitro_attestation::sha256(b"tx")),
             }),
         )
         .await;
@@ -798,7 +777,6 @@ mod tests {
                     "credential_id": b64.encode(id),
                     "method": "POST",
                     "path": "/sign",
-                    "body_sha256": b64.encode([0u8; 32]),
                 }),
             )
             .await
@@ -826,7 +804,6 @@ mod tests {
                     "credential_id": b64.encode(credential_id),
                     "method": "POST",
                     "path": "/sign",
-                    "body_sha256": b64.encode([0u8; 32]),
                 }),
             )
             .await
@@ -854,7 +831,7 @@ mod tests {
             .is_none());
         assert!(f
             .endpoints
-            .handle(&hyper::Method::GET, "/enclave/config", b"")
+            .handle(&hyper::Method::GET, "/counter", b"")
             .await
             .is_none());
     }

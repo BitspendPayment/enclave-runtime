@@ -19,7 +19,6 @@
 pub mod acme;
 pub mod attest;
 pub mod client;
-pub mod endpoints;
 mod http;
 pub mod pool;
 pub mod progress;
@@ -27,7 +26,6 @@ pub mod tls;
 
 pub use acme::{AcmeConfig, CertificateSlot, SealedAcmeCache};
 pub use client::{apply_tenant, X_ENCLAVE_TENANT};
-pub use endpoints::{EnclaveEndpoints, ENCLAVE_PREFIX};
 pub use http::{serve_component, GuestInstance, ServeConfig, ServeHandle, Server, Tenancy};
 pub use pool::{Checkout, LiveTenant, PoolLimits, Slot, TenantPool};
 pub use tls::{TlsIdentity, TlsMode};

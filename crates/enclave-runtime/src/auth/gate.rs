@@ -33,11 +33,10 @@
 
 use std::sync::Arc;
 
-use base64::Engine as _;
-use bytes::Bytes;
 use webauthn_rs::prelude::*;
 
-use super::challenge::{ChallengeError, ChallengeStore, RequestBinding};
+use super::challenge::{ChallengeError, ChallengeStore};
+use super::token::{InteractionScope, TokenError, TokenStore};
 
 /// Names the challenge a request is answering.
 pub const CHALLENGE_HEADER: &str = "x-webauthn-challenge-id";
@@ -50,28 +49,24 @@ pub const CHALLENGE_HEADER: &str = "x-webauthn-challenge-id";
 /// where a subtle mismatch would hide.
 pub const ASSERTION_HEADER: &str = "x-webauthn-assertion";
 
-/// Every header the gate consumes. Stripped before the guest sees a request,
-/// so a guest can neither read a client's assertion nor forge one.
-/// Asks for a bidirectional stream rather than an ordinary request.
+/// Carries the interaction token: `Authorization: Bearer <token>`.
 ///
-/// Runtime vocabulary, alongside `x-enclave-nonce` and `x-enclave-tenant`, and
-/// deliberately not `content-type: application/grpc` or a path prefix. The
-/// content type is application data the guest also reads, and two parties
-/// interpreting one field is where they come to disagree; a path prefix would
-/// bake a service name into a runtime that knows nothing about the guest's
-/// routes. This header is impossible to send by accident and trivial to set as
-/// gRPC call metadata.
+/// An ordinary HTTP header rather than an `x-enclave-*` one, deliberately: a
+/// gRPC stream's opening metadata *is* an HTTP/2 HEADERS frame, so one header
+/// covers a request and a stream alike, and every client library already knows
+/// how to set this one.
+pub const AUTHORIZATION_HEADER: &str = "authorization";
+
+/// Every header the gate consumes. Stripped before the guest sees a request, so
+/// a guest can neither read a client's token nor forge one.
+pub const AUTH_HEADERS: [&str; 1] = [AUTHORIZATION_HEADER];
+
+/// Ceiling on a bearer token, in characters.
 ///
-/// It is not believed on its own. It must agree with the binding the challenge
-/// was issued under — see [`Gate::verify`].
-pub const STREAM_HEADER: &str = "x-enclave-stream";
-
-pub const AUTH_HEADERS: [&str; 3] = [CHALLENGE_HEADER, ASSERTION_HEADER, STREAM_HEADER];
-
-/// Ceiling on the assertion header. An assertion is a few hundred bytes; this
-/// is loose enough not to matter and tight enough that the header cannot be
-/// used to make the runtime allocate.
-const MAX_ASSERTION_BYTES: usize = 8 * 1024;
+/// The runtime mints 32 bytes as base64url, so anything much longer is not one
+/// of ours; the bound exists so a header cannot make the runtime hash an
+/// arbitrary amount of input before deciding it was never valid.
+const MAX_TOKEN_CHARS: usize = 128;
 
 /// What a client is known as, once it has proved it.
 #[derive(Debug, Clone)]
@@ -82,14 +77,16 @@ pub struct Verified {
     /// collision-checked 128-bit identifier is ample; it is not a secret and
     /// nothing derives a key from it.
     pub tenant_id: [u8; 16],
+}
+
+/// What a passkey ceremony established, before a token was minted for it.
+#[derive(Debug, Clone)]
+pub struct Authenticated {
+    pub tenant_id: [u8; 16],
     pub credential_id: Vec<u8>,
-    /// The buffered body, to be forwarded. Returned rather than re-read
-    /// because it has already been consumed to compute the hash, and reading
-    /// it twice is not possible.
-    ///
-    /// `None` for a stream open, where there is no hash and so nothing was
-    /// read: the caller forwards the live body instead.
-    pub body: Option<Bytes>,
+    /// The interaction the challenge was issued for, which is what the token
+    /// will be good for and nothing else.
+    pub scope: InteractionScope,
 }
 
 /// Why a request did not get past the gate.
@@ -105,6 +102,7 @@ pub enum Denied {
     /// Present but not parseable, or over the size limit.
     Malformed(String),
     Challenge(ChallengeError),
+    Token(TokenError),
     /// The request is not the one the challenge was issued for.
     NotTheRequest,
     /// No such credential, or it has been revoked.
@@ -140,6 +138,7 @@ impl std::fmt::Display for Denied {
             Denied::Missing => write!(f, "no assertion presented"),
             Denied::Malformed(e) => write!(f, "malformed assertion: {e}"),
             Denied::Challenge(e) => write!(f, "{e}"),
+            Denied::Token(e) => write!(f, "{e}"),
             Denied::NotTheRequest => {
                 write!(f, "the assertion was issued for a different request")
             }
@@ -181,7 +180,7 @@ impl std::fmt::Debug for Gate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Gate")
             .field("outstanding_challenges", &self.challenges.outstanding())
-            .field("max_body_bytes", &self.max_body_bytes)
+            .field("outstanding_tokens", &self.tokens.outstanding())
             .finish_non_exhaustive()
     }
 }
@@ -190,7 +189,7 @@ pub struct Gate {
     webauthn: Webauthn,
     challenges: ChallengeStore,
     credentials: Arc<dyn CredentialStore>,
-    max_body_bytes: usize,
+    tokens: TokenStore,
 }
 
 impl Gate {
@@ -198,13 +197,13 @@ impl Gate {
         webauthn: Webauthn,
         challenges: ChallengeStore,
         credentials: Arc<dyn CredentialStore>,
-        max_body_bytes: usize,
+        tokens: TokenStore,
     ) -> Self {
         Gate {
             webauthn,
             challenges,
             credentials,
-            max_body_bytes,
+            tokens,
         }
     }
 
@@ -220,14 +219,19 @@ impl Gate {
         &self.credentials
     }
 
-    /// Issue a challenge for one intended request.
+    pub fn tokens(&self) -> &TokenStore {
+        &self.tokens
+    }
+
+    /// Issue a challenge for one intended interaction.
     ///
-    /// The binding is recorded now and compared later; the client cannot
-    /// influence it after the fact because it never sees the record.
+    /// The scope is recorded now and compared when the token it leads to is
+    /// spent; the client cannot influence it after the fact because it never
+    /// sees the record.
     pub fn issue(
         &self,
         id: [u8; 16],
-        binding: RequestBinding,
+        scope: InteractionScope,
         allowed: &[Passkey],
     ) -> Result<RequestChallengeResponse, Denied> {
         let (options, state) = self
@@ -235,86 +239,30 @@ impl Gate {
             .start_passkey_authentication(allowed)
             .map_err(|e| Denied::Assertion(e.to_string()))?;
         self.challenges
-            .issue(id, binding, state)
+            .issue(id, scope, state)
             .map_err(Denied::Challenge)?;
         Ok(options)
     }
 
-    /// The whole gate, in the order the checks have to happen.
+    /// The passkey half: prove who is asking, and what they are asking for.
     ///
-    /// Returns the buffered body alongside the identity, because the caller
-    /// must forward exactly the bytes that were hashed — anything else would
-    /// mean the guest saw a body the user never approved.
-    pub async fn verify<B>(&self, req: &mut hyper::Request<B>) -> Result<Verified, Denied>
-    where
-        B: hyper::body::Body<Data = Bytes> + Unpin,
-        B::Error: std::fmt::Display,
-    {
-        let challenge_id = header_bytes(req, CHALLENGE_HEADER)?
-            .ok_or(Denied::Missing)
-            .and_then(|raw| {
-                <[u8; 16]>::try_from(raw.as_slice())
-                    .map_err(|_| Denied::Malformed("challenge id is not 16 bytes".into()))
-            })?;
-        let assertion_json = header_bytes(req, ASSERTION_HEADER)?.ok_or(Denied::Missing)?;
-        let assertion: PublicKeyCredential =
-            serde_json::from_slice(&assertion_json).map_err(|e| {
-                Denied::Malformed(format!("assertion is not a PublicKeyCredential: {e}"))
-            })?;
-
-        // Consumed before the body is touched, because the binding is what
-        // decides whether there is a body to read at all. Consumed whatever
-        // happens next, for the reason it always was: an assertion that was
-        // offered and refused has still been seen by whoever sent it, and a
-        // second attempt at the same challenge buys them only attempts.
-        //
-        // One consequence of consuming first: an oversized body now burns its
-        // challenge before it is refused, where before the refusal came first.
-        // That is the safer direction — the alternative lets a caller probe the
-        // size limit without ever spending an approval.
+    /// This is everything the old per-request gate did except reading a body,
+    /// in the same order and with the same refusals. What it does *not* do is
+    /// let anything through — it establishes an identity and an interaction, and
+    /// the caller mints a token for that pair. The interaction itself presents
+    /// the token.
+    pub async fn authenticate(
+        &self,
+        challenge_id: &[u8; 16],
+        assertion: &PublicKeyCredential,
+    ) -> Result<Authenticated, Denied> {
+        // Consumed whatever happens next: an assertion that was offered and
+        // refused has still been seen by whoever sent it, and a second attempt
+        // at the same challenge buys them only attempts.
         let (issued_for, state) = self
             .challenges
-            .consume(&challenge_id)
+            .consume(challenge_id)
             .map_err(Denied::Challenge)?;
-
-        // Two keys, and both must turn. The client's header alone cannot talk
-        // the runtime out of hashing a body, and an unbound approval alone
-        // cannot be spent on a request that arrived as an ordinary one.
-        let asked_for_stream = req.headers().contains_key(STREAM_HEADER);
-        let body = match (issued_for.is_stream_open(), asked_for_stream) {
-            // The ordinary path, unchanged: buffer, then compare the hash of
-            // the bytes that will actually be forwarded.
-            (false, false) => {
-                let bytes = self.buffer_body(req).await?;
-                let arrived_as = RequestBinding::new(
-                    req.method().as_str(),
-                    req.uri().path(),
-                    req.uri().query(),
-                    &bytes,
-                );
-                if arrived_as != issued_for {
-                    return Err(Denied::NotTheRequest);
-                }
-                Some(bytes)
-            }
-            // A stream open: the route is pinned, the body is not read, not
-            // hashed and not held.
-            (true, true) => {
-                let arrived_as = RequestBinding::stream_open(
-                    req.method().as_str(),
-                    req.uri().path(),
-                    req.uri().query(),
-                );
-                if arrived_as != issued_for {
-                    return Err(Denied::NotTheRequest);
-                }
-                None
-            }
-            // An approval offered for the other kind of request. Refused with
-            // the same message as everything else, so the mismatch teaches a
-            // caller nothing it could not have worked out itself.
-            _ => return Err(Denied::NotTheRequest),
-        };
 
         let record = self
             .credentials
@@ -326,7 +274,7 @@ impl Gate {
 
         let result = self
             .webauthn
-            .finish_passkey_authentication(&assertion, &state)
+            .finish_passkey_authentication(assertion, &state)
             .map_err(|e| Denied::Assertion(e.to_string()))?;
 
         // Belt and braces: `start_passkey_authentication` sets
@@ -343,65 +291,51 @@ impl Gate {
             .await
             .map_err(|e| Denied::Assertion(e.to_string()))?;
 
-        Ok(Verified {
+        Ok(Authenticated {
             tenant_id: record.tenant_id,
             credential_id: assertion.raw_id.as_ref().to_vec(),
-            body,
+            scope: issued_for,
         })
     }
 
-    async fn buffer_body<B>(&self, req: &mut hyper::Request<B>) -> Result<Bytes, Denied>
-    where
-        B: hyper::body::Body<Data = Bytes> + Unpin,
-        B::Error: std::fmt::Display,
-    {
-        // Refused on the declared length where there is one, so an oversized
-        // body is rejected before it is read rather than after.
-        if let Some(len) = req.body().size_hint().upper() {
-            if len as usize > self.max_body_bytes {
-                return Err(Denied::BodyTooLarge);
-            }
+    /// Record an approval as a token, and hand back the token's bytes.
+    ///
+    /// Generated here rather than by the caller so that the only copy outside
+    /// this function is the one going to the client — the store keeps a hash.
+    pub fn grant(&self, token: &[u8], who: &Authenticated) -> Result<std::time::Duration, Denied> {
+        self.tokens
+            .issue(token, who.tenant_id, who.scope.clone())
+            .map_err(Denied::Token)?;
+        Ok(self.tokens.ttl())
+    }
+
+    /// The token half: spend one approval on one interaction.
+    ///
+    /// The scope is rebuilt from the request that actually arrived and compared
+    /// with the one the person approved, so a token cannot be moved to another
+    /// route. It says nothing about the body, and deliberately: an interaction
+    /// may be a stream, whose body does not exist when the approval is given.
+    pub fn redeem<B>(&self, req: &hyper::Request<B>) -> Result<Verified, Denied> {
+        let offered = req
+            .headers()
+            .get(AUTHORIZATION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::trim)
+            .ok_or(Denied::Missing)?;
+        if offered.is_empty() || offered.len() > MAX_TOKEN_CHARS {
+            return Err(Denied::Malformed("token is not a plausible length".into()));
         }
 
-        let mut collected = Vec::new();
-        let body = req.body_mut();
-        loop {
-            let frame = match std::future::poll_fn(|cx| {
-                std::pin::Pin::new(&mut *body).poll_frame(cx)
-            })
-            .await
-            {
-                Some(Ok(frame)) => frame,
-                Some(Err(e)) => return Err(Denied::Body(e.to_string())),
-                None => break,
-            };
-            if let Ok(data) = frame.into_data() {
-                // Checked as it arrives, not after: a body with no declared
-                // length must not be able to exhaust memory by streaming.
-                if collected.len() + data.len() > self.max_body_bytes {
-                    return Err(Denied::BodyTooLarge);
-                }
-                collected.extend_from_slice(&data);
-            }
-        }
-        Ok(Bytes::from(collected))
-    }
-}
+        let arrived_as =
+            InteractionScope::new(req.method().as_str(), req.uri().path(), req.uri().query());
+        let tenant_id = self
+            .tokens
+            .redeem(offered.as_bytes(), &arrived_as)
+            .map_err(Denied::Token)?;
 
-fn header_bytes<B>(req: &hyper::Request<B>, name: &str) -> Result<Option<Vec<u8>>, Denied> {
-    let Some(value) = req.headers().get(name) else {
-        return Ok(None);
-    };
-    if value.len() > MAX_ASSERTION_BYTES {
-        return Err(Denied::Malformed(format!("{name} is too large")));
+        Ok(Verified { tenant_id })
     }
-    let text = value
-        .to_str()
-        .map_err(|_| Denied::Malformed(format!("{name} is not ASCII")))?;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(text.trim())
-        .map(Some)
-        .map_err(|_| Denied::Malformed(format!("{name} is not base64url")))
 }
 
 #[cfg(test)]
@@ -409,179 +343,76 @@ mod tests {
     use super::*;
     use crate::auth::authenticator::flags;
     use crate::auth::testing::{Harness, Relying, ORIGIN};
+    use bytes::Bytes;
 
-    fn plain(method: &str, path: &str, body: &[u8]) -> hyper::Request<http_body_util::Full<Bytes>> {
-        hyper::Request::builder()
-            .method(method)
-            .uri(format!("https://enclave.test{path}"))
-            .body(http_body_util::Full::new(Bytes::copy_from_slice(body)))
-            .expect("well-formed request")
+    fn credential(assertion: &serde_json::Value) -> PublicKeyCredential {
+        serde_json::from_str(&assertion.to_string()).expect("a credential")
     }
+
+    /// Issue a challenge for `scope` and answer it with `authenticator`.
+    async fn answer(
+        h: &Harness,
+        id: [u8; 16],
+        scope: InteractionScope,
+        authenticator: &crate::auth::SoftwareAuthenticator,
+        origin: &str,
+    ) -> Result<Authenticated, Denied> {
+        let options = h
+            .gate
+            .issue(id, scope, std::slice::from_ref(&h.passkey))
+            .expect("issuing a challenge");
+        let assertion = authenticator.assert(&Relying::challenge_for(&options), origin);
+        h.gate.authenticate(&id, &credential(&assertion)).await
+    }
+
+    fn scope() -> InteractionScope {
+        InteractionScope::new("POST", "/sign", None)
+    }
+
+    // --- the passkey half -------------------------------------------------
 
     /// The happy path, so every refusal below means something.
     #[tokio::test]
-    async fn a_bound_assertion_identifies_the_tenant() {
+    async fn an_assertion_identifies_the_tenant_and_the_interaction() {
         let h = Harness::new();
-        let mut req = h.signed_request("POST", "/sign", b"pay alice");
-        let verified = h.gate.verify(&mut req).await.expect("verifies");
-        assert_eq!(verified.tenant_id, h.tenant_id);
-        assert_eq!(verified.credential_id, h.authenticator.credential_id());
-        assert_eq!(verified.body.as_deref(), Some(&b"pay alice"[..]));
-    }
-
-    /// A stream open is authorized, and its body is never read.
-    #[tokio::test]
-    async fn a_stream_open_assertion_opens_a_stream() {
-        let h = Harness::new();
-        let mut req = h.stream_request("POST", "/enclave.cosign.v1.SigningSession/Sign", b"");
-        let verified = h.gate.verify(&mut req).await.expect("verifies");
-        assert_eq!(verified.tenant_id, h.tenant_id);
-        assert!(
-            verified.body.is_none(),
-            "a stream open buffered a body it made no promise about"
-        );
-    }
-
-    /// **The substitution, in the direction this change could have opened.**
-    ///
-    /// A stream-open approval commits to no body, so if it could be spent on
-    /// an ordinary request it would authorize any payload at that route — the
-    /// exact attack the body hash exists to stop, reintroduced through a
-    /// weaker sibling. Refused because the bindings are different values, not
-    /// because anything remembered to check.
-    #[tokio::test]
-    async fn a_stream_open_assertion_cannot_authorize_an_ordinary_request() {
-        let h = Harness::new();
-        let mut req = h.stream_request("POST", "/sign", b"pay mallory 1 btc");
-        // The client drops the header and sends it as a normal request.
-        req.headers_mut().remove(STREAM_HEADER);
-        assert!(
-            matches!(h.gate.verify(&mut req).await, Err(Denied::NotTheRequest)),
-            "an approval that named no body authorized a body"
-        );
-    }
-
-    /// And the reverse: an ordinary approval cannot be escalated into a
-    /// channel by claiming one, which would turn a one-operation approval into
-    /// an open-ended session.
-    #[tokio::test]
-    async fn an_ordinary_assertion_cannot_open_a_stream() {
-        let h = Harness::new();
-        let mut req = h.signed_request("POST", "/sign", b"pay alice");
-        req.headers_mut().insert(
-            STREAM_HEADER,
-            hyper::header::HeaderValue::from_static("open"),
-        );
-        assert!(
-            matches!(h.gate.verify(&mut req).await, Err(Denied::NotTheRequest)),
-            "an approval for one operation was spent on an open channel"
-        );
-    }
-
-    /// A stream's body is never buffered, so the body limit cannot apply to it.
-    ///
-    /// This is the point of the whole split: an open-ended stream has no body
-    /// to hold, and holding one would be both wrong and unbounded. A body well
-    /// past the limit must pass here — where an ordinary request of the same
-    /// size is refused, which the test below it still asserts.
-    #[tokio::test]
-    async fn a_stream_open_body_is_never_buffered_and_so_never_too_large() {
-        let h = Harness::with_body_limit(1024);
-        let oversized = vec![0x41u8; 8 * 1024];
-        let mut req = h.stream_request("POST", "/stream", &oversized);
-        let verified = h
-            .gate
-            .verify(&mut req)
+        let who = answer(&h, [1u8; 16], scope(), &h.authenticator, ORIGIN)
             .await
-            .expect("a stream open must not be measured against the body limit");
-        assert!(verified.body.is_none());
+            .expect("verifies");
+        assert_eq!(who.tenant_id, h.tenant_id);
+        assert_eq!(who.credential_id, h.authenticator.credential_id());
+        assert_eq!(
+            who.scope,
+            scope(),
+            "the approval named a different interaction"
+        );
     }
 
-    /// The whole rule: nothing gets through without one.
+    /// **The replay.** One challenge, one assertion, once.
     #[tokio::test]
-    async fn a_request_without_an_assertion_is_refused() {
+    async fn a_challenge_cannot_be_answered_twice() {
         let h = Harness::new();
-        let mut req = plain("POST", "/sign", b"pay alice");
+        let id = [2u8; 16];
+        let options = h
+            .gate
+            .issue(id, scope(), std::slice::from_ref(&h.passkey))
+            .unwrap();
+        let assertion = credential(
+            &h.authenticator
+                .assert(&Relying::challenge_for(&options), ORIGIN),
+        );
+        h.gate.authenticate(&id, &assertion).await.expect("first");
         assert!(matches!(
-            h.gate.verify(&mut req).await,
-            Err(Denied::Missing)
-        ));
-    }
-
-    /// **The replay.** One approval authorizes one operation, once.
-    #[tokio::test]
-    async fn an_assertion_cannot_be_used_twice() {
-        let h = Harness::new();
-        let mut first = h.signed_request("POST", "/sign", b"pay alice");
-        let headers = first.headers().clone();
-        h.gate.verify(&mut first).await.expect("first use verifies");
-
-        let mut replay = plain("POST", "/sign", b"pay alice");
-        *replay.headers_mut() = headers;
-        assert!(matches!(
-            h.gate.verify(&mut replay).await,
+            h.gate.authenticate(&id, &assertion).await,
             Err(Denied::Challenge(ChallengeError::Unknown))
         ));
     }
 
-    /// **The substitution.** An approval for one payload must not authorize a
-    /// different one — the reason the binding exists at all.
-    #[tokio::test]
-    async fn an_assertion_for_one_body_cannot_authorize_another() {
-        let h = Harness::new();
-        let mut req = h.assertion_for(
-            ("POST", "/sign", b"pay alice 1 btc"),
-            ("POST", "/sign", b"pay mallory 1 btc"),
-        );
-        assert!(matches!(
-            h.gate.verify(&mut req).await,
-            Err(Denied::NotTheRequest)
-        ));
-    }
-
-    #[tokio::test]
-    async fn an_assertion_for_one_route_cannot_authorize_another() {
-        let h = Harness::new();
-        let mut req = h.assertion_for(("POST", "/sign", b"{}"), ("POST", "/policy/limit", b"{}"));
-        assert!(matches!(
-            h.gate.verify(&mut req).await,
-            Err(Denied::NotTheRequest)
-        ));
-    }
-
-    #[tokio::test]
-    async fn an_assertion_for_one_method_cannot_authorize_another() {
-        let h = Harness::new();
-        let mut req = h.assertion_for(("GET", "/keys", b""), ("DELETE", "/keys", b""));
-        assert!(matches!(
-            h.gate.verify(&mut req).await,
-            Err(Denied::NotTheRequest)
-        ));
-    }
-
-    /// A query is part of the operation: `?limit=1` is not `?limit=100`.
-    #[tokio::test]
-    async fn an_assertion_for_one_query_cannot_authorize_another() {
-        let h = Harness::new();
-        let mut req = h.assertion_for(
-            ("POST", "/policy?limit=1", b""),
-            ("POST", "/policy?limit=100", b""),
-        );
-        assert!(matches!(
-            h.gate.verify(&mut req).await,
-            Err(Denied::NotTheRequest)
-        ));
-    }
-
-    /// A lost phone's passkey is refused by name, which is why revoked records
-    /// are kept rather than deleted.
     #[tokio::test]
     async fn a_revoked_credential_is_refused() {
         let h = Harness::new();
         h.credentials.revoke(h.authenticator.credential_id());
-        let mut req = h.signed_request("POST", "/sign", b"pay alice");
         assert!(matches!(
-            h.gate.verify(&mut req).await,
+            answer(&h, [3u8; 16], scope(), &h.authenticator, ORIGIN).await,
             Err(Denied::UnknownCredential)
         ));
     }
@@ -591,67 +422,43 @@ mod tests {
     async fn an_unregistered_credential_is_refused() {
         let h = Harness::new();
         let stranger = crate::auth::SoftwareAuthenticator::new("enclave.test");
-        let id = [3u8; 16];
-        let options = h
-            .gate
-            .issue(
-                id,
-                RequestBinding::new("POST", "/sign", None, b"x"),
-                std::slice::from_ref(&h.passkey),
-            )
-            .unwrap();
-        let assertion = stranger.assert(&Relying::challenge_for(&options), ORIGIN);
-        let mut req = Harness::request_with("POST", "/sign", b"x", &id, &assertion);
         assert!(matches!(
-            h.gate.verify(&mut req).await,
+            answer(&h, [4u8; 16], scope(), &stranger, ORIGIN).await,
             Err(Denied::UnknownCredential)
         ));
     }
 
-    /// A phone in a pocket is not a person approving a transaction.
+    /// A phone in a pocket is not a person approving anything.
     #[tokio::test]
-    async fn an_assertion_without_user_verification_is_refused() {
+    async fn an_assertion_from_another_origin_is_refused() {
         let h = Harness::new();
-        let id = [4u8; 16];
-        let options = h
-            .gate
-            .issue(
-                id,
-                RequestBinding::new("POST", "/sign", None, b"x"),
-                std::slice::from_ref(&h.passkey),
-            )
-            .unwrap();
-        let assertion = h.authenticator.assert_with(
-            &Relying::challenge_for(&options),
-            ORIGIN,
-            flags::UP, // present, not verified
-        );
-        let mut req = Harness::request_with("POST", "/sign", b"x", &id, &assertion);
         assert!(matches!(
-            h.gate.verify(&mut req).await,
+            answer(
+                &h,
+                [5u8; 16],
+                scope(),
+                &h.authenticator,
+                "https://attacker.example"
+            )
+            .await,
             Err(Denied::Assertion(_))
         ));
     }
 
+    /// **"A person did this" is the entire claim.** Mere presence is not it.
     #[tokio::test]
-    async fn an_assertion_from_another_origin_is_refused() {
+    async fn an_assertion_without_user_verification_is_refused() {
         let h = Harness::new();
-        let id = [5u8; 16];
+        let id = [6u8; 16];
         let options = h
             .gate
-            .issue(
-                id,
-                RequestBinding::new("POST", "/sign", None, b"x"),
-                std::slice::from_ref(&h.passkey),
-            )
+            .issue(id, scope(), std::slice::from_ref(&h.passkey))
             .unwrap();
-        let assertion = h.authenticator.assert(
-            &Relying::challenge_for(&options),
-            "https://attacker.example",
-        );
-        let mut req = Harness::request_with("POST", "/sign", b"x", &id, &assertion);
+        let assertion =
+            h.authenticator
+                .assert_with(&Relying::challenge_for(&options), ORIGIN, flags::UP);
         assert!(matches!(
-            h.gate.verify(&mut req).await,
+            h.gate.authenticate(&id, &credential(&assertion)).await,
             Err(Denied::Assertion(_))
         ));
     }
@@ -659,90 +466,158 @@ mod tests {
     #[tokio::test]
     async fn a_challenge_that_was_never_issued_is_refused() {
         let h = Harness::new();
-        let mut req = h.signed_request("POST", "/sign", b"x");
-        req.headers_mut().insert(
-            CHALLENGE_HEADER,
-            hyper::header::HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA"),
+        let id = [7u8; 16];
+        let options = h
+            .gate
+            .issue(id, scope(), std::slice::from_ref(&h.passkey))
+            .unwrap();
+        let assertion = credential(
+            &h.authenticator
+                .assert(&Relying::challenge_for(&options), ORIGIN),
         );
         assert!(matches!(
-            h.gate.verify(&mut req).await,
+            h.gate.authenticate(&[0xff; 16], &assertion).await,
             Err(Denied::Challenge(ChallengeError::Unknown))
         ));
     }
 
-    #[tokio::test]
-    async fn a_malformed_assertion_is_refused_rather_than_panicking() {
-        let h = Harness::new();
-        for value in ["", "not-base64url!!", "aGVsbG8"] {
-            let mut req = h.signed_request("POST", "/sign", b"x");
-            req.headers_mut().insert(
-                ASSERTION_HEADER,
-                hyper::header::HeaderValue::from_str(value).unwrap(),
-            );
-            assert!(
-                h.gate.verify(&mut req).await.is_err(),
-                "{value:?} was accepted"
-            );
-        }
-    }
-
-    /// The body must be bounded: it is buffered to be hashed, and an unbounded
-    /// buffer is an unauthenticated way to exhaust an enclave's memory.
-    #[tokio::test]
-    async fn an_oversized_body_is_refused() {
-        let h = Harness::with_body_limit(16);
-        let mut req = h.signed_request("POST", "/sign", &[b'x'; 64]);
-        assert!(matches!(
-            h.gate.verify(&mut req).await,
-            Err(Denied::BodyTooLarge)
-        ));
-    }
-
-    /// **The race.** Two copies of one assertion, arriving together. Exactly
-    /// one may win — a lock that merely looked the challenge up and removed it
-    /// separately would let both through, and both would be a signature.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn two_simultaneous_uses_of_one_assertion_race_to_exactly_one_winner() {
+    /// **Under concurrency, one winner.** Two threads answering one challenge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_simultaneous_answers_to_one_challenge_race_to_exactly_one_winner() {
         for _ in 0..25 {
             let h = std::sync::Arc::new(Harness::new());
-            let mut first = h.signed_request("POST", "/sign", b"pay alice");
-            let headers = first.headers().clone();
-            let mut second = plain("POST", "/sign", b"pay alice");
-            *second.headers_mut() = headers;
+            let id = [8u8; 16];
+            let options = h
+                .gate
+                .issue(id, scope(), std::slice::from_ref(&h.passkey))
+                .unwrap();
+            let assertion = credential(
+                &h.authenticator
+                    .assert(&Relying::challenge_for(&options), ORIGIN),
+            );
 
-            let a = {
-                let h = h.clone();
-                tokio::spawn(async move { h.gate.verify(&mut first).await.is_ok() })
+            let (a, b) = {
+                let (h1, h2) = (h.clone(), h.clone());
+                let (c1, c2) = (assertion.clone(), assertion.clone());
+                tokio::join!(
+                    tokio::spawn(async move { h1.gate.authenticate(&id, &c1).await.is_ok() }),
+                    tokio::spawn(async move { h2.gate.authenticate(&id, &c2).await.is_ok() }),
+                )
             };
-            let b = {
-                let h = h.clone();
-                tokio::spawn(async move { h.gate.verify(&mut second).await.is_ok() })
-            };
-            let winners = [a.await.unwrap(), b.await.unwrap()]
-                .into_iter()
-                .filter(|ok| *ok)
-                .count();
-            assert_eq!(winners, 1, "an assertion authorized {winners} requests");
+            let winners = usize::from(a.unwrap()) + usize::from(b.unwrap());
+            assert_eq!(winners, 1, "one challenge was answered {winners} times");
         }
     }
 
-    /// Every refusal tells the client the same thing. Distinguishing them
-    /// would tell an attacker which guess to refine.
+    // --- the token half ---------------------------------------------------
+
+    /// A token identifies its tenant, and spends itself doing it.
+    #[tokio::test]
+    async fn a_token_admits_one_interaction() {
+        let h = Harness::new();
+        let token = h.token_for("POST", "/sign").await;
+        let req = Harness::bearer("POST", "/sign", b"pay alice", &token);
+        assert_eq!(h.gate.redeem(&req).unwrap().tenant_id, h.tenant_id);
+
+        let again = Harness::bearer("POST", "/sign", b"pay alice", &token);
+        assert!(
+            matches!(h.gate.redeem(&again), Err(Denied::Token(_))),
+            "a token admitted a second interaction"
+        );
+    }
+
+    /// **What the token still refuses.** It names a route, and cannot be moved.
+    #[tokio::test]
+    async fn a_token_cannot_be_moved_to_another_interaction() {
+        for (method, path) in [
+            ("POST", "/withdraw"),
+            ("GET", "/sign"),
+            ("POST", "/sign?all=1"),
+        ] {
+            let h = Harness::new();
+            let token = h.token_for("POST", "/sign").await;
+            let req = Harness::bearer(method, path, b"", &token);
+            assert!(
+                matches!(h.gate.redeem(&req), Err(Denied::Token(_))),
+                "an approval for POST /sign was spent on {method} {path}"
+            );
+        }
+    }
+
+    /// **What it deliberately does not refuse, and this is the trade.**
+    ///
+    /// The approval names the interaction, not the payload. A different body at
+    /// the same route is the same interaction as far as the runtime is
+    /// concerned, and the person who approved it saw no bytes. This test exists
+    /// so the property is written down rather than discovered.
+    #[tokio::test]
+    async fn a_token_does_not_bind_the_body() {
+        let h = Harness::new();
+        let token = h.token_for("POST", "/sign").await;
+        let req = Harness::bearer("POST", "/sign", b"pay mallory 1000", &token);
+        assert!(
+            h.gate.redeem(&req).is_ok(),
+            "the token bound a body it was never given"
+        );
+    }
+
+    /// The whole rule: nothing gets through without one.
+    #[tokio::test]
+    async fn a_request_without_a_token_is_refused() {
+        let h = Harness::new();
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri("https://enclave.test/sign")
+            .body(http_body_util::Full::new(Bytes::new()))
+            .expect("well-formed request");
+        assert!(matches!(h.gate.redeem(&req), Err(Denied::Missing)));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_authorization_header_is_refused_rather_than_panicking() {
+        let h = Harness::new();
+        for value in [
+            "",
+            "Bearer ",
+            "Basic abc",
+            "bearer lowercase-scheme",
+            &"x".repeat(4096),
+        ] {
+            let req = hyper::Request::builder()
+                .method("POST")
+                .uri("https://enclave.test/sign")
+                .header(AUTHORIZATION_HEADER, value)
+                .body(http_body_util::Full::new(Bytes::new()))
+                .expect("well-formed request");
+            assert!(
+                h.gate.redeem(&req).is_err(),
+                "{value:?} was accepted as a token"
+            );
+        }
+    }
+
+    /// **The uniformity guarantee.** Every refusal says the same thing.
     #[test]
     fn refusals_are_indistinguishable_to_the_client() {
-        let messages = [
-            Denied::Missing.public_message(),
-            Denied::NotTheRequest.public_message(),
-            Denied::UnknownCredential.public_message(),
-            Denied::Assertion("signature".into()).public_message(),
-            Denied::Challenge(ChallengeError::Expired).public_message(),
+        let all = [
+            Denied::Missing,
+            Denied::Malformed("x".into()),
+            Denied::Challenge(ChallengeError::Unknown),
+            Denied::Token(crate::auth::TokenError::WrongInteraction),
+            Denied::Token(crate::auth::TokenError::Expired),
+            Denied::UnknownCredential,
+            Denied::Assertion("x".into()),
         ];
-        assert!(
-            messages.iter().all(|m| *m == messages[0]),
-            "refusals leak which check failed: {messages:?}"
-        );
-        assert!(messages
-            .iter()
-            .all(|m| !m.contains("credential") && !m.contains("signature")));
+        for denied in &all {
+            assert_eq!(
+                denied.public_message(),
+                all[0].public_message(),
+                "{denied} tells a client something the others do not"
+            );
+            let public = denied.public_message();
+            assert!(!public.contains("credential"), "{public}");
+            assert!(!public.contains("signature"), "{public}");
+            assert!(!public.contains("expired"), "{public}");
+        }
     }
 }

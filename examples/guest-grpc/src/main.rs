@@ -62,10 +62,6 @@ pub struct ClientMsg {
     pub kind: i32,
     #[prost(bytes = "vec", tag = "4")]
     pub payload: Vec<u8>,
-    #[prost(string, tag = "5")]
-    pub challenge_id: String,
-    #[prost(bytes = "vec", tag = "6")]
-    pub assertion: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -187,9 +183,11 @@ impl Session {
                 k if k == Kind::Finish as i32 => Kind::Finish as i32,
                 _ => Kind::Round as i32,
             },
-            // Echoed, not signed. A cosigner would do its round here, and
-            // would first have to be satisfied by `msg.challenge_id` and
-            // `msg.assertion` — which opening this channel did not provide.
+            // Echoed, not signed. A cosigner would do its round here — and
+            // would first need per-message approval, which nothing in this
+            // guest can obtain: verifying an assertion needs state that lives
+            // in the runtime, and there is no host function to ask through.
+            // See the `.proto` beside this file.
             payload: msg.payload,
         }
     }
@@ -241,9 +239,23 @@ impl HttpBody for Session {
             // pollable it holds.
             match Pin::new(&mut this.inbound).poll_frame(cx) {
                 Poll::Pending => return Poll::Pending,
-                // The client half-closed. An orderly end: answer nothing more
-                // and say so in the trailers.
-                Poll::Ready(None) => this.finish(GRPC_OK, ""),
+                // The client half-closed — which is an orderly end only if it
+                // came between messages. A half-close with bytes still stranded
+                // in the deframer is a truncated frame, and reporting OK for it
+                // would tell the client its last message was received when it
+                // was not. The close looked clean at the HTTP layer; the gRPC
+                // stream did not end cleanly, and the trailers are the only
+                // place that difference can be said.
+                Poll::Ready(None) => {
+                    if this.deframer.is_empty() {
+                        this.finish(GRPC_OK, "");
+                    } else {
+                        this.finish(
+                            GRPC_INVALID_ARGUMENT,
+                            "the stream ended part-way through a message",
+                        );
+                    }
+                }
                 Poll::Ready(Some(Err(e))) => {
                     this.finish(GRPC_UNAVAILABLE, &e.to_string());
                 }

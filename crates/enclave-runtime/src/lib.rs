@@ -50,8 +50,9 @@ pub mod wasi;
 #[cfg(any(test, feature = "testing"))]
 pub use auth::SoftwareAuthenticator;
 pub use auth::{
-    build_relying_party, AuthEndpoints, ChallengeStore, FilesystemCredentials, Gate, RateLimiter,
-    AUTH_PREFIX, DEFAULT_CAPACITY,
+    build_relying_party, AuthEndpoints, ChallengeStore, FilesystemCredentials, Gate,
+    InteractionScope, RateLimiter, TokenStore, AUTH_PREFIX, DEFAULT_CAPACITY,
+    DEFAULT_TOKEN_CAPACITY,
 };
 pub use boot::{authorise_successor, boot, BootConfig, BootMode, Booted, ReceiptTrust};
 pub use clock::{open_clock, ClockSource, HostClock, PtpClock, TrustedClock, DEFAULT_PTP_DEVICE};
@@ -77,9 +78,9 @@ pub use nitro_nsm::{Nsm, NsmDevice, DEFAULT_NSM_DEVICE};
 pub use random::{open_entropy, GuestRandom, HostEntropy, RandomSource};
 pub use run::{read_component, GuestEnvironment, GuestOutcome, EXIT_RUNTIME_FAILURE};
 pub use serve::{
-    apply_tenant, serve_component, AcmeConfig, CertificateSlot, EgressPolicy, EnclaveEndpoints,
-    GuestInstance, PoolLimits, SealedAcmeCache, ServeConfig, ServeHandle, Server, Tenancy,
-    TenantPool, TlsIdentity, TlsMode, X_ENCLAVE_TENANT,
+    apply_tenant, serve_component, AcmeConfig, CertificateSlot, EgressPolicy, GuestInstance,
+    PoolLimits, SealedAcmeCache, ServeConfig, ServeHandle, Server, Tenancy, TenantPool,
+    TlsIdentity, TlsMode, X_ENCLAVE_TENANT,
 };
 pub use state::State;
 pub use tenant::{tenant_root_by_id, tenants, Arrival, TenantRoot};

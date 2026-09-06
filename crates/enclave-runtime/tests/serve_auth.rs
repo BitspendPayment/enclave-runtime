@@ -33,8 +33,68 @@ fn component_path() -> PathBuf {
         .join("../../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm")
 }
 
+/// An NSM that signs for real, echoing back whatever it was asked to bind.
+///
+/// The auth exchange is now the only place the runtime attests, and it is the
+/// exchange a client uses to identify the enclave before approving anything —
+/// so this harness has to produce documents that verify, not canned bytes.
+#[derive(Debug)]
+struct SigningNsm {
+    chain: nitro_attestation::testing::TestChain,
+    pcr0: [u8; 48],
+    /// Counted, so successive draws differ. A device that returned the same
+    /// bytes every time would mint one tenant id for every passkey, which is
+    /// the isolation property quietly inverted.
+    draws: std::sync::atomic::AtomicU64,
+}
+
+impl SigningNsm {
+    fn new() -> Self {
+        SigningNsm {
+            chain: nitro_attestation::testing::TestChain::new().expect("test chain"),
+            pcr0: [0x5a; 48],
+            draws: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl nitro_nsm::Nsm for SigningNsm {
+    fn get_random(&self, buf: &mut [u8]) -> anyhow::Result<()> {
+        let draw = self.draws.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8)
+                .wrapping_mul(7)
+                .wrapping_add(3)
+                .wrapping_add(draw as u8);
+        }
+        Ok(())
+    }
+    fn attest(&self, request: &nitro_nsm::AttestationRequest) -> anyhow::Result<Vec<u8>> {
+        self.chain
+            .document(request.user_data.clone(), request.nonce.clone(), self.pcr0)
+    }
+    fn describe_pcr(&self, index: u16) -> anyhow::Result<nitro_nsm::Pcr> {
+        Ok(nitro_nsm::Pcr {
+            locked: index < 3,
+            value: if index == 0 {
+                self.pcr0.to_vec()
+            } else {
+                nitro_nsm::PCR_ZERO.to_vec()
+            },
+        })
+    }
+    fn extend_pcr(&self, _index: u16, _data: &[u8]) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("this fake does not model PCR extension")
+    }
+    fn describe(&self) -> String {
+        "signing test NSM".into()
+    }
+}
+
 struct Harness {
     addr: std::net::SocketAddr,
+    nsm: Arc<SigningNsm>,
+    guest_bytes: Vec<u8>,
 }
 
 async fn start() -> Harness {
@@ -56,14 +116,19 @@ async fn start() -> Harness {
             component_path().display()
         )
     });
+    let bytes_for_harness = bytes.clone();
 
-    let entropy: Arc<dyn nitro_nsm::Nsm> = Arc::new(nitro_nsm::fake::FakeNsm::new());
+    let nsm = Arc::new(SigningNsm::new());
+    let entropy: Arc<dyn nitro_nsm::Nsm> = nsm.clone();
     let credentials = Arc::new(FilesystemCredentials::new(fs.clone()));
     let gate = Arc::new(Gate::new(
         enclave_runtime::build_relying_party(RP_ID, ORIGIN).expect("relying party"),
         ChallengeStore::new(std::time::Duration::from_secs(60), 256),
         credentials.clone(),
-        64 * 1024,
+        enclave_runtime::TokenStore::new(
+            std::time::Duration::from_secs(60),
+            enclave_runtime::DEFAULT_TOKEN_CAPACITY,
+        ),
     ));
     let auth = Arc::new(AuthEndpoints::new(
         gate.clone(),
@@ -88,6 +153,7 @@ async fn start() -> Harness {
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
+    let nsm_for_server: Arc<dyn nitro_nsm::Nsm> = nsm.clone();
     tokio::spawn(async move {
         let _ = enclave_runtime::serve_component(
             &bytes,
@@ -96,8 +162,9 @@ async fn start() -> Harness {
                 addr,
                 certificate: Some(enclave_runtime::CertificateSlot::fixed(Arc::new(tls))),
                 acme: None,
-                attestation: None,
+                attestation: Some(nsm_for_server),
                 request_timeout: std::time::Duration::from_secs(30),
+                max_interaction: std::time::Duration::from_secs(300),
                 tenancy: Some(Arc::new(Tenancy::new(PoolLimits::default()))),
                 authentication: Some((auth, gate)),
             },
@@ -107,7 +174,11 @@ async fn start() -> Harness {
 
     for _ in 0..400 {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return Harness { addr };
+            return Harness {
+                addr,
+                nsm,
+                guest_bytes: bytes_for_harness,
+            };
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -119,6 +190,14 @@ async fn start() -> Harness {
 ///
 /// Distinct rather than random: these tests need only that no two requests
 /// share one. A real client uses a CSPRNG.
+fn raw_nonce() -> Vec<u8> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1_000);
+    let mut nonce = vec![0x5au8; 20];
+    nonce[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    nonce
+}
+
 fn fresh_nonce() -> String {
     use base64::Engine as _;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -126,6 +205,69 @@ fn fresh_nonce() -> String {
     let mut nonce = vec![0x5au8; 20];
     nonce[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce)
+}
+
+/// Like [`https`], but returns the response head and the certificate this
+/// connection presented — which is what an attestation binds.
+async fn https_full(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    nonce: &[u8],
+    headers: &[(&str, String)],
+    body: &str,
+) -> (u16, String, Vec<u8>) {
+    use base64::Engine as _;
+    let config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AcceptAny))
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let name = rustls::pki_types::ServerName::try_from(RP_ID).unwrap();
+    let socket = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut stream = connector.connect(name, socket).await.expect("handshake");
+
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {RP_ID}\r\nConnection: close\r\n\
+         x-enclave-nonce: {}\r\nContent-Length: {}\r\n",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce),
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    stream.write_all(request.as_bytes()).await.expect("write");
+
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw).await;
+    let presented = {
+        let (_, conn) = stream.get_ref();
+        conn.peer_certificates()
+            .and_then(|c| c.first().cloned())
+            .expect("server certificate")
+            .to_vec()
+    };
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("headers");
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let status: u16 = head
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    (status, head, presented)
 }
 
 async fn https(
@@ -149,9 +291,9 @@ async fn https(
     let socket = tokio::net::TcpStream::connect(addr).await.expect("connect");
     let mut stream = connector.connect(name, socket).await.expect("handshake");
 
-    // Every request carries a nonce, whether or not the deployment attests —
-    // this harness runs with `attestation: None` and must still send one, which
-    // is the point of that rule: a client behaves the same either way.
+    // Every request carries a nonce, whether or not the response it gets back
+    // is attested — the runtime attests `/auth/` exchanges and nothing else, and
+    // a client behaves the same either way.
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {RP_ID}\r\nConnection: close\r\n\
          x-enclave-nonce: {}\r\nContent-Length: {}\r\n",
@@ -258,6 +400,11 @@ async fn enrol(addr: std::net::SocketAddr, token: &str) -> SoftwareAuthenticator
 }
 
 /// A signed request: ask for a challenge bound to it, then send it.
+/// Walk the whole flow: challenge, assertion, token, interaction.
+///
+/// Three trips, and they have to be three: a passkey is a challenge-response,
+/// so the assertion cannot exist until the challenge has been answered, and the
+/// token cannot exist until the assertion has been checked.
 async fn signed(
     addr: std::net::SocketAddr,
     auth: &SoftwareAuthenticator,
@@ -265,6 +412,24 @@ async fn signed(
     path: &str,
     body: &str,
 ) -> (u16, String) {
+    let token = token_for(addr, auth, method, path).await;
+    https(
+        addr,
+        method,
+        path,
+        &[("authorization", format!("Bearer {token}"))],
+        body,
+    )
+    .await
+}
+
+/// Trips one and two, returning the token they produce.
+async fn token_for(
+    addr: std::net::SocketAddr,
+    auth: &SoftwareAuthenticator,
+    method: &str,
+    path: &str,
+) -> String {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let (path_only, query) = match path.split_once('?') {
@@ -280,7 +445,6 @@ async fn signed(
             "method": method,
             "path": path_only,
             "query": query,
-            "body_sha256": b64.encode(nitro_attestation::sha256(body.as_bytes())),
         }),
     )
     .await;
@@ -290,20 +454,18 @@ async fn signed(
         .as_str()
         .expect("a challenge");
     let assertion = auth.assert(challenge, ORIGIN);
-    https(
+
+    let (status, granted) = post_json(
         addr,
-        method,
-        path,
-        &[
-            (
-                "x-webauthn-challenge-id",
-                options["challenge_id"].as_str().unwrap().to_string(),
-            ),
-            ("x-webauthn-assertion", b64.encode(assertion.to_string())),
-        ],
-        body,
+        "/auth/request/verify",
+        serde_json::json!({
+            "challenge_id": options["challenge_id"].as_str().expect("a challenge id"),
+            "assertion": b64.encode(assertion.to_string()),
+        }),
     )
-    .await
+    .await;
+    assert_eq!(status, 200, "{granted}");
+    granted["token"].as_str().expect("a token").to_string()
 }
 
 /// **The rule.** Nothing reaches the guest without an assertion.
@@ -352,86 +514,54 @@ async fn the_guest_is_told_the_resolved_tenant() {
 }
 
 /// **The substitution, over a real socket.** An approval for one body must not
-/// authorize another.
+/// **What the approval still names: the interaction.**
+///
+/// A token issued for one route cannot be spent on another, so an approval to
+/// write one file is not an approval to write a different one.
+///
+/// What it deliberately no longer names is the *body* — see
+/// `a_token_does_not_bind_the_body` in the gate's own tests. That is the trade
+/// this model makes, and it is written down rather than left to be discovered.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn an_assertion_cannot_be_moved_to_another_request() {
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+async fn a_token_cannot_be_moved_to_another_interaction() {
     let h = start().await;
     let auth = enrol(h.addr, TOKENS[0]).await;
 
-    // A challenge bound to writing "approved".
-    let (_, options) = post_json(
+    // Approved for writing one file.
+    let token = token_for(h.addr, &auth, "POST", "/files/approved.txt").await;
+
+    // Spent on another.
+    let (status, body) = https(
         h.addr,
-        "/auth/request/options",
-        serde_json::json!({
-            "credential_id": b64.encode(auth.credential_id()),
-            "method": "POST",
-            "path": "/files/note.txt",
-            "body_sha256": b64.encode(nitro_attestation::sha256(b"approved")),
-        }),
+        "POST",
+        "/files/substituted.txt",
+        &[("authorization", format!("Bearer {token}"))],
+        "substituted",
     )
     .await;
-    let assertion = auth.assert(
-        options["options"]["publicKey"]["challenge"]
-            .as_str()
-            .unwrap(),
-        ORIGIN,
-    );
-    let headers = [
-        (
-            "x-webauthn-challenge-id",
-            options["challenge_id"].as_str().unwrap().to_string(),
-        ),
-        ("x-webauthn-assertion", b64.encode(assertion.to_string())),
-    ];
+    assert_eq!(status, 401, "a token was moved to another route: {body}");
 
-    // Sent with a different body.
-    let (status, body) = https(h.addr, "POST", "/files/note.txt", &headers, "substituted").await;
-    assert_eq!(status, 401, "a substituted body was authorized: {body}");
-    // And the file was never written, so the guest genuinely was not called.
-    let (status, _) = signed(h.addr, &auth, "GET", "/files/note.txt", "").await;
-    assert_eq!(status, 404, "the substituted body reached the filesystem");
+    // And the guest genuinely was not called.
+    let (status, _) = signed(h.addr, &auth, "GET", "/files/substituted.txt", "").await;
+    assert_eq!(
+        status, 404,
+        "the substituted request reached the filesystem"
+    );
 }
 
-/// One approval, one request. A captured assertion is worthless afterwards.
+/// **One approval, one interaction.** A captured token is worthless afterwards.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn an_assertion_cannot_be_replayed() {
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+async fn a_token_cannot_be_replayed() {
     let h = start().await;
     let auth = enrol(h.addr, TOKENS[0]).await;
-
-    let (_, options) = post_json(
-        h.addr,
-        "/auth/request/options",
-        serde_json::json!({
-            "credential_id": b64.encode(auth.credential_id()),
-            "method": "GET",
-            "path": "/counter",
-            "body_sha256": b64.encode(nitro_attestation::sha256(b"")),
-        }),
-    )
-    .await;
-    let assertion = auth.assert(
-        options["options"]["publicKey"]["challenge"]
-            .as_str()
-            .unwrap(),
-        ORIGIN,
-    );
-    let headers = [
-        (
-            "x-webauthn-challenge-id",
-            options["challenge_id"].as_str().unwrap().to_string(),
-        ),
-        ("x-webauthn-assertion", b64.encode(assertion.to_string())),
-    ];
+    let token = token_for(h.addr, &auth, "GET", "/counter").await;
+    let headers = [("authorization", format!("Bearer {token}"))];
 
     assert_eq!(https(h.addr, "GET", "/counter", &headers, "").await.0, 200);
     let (status, _) = https(h.addr, "GET", "/counter", &headers, "").await;
-    assert_eq!(status, 401, "an assertion authorized a second request");
+    assert_eq!(status, 401, "a spent token was accepted a second time");
 }
 
 /// Two passkeys, two tenants, and neither can see the other's data — the whole
@@ -573,6 +703,14 @@ async fn the_passkey_client_binary_drives_the_gate() {
             tokio::task::spawn_blocking(move || {
                 let out = std::process::Command::new(&exe)
                     .args(["--url", &url, "--state", state.to_str().unwrap()])
+                    // The harness signs with a `TestChain`, which roots at
+                    // itself rather than AWS. The chain is still verified —
+                    // this only says "do not require the AWS root", which is
+                    // the whole difference between this and production.
+                    .arg("--allow-untrusted-root")
+                    // And which enclave, which the client now insists on
+                    // knowing: `SigningNsm` reports this as PCR0.
+                    .args(["--pcr0", &"5a".repeat(48)])
                     .args(&args)
                     .output()
                     .expect("running passkey-client");
@@ -605,20 +743,122 @@ async fn the_passkey_client_binary_drives_the_gate() {
     // And the substitution the harness checks: refused, and nothing written.
     let (_, out, _) = run(vec![
         "substitute".into(),
-        "--path".into(),
-        "/files/e2e.txt".into(),
         "--approved".into(),
-        "approved".into(),
+        "/files/approved.txt".into(),
         "--sent".into(),
+        "/files/substituted.txt".into(),
+        "--body".into(),
         "substituted".into(),
     ])
     .await;
     assert!(
         out.starts_with("401"),
-        "a substituted body was authorized: {out}"
+        "a token was spent on a route it was not approved for: {out}"
     );
-    let (ok, _, _) = run(vec!["get".into(), "--path".into(), "/files/e2e.txt".into()]).await;
-    assert!(!ok, "the substituted body reached the filesystem");
+    let (ok, _, _) = run(vec![
+        "get".into(),
+        "--path".into(),
+        "/files/substituted.txt".into(),
+    ])
+    .await;
+    assert!(!ok, "the substituted request reached the filesystem");
 
     let _ = std::fs::remove_file(&state);
+}
+
+/// **The exchange a client uses to identify the enclave.**
+///
+/// `/auth/request/options` is the first trip of three, and the one that goes
+/// out on a connection nothing has vouched for yet — so its response is the one
+/// that has to carry a document. A client checks it *before* asking a person to
+/// approve anything, and then pins the certificate it named for the two trips
+/// that follow.
+///
+/// This is why there is no separate probe route: the round trip was needed
+/// anyway.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn the_challenge_exchange_is_attested_and_binds_its_connection() {
+    use base64::Engine as _;
+    let h = start().await;
+    let auth = enrol(h.addr, TOKENS[0]).await;
+
+    let nonce = raw_nonce();
+    let (status, head, presented) = https_full(
+        h.addr,
+        "POST",
+        "/auth/request/options",
+        &nonce,
+        &[("content-type", "application/json".to_string())],
+        &serde_json::json!({
+            "credential_id": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(auth.credential_id()),
+            "method": "GET",
+            "path": "/counter",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, 200, "{head}");
+
+    let document = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("x-enclave-attestation:"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim())
+        .expect("the challenge exchange carried no attestation");
+    let cose = base64::engine::general_purpose::STANDARD
+        .decode(document)
+        .expect("the document is base64");
+
+    nitro_attestation::verify(
+        &cose,
+        &nitro_attestation::VerifyOptions {
+            trust_root: h.nsm.chain.root_der().to_vec(),
+            now: std::time::SystemTime::now(),
+            allow_untrusted_root: false,
+        },
+    )
+    .expect("the document verifies")
+    .expect(
+        &nitro_attestation::Expectations {
+            nonce: Some(nonce.clone()),
+            user_data: Some(
+                nitro_attestation::AttestationHashes::new(&presented, &h.guest_bytes).serialize(),
+            ),
+            ..Default::default()
+        },
+        std::time::SystemTime::now(),
+    )
+    .expect("the document must bind this connection's certificate and this nonce");
+}
+
+/// And the interaction itself is *not* attested, deliberately.
+///
+/// A second document would establish nothing the first has not: the client
+/// pinned the certificate the challenge exchange named, and TLS proves the peer
+/// holds its private key. What it would cost is an NSM signature per
+/// interaction, on a device that is the runtime's throughput ceiling.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn a_guest_response_is_not_attested() {
+    let h = start().await;
+    let auth = enrol(h.addr, TOKENS[0]).await;
+    let token = token_for(h.addr, &auth, "GET", "/counter").await;
+
+    let nonce = raw_nonce();
+    let (status, head, _) = https_full(
+        h.addr,
+        "GET",
+        "/counter",
+        &nonce,
+        &[("authorization", format!("Bearer {token}"))],
+        "",
+    )
+    .await;
+    assert_eq!(status, 200, "{head}");
+    assert!(
+        !head.to_ascii_lowercase().contains("x-enclave-attestation:"),
+        "a guest response carried a document:\n{head}"
+    );
 }

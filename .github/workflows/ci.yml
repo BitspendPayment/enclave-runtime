@@ -72,11 +72,24 @@ jobs:
         run: cargo test -p enclave-runtime --test serve_grpc -- --include-ignored
 
       # The same guest driven by tonic over TLS, so the guest's hand-written
-      # framing is checked against an implementation from outside this repo —
-      # and the attestation is verified from the initial metadata before the
-      # client sends anything.
+      # framing is checked against an implementation from outside this repo.
       - name: gRPC on the wire, with a real client
         run: cargo test -p enclave-runtime --test serve_grpc_wire -- --include-ignored
+
+      # `serve_auth` ran in no job at all until now, which is not a gap anyone
+      # could afford: it is the suite for the whole authorization model —
+      # challenge, assertion, token, scope, tenant isolation — and the only one
+      # that checks an attestation document against the connection it came in
+      # on. The client binary is built first because one of its tests drives
+      # the real thing rather than a stand-in, and skips silently without it.
+      - name: build the passkey client
+        run: cargo build --release -p enclave-runtime --features testing --bin passkey-client
+
+      - name: interaction tokens, end to end
+        run: cargo test -p enclave-runtime --test serve_auth -- --include-ignored
+
+      - name: guest logging
+        run: cargo test -p enclave-runtime --test guest_logs -- --include-ignored
 
       - name: build the verifier CLI
         run: cargo build -p nitro-attestation --features cli

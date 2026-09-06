@@ -331,12 +331,22 @@ struct Cli {
     #[arg(long, env = "S3FS_CHALLENGE_TTL_SECS", default_value_t = 60)]
     challenge_ttl_secs: u64,
 
-    /// Largest request body the runtime will buffer, in bytes.
+    /// Seconds an interaction token is good for before it is spent.
     ///
-    /// The body is buffered because the assertion commits to its hash, so this
-    /// bounds what an unauthenticated caller can make the runtime allocate.
-    #[arg(long, env = "S3FS_MAX_REQUEST_BODY_BYTES", default_value_t = 1024 * 1024)]
-    max_request_body_bytes: usize,
+    /// This bounds the time to *start* an interaction — a person who approves
+    /// something and then puts their phone down should not find the approval
+    /// still live later. It is not how long an interaction may run.
+    #[arg(long, env = "S3FS_INTERACTION_TOKEN_TTL_SECS", default_value_t = 60)]
+    interaction_token_ttl_secs: u64,
+
+    /// Seconds an interaction may run once started.
+    ///
+    /// The other half of the distinction: a stream holds its tenant's single
+    /// slot for its whole life, so this is what bounds how long that tenant's
+    /// next request waits. Enforced by wall clock, because a guest parked in a
+    /// host call executes no wasm and the epoch cannot see it.
+    #[arg(long, env = "S3FS_MAX_INTERACTION_SECS", default_value_t = 300)]
+    max_interaction_secs: u64,
 
     /// Single-use enrollment tokens, seeded at boot if not already there.
     /// Repeatable, or comma-separated.
@@ -445,15 +455,6 @@ struct Cli {
     /// The tap forwarder binary, shipped inside the enclave image.
     #[arg(long, env = "S3FS_GVFORWARDER", default_value = DEFAULT_GVFORWARDER)]
     gvforwarder: PathBuf,
-
-    /// Attest every response, and serve `/enclave/config`.
-    ///
-    /// On by default: an enclave nobody can verify is an enclave for nothing.
-    /// Turning it off is for running the same image outside one, where the NSM
-    /// is absent and startup would otherwise fail.
-    #[arg(long, env = "S3FS_ATTESTATION", value_parser = enclave_runtime::parse_bool_flag,
-          num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
-    attestation: bool,
 
     /// Arguments passed to the guest.
     #[arg(last = true)]
@@ -687,7 +688,11 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         "serving guest"
     );
 
-    let attestation = cli.attestation.then(|| entropy.clone());
+    // Not a choice. An enclave nobody can verify is an enclave for nothing, and
+    // a flag that turns verification off is a flag that can be turned off by
+    // whoever starts the process — which inside an enclave is the party the
+    // enclave exists to exclude.
+    let attestation = Some(entropy.clone());
 
     // Per-client views of the one filesystem. Each client's guest sees
     // its own directory as `/`; the mount, the block cache and the
@@ -725,7 +730,10 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
                     enclave_runtime::DEFAULT_CAPACITY,
                 ),
                 credentials.clone(),
-                cli.max_request_body_bytes,
+                enclave_runtime::TokenStore::new(
+                    Duration::from_secs(cli.interaction_token_ttl_secs),
+                    enclave_runtime::DEFAULT_TOKEN_CAPACITY,
+                ),
             ));
             let auth = std::sync::Arc::new(enclave_runtime::AuthEndpoints::new(
                 gate.clone(),
@@ -872,6 +880,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             acme,
             attestation,
             request_timeout: Duration::from_secs(cli.request_timeout_secs),
+            max_interaction: Duration::from_secs(cli.max_interaction_secs),
             tenancy,
             authentication,
         },

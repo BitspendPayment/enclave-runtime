@@ -283,10 +283,10 @@ impl Default for Harness {
 
 impl Harness {
     pub fn new() -> Self {
-        Self::with_body_limit(64 * 1024)
+        Self::with_token_ttl(super::token::DEFAULT_TTL)
     }
 
-    pub fn with_body_limit(max_body_bytes: usize) -> Self {
+    pub fn with_token_ttl(ttl: std::time::Duration) -> Self {
         let rp = Relying::new();
         let authenticator = SoftwareAuthenticator::new(RP_ID);
         let passkey = rp.register(&authenticator);
@@ -308,7 +308,7 @@ impl Harness {
                 rp.webauthn,
                 super::ChallengeStore::new(super::DEFAULT_TTL, super::DEFAULT_CAPACITY),
                 credentials.clone(),
-                max_body_bytes,
+                super::TokenStore::new(ttl, super::token::DEFAULT_CAPACITY),
             ),
             authenticator,
             passkey,
@@ -317,13 +317,12 @@ impl Harness {
         }
     }
 
-    /// A request carrying a valid assertion for exactly itself.
-    pub fn signed_request(
-        &self,
-        method: &str,
-        path_and_query: &str,
-        body: &[u8],
-    ) -> hyper::Request<http_body_util::Full<bytes::Bytes>> {
+    /// Walk the real two-trip flow and return the token it produces.
+    ///
+    /// Challenge, assertion, verification — the same path a client takes, so a
+    /// test that uses this is exercising what a client actually does rather
+    /// than a shortcut around it.
+    pub async fn token_for(&self, method: &str, path_and_query: &str) -> String {
         let (path, query) = match path_and_query.split_once('?') {
             Some((p, q)) => (p, Some(q)),
             None => (path_and_query, None),
@@ -333,75 +332,43 @@ impl Harness {
             .gate
             .issue(
                 id,
-                super::RequestBinding::new(method, path, query, body),
+                super::InteractionScope::new(method, path, query),
                 std::slice::from_ref(&self.passkey),
             )
             .expect("issuing a challenge");
         let assertion = self
             .authenticator
             .assert(&Relying::challenge_for(&options), ORIGIN);
-        Self::request_with(method, path_and_query, body, &id, &assertion)
+        let assertion: webauthn_rs::prelude::PublicKeyCredential =
+            serde_json::from_str(&assertion.to_string()).expect("a credential");
+        let who = self
+            .gate
+            .authenticate(&id, &assertion)
+            .await
+            .expect("the assertion verifies");
+
+        let token = "a-test-token-of-plausible-length".to_string();
+        self.gate
+            .grant(token.as_bytes(), &who)
+            .expect("recording the approval");
+        token
     }
 
-    /// A request carrying a *stream-open* assertion, with the header that says
-    /// so.
-    ///
-    /// `body` is whatever the client happens to send after the head; a stream
-    /// open commits to none of it, so passing something here is the point
-    /// rather than an oversight.
-    pub fn stream_request(
-        &self,
+    /// A request carrying a bearer token.
+    pub fn bearer(
         method: &str,
         path_and_query: &str,
         body: &[u8],
+        token: &str,
     ) -> hyper::Request<http_body_util::Full<bytes::Bytes>> {
-        let (path, query) = match path_and_query.split_once('?') {
-            Some((p, q)) => (p, Some(q)),
-            None => (path_and_query, None),
-        };
-        let id = [9u8; 16];
-        let options = self
-            .gate
-            .issue(
-                id,
-                super::RequestBinding::stream_open(method, path, query),
-                std::slice::from_ref(&self.passkey),
-            )
-            .expect("issuing a stream-open challenge");
-        let assertion = self
-            .authenticator
-            .assert(&Relying::challenge_for(&options), ORIGIN);
-        let mut req = Self::request_with(method, path_and_query, body, &id, &assertion);
-        req.headers_mut().insert(
-            super::STREAM_HEADER,
-            hyper::header::HeaderValue::from_static("open"),
-        );
-        req
-    }
-
-    /// A request carrying an assertion that was issued for something else.
-    pub fn assertion_for(
-        &self,
-        issued: (&str, &str, &[u8]),
-        sent: (&str, &str, &[u8]),
-    ) -> hyper::Request<http_body_util::Full<bytes::Bytes>> {
-        let (path, query) = match issued.1.split_once('?') {
-            Some((p, q)) => (p, Some(q)),
-            None => (issued.1, None),
-        };
-        let id = [8u8; 16];
-        let options = self
-            .gate
-            .issue(
-                id,
-                super::RequestBinding::new(issued.0, path, query, issued.2),
-                std::slice::from_ref(&self.passkey),
-            )
-            .expect("issuing a challenge");
-        let assertion = self
-            .authenticator
-            .assert(&Relying::challenge_for(&options), ORIGIN);
-        Self::request_with(sent.0, sent.1, sent.2, &id, &assertion)
+        hyper::Request::builder()
+            .method(method)
+            .uri(format!("https://enclave.test{path_and_query}"))
+            .header(super::AUTHORIZATION_HEADER, format!("Bearer {token}"))
+            .body(http_body_util::Full::new(bytes::Bytes::copy_from_slice(
+                body,
+            )))
+            .expect("well-formed request")
     }
 
     pub fn request_with(

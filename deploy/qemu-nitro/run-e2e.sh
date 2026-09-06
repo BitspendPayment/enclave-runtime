@@ -155,8 +155,14 @@ ENROLLMENT_TOKEN="qemu-e2e-enrollment-token"
 ENROLLMENT_TOKEN_2="qemu-e2e-enrollment-token-2"
 # Two identities, each with its own passkey file, so the harness can show that
 # one tenant cannot see another's data.
-signed()  { "$PASSKEY" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/alice.json" "$@"; }
-signed2() { "$PASSKEY" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/bob.json"   "$@"; }
+# `--unsigned-emulator`: QEMU's NSM does not sign its documents at all, so
+# there is no signature to check and nothing here establishes *who* produced
+# one. What the client still checks is what the runtime put in — the nonce and
+# the certificate this connection was served — and those are our code's work.
+# Against real hardware this flag must not appear.
+PASSKEY_ARGS=(--unsigned-emulator)
+signed()  { "$PASSKEY" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/alice.json" "${PASSKEY_ARGS[@]}" "$@"; }
+signed2() { "$PASSKEY" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/bob.json"   "${PASSKEY_ARGS[@]}" "$@"; }
 
 # ---------------------------------------------------------------------------
 # The store the enclave will mount.
@@ -431,12 +437,12 @@ echo "counter: $first then $second"
     || fail "the counter did not advance ($first → $second); writes are not reaching MinIO"
 
 say "3/7  the attestation binds this connection's certificate"
-# There is no attestation endpoint: the document rides on an ordinary
-# response, in `x-enclave-attestation`. `/enclave/config` is the probe route —
-# no passkey, no guest — so this is the check a client makes *before* it sends
-# anything, on the connection it then goes on to use.
+# There is no attestation endpoint: the document rides on the `/auth/` exchange,
+# in `x-enclave-attestation`. That is where a client identifies the enclave
+# before approving anything, and it needs no credential — so this is the check a
+# client makes on the connection it then goes on to use.
 "$ATTEST" \
-    --url "https://127.0.0.1:$HTTPS_PORT/enclave/config" \
+    --url "https://127.0.0.1:$HTTPS_PORT/auth/" \
     --unsigned-emulator \
     --pcr0 "$EXPECTED_PCR0" \
     | tee "$RUNDIR/attest.log" \
@@ -445,16 +451,21 @@ say "3/7  the attestation binds this connection's certificate"
 grep -q "binding    the attested certificate" "$RUNDIR/attest.log" \
     || fail "the document did not bind the certificate this connection was served"
 
-say "3b/7 a signed guest request carries its own proof"
-# The case the old endpoint could never cover: the response to a real,
-# passkey-signed request to the guest. `--dump-proof` keeps the three things a
-# verifier cannot recover afterwards — the document, the certificate this
-# connection was served, and the nonce that request sent.
+say "3b/7 a signed interaction verifies the enclave before it trusts it"
+# The proof comes from the `/auth/` exchange, not from the guest's response:
+# that exchange is where a client identifies the enclave, before it hands over
+# an assertion and before the interaction runs. Guest responses deliberately
+# carry no document — the client has pinned the certificate by then, and TLS
+# proves the peer still holds its key.
+#
+# `--dump-proof` keeps the three things a verifier cannot recover afterwards:
+# the document, the certificate that connection was served, and the nonce the
+# request sent.
 rm -rf "$RUNDIR/proof"
 signed --dump-proof "$RUNDIR/proof" get --path /counter >/dev/null \
-    || fail "the signed request failed"
+    || fail "the signed interaction failed"
 [[ -s "$RUNDIR/proof/document.b64" ]] \
-    || fail "the guest's response carried no attestation document"
+    || fail "the challenge exchange carried no attestation document"
 
 "$ATTEST" \
     --document "$RUNDIR/proof/document.b64" \
@@ -463,10 +474,10 @@ signed --dump-proof "$RUNDIR/proof" get --path /counter >/dev/null \
     --unsigned-emulator \
     --pcr0 "$EXPECTED_PCR0" \
     | tee "$RUNDIR/attest-guest.log" \
-    || fail "the guest response's document did not verify"
+    || fail "the challenge exchange's document did not verify"
 
 grep -q "binding    the attested certificate" "$RUNDIR/attest-guest.log" \
-    || fail "the guest response's document did not bind that connection's certificate"
+    || fail "the document did not bind that connection's certificate"
 
 say "4/7  the attested PCR0 is the one the build produced"
 # `nitro-attest --pcr0` already enforced this, so reaching here means it held.

@@ -21,65 +21,72 @@ independent.
 The runtime negotiates HTTP/2 by ALPN, per connection. There is no
 configuration for it, and HTTP/1.1 clients are unaffected.
 
-## Authorization: a channel is not a signature
+## Authorization: one model, and what it names
 
-An ordinary request is approved by a WebAuthn assertion bound to
-`{method, path, query, sha256(body)}`. The body hash is the part that makes the
-approval mean *this* operation — without it, an approval for one payload
-authorizes any payload at that route.
-
-**A stream's body is the message sequence, and none of it exists when the
-channel opens.** There is nothing to hash. So a stream is opened with a
-different, weaker approval, issued by a different endpoint:
+A stream and an ordinary request are approved the same way. That unification is
+recent and deliberate: a stream's body **is** its message sequence, so it could
+never be bound by a body hash, and rather than keep a second weaker path for it,
+the approval now names something both shapes have — the interaction.
 
 ```console
-POST /auth/stream/options   { credential_id, method, path, query }
-        ↓                    no body hash, because there is no body yet
+POST /auth/request/options   { credential_id, method, path, query }
+        ↓                     response is attested: check it, pin the certificate
    Face ID / Touch ID
         ↓
-POST <path>                 x-webauthn-challenge-id, x-webauthn-assertion,
-                            x-enclave-stream: open
+POST /auth/request/verify    { challenge_id, assertion }  →  { token, expires_in_secs }
+        ↓
+<the interaction>            Authorization: Bearer <token>
 ```
 
 ### What it authorizes
 
-**Opening one channel, on that method, path and query. Nothing else.** The same
-shape as an enrollment token, which creates a tenant and does nothing else.
+**One interaction, at that method, path and query.** Not one message, and not
+one payload.
 
-It commits to no bytes, so it approves no operation. **Every message inside the
-stream that asks the enclave to sign anything must carry its own fresh,
-single-use assertion bound to that message.** Treating an open channel as
-standing permission to sign would be exactly the substitution the body hash
-exists to prevent — one approval, spent on operations the person never saw.
+The token commits to no bytes. A token issued for `POST /sign` authorizes
+whatever body follows, so a client compromised between the approval and the
+request can substitute the payload — the runtime will not catch it, because it
+is no longer looking. That is the trade this model makes, and it is stated here
+rather than left to be discovered.
 
-That per-message check is the guest's, and it is **not implemented here**. The
-prototype carries `challenge_id` and `assertion` fields on `ClientMsg` and
-demonstrates refusing without them; verifying them needs a runtime hook that
-does not exist yet, and it must be designed before any real key is involved.
+What the runtime still refuses: moving a token to another route, spending one
+twice, spending one after it expires, and spending one belonging to another
+tenant. Redeeming removes it before anything about it is checked, so two callers
+racing one token have exactly one winner and a token offered for the wrong route
+is spent by the attempt.
 
-### What stops the weaker approval leaking into the strong path
+### Per-message approval: not built, and not buildable today
 
-Two independent things, and both must agree:
+If a guest wants "the person approved *these bytes*", it must obtain that
+itself, per message, inside the interaction. **The runtime cannot do it**: it
+hands the body through without reading it, and teaching it to parse a guest's
+message format would make it care about a protocol it deliberately knows
+nothing about.
 
-- The bindings are **different values** — `BodyBinding::Unbound` never equals
-  `BodyBinding::Exact(_)`, for any hash. No `if` enforces this, so none can be
-  forgotten.
-- The request must carry `x-enclave-stream`, a runtime-owned header stripped
-  before the guest sees it. Header without an unbound approval, or an unbound
-  approval without the header, is refused.
+**But the guest cannot do it either, yet.** Verifying a passkey assertion needs
+the stored credential, the challenge that was issued, the relying-party
+configuration, and the ability to mark that challenge used. All four live in the
+runtime, and a guest is given standard WASI and nothing else — there is no host
+function it can call to ask.
 
-Deliberately *not* keyed on `content-type: application/grpc` or a path prefix:
-the content type is application data the guest also reads, and a path prefix
-would bake a service name into a runtime that knows nothing about the guest's
-routes.
+`examples/guest-grpc` deliberately carries **no** approval fields on
+`ClientMsg`. An earlier draft carried `challenge_id` and `assertion` and refused
+messages without them, which promised a check nothing performed; fields that
+look like a credential and are never verified read as a guarantee, and are worse
+than their absence.
 
-### What a stolen stream-open assertion buys
+Closing this needs a new host import — a way for a guest to hand the runtime an
+assertion and get back yes or no. **It should be designed before a real key
+depends on it**, because until then "someone opened an interaction" is the only
+thing between a compromised client and whatever the guest will do.
 
-It is single-use, expires in 60 seconds, is bound to one route, and is
-rate-limited per credential. Spending one gets: one open channel to that
-tenant's guest, and whatever the guest will do without a further assertion —
-which is the guest's boundary to hold. It gets nothing about another tenant,
-and no replay: the challenge is gone the moment it is used.
+### What a stolen token buys
+
+It is single-use, expires in `--interaction-token-ttl-secs` (60s by default), is
+bound to one route, and issuing one is rate-limited per credential. Spending one
+gets: one interaction with that tenant's guest, and whatever the guest will do
+without a further check. It gets nothing about another tenant, and no replay —
+the token is gone the moment it is used.
 
 ## What it costs: one stream occupies one tenant slot
 
@@ -104,6 +111,7 @@ no gate is configured.**
 | **client cancels or disconnects** | the guest's next write fails, the call ends, the instance is dropped and never reused, the tenant lock frees |
 | **head timeout** (`request_timeout`) | bounds only the *response head*. It does not apply once the head is out, so it never ends a healthy stream |
 | **no traffic either way** | the epoch watchdog asks whether bytes moved, not how long the call ran. Sustained silence while executing wasm ends the call |
+| **interaction deadline** (`--max-interaction-secs`, 300s) | a wall clock, checked whether or not wasm is executing — so it reaches a guest blocked in a host call, which the epoch never can. Ends the interaction and frees the tenant |
 | **guest spins** | trapped by the epoch, on the same schedule as before streams existed |
 | **guest traps** | the instance is discarded, never reused — a partially-executed call leaves a store that cannot be re-entered |
 | **`grpc-timeout` header** | **not enforced by the runtime.** Forwarded to the guest, which owns it. The runtime's deadlines are its own, so a client cannot lengthen them |
@@ -119,7 +127,7 @@ every other request.
 The runtime does not retry, resume, or deduplicate anything. **There is no
 exactly-once guarantee and no automatic replay of signing rounds.** A client
 that reconnects opens a *new* stream with a *new* stream-open assertion, and
-any message it re-sends is a new message needing its own per-message assertion.
+any message it re-sends is simply a new message.
 Duplicates are the guest's to detect by sequence number, and its round handling
 must be idempotent because the transport promises nothing.
 

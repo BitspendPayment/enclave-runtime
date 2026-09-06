@@ -17,11 +17,9 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 use enclave_runtime::{GuestEnvironment, HostClock, ServeConfig, TlsIdentity};
 use nitro_attestation::testing::TestChain;
-use nitro_attestation::{AttestationHashes, Expectations, VerifyOptions};
 use nitro_nsm::{AttestationRequest, Nsm};
 use s3fs_core::backend::memory::MemoryBackend;
 use s3fs_core::{Config, Fs, MasterSecret};
@@ -43,10 +41,6 @@ struct ClientMsg {
     kind: i32,
     #[prost(bytes = "vec", tag = "4")]
     payload: Vec<u8>,
-    #[prost(string, tag = "5")]
-    challenge_id: String,
-    #[prost(bytes = "vec", tag = "6")]
-    assertion: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -149,8 +143,6 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 
 struct Harness {
     addr: std::net::SocketAddr,
-    nsm: Arc<SigningNsm>,
-    guest_bytes: Vec<u8>,
 }
 
 async fn start() -> Harness {
@@ -198,6 +190,7 @@ async fn start() -> Harness {
                 acme: None,
                 attestation: Some(nsm_for_server),
                 request_timeout: std::time::Duration::from_secs(30),
+                max_interaction: std::time::Duration::from_secs(300),
                 tenancy: None,
                 authentication: None,
             },
@@ -215,11 +208,7 @@ async fn start() -> Harness {
     }
     assert!(ready, "the server never came up on {addr}");
 
-    Harness {
-        addr,
-        nsm,
-        guest_bytes,
-    }
+    Harness { addr }
 }
 
 /// Adapts hyper's h2 connection to the `tower::Service` tonic expects.
@@ -263,17 +252,14 @@ fn nonce_header(nonce: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce)
 }
 
-/// **A real gRPC client, a real bidirectional stream, and the attestation
-/// checked before anything sensitive is sent.**
+/// **A real gRPC client driving a real bidirectional stream.**
 ///
-/// The order here is the point, not an accident of how the test is written. A
-/// client verifies the document in the *initial metadata* — binding the nonce
-/// it chose and the certificate from its own handshake — and only then starts
-/// sending. Verifying afterwards would prove the enclave was talking to you
-/// after you had already told it something.
+/// tonic, over TLS and ALPN-negotiated HTTP/2, decoding with prost — so the
+/// guest's hand-written framing is checked against an implementation that did
+/// not come from this repository.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-grpc built for wasm32-wasip2"]
-async fn tonic_drives_a_bidirectional_stream_over_an_attested_connection() {
+async fn tonic_drives_a_bidirectional_stream_over_the_wire() {
     let harness = start().await;
     let chosen_nonce = nonce();
 
@@ -343,37 +329,12 @@ async fn tonic_drives_a_bidirectional_stream_over_an_attested_connection() {
         .await
         .expect("the stream opened");
 
-    // --- verify the enclave before telling it anything ---------------------
-    let document = response
-        .metadata()
-        .get("x-enclave-attestation")
-        .expect("no attestation in the initial metadata")
-        .as_bytes()
-        .to_vec();
-    let document = {
-        use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD
-            .decode(&document)
-            .expect("the document is base64")
-    };
-    nitro_attestation::verify(
-        &document,
-        &VerifyOptions {
-            trust_root: harness.nsm.chain.root_der().to_vec(),
-            now: SystemTime::now(),
-            allow_untrusted_root: false,
-        },
-    )
-    .expect("the document verifies")
-    .expect(
-        &Expectations {
-            nonce: Some(chosen_nonce.clone()),
-            user_data: Some(AttestationHashes::new(&presented, &harness.guest_bytes).serialize()),
-            ..Default::default()
-        },
-        SystemTime::now(),
-    )
-    .expect("the document must bind this connection's certificate and this nonce");
+    // The attestation is *not* checked here, and that is the design rather than
+    // an omission: the runtime attests the `/auth/` exchange, where a client
+    // identifies the enclave before approving anything, and the interaction
+    // itself is pinned to the certificate that exchange named. `serve_auth`
+    // covers that half. What this test is for is tonic on the wire.
+    let _ = &presented;
 
     // --- and only now, talk -------------------------------------------------
     let mut inbound = response.into_inner();
@@ -383,10 +344,6 @@ async fn tonic_drives_a_bidirectional_stream_over_an_attested_connection() {
             seq,
             kind: 2,
             payload: format!("round-{seq}").into_bytes(),
-            // Present but unverified: opening the channel did not authorize
-            // signing, and this is where a per-message approval would go.
-            challenge_id: format!("challenge-{seq}"),
-            assertion: vec![0xde, 0xad],
         })
         .await
         .expect("the guest stopped reading");
@@ -490,8 +447,6 @@ async fn a_refusal_reaches_tonic_as_permission_denied() {
         seq: 0,
         kind: 2,
         payload: b"please sign".to_vec(),
-        challenge_id: String::new(),
-        assertion: Vec::new(),
     })
     .await
     .expect("the guest stopped reading");
@@ -564,8 +519,6 @@ async fn a_grpc_timeout_does_not_shorten_or_lengthen_the_runtime_deadlines() {
         seq: 0,
         kind: 2,
         payload: b"still here".to_vec(),
-        challenge_id: String::new(),
-        assertion: Vec::new(),
     })
     .await
     .expect("the guest stopped reading");

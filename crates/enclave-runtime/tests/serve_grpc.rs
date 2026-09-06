@@ -600,3 +600,193 @@ async fn an_abandoned_stream_frees_its_tenant() {
         "the tenant came back but its instance was not usable"
     );
 }
+
+/// Read a stream to its end and return the `grpc-status` it finished with.
+async fn status_after_half_close(path: &str, partial: &[u8]) -> (Option<String>, Option<String>) {
+    let handle = grpc_handle().await;
+    let (req, tx) = open_request(path);
+    let response = handle
+        .handle(Scheme::Http, req, None)
+        .await
+        .expect("the guest answered");
+    let mut body = response.into_body();
+
+    send(&tx, Bytes::copy_from_slice(partial)).await;
+    // Half-close with those bytes stranded: at the HTTP layer this is a clean
+    // end, which is exactly why the gRPC status has to disagree.
+    drop(tx);
+
+    let (mut status, mut message) = (None, None);
+    while let Some(Ok(frame)) = body.frame().await {
+        if let Some(trailers) = frame.trailers_ref() {
+            status = trailers
+                .get("grpc-status")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            message = trailers
+                .get("grpc-message")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+        }
+    }
+    (status, message)
+}
+
+/// **A truncated header must not read as success.**
+///
+/// Four bytes is less than the five-byte prefix, so the guest never saw a
+/// length at all. Answering `grpc-status: 0` would tell the client its message
+/// had been received when nothing had been.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-grpc built for wasm32-wasip2"]
+async fn a_stream_ending_on_a_truncated_header_is_not_a_success() {
+    let (status, message) = status_after_half_close(SIGN, &[0u8, 0, 0, 0]).await;
+    assert_eq!(
+        status.as_deref(),
+        Some("3"),
+        "a stream cut off inside its header reported success"
+    );
+    assert!(
+        message.unwrap_or_default().contains("part-way through"),
+        "the refusal did not say what was wrong"
+    );
+}
+
+/// And the subtler shape: a complete header whose payload never finished.
+///
+/// The guest read a length of ten and got four bytes. It has been waiting for
+/// the rest, and the rest is never coming.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-grpc built for wasm32-wasip2"]
+async fn a_stream_ending_on_a_truncated_payload_is_not_a_success() {
+    let mut partial = vec![0u8];
+    partial.extend_from_slice(&10u32.to_be_bytes());
+    partial.extend_from_slice(b"four");
+
+    let (status, message) = status_after_half_close(SIGN, &partial).await;
+    assert_eq!(
+        status.as_deref(),
+        Some("3"),
+        "a stream cut off inside its payload reported success"
+    );
+    assert!(message.unwrap_or_default().contains("part-way through"));
+}
+
+/// The control: a stream that ends between messages still ends cleanly.
+///
+/// Without this the two tests above would pass on a guest that simply always
+/// refused, which would be a different bug wearing the same trailers.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-grpc built for wasm32-wasip2"]
+async fn a_stream_ending_between_messages_is_still_a_success() {
+    let (status, _) = status_after_half_close(SIGN, &client_msg("whole", 0, b"complete")).await;
+    assert_eq!(
+        status.as_deref(),
+        Some("0"),
+        "a cleanly framed stream was reported as truncated"
+    );
+}
+
+/// **The case the epoch watchdog cannot see.**
+///
+/// The client opens a stream and then says nothing. The guest is blocked in a
+/// host call waiting for a frame, so no wasm executes, so no epoch check is
+/// ever reached — the epoch could wait forever and never fire. Meanwhile the
+/// stream holds its tenant's only slot.
+///
+/// A wall clock is the instrument here, and it works for the same reason the
+/// epoch does not: a guest parked in a host call *is* at an await point, so an
+/// abort reaches it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-grpc built for wasm32-wasip2"]
+async fn a_silent_stream_is_ended_at_its_deadline_and_frees_its_tenant() {
+    let handle = tenanted()
+        .await
+        .with_max_interaction(Duration::from_millis(400));
+    let quiet = [0xd0; 16];
+
+    let (req, tx) = open_request(SIGN);
+    let response = handle
+        .handle(Scheme::Http, req, Some(&quiet))
+        .await
+        .expect("the stream opened");
+    let mut body = response.into_body();
+
+    // Not one frame, ever. The sender is held so the request body stays open —
+    // this is a client that connected and then went quiet, not one that left.
+    let started = std::time::Instant::now();
+    let ended = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(frame) = body.frame().await {
+            if frame.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+    let took = started.elapsed();
+
+    assert!(
+        ended.is_ok(),
+        "a silent stream was never ended: still running after {took:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(400),
+        "the stream ended before its deadline, so this proves nothing: {took:?}"
+    );
+
+    // And the tenant is usable again — which is the point of ending it.
+    let (again, again_tx) = open_request(SIGN);
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.handle(Scheme::Http, again, Some(&quiet)),
+    )
+    .await
+    .expect("the deadline did not free the tenant")
+    .expect("the tenant's next interaction opened");
+    assert_eq!(response.status(), 200);
+    drop(again_tx);
+    drop(tx);
+}
+
+/// The other half: a stream that *is* talking runs past the same deadline
+/// without being touched, because the deadline bounds neglect rather than
+/// duration.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-grpc built for wasm32-wasip2"]
+async fn a_busy_stream_is_not_ended_by_the_head_timeout() {
+    let handle = grpc_handle()
+        .await
+        .with_timeout(Duration::from_millis(300))
+        .with_max_interaction(Duration::from_secs(30));
+    let (req, tx) = open_request(SIGN);
+
+    let response = handle
+        .handle(Scheme::Http, req, None)
+        .await
+        .expect("the stream opened");
+    let mut body = response.into_body();
+    let mut deframer = Deframer::default();
+
+    let started = std::time::Instant::now();
+    for seq in 0..5u64 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        send(&tx, client_msg("busy", seq, b"tick")).await;
+        loop {
+            if deframer.next().is_some() {
+                break;
+            }
+            let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+                .await
+                .unwrap_or_else(|_| panic!("the stream stalled at message {seq}"))
+                .expect("the stream was cut short")
+                .expect("a frame");
+            if let Some(data) = frame.data_ref() {
+                deframer.push(data);
+            }
+        }
+    }
+    assert!(
+        started.elapsed() > Duration::from_millis(300),
+        "the exchange finished inside the head timeout, so it proves nothing"
+    );
+}

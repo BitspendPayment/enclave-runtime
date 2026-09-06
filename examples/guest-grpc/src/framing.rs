@@ -71,6 +71,20 @@ impl Deframer {
         let _prefix = self.buffer.split_to(5);
         Ok(Some(self.buffer.split_to(len).freeze()))
     }
+
+    /// Whether anything is stranded part-way through a frame.
+    ///
+    /// [`Deframer::next`] splits off the prefix and the payload together, so
+    /// after a complete message the buffer is genuinely empty. Anything left is
+    /// therefore the beginning of a frame whose rest never arrived — either a
+    /// short header or a header whose declared payload is incomplete — and both
+    /// are the same fact: the peer stopped mid-message.
+    ///
+    /// This is what a half-close has to consult. A stream that ends here has
+    /// not ended cleanly, however orderly the close looked at the HTTP layer.
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
 }
 
 #[cfg(test)]

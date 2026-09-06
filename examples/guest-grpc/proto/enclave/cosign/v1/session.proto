@@ -32,15 +32,19 @@ message ClientMsg {
   Kind kind = 3;
   bytes payload = 4;
 
-  // Per-operation approval, carried *inside* the stream.
+  // There is deliberately **no per-message approval field here.**
   //
-  // Opening the channel authorizes opening the channel. It does not authorize
-  // signing anything, so a message that asks for a signature carries its own
-  // fresh, single-use assertion. This prototype only checks that the fields
-  // are present and well formed — verifying them is the cosigner's work, and
-  // it is deliberately not done here where there is no key to protect.
-  string challenge_id = 5;
-  bytes assertion = 6;
+  // An earlier draft carried `challenge_id` and `assertion`, which promised a
+  // check nothing performed: verifying a passkey assertion needs the stored
+  // credential, the issued challenge and the relying-party configuration, all
+  // of which live in the runtime and none of which a guest can reach. Fields
+  // that look like a credential and are never checked are worse than no fields
+  // — they read as a guarantee.
+  //
+  // A cosigner that needs "the person approved *these bytes*" must obtain it
+  // per message, and that needs a host function letting a guest ask the runtime
+  // to verify one. No such import exists. It should be designed before a real
+  // key depends on it. See docs/STREAMING.md.
 }
 
 message ServerMsg {

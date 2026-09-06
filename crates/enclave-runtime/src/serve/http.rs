@@ -32,7 +32,6 @@ use crate::run::GuestEnvironment;
 use crate::serve::acme::CertificateSlot;
 use crate::serve::attest::{nonce_from_headers, ResponseAttestor};
 use crate::serve::client::apply_tenant;
-use crate::serve::endpoints::EnclaveEndpoints;
 use crate::serve::pool::{LiveTenant, PoolLimits, TenantPool};
 use crate::serve::progress::{Counting, StreamProgress};
 use crate::state::State;
@@ -67,6 +66,12 @@ pub struct ServeConfig {
     /// tenant forever — and only that tenant, since nothing else queues behind
     /// it. See [`EPOCH_TICK`].
     pub request_timeout: Duration,
+    /// How long an interaction may run once it has answered.
+    ///
+    /// Deliberately separate from `request_timeout`: that one bounds getting a
+    /// head out, and does not apply afterwards, so without this a stream had no
+    /// ceiling at all and held its tenant's slot indefinitely.
+    pub max_interaction: Duration,
     /// Give each authenticated client their own filesystem. `None` keeps the
     /// original model: one filesystem, a fresh instance per request.
     pub tenancy: Option<Arc<Tenancy>>,
@@ -99,6 +104,7 @@ impl Default for ServeConfig {
             acme: None,
             attestation: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_interaction: DEFAULT_MAX_INTERACTION,
             // Off. Turning it on changes what two clients may do at the same
             // time, which a guest may have been relying on — so it is asked
             // for, never inherited.
@@ -128,6 +134,15 @@ const SILENT_TICKS_BEFORE_TRAP: u32 = 8;
 
 /// Default ceiling on producing a response head.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an interaction may run once it has produced a head.
+///
+/// Minutes rather than seconds, because a signing session legitimately takes
+/// them and a stream doing its job must not be cut off for being slow. What
+/// this bounds is the other case: a peer that opened an interaction and then
+/// went quiet still holds its tenant's only slot, and without a ceiling it
+/// holds it until the process ends.
+const DEFAULT_MAX_INTERACTION: Duration = Duration::from_secs(300);
 
 /// A guest instance and the store it is bound to.
 ///
@@ -162,6 +177,8 @@ pub struct ServeHandle {
     anonymous: Arc<tokio::sync::Mutex<()>>,
     /// Ceiling on producing a response head. See [`ServeHandle::watchdog`].
     timeout: Duration,
+    /// How long a call may run after its head is out. See `supervise`.
+    max_interaction: Duration,
     /// Per-client filesystems, when the deployment asked for them.
     ///
     /// `None` is the original model and stays the default: one filesystem, a
@@ -254,6 +271,7 @@ impl ServeHandle {
             guest: Arc::new(guest),
             anonymous: Arc::new(tokio::sync::Mutex::new(())),
             timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_interaction: DEFAULT_MAX_INTERACTION,
             tenancy: None,
         })
     }
@@ -273,6 +291,17 @@ impl ServeHandle {
     /// Override the response-head deadline.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Override how long an interaction may run once it has answered.
+    ///
+    /// Distinct from [`ServeHandle::with_timeout`], and the distinction is the
+    /// point: one bounds how long a guest may take to *start* answering, the
+    /// other how long it may go on. A stream that is healthy for minutes is
+    /// normal; a tenant's slot held for hours is not.
+    pub fn with_max_interaction(mut self, max_interaction: Duration) -> Self {
+        self.max_interaction = max_interaction;
         self
     }
 
@@ -466,7 +495,7 @@ impl ServeHandle {
             result
         });
 
-        await_head(self.timeout, task, receiver, progress).await
+        await_head(self.timeout, self.max_interaction, task, receiver, progress).await
     }
 
     /// Build an instance whose guest sees `scope` as `/`.
@@ -564,7 +593,7 @@ impl ServeHandle {
                 .await
         });
 
-        await_head(self.timeout, task, receiver, progress).await
+        await_head(self.timeout, self.max_interaction, task, receiver, progress).await
     }
 
     /// Prove the guest instantiates, before a single request depends on it.
@@ -607,8 +636,43 @@ impl ServeHandle {
 /// — rather than when its headers happened to appear. A free function rather
 /// than a method because that lifetime is worth testing on its own, without an
 /// engine and a compiled component to build a `ServeHandle` around.
+/// Bound how long an interaction may run, once its head is out.
+///
+/// Until this existed nothing watched the call after `await_head` returned: the
+/// `JoinHandle` was dropped, which detaches, and the only remaining limits were
+/// the epoch — which a guest parked in a host call never reaches, because it
+/// executes no wasm — and `wasi:http`'s hardcoded ten-minute between-bytes
+/// ceiling. A client that opened a stream and then said nothing held its
+/// tenant's single slot for as long as it liked.
+///
+/// A wall clock is the right instrument here precisely where the epoch is the
+/// wrong one. A guest blocked in a host call *is* at an await point inside
+/// `call_handle`, so `abort` reaches it — and dropping the task drops the
+/// tenant's guard, the pool checkout, and the instance, none of which it can
+/// hand back.
+///
+/// Detached deliberately: the caller is returning a response body that hyper is
+/// about to stream, so it cannot hold this. The handle races the deadline and
+/// goes away when either finishes.
+fn supervise(max_interaction: Duration, task: tokio::task::JoinHandle<wasmtime::Result<()>>) {
+    tokio::task::spawn(async move {
+        let mut task = task;
+        if tokio::time::timeout(max_interaction, &mut task)
+            .await
+            .is_err()
+        {
+            tracing::info!(
+                limit = ?max_interaction,
+                "an interaction reached its deadline; abandoning it and freeing its tenant"
+            );
+            task.abort();
+        }
+    });
+}
+
 async fn await_head(
     timeout: Duration,
+    max_interaction: Duration,
     task: tokio::task::JoinHandle<wasmtime::Result<()>>,
     receiver: tokio::sync::oneshot::Receiver<
         std::result::Result<
@@ -641,6 +705,7 @@ async fn await_head(
             // From here `await_head` is out of the picture, so the watchdog may
             // stop racing it and start judging silence on its merits.
             progress.head_sent();
+            supervise(max_interaction, task);
             Ok(resp.map(|body| {
                 use http_body_util::BodyExt;
                 Counting::new(body, progress).boxed_unsync()
@@ -719,7 +784,6 @@ fn refused(status: hyper::StatusCode, detail: &str) -> hyper::Response<HyperOutg
 #[derive(Clone)]
 pub struct Routes {
     guest: Arc<ServeHandle>,
-    endpoints: Option<Arc<EnclaveEndpoints>>,
     auth: Option<Arc<AuthEndpoints>>,
     gate: Option<Arc<Gate>>,
     attestor: Option<Arc<ResponseAttestor>>,
@@ -741,7 +805,6 @@ where
 {
     let Routes {
         guest,
-        endpoints,
         auth,
         gate,
         attestor,
@@ -750,7 +813,6 @@ where
     let certificate = certificate.map(Arc::new);
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let guest = guest.clone();
-        let endpoints = endpoints.clone();
         let auth = auth.clone();
         let gate = gate.clone();
         let attestor = attestor.clone();
@@ -779,13 +841,29 @@ where
                 }
             };
 
+            // Only where a client still has to work out who it is talking to,
+            // which is the `/auth/` exchange and nothing after it.
+            //
+            // A client identifies the enclave on the challenge request — that
+            // response's document binds the certificate it was served — and
+            // then pins that certificate for the operation. TLS proves the peer
+            // holds its private key, which the certificate itself, being
+            // public, does not; so "the same certificate" and "the same
+            // enclave" are one statement, and the operation needs no second
+            // signature to establish what the first already did.
+            //
+            // Attesting it anyway cost an NSM signature per operation, and the
+            // device is the throughput ceiling — `CONCURRENT_DOCUMENTS` is 4.
+            // That halves the signatures a signed request costs.
+            let attest_this = req.uri().path().starts_with(crate::auth::AUTH_PREFIX);
+
             // Generated before the request is routed, not after the
             // response exists: it binds the nonce and the connection's
             // certificate, neither of which depends on what the guest says.
             // Doing it here means a failure refuses before the guest runs,
             // rather than stranding a half-produced response.
             let document = match &attestor {
-                Some(attestor) => {
+                Some(attestor) if attest_this => {
                     match attestor
                         .document(certificate.as_ref().map(|c| c.as_slice()), &nonce)
                         .await
@@ -810,12 +888,18 @@ where
                         }
                     }
                 }
-                None => None,
+                // Either the deployment does not attest, or this is a request
+                // whose caller has already identified the enclave.
+                _ => None,
             };
 
-            let mut response = route(req, guest, endpoints, auth, gate, scheme).await?;
-            if let Some(document) = document {
-                crate::serve::attest::attach(&mut response, document);
+            let mut response = route(req, guest, auth, gate, scheme).await?;
+            match document {
+                Some(document) => crate::serve::attest::attach(&mut response, document),
+                // Not "leave it as it is": a response the runtime did not
+                // attest must not carry the header at all, or a guest could
+                // put one there itself.
+                None => crate::serve::attest::strip(&mut response),
             }
             Ok(response)
         }
@@ -841,9 +925,8 @@ where
 /// makes "no response leaves unattested" and "a guest cannot own the header"
 /// single facts rather than five places to audit.
 async fn route(
-    mut req: hyper::Request<hyper::body::Incoming>,
+    req: hyper::Request<hyper::body::Incoming>,
     guest: Arc<ServeHandle>,
-    endpoints: Option<Arc<EnclaveEndpoints>>,
     auth: Option<Arc<AuthEndpoints>>,
     gate: Option<Arc<Gate>>,
     scheme: Scheme,
@@ -853,16 +936,9 @@ async fn route(
             let method = req.method().clone();
             let path = req.uri().path().to_string();
 
-            // The runtime's own paths are checked first and are not
-            // forwardable: a guest able to answer under `/enclave/` could serve
-            // any attestation it liked, and one able to answer under `/auth/`
-            // could hand out its own challenges and verify its own assertions,
-            // which is the same as having none.
-            if let Some(endpoints) = &endpoints {
-                if let Some(response) = endpoints.handle(&path).await {
-                    return Ok::<_, anyhow::Error>(response);
-                }
-            }
+            // `/auth/` is checked first and is not forwardable: a guest able
+            // to answer there could hand out its own challenges and verify its
+            // own assertions, which is the same as having none.
             if let Some(auth) = &auth {
                 if path.starts_with(crate::auth::AUTH_PREFIX) {
                     // `/auth/*` bodies are small and bounded by the endpoints
@@ -885,33 +961,17 @@ async fn route(
                 }
             }
 
-            // A stream needs a tenant to belong to, and without a gate there
-            // is none. Anonymous callers all share one lock, so an anonymous
-            // stream would hold it for its whole life and starve every other
-            // anonymous caller — a single client silencing the runtime by
-            // connecting. Refused rather than bounded: an unauthenticated
-            // deployment is a development arrangement, and it should not learn
-            // to depend on a shape that only works when identities exist.
-            if gate.is_none() && req.headers().contains_key(crate::auth::STREAM_HEADER) {
-                tracing::info!(%path, "refused a stream on an unauthenticated runtime");
-                return Ok(refused(
-                    hyper::StatusCode::FORBIDDEN,
-                    "streams need an authenticated tenant",
-                ));
-            }
-
             // Everything else is the guest, and **nothing reaches the guest
-            // without a verified assertion bound to exactly this request.**
-            // With no gate configured the runtime is unauthenticated by
-            // deliberate choice — development, and the QEMU harness.
+            // without an unspent interaction token.** With no gate configured
+            // the runtime is unauthenticated by deliberate choice —
+            // development, and the QEMU harness.
             let tenant = match &gate {
-                Some(gate) => match gate.verify(&mut req).await {
+                Some(gate) => match gate.redeem(&req) {
                     Ok(verified) => {
-                        // Rebuilt either way, because the auth headers must not
-                        // reach the guest. What differs is the body: an
-                        // ordinary request carries exactly the bytes that were
-                        // hashed and approved, and a stream open carries the
-                        // client's live body, which was never read here.
+                        // Rebuilt so the token cannot reach the guest. The body
+                        // is forwarded as it arrives, never buffered: an
+                        // interaction may be a stream, and there is no hash to
+                        // hold it still for any more.
                         let mut rebuilt = hyper::Request::builder()
                             .method(req.method().clone())
                             .uri(req.uri().clone());
@@ -923,15 +983,11 @@ async fn route(
                                 rebuilt = rebuilt.header(name, value);
                             }
                         }
-                        let body = match verified.body {
-                            Some(approved) => full(approved),
-                            None => {
-                                use http_body_util::BodyExt;
-                                req.into_body()
-                                    .map_err(wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::from)
-                                    .boxed_unsync()
-                            }
-                        };
+                        use http_body_util::BodyExt;
+                        let body = req
+                            .into_body()
+                            .map_err(wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::from)
+                            .boxed_unsync();
                         let rebuilt = rebuilt.body(body).expect("request is well formed");
                         return guest
                             .handle(scheme, rebuilt, Some(&verified.tenant_id))
@@ -941,7 +997,7 @@ async fn route(
                         // Logged in full, answered in one sentence: which check
                         // failed is the runtime's business, and telling a
                         // caller would tell them which guess to refine.
-                        tracing::info!(%path, reason = %denied, "refused an unauthenticated request");
+                        tracing::info!(%path, reason = %denied, "refused an unauthorized interaction");
                         return Ok(refused(denied.status(), denied.public_message()));
                     }
                 },
@@ -960,7 +1016,6 @@ async fn route(
 /// it.
 pub struct Server {
     guest: Arc<ServeHandle>,
-    endpoints: Option<Arc<EnclaveEndpoints>>,
     /// Produces the per-response proof. `None` leaves the runtime behaving
     /// exactly as it did before attestation existed, nonce included.
     attestor: Option<Arc<ResponseAttestor>>,
@@ -1005,7 +1060,6 @@ impl Server {
     pub fn new(guest: ServeHandle, addr: SocketAddr) -> Self {
         Server {
             guest: Arc::new(guest),
-            endpoints: None,
             attestor: None,
             auth: None,
             gate: None,
@@ -1019,11 +1073,6 @@ impl Server {
     pub fn with_authentication(mut self, auth: Arc<AuthEndpoints>, gate: Arc<Gate>) -> Self {
         self.auth = Some(auth);
         self.gate = Some(gate);
-        self
-    }
-
-    pub fn with_endpoints(mut self, endpoints: Arc<EnclaveEndpoints>) -> Self {
-        self.endpoints = Some(endpoints);
         self
     }
 
@@ -1057,7 +1106,7 @@ impl Server {
         tracing::info!(
             addr = %listener.local_addr()?,
             tls = self.tls.is_some(),
-            attestation = self.endpoints.is_some(),
+            attestation = self.attestor.is_some(),
             "serving"
         );
 
@@ -1082,7 +1131,6 @@ impl Server {
             let (client, peer) = listener.accept().await.context("accepting connection")?;
             let routes = Routes {
                 guest: self.guest.clone(),
-                endpoints: self.endpoints.clone(),
                 auth: self.auth.clone(),
                 gate: self.gate.clone(),
                 attestor: self.attestor.clone(),
@@ -1191,8 +1239,9 @@ pub async fn serve_component(
     // wasmtime 44 enables async at the engine level when the `async` feature
     // is on; `Config::async_support` is a no-op. Same as `run_component`.
     let engine = ServeHandle::engine_with_watchdog()?;
-    let mut handle =
-        ServeHandle::new(&engine, component_bytes, guest)?.with_timeout(config.request_timeout);
+    let mut handle = ServeHandle::new(&engine, component_bytes, guest)?
+        .with_timeout(config.request_timeout)
+        .with_max_interaction(config.max_interaction);
     if let Some(tenancy) = &config.tenancy {
         handle = handle.with_tenancy(tenancy.clone());
     }
@@ -1224,11 +1273,8 @@ pub async fn serve_component(
     match (&certificate, &config.attestation) {
         (Some(slot), attestation) => {
             if let Some(nsm) = attestation {
-                let endpoints = EnclaveEndpoints::new(nsm.clone(), slot.clone(), component_bytes)?;
-                server = server.with_endpoints(Arc::new(endpoints));
-
-                // Every response carries a proof, so the device is now on the
-                // path of every request rather than one endpoint.
+                // Every response carries a proof, so the device is on the path
+                // of every request.
                 let attestor = Arc::new(ResponseAttestor::new(nsm.clone(), component_bytes));
 
                 // Checked once, here, with the largest nonce a client may send.
@@ -1319,6 +1365,7 @@ mod concurrency_tests {
         // The head is out, and the guest is still writing its body.
         await_head(
             Duration::from_secs(5),
+            Duration::from_secs(300),
             task,
             receiver,
             Arc::new(StreamProgress::new()),
@@ -1355,6 +1402,7 @@ mod concurrency_tests {
         let alice_task = guest_task(alice.clone().lock_owned().await, alice_head, alice_finished);
         await_head(
             Duration::from_secs(5),
+            Duration::from_secs(300),
             alice_task,
             alice_receiver,
             Arc::new(StreamProgress::new()),
@@ -1373,6 +1421,7 @@ mod concurrency_tests {
             Duration::from_secs(5),
             await_head(
                 Duration::from_secs(5),
+                Duration::from_secs(300),
                 bob_task,
                 bob_receiver,
                 Arc::new(StreamProgress::new()),
@@ -1398,6 +1447,7 @@ mod concurrency_tests {
         let task = guest_task(held, set_head, finished);
         await_head(
             Duration::from_secs(5),
+            Duration::from_secs(300),
             task,
             receiver,
             Arc::new(StreamProgress::new()),
@@ -1431,6 +1481,7 @@ mod concurrency_tests {
 
         let error = await_head(
             Duration::from_millis(50),
+            Duration::from_secs(300),
             task,
             receiver,
             Arc::new(StreamProgress::new()),
@@ -1462,6 +1513,7 @@ mod concurrency_tests {
 
         let error = await_head(
             Duration::from_secs(5),
+            Duration::from_secs(300),
             task,
             receiver,
             Arc::new(StreamProgress::new()),

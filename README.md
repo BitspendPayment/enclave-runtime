@@ -64,12 +64,11 @@ cargo build --release -p enclave-runtime --features aws
   --force-path-style \
   --master-key 0000000000000000000000000000000000000000000000000000000000000001 \
   --tls off \
-  --attestation false \
   --http-listen 127.0.0.1:8080 \
   --guest-path examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm
 
-# then, from another shell. Every request carries a nonce, whether or not
-# this deployment attests — so a client behaves the same either way:
+# then, from another shell. Every request carries a nonce, whether or not the
+# response it gets back is attested — so a client behaves the same either way:
 nonce() { openssl rand 20 | basenc --base64url | tr -d '='; }
 curl -H "x-enclave-nonce: $(nonce)" localhost:8080/           # what this guest is
 curl -H "x-enclave-nonce: $(nonce)" localhost:8080/counter    # increments, and persists
@@ -598,7 +597,7 @@ with a test, not a consequence of which crate features happened to be on.
 
 ```console
 $ (cd examples/guest-http && cargo build --release --target wasm32-wasip2)
-$ S3FS_TLS=off S3FS_ATTESTATION=false S3FS_HTTP_LISTEN=127.0.0.1:8080 \
+$ S3FS_TLS=off S3FS_HTTP_LISTEN=127.0.0.1:8080 \
   S3FS_GUEST_PATH=examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm \
   ./target/release/enclave-runtime
 $ nonce() { openssl rand 20 | basenc --base64url | tr -d '='; }
@@ -639,27 +638,41 @@ persist — for a cosigner, the nonce ledger before anything else — goes to th
 filesystem, where it is Merkle-anchored, attested and still there after a
 restart.
 
-### Who is calling: a passkey, per request
+### Who is calling: a passkey, per interaction
 
-**No valid, fresh, single-use WebAuthn assertion bound to this exact request
-means the guest is never called.** No session, no cookie, no bearer token and
-no certificate authorizes a guest request by itself.
+**No unspent interaction token means the guest is never called**, and a token
+exists only because a person authenticated with their passkey moments earlier.
+No session, no cookie, no long-lived credential.
 
-That rule is absolute because of what this thing is. A cosigner's whole value
-is that compromising the client is not enough — and a bearer credential the
-client holds is exactly a thing that can be stolen and replayed. An assertion
-cannot be, because the challenge it answers was issued for one operation and is
-destroyed when it is used.
+An **interaction** is one HTTP request and its response, or one bidirectional
+stream until it closes or reaches its lifetime limit. That unit is the whole
+design: a stream has no single request to hang an assertion on — its body *is*
+the message sequence, and none of it exists when the channel opens — so the
+approval has to name something that exists at approval time. It names the
+interaction.
 
 ```console
-POST /auth/request/options     { credential_id, method, path, query, body_sha256 }
-        ↓                      runtime records what the challenge is for
+POST /auth/request/options     { credential_id, method, path, query }
+        ↓                      response is attested: check it, pin the certificate
    Face ID / Touch ID
         ↓
-POST /sign                     x-webauthn-challenge-id, x-webauthn-assertion
-        ↓                      runtime re-hashes the body it will forward
+POST /auth/request/verify      { challenge_id, assertion }
+        ↓                      → { token, expires_in_secs }
+POST /sign                     Authorization: Bearer <token>
+        ↓                      consumed atomically, before dispatch
    verified → tenant → guest
 ```
+
+Three trips, and they have to be three. A passkey is a challenge-response, so
+the assertion cannot exist until the challenge has been answered; the token
+cannot exist until the assertion has been checked.
+
+The first trip does double duty. It goes out on a connection nothing has
+vouched for yet, which is exactly why it is the right thing to send first: it
+carries the operation's route but no approval, so a party that intercepted it
+learns what is intended and holds nothing it can act on. Its response is
+attested, so **the round trip that fetches the challenge is the one that
+identifies the enclave** — there is no separate probe route and none is wanted.
 
 #### What is checked, and by whom
 
@@ -669,23 +682,36 @@ POST /sign                     x-webauthn-challenge-id, x-webauthn-assertion
 presence, and the signature checks out under the stored key.
 
 The runtime checks everything the protocol has no field for — that the
-challenge exists, has not expired and has not been used; that the credential is
-one it knows and has not revoked; and that **the request that arrived is the
-request the challenge was issued for**. Without that last one an approval for
-one transaction would authorize another, which for a cosigner is the whole
-attack.
+challenge exists, has not expired and has not been used; and that the
+credential is one it knows and has not revoked.
 
-The body is buffered so its hash can be checked, bounded by
-`--max-request-body-bytes`, and the hash is taken from the bytes that will
-actually be forwarded — never from anything the client says about them.
+The token it issues is 32 bytes from the NSM, stored only as `sha256(token)` so
+possession of the store is not possession of a token, good once, and gone on
+restart. Redeeming it removes it before anything about it is checked, so two
+callers racing one token have exactly one winner and a token offered for the
+wrong route is spent by the attempt.
 
-#### What a signature does and does not prove
+#### What the approval does and does not name
 
-An authenticator displays nothing. The user approves *a prompt at a moment*,
-not a payload they read. "The user approved this exact operation" is precise
-only because the runtime chose the challenge, remembered what it was for, and
-will accept it for nothing else. The strength is in the binding, not the
-ceremony.
+**It names the interaction: method, path and query. It does not name the
+body.**
+
+This is a deliberate trade and it is worth stating flatly rather than burying.
+A token issued for `POST /sign` authorizes whatever body follows, so a client
+compromised between the approval and the request can substitute the payload.
+The runtime will not catch that, because it is no longer looking.
+
+What the runtime still refuses: moving a token to another route, spending one
+twice, spending one after it expires, and spending one that belongs to another
+tenant.
+
+An authenticator displays nothing either way. The user approves *a prompt at a
+moment*, and what that prompt now means is "let this app do this thing here",
+not "sign these exact bytes". A design that needs the stronger claim needs the
+guest to make it, per message — and the guest cannot yet, because verifying an
+assertion needs runtime state it has no way to reach. See
+[docs/STREAMING.md](docs/STREAMING.md); that gap should be closed before a real
+key depends on it.
 
 #### The topology this implies
 
@@ -712,20 +738,23 @@ gates resource creation; passkeys gate access.
 The tenant id is 32 bytes minted from the NSM, stored beside the credential —
 not derived from it, so one tenant can hold several passkeys.
 
-#### Opening a stream
+#### What a stream costs
 
-A bidirectional stream cannot be approved the same way, and the reason is not a
-gap: its body **is** the message sequence, so there is no `body_sha256` to
-commit to when the channel opens. It gets its own weaker approval, from
-`/auth/stream/options`, which authorizes **opening one channel on one route and
-nothing else** — the same shape as an enrollment token, and for the same
-reason. It commits to no bytes, so it approves no operation.
+A stream is an interaction, so it is approved the same way as anything else —
+that unification is what removed a second, weaker approval path that used to
+exist only because the old body-hash binding could not express a stream.
 
-Every message inside the stream that asks the enclave to sign carries its own
-fresh, single-use assertion. An open channel is not standing permission to
-sign; treating it as one would be the substitution the body hash exists to
-prevent. See [docs/STREAMING.md](docs/STREAMING.md) for what a stream costs the
-tenant holding it, and what the runtime does not promise.
+The cost is that **an open stream holds its tenant's single slot for its whole
+life**. Concurrency is one active guest handler per tenant, because a tenant's
+SQLite database is only safe while exactly one of their requests is in flight,
+so that tenant's next request waits behind the stream. Different tenants are
+unaffected. Two limits bound it: `--interaction-token-ttl-secs` for how long an
+approval may sit unspent, and `--max-interaction-secs` for how long one may run
+once started.
+
+See [docs/STREAMING.md](docs/STREAMING.md) for the failure modes and what the
+runtime does not promise — there is no retry, no resumption, no deduplication
+and no exactly-once execution.
 
 #### Limits
 
@@ -829,8 +858,8 @@ round trip.
 | `x-enclave-nonce` | request. base64url, no padding; 8–64 bytes decoded. **Required on every request**, whether or not the runtime attests — so a client behaves the same either way and a deployment cannot quietly stop attesting. Missing or malformed is a 400, before the guest is invoked. |
 | `x-enclave-attestation` | response. base64 COSE_Sign1. Runtime-owned: it is `insert`ed, never appended, so a guest that sets it is overwritten. The response is also forced to `cache-control: no-store` — a cached document is a replayed one. |
 
-Every response gets one: the guest's, `/enclave/config`, an auth exchange, and
-a gate refusal alike. The document is generated *before* the request is routed,
+Every response gets one: the guest's, an auth exchange, and a gate refusal
+alike. The document is generated *before* the request is routed,
 because it binds nothing the guest produces; if the NSM refuses, the request
 fails with a 503 and the guest is never invoked.
 
@@ -842,10 +871,18 @@ digests, 68 bytes:
 ```
 
 The certificate hash ties the TLS session to the document; the guest hash says
-which application was behind it. `/enclave/` is reserved and checked before the
-guest sees a request — a guest that could answer there could describe the
-enclave however it liked. `GET /enclave/config` reports the same two hashes and
-PCR0 in plain text.
+which application was behind it.
+
+**These two are not equally trustworthy, and the difference decides how you
+pin.** PCR0 is measured by the hypervisor from the image and locked, so nothing
+running inside the enclave can choose it. The guest hash is part of `user_data`,
+which the *runtime* hands to the device — so an attacker running their own
+enclave produces a genuinely signed document claiming whatever guest hash you
+were going to check for.
+
+So **pin PCR0**. `--guest` is worth passing on top of it — against a runtime
+already pinned, it catches that runtime serving a different application — but on
+its own it authenticates the hardware and calls it the software.
 
 Verify an endpoint with one command:
 
@@ -889,11 +926,30 @@ which is nothing beside the per-request one below.
   enclave-to-TLS binding, *not* an independently signed receipt for what the
   guest said.
 - **Nothing before the request was sent.** By the time the client sees the
-  proof, its request is already inside the enclave. A client that must verify
-  *first* sends a nonced `GET /enclave/config` — no passkey, no guest — checks
-  the document, and reuses **the same connection** for its real request. That
-  is stronger than a separate attestation endpoint could be, since the binding
-  is per-connection rather than per-process.
+  proof, its request is already inside the enclave. Verifying a connection means
+  receiving a response on it, so something has to go first on a connection
+  nothing has vouched for.
+
+  The challenge request is that something, and it is the right thing to send:
+  `POST /auth/request/options` carries the operation's hash but no approval, so
+  a party that intercepted it learns what is intended and holds nothing it can
+  act on. Its response is attested like every other, so **the round trip that
+  was needed anyway is the one that identifies the enclave** — there is no
+  separate probe route and none is wanted.
+
+  The order matters. A person is asked to approve only *after* the far end has
+  been identified, never before.
+
+  The operation then needs no second document. The verified one binds a
+  certificate, and TLS proves the peer holds that certificate's *private key* —
+  which the certificate, being public, does not prove by itself. So the client
+  completes the operation's handshake, checks it was served the same
+  certificate, and only then sends: a changed far end means the request is never
+  sent rather than sent and regretted. It is deliberately **not** retried, since
+  the assertion is single-use and bound to that exact body, so a retry risks
+  executing twice. This is why session resumption is refused — a resumed session
+  need present no certificate, and pinning against a cached one checks nothing.
+  See `passkey-client` for the flow in full.
 - **Not verifiable from a browser page.** The check requires the client's own
   peer certificate, and ordinary JavaScript cannot read it. This is for native
   clients and `nitro-attest`.

@@ -41,19 +41,23 @@ pub mod ratelimit;
 pub mod routes;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+mod token;
 
 #[cfg(any(test, feature = "testing"))]
 pub use authenticator::SoftwareAuthenticator;
-pub use challenge::{
-    BodyBinding, ChallengeError, ChallengeStore, RequestBinding, DEFAULT_CAPACITY, DEFAULT_TTL,
-};
+pub use challenge::{ChallengeError, ChallengeStore, DEFAULT_CAPACITY, DEFAULT_TTL};
 pub use credential::{mint_tenant_id, FilesystemCredentials, StoredCredential};
 pub use enrollment::EnrollmentTokens;
 pub use gate::{
-    CredentialRecord, CredentialStore, Denied, Gate, Verified, AUTH_HEADERS, STREAM_HEADER,
+    Authenticated, CredentialRecord, CredentialStore, Denied, Gate, Verified, AUTHORIZATION_HEADER,
+    AUTH_HEADERS,
 };
 pub use ratelimit::RateLimiter;
 pub use routes::{AuthEndpoints, AUTH_PREFIX};
+pub use token::{
+    InteractionScope, TokenError, TokenStore, DEFAULT_CAPACITY as DEFAULT_TOKEN_CAPACITY,
+    DEFAULT_TTL as DEFAULT_TOKEN_TTL,
+};
 
 /// Build the relying party from a domain and an origin.
 ///

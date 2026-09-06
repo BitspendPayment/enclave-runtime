@@ -34,8 +34,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
 use base64::Engine as _;
+use clap::Parser;
 use nitro_attestation::{
     AttestationHashes, Expectations, Trust, Verified, VerifyOptions, AWS_NITRO_ROOT_G1_PEM,
 };
@@ -48,9 +48,14 @@ const ATTESTATION_HEADER: &str = "x-enclave-attestation";
 #[derive(Parser, Debug)]
 #[command(version, about = "Verify an AWS Nitro Enclaves attestation document")]
 struct Cli {
-    /// URL to request, e.g. `https://enclave.example`. Any route works —
-    /// every response carries a document — and the path defaults to
-    /// `/enclave/config`, which needs neither a passkey nor the guest.
+    /// URL to request, e.g. `https://enclave.example`. The path defaults to
+    /// `/auth/`.
+    ///
+    /// Not every route carries a document: the runtime attests its `/auth/`
+    /// exchanges, which is where a client identifies the enclave before
+    /// approving anything, and leaves guest responses alone — a caller has
+    /// already pinned the certificate by then. `/auth/` needs no credential and
+    /// reaches no guest; it answers 404 or 405, and is attested either way.
     #[arg(long, conflicts_with = "document")]
     url: Option<String>,
 
@@ -134,8 +139,7 @@ fn run() -> Result<()> {
             let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
             let certificate = match &cli.peer_certificate {
                 Some(path) => Some(
-                    std::fs::read(path)
-                        .with_context(|| format!("reading {}", path.display()))?,
+                    std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
                 ),
                 None => None,
             };
@@ -181,8 +185,7 @@ fn run() -> Result<()> {
         // its request sent. Without one there is nothing to compare, and the
         // document could be any age the clock allows.
         (None, Some(hex)) => {
-            expectations.nonce =
-                Some(hex::decode(hex.trim()).context("--nonce is not hex")?)
+            expectations.nonce = Some(hex::decode(hex.trim()).context("--nonce is not hex")?)
         }
         (None, None) => {}
     }
@@ -382,9 +385,9 @@ fn split_url(url: &str) -> Result<(String, u16, String)> {
         .context("--url must start with https://")?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
-        // The cheap probe route: no gate, no guest, and its response carries a
-        // document for this connection like any other.
-        None => (rest, "/enclave/config"),
+        // The probe: attested, needs no credential, reaches no guest. What
+        // comes back is a refusal, and the document on it is the point.
+        None => (rest, "/auth/"),
     };
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().context("invalid port")?),

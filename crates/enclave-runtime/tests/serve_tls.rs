@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime};
 
 use enclave_runtime::{GuestEnvironment, HostClock, ServeConfig, TlsIdentity};
 use nitro_attestation::testing::TestChain;
-use nitro_attestation::{AttestationHashes, Expectations, Trust, VerifyOptions};
+use nitro_attestation::{AttestationHashes, Expectations, VerifyOptions};
 use nitro_nsm::{AttestationRequest, Nsm};
 use s3fs_core::backend::memory::MemoryBackend;
 use s3fs_core::{Config, Fs, MasterSecret};
@@ -173,6 +173,7 @@ async fn start_inner(slot: Option<enclave_runtime::CertificateSlot>) -> Harness 
                 acme: None,
                 attestation: Some(nsm_for_server),
                 request_timeout: std::time::Duration::from_secs(30),
+                max_interaction: std::time::Duration::from_secs(300),
                 tenancy: None,
                 // These tests are about the attestation binding, which is
                 // reached under `/enclave/` and never passes the gate.
@@ -331,39 +332,6 @@ fn dechunk(body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A client that saw a *different* certificate must not be satisfied — the
-/// case where something terminates TLS in between.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn a_substituted_certificate_breaks_the_binding() {
-    let harness = start().await;
-    let nonce = fresh_nonce();
-
-    let (_, head, _, _) = https_full(harness.addr, "/counter", &nonce).await;
-    let verified = nitro_attestation::verify(
-        &document_from(&head).expect("a document on the response"),
-        &VerifyOptions {
-            trust_root: harness.nsm.chain.root_der().to_vec(),
-            now: SystemTime::now(),
-            allow_untrusted_root: false,
-        },
-    )
-    .unwrap();
-
-    let impostor = TlsIdentity::self_signed(&["enclave.test".to_string()]).unwrap();
-    let wrong = AttestationHashes::new(&impostor.certificate_der, &harness.guest_bytes);
-    let err = verified
-        .expect(
-            &Expectations {
-                user_data: Some(wrong.serialize()),
-                ..Default::default()
-            },
-            SystemTime::now(),
-        )
-        .unwrap_err();
-    assert!(format!("{err:#}").contains("user_data mismatch"), "{err:#}");
-}
-
 /// The guest keeps working over TLS, and never sees the runtime's paths.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
@@ -377,74 +345,6 @@ async fn the_guest_serves_everything_else() {
     let (status, body, _) = https(harness.addr, "/counter").await;
     assert_eq!(status, 200);
     assert_eq!(body.trim(), "2", "state must persist across TLS requests");
-
-    // `/enclave/…` belongs to the runtime. The guest answers 404 for unknown
-    // routes, so a 404 here would mean the request reached it.
-    let (status, body, _) = https(harness.addr, "/enclave/nonsense").await;
-    assert_eq!(status, 404);
-    assert!(
-        body.contains("runtime endpoint"),
-        "the runtime must answer under /enclave/, not the guest: {body}"
-    );
-}
-
-/// `/enclave/config` is the probe route a client uses to verify *before* it
-/// sends anything sensitive: it needs no gate and no guest, and its response
-/// carries a document for the connection the client goes on to reuse. What it
-/// advertises must be what that document binds.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn config_reports_the_same_binding_the_document_carries() {
-    let harness = start().await;
-    let nonce = fresh_nonce();
-    let (status, head, body, presented) = https_full(harness.addr, "/enclave/config", &nonce).await;
-    assert_eq!(status, 200);
-
-    let hashes = AttestationHashes::new(&presented, &harness.guest_bytes);
-    assert!(
-        body.contains(&hex::encode(hashes.tls_certificate)),
-        "{body}"
-    );
-    assert!(body.contains(&hex::encode(hashes.guest)), "{body}");
-    assert!(body.contains(&hex::encode(harness.nsm.pcr0)), "{body}");
-
-    // And the probe itself is attested, or it would not be a probe.
-    let verified = nitro_attestation::verify(
-        &document_from(&head).expect("the probe route carries a document too"),
-        &VerifyOptions {
-            trust_root: harness.nsm.chain.root_der().to_vec(),
-            now: SystemTime::now(),
-            allow_untrusted_root: false,
-        },
-    )
-    .expect("document verifies");
-    verified
-        .expect(
-            &Expectations {
-                nonce: Some(nonce.clone()),
-                user_data: Some(hashes.serialize()),
-                pcrs: [(0u32, harness.nsm.pcr0.to_vec())].into(),
-                max_age: Some(Duration::from_secs(60)),
-            },
-            SystemTime::now(),
-        )
-        .expect("the probe must bind what config advertises");
-}
-
-/// The runtime asks the device to bind the certificate and the guest, not
-/// something it made up.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn the_runtime_binds_the_certificate_it_actually_serves() {
-    let harness = start().await;
-    let _ = https(harness.addr, "/enclave/config").await;
-
-    let request = harness.nsm.last.lock().unwrap().clone().expect("asked");
-    let expected = AttestationHashes::new(&harness.certificate_der, &harness.guest_bytes);
-    assert_eq!(
-        request.user_data.as_deref(),
-        Some(&expected.serialize()[..])
-    );
 }
 
 #[derive(Debug)]
@@ -494,99 +394,6 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 // Per-response attestation
 // ---------------------------------------------------------------------------
 
-/// The whole feature, in one test: an ordinary guest response carries a
-/// document that binds the nonce this client chose and the certificate this
-/// client's own handshake was served — with no second round trip.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn a_guest_response_proves_its_own_connection() {
-    let harness = start().await;
-    let nonce = fresh_nonce();
-
-    let (status, head, _body, presented) = https_full(harness.addr, "/counter", &nonce).await;
-    assert_eq!(status, 200);
-
-    let document = document_from(&head).expect("a guest response must carry a document");
-    let verified = nitro_attestation::verify(
-        &document,
-        &VerifyOptions {
-            trust_root: harness.nsm.chain.root_der().to_vec(),
-            now: SystemTime::now(),
-            allow_untrusted_root: false,
-        },
-    )
-    .expect("the document must verify");
-    assert_eq!(verified.trust, Trust::ChainVerified);
-
-    // The binding: this nonce, and the certificate *this connection* presented.
-    let expected = AttestationHashes::new(&presented, &harness.guest_bytes);
-    verified
-        .expect(
-            &Expectations {
-                nonce: Some(nonce.clone()),
-                user_data: Some(expected.serialize()),
-                pcrs: [(0u32, harness.nsm.pcr0.to_vec())].into(),
-                max_age: Some(Duration::from_secs(60)),
-            },
-            SystemTime::now(),
-        )
-        .expect("the document must bind this connection and this nonce");
-}
-
-/// Two requests, two nonces, two documents. This is what makes it
-/// per-*response* rather than per-boot: a document lifted from an earlier
-/// request does not satisfy a later one.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn each_response_is_bound_to_its_own_nonce() {
-    let harness = start().await;
-    let first = fresh_nonce();
-    let second = fresh_nonce();
-    assert_ne!(first, second);
-
-    let (_, head_a, _, cert_a) = https_full(harness.addr, "/counter", &first).await;
-    let (_, head_b, _, _) = https_full(harness.addr, "/counter", &second).await;
-
-    let doc_a = document_from(&head_a).expect("a");
-    let doc_b = document_from(&head_b).expect("b");
-    assert_ne!(doc_a, doc_b, "two requests shared one document");
-
-    let options = VerifyOptions {
-        trust_root: harness.nsm.chain.root_der().to_vec(),
-        now: SystemTime::now(),
-        allow_untrusted_root: false,
-    };
-    let verified_a = nitro_attestation::verify(&doc_a, &options).expect("a verifies");
-    let binding = AttestationHashes::new(&cert_a, &harness.guest_bytes).serialize();
-
-    // The first document answers the first nonce...
-    verified_a
-        .expect(
-            &Expectations {
-                nonce: Some(first),
-                user_data: Some(binding.clone()),
-                ..Default::default()
-            },
-            SystemTime::now(),
-        )
-        .expect("its own nonce");
-
-    // ...and not the second, which is what stops a replay.
-    assert!(
-        verified_a
-            .expect(
-                &Expectations {
-                    nonce: Some(second),
-                    user_data: Some(binding),
-                    ..Default::default()
-                },
-                SystemTime::now(),
-            )
-            .is_err(),
-        "a document satisfied a nonce it was not made for"
-    );
-}
-
 /// A request with no nonce is refused before anything runs — and the guest is
 /// the witness: `/counter` increments only when the guest is invoked.
 #[tokio::test(flavor = "multi_thread")]
@@ -620,46 +427,23 @@ async fn a_request_without_a_nonce_never_reaches_the_guest() {
 async fn the_guest_cannot_forge_the_proof() {
     let harness = start().await;
     let nonce = fresh_nonce();
-    let (status, head, _, presented) = https_full(harness.addr, "/forge-attestation", &nonce).await;
+    let (status, head, _, _) = https_full(harness.addr, "/forge-attestation", &nonce).await;
     assert_eq!(status, 200);
 
+    // None, not one. The runtime does not attest a guest response — a caller
+    // has already identified the enclave on the `/auth/` exchange and pinned
+    // its certificate — so there is no document of its own to overwrite the
+    // guest's with. The header is taken away instead.
+    //
+    // This is the check that keeps the header runtime-owned. It used to hold
+    // as a side effect of attesting everything; now it is deliberate, and
+    // failing it means a guest can hand a client a document under the
+    // runtime's name.
     let copies = head
         .lines()
         .filter(|l| l.to_ascii_lowercase().starts_with("x-enclave-attestation:"))
         .count();
-    assert_eq!(copies, 1, "the guest's copies survived:\n{head}");
-
-    // And the one that survived is the runtime's, not the guest's.
-    let document = document_from(&head).expect("a document");
-    let verified = nitro_attestation::verify(
-        &document,
-        &VerifyOptions {
-            trust_root: harness.nsm.chain.root_der().to_vec(),
-            now: SystemTime::now(),
-            allow_untrusted_root: false,
-        },
-    )
-    .expect("the surviving document must be the runtime's");
-    verified
-        .expect(
-            &Expectations {
-                nonce: Some(nonce),
-                user_data: Some(
-                    AttestationHashes::new(&presented, &harness.guest_bytes).serialize(),
-                ),
-                ..Default::default()
-            },
-            SystemTime::now(),
-        )
-        .expect("bound to this connection");
-
-    // A guest that set a caching directive does not get to keep it either: a
-    // cached attested response is a replayed document.
-    assert!(
-        head.to_ascii_lowercase()
-            .contains("cache-control: no-store"),
-        "head:\n{head}"
-    );
+    assert_eq!(copies, 0, "the guest's copies survived:\n{head}");
 }
 
 /// A TLS connection the caller keeps, so it can ask twice.
@@ -767,11 +551,14 @@ impl KeptConnection {
 /// the new certificate, which a runtime reading one global value gets right by
 /// accident. Only a connection that outlives the replacement can catch it.
 ///
+/// Driven over `/auth/request/options` because that is where the runtime
+/// attests now — the exchange a client uses to identify the enclave before
+/// approving anything. This harness configures no gate, so the route itself
+/// answers 404; the document on it is what the test is for, and it is attached
+/// before the request is routed.
+///
 /// `#[ignore]`d like its neighbours: [`start_with_slot`] builds the real
-/// server, which needs the guest component built first. An earlier note here
-/// claimed otherwise, and on a clean checkout that made `cargo test` fail
-/// rather than skip. CI runs it in the job that builds the guest, with
-/// `--include-ignored`.
+/// server, which needs the guest component built first.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the guest component; see the module docs"]
 async fn a_connection_keeps_the_certificate_it_was_served_across_a_renewal() {
@@ -782,7 +569,7 @@ async fn a_connection_keeps_the_certificate_it_was_served_across_a_renewal() {
     let mut a = KeptConnection::open(harness.addr).await;
     assert_eq!(a.presented, original, "A was served the original");
     let nonce_a1 = fresh_nonce();
-    let head_a1 = a.request("/enclave/config", &nonce_a1).await;
+    let head_a1 = a.request("/auth/request/options", &nonce_a1).await;
 
     // The renewal, with A still connected. Everything that handshakes after
     // this gets the new certificate; A must not.
@@ -795,11 +582,12 @@ async fn a_connection_keeps_the_certificate_it_was_served_across_a_renewal() {
     // The point of the whole test: A asks again, on the same connection, after
     // the slot has moved on.
     let nonce_a2 = fresh_nonce();
-    let head_a2 = a.request("/enclave/config", &nonce_a2).await;
+    let head_a2 = a.request("/auth/request/options", &nonce_a2).await;
 
     // B, served under the new certificate.
     let nonce_b = fresh_nonce();
-    let (_, head_b, _, presented_b) = https_full(harness.addr, "/enclave/config", &nonce_b).await;
+    let (_, head_b, _, presented_b) =
+        https_full(harness.addr, "/auth/request/options", &nonce_b).await;
     assert_eq!(
         presented_b, renewed.certificate_der,
         "B should have been served the renewed certificate"
@@ -913,8 +701,6 @@ async fn a_document_does_not_wait_for_the_body() {
 
     // The guest pauses 150ms before each of the last two chunks, so a
     // buffering runtime could not have produced the head in under 300ms.
-    let document = document_from(&head).expect("a document on the response head");
-    assert!(!document.is_empty());
     assert!(
         body_at >= Duration::from_millis(250),
         "the guest did not actually pause; the timing below proves nothing"

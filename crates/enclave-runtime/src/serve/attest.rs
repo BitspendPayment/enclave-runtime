@@ -25,7 +25,7 @@
 //!
 //! **Nothing before the request was sent.** By the time a client sees the
 //! proof, its request is already inside the enclave. A client that must know
-//! first sends a nonced `GET /enclave/config`, verifies, and reuses **the same
+//! first sends a nonced request, verifies, and reuses **the same
 //! connection** — which proves more than a separate round trip could, since the
 //! binding is per-connection.
 //!
@@ -305,6 +305,22 @@ pub fn attach<B>(response: &mut hyper::Response<B>, document: HeaderValue) {
         hyper::header::CACHE_CONTROL,
         HeaderValue::from_static("no-store"),
     );
+}
+
+/// Take the header away from a response the runtime did not attest.
+///
+/// The header is runtime-owned, and it was only ever guest-proof because
+/// [`attach`] overwrote it on every response. Once some responses are not
+/// attested — an operation whose caller already identified the enclave on the
+/// `/auth/` exchange and pinned its certificate — "overwritten" stops being
+/// true for them, and a guest that sets it would be handing the client a
+/// document of its own choosing under the runtime's name.
+///
+/// So the header is removed rather than left alone. A guest cannot speak here
+/// whether or not the runtime is speaking here, which is the property; that it
+/// used to hold as a side effect of always attesting was luck, not design.
+pub fn strip<B>(response: &mut hyper::Response<B>) {
+    response.headers_mut().remove(ATTESTATION_HEADER);
 }
 
 #[cfg(test)]

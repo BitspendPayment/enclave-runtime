@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 
 use webauthn_rs::prelude::PasskeyAuthentication;
 
+use super::token::InteractionScope;
+
 /// How long a challenge is good for.
 ///
 /// Long enough for a human to look at a prompt and present a finger; short
@@ -49,81 +51,9 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
 /// anonymous caller can make the runtime hold.
 pub const DEFAULT_CAPACITY: usize = 1024;
 
-/// What a challenge was issued for.
-///
-/// Every field is something an attacker would otherwise be free to vary while
-/// reusing an approval the user gave for something else.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestBinding {
-    pub method: String,
-    pub path: String,
-    /// `None` and `Some("")` are different: a challenge issued for `?a=1` must
-    /// not be usable for a request with no query at all.
-    pub query: Option<String>,
-    pub body: BodyBinding,
-}
-
-/// What an approval says about the body.
-///
-/// The distinction is the whole of what separates authorizing an operation
-/// from authorizing a channel, and it is an enum rather than an
-/// `Option<[u8; 32]>` so that neither can be mistaken for the other by
-/// anything that merely forgot to look.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BodyBinding {
-    /// SHA-256 of the exact bytes, recomputed by the runtime from what it will
-    /// forward — never taken from the client. **The only binding that
-    /// authorizes an operation**, because it is the only one that says which
-    /// operation.
-    Exact([u8; 32]),
-    /// Nothing at all about the body.
-    ///
-    /// Issued only for opening a bidirectional stream, where there is no body
-    /// yet to commit to: the messages are the body, and they do not exist when
-    /// the channel opens. It authorizes **opening one channel on this
-    /// method, path and query, and nothing else** — the same shape as an
-    /// enrollment token, which authorizes creating a tenant and nothing else.
-    ///
-    /// It approves no message that travels on the channel. Anything asking the
-    /// enclave to sign carries its own fresh, single-use assertion, inside the
-    /// stream. Treating an open channel as standing permission to sign is the
-    /// failure this split exists to prevent.
-    Unbound,
-}
-
-impl RequestBinding {
-    pub fn new(method: &str, path: &str, query: Option<&str>, body: &[u8]) -> Self {
-        RequestBinding {
-            method: method.to_ascii_uppercase(),
-            path: path.to_string(),
-            query: query.map(str::to_string),
-            body: BodyBinding::Exact(nitro_attestation::sha256(body)),
-        }
-    }
-
-    /// The only way to make an approval that commits to no body.
-    ///
-    /// Separate from [`RequestBinding::new`] deliberately: an unbound approval
-    /// is weaker than every other kind, so it should be impossible to produce
-    /// one by passing a different argument to the usual constructor.
-    pub fn stream_open(method: &str, path: &str, query: Option<&str>) -> Self {
-        RequestBinding {
-            method: method.to_ascii_uppercase(),
-            path: path.to_string(),
-            query: query.map(str::to_string),
-            body: BodyBinding::Unbound,
-        }
-    }
-
-    /// Whether this approval commits to a body, and so to an operation.
-    pub fn is_stream_open(&self) -> bool {
-        matches!(self.body, BodyBinding::Unbound)
-    }
-}
-
 /// A challenge that has been issued and not yet used.
 struct Pending {
-    binding: RequestBinding,
+    scope: InteractionScope,
     /// The crate's own state for this challenge. Holding it here is what makes
     /// the challenge single-use: it exists in exactly one place, and consuming
     /// takes it.
@@ -177,7 +107,7 @@ impl ChallengeStore {
     pub fn issue(
         &self,
         id: [u8; 16],
-        binding: RequestBinding,
+        scope: InteractionScope,
         state: PasskeyAuthentication,
     ) -> Result<(), ChallengeError> {
         let now = Instant::now();
@@ -189,7 +119,7 @@ impl ChallengeStore {
         pending.insert(
             id,
             Pending {
-                binding,
+                scope,
                 state,
                 expires: now + self.ttl,
             },
@@ -205,13 +135,13 @@ impl ChallengeStore {
     pub fn consume(
         &self,
         id: &[u8; 16],
-    ) -> Result<(RequestBinding, PasskeyAuthentication), ChallengeError> {
+    ) -> Result<(InteractionScope, PasskeyAuthentication), ChallengeError> {
         let mut pending = self.pending.lock().expect("challenge store poisoned");
         let entry = pending.remove(id).ok_or(ChallengeError::Unknown)?;
         if entry.expires <= Instant::now() {
             return Err(ChallengeError::Expired);
         }
-        Ok((entry.binding, entry.state))
+        Ok((entry.scope, entry.state))
     }
 
     pub fn outstanding(&self) -> usize {
@@ -227,31 +157,6 @@ mod tests {
     use super::*;
     use crate::auth::testing::Relying;
 
-    #[test]
-    fn a_binding_normalises_the_method_and_hashes_the_body() {
-        let b = RequestBinding::new("post", "/sign", None, b"x");
-        assert_eq!(b.method, "POST", "method case must not decide a match");
-        assert_eq!(b.body, BodyBinding::Exact(nitro_attestation::sha256(b"x")));
-    }
-
-    /// A query that is absent is not a query that is empty. Otherwise a
-    /// challenge issued for `?limit=1` would be usable with no query at all.
-    #[test]
-    fn an_absent_query_differs_from_an_empty_one() {
-        assert_ne!(
-            RequestBinding::new("GET", "/p", None, b""),
-            RequestBinding::new("GET", "/p", Some(""), b"")
-        );
-    }
-
-    #[test]
-    fn a_different_body_is_a_different_binding() {
-        assert_ne!(
-            RequestBinding::new("POST", "/sign", None, b"pay alice"),
-            RequestBinding::new("POST", "/sign", None, b"pay mallory")
-        );
-    }
-
     /// Issued, then used once — and the second attempt finds nothing. This is
     /// what stops a captured signing approval being replayed.
     #[test]
@@ -259,7 +164,7 @@ mod tests {
         let rp = Relying::new();
         let store = ChallengeStore::new(DEFAULT_TTL, DEFAULT_CAPACITY);
         let id = [1u8; 16];
-        let binding = RequestBinding::new("POST", "/sign", None, b"tx");
+        let binding = InteractionScope::new("POST", "/sign", None);
 
         store
             .issue(id, binding.clone(), rp.begin_authentication().1)
@@ -276,7 +181,7 @@ mod tests {
         store
             .issue(
                 id,
-                RequestBinding::new("POST", "/sign", None, b""),
+                InteractionScope::new("POST", "/sign", None),
                 rp.begin_authentication().1,
             )
             .unwrap();
@@ -305,7 +210,7 @@ mod tests {
             store
                 .issue(
                     id,
-                    RequestBinding::new("GET", "/", None, b""),
+                    InteractionScope::new("GET", "/", None),
                     rp.begin_authentication().1,
                 )
                 .unwrap();
@@ -314,7 +219,7 @@ mod tests {
             store
                 .issue(
                     [99u8; 16],
-                    RequestBinding::new("GET", "/", None, b""),
+                    InteractionScope::new("GET", "/", None),
                     rp.begin_authentication().1
                 )
                 .unwrap_err(),
@@ -335,7 +240,7 @@ mod tests {
             store
                 .issue(
                     id,
-                    RequestBinding::new("GET", "/", None, b""),
+                    InteractionScope::new("GET", "/", None),
                     rp.begin_authentication().1,
                 )
                 .unwrap();
@@ -345,44 +250,9 @@ mod tests {
         store
             .issue(
                 [7u8; 16],
-                RequestBinding::new("GET", "/", None, b""),
+                InteractionScope::new("GET", "/", None),
                 rp.begin_authentication().1,
             )
             .unwrap();
-    }
-
-    /// The refusal that costs nothing to maintain.
-    ///
-    /// A stream-open binding and an ordinary one are different values, so
-    /// neither can satisfy the other's comparison. No `if` enforces this and
-    /// none can be forgotten — which matters more than the check itself,
-    /// because the check is in `Gate::verify` and this is what makes it
-    /// impossible to weaken by accident there.
-    #[test]
-    fn a_stream_open_binding_never_equals_a_bound_one() {
-        let bound = RequestBinding::new("POST", "/sign", None, b"");
-        let open = RequestBinding::stream_open("POST", "/sign", None);
-        assert_ne!(bound, open);
-        assert!(open.is_stream_open());
-        assert!(!bound.is_stream_open());
-        // Including against the hash of the empty body, which is the one an
-        // unbound binding might plausibly be mistaken for.
-        assert_ne!(
-            open.body,
-            BodyBinding::Exact(nitro_attestation::sha256(b""))
-        );
-    }
-
-    /// It still pins the route, so an approval to open one channel is not an
-    /// approval to open a different one.
-    #[test]
-    fn a_stream_open_binding_still_pins_the_route() {
-        let sign = RequestBinding::stream_open("POST", "/Sign", None);
-        assert_ne!(sign, RequestBinding::stream_open("POST", "/Withdraw", None));
-        assert_ne!(sign, RequestBinding::stream_open("GET", "/Sign", None));
-        assert_ne!(
-            sign,
-            RequestBinding::stream_open("POST", "/Sign", Some("a=1"))
-        );
     }
 }
