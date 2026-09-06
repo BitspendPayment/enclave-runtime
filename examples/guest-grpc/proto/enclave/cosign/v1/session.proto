@@ -1,0 +1,51 @@
+// The wire format this guest speaks. Checked in as the specification a client
+// generates stubs from — nothing in this workspace compiles it, because four
+// fields of `#[derive(prost::Message)]` is less machinery than a protoc
+// toolchain in every build.
+//
+// The messages are deliberately about a *signing session* without being about
+// signing: this prototype settles the transport and the authorization, and
+// carries no cryptography at all.
+syntax = "proto3";
+
+package enclave.cosign.v1;
+
+service SigningSession {
+  // One long-lived channel. Both directions are open at once: the guest
+  // answers each message as it arrives rather than waiting for the client to
+  // finish, which is the property the runtime exists to support here.
+  rpc Sign(stream ClientMsg) returns (stream ServerMsg);
+}
+
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  KIND_HELLO = 1;
+  KIND_ROUND = 2;
+  KIND_FINISH = 3;
+}
+
+message ClientMsg {
+  // The client's, never the runtime's. A stream that dies takes its in-memory
+  // session with it; only what the guest committed to storage survives.
+  string session_id = 1;
+  uint64 seq = 2;
+  Kind kind = 3;
+  bytes payload = 4;
+
+  // Per-operation approval, carried *inside* the stream.
+  //
+  // Opening the channel authorizes opening the channel. It does not authorize
+  // signing anything, so a message that asks for a signature carries its own
+  // fresh, single-use assertion. This prototype only checks that the fields
+  // are present and well formed — verifying them is the cosigner's work, and
+  // it is deliberately not done here where there is no key to protect.
+  string challenge_id = 5;
+  bytes assertion = 6;
+}
+
+message ServerMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  Kind kind = 3;
+  bytes payload = 4;
+}

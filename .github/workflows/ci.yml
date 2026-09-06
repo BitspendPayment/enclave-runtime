@@ -61,6 +61,16 @@ jobs:
       - name: HTTP/2 negotiation, and HTTP/1.1 beside it
         run: cargo test -p enclave-runtime --test serve_h2 -- --include-ignored
 
+      - name: build the gRPC guest
+        working-directory: examples/guest-grpc
+        run: cargo build --release --target wasm32-wasip2
+
+      # Both directions open at once: the guest answering while the client is
+      # still sending, backpressure, trailers, and what an open stream costs
+      # the tenant holding it.
+      - name: bidirectional gRPC streaming
+        run: cargo test -p enclave-runtime --test serve_grpc -- --include-ignored
+
       - name: build the verifier CLI
         run: cargo build -p nitro-attestation --features cli
 

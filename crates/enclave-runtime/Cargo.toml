@@ -181,6 +181,10 @@ http = "1"
 # the server negotiates it and frames it correctly.
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "server", "server-auto", "http1", "http2", "tokio"] }
+# Turning a channel into a request body, so a test can hold the request open
+# and feed it one gRPC frame at a time — which is the only way to observe the
+# guest answering before the client has finished asking.
+tokio-stream = "0.1"
 # The integration suites drive the gate with a software passkey, which only
 # exists under `testing`. A dev-dependency on the crate itself is how a crate
 # turns a feature on for its own tests without turning it on for consumers.

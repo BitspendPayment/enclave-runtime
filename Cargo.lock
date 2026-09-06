@@ -2049,6 +2049,7 @@ dependencies = [
  "spki",
  "tokio",
  "tokio-rustls 0.26.4",
+ "tokio-stream",
  "tracing",
  "tracing-subscriber",
  "wasmtime",
