@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use hyper::server::conn::http1;
 use tokio::net::TcpListener;
 use wasmtime::component::{Component, InstancePre};
 use wasmtime::{Engine, Store, UpdateDeadline};
@@ -733,7 +732,10 @@ async fn serve_connection<S>(
     // The leaf this connection's handshake actually presented, loaded once at
     // accept time. `None` for plaintext.
     certificate: Option<Vec<u8>>,
-) -> std::result::Result<(), hyper::Error>
+    // Boxed rather than `hyper::Error`: the protocol is chosen per connection
+    // now, and `auto::Builder` reports failures from whichever of the two it
+    // ended up speaking.
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -819,10 +821,18 @@ where
         }
     });
 
-    http1::Builder::new()
-        .keep_alive(true)
-        .serve_connection(TokioIo::new(io), service)
-        .await
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    builder.http1().keep_alive(true);
+    // A stream carrying nothing is indistinguishable from a peer that has gone
+    // away, and a peer that has gone away is still holding its tenant's slot.
+    // PING is the only thing at this layer that can tell them apart.
+    builder
+        .http2()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .keep_alive_interval(Some(Duration::from_secs(30)))
+        .keep_alive_timeout(Duration::from_secs(20));
+    builder.serve_connection(TokioIo::new(io), service).await
 }
 
 /// Everything that decides what a response *is*, with attestation stripped out.

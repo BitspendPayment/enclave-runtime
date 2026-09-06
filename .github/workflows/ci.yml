@@ -55,6 +55,12 @@ jobs:
       - name: TLS termination and the attestation binding
         run: cargo test -p enclave-runtime --test serve_tls -- --include-ignored
 
+      # There is no test glob here, so a suite that is not named runs nowhere.
+      # This one guards the transport: h2 is negotiated for the clients that
+      # ask, and every client that does not is untouched.
+      - name: HTTP/2 negotiation, and HTTP/1.1 beside it
+        run: cargo test -p enclave-runtime --test serve_h2 -- --include-ignored
+
       - name: build the verifier CLI
         run: cargo build -p nitro-attestation --features cli
 

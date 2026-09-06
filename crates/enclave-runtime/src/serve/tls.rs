@@ -103,6 +103,19 @@ impl TlsIdentity {
         config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         config.send_tls13_tickets = 0;
 
+        // Preference order, and both are offered because both are served. A
+        // gRPC client offers only `h2` and must be given it; curl and a browser
+        // offer `http/1.1`, or no ALPN at all, and rustls skips the extension
+        // entirely for the latter. The one client this turns away is one that
+        // offers ALPN with no overlap, which is correct: there is no protocol
+        // in common to speak.
+        //
+        // Unrelated to the TLS-ALPN-01 challenge, which never reaches this
+        // configuration — `rustls_acme` builds its own advertising
+        // `acme-tls/1`, chosen by inspecting the ClientHello before any
+        // serving identity is consulted.
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
         Ok(TlsIdentity {
             certificate_der: leaf,
             config: Arc::new(config),
@@ -226,6 +239,22 @@ mod tests {
         let err = TlsMode::parse("self-signed").unwrap_err();
         assert!(err.contains("ACME-issued certificates only"), "{err}");
         assert!(err.contains("--acme-directory"), "{err}");
+    }
+
+    /// Both protocols, in preference order, on every serving identity.
+    ///
+    /// `from_chain` is the single constructor — `self_signed` and the ACME path
+    /// both route through it — so this is the one place the list is stated and
+    /// there is nowhere for two identities to disagree about what they speak.
+    #[test]
+    fn a_serving_identity_offers_h2_and_http11_in_that_order() {
+        let identity = TlsIdentity::self_signed(&["enclave.test".to_string()])
+            .expect("a self-signed identity");
+        assert_eq!(
+            identity.config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "gRPC needs h2 offered, and everything else needs http/1.1 kept"
+        );
     }
 
     #[test]

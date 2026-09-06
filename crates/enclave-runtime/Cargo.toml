@@ -65,7 +65,13 @@ wasmtime-wasi-io = "=44.0.0"
 # visible decision rather than a feature flag nobody looked at. See
 # `serve::EgressPolicy`.
 wasmtime-wasi-http = { version = "=44.0.0", default-features = false, features = ["p2"] }
-hyper          = { version = "1", features = ["http1", "server"] }
+hyper          = { version = "1", features = ["http1", "http2", "server"] }
+# Protocol chosen per connection rather than per deployment. `auto::Builder`
+# reads the HTTP/2 connection preface before deciding, so one listener serves
+# both and a client that never heard of h2 is unaffected. h2 is what gRPC
+# requires and nothing else here needs; it is pure Rust and brings no crypto of
+# its own, so what it adds to the measured image is a framing layer.
+hyper-util     = { version = "0.1", default-features = false, features = ["server", "server-auto", "http1", "http2", "tokio"] }
 http           = "1"
 http-body-util = "0.1"
 
@@ -168,6 +174,13 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test
 aws-smithy-types = { workspace = true }
 # Building canned HTTP requests/responses for the replay client.
 http = "1"
+# The HTTP/2 client half, for the streaming suites. `client` is a dev-only
+# feature: the runtime serves, it never calls out over HTTP, and cargo unifies
+# dev-dependency features only when building tests — so this adds nothing to
+# the shipped binary. Driving h2 from a real client is the only way to prove
+# the server negotiates it and frames it correctly.
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "server", "server-auto", "http1", "http2", "tokio"] }
 # The integration suites drive the gate with a software passkey, which only
 # exists under `testing`. A dev-dependency on the crate itself is how a crate
 # turns a feature on for its own tests without turning it on for consumers.
