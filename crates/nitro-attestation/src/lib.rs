@@ -10,7 +10,7 @@
 //!   COSE_Sign1
 //!   ├── protected   {1: -35}          ES384
 //!   ├── payload     CBOR map
-//!   │   ├── pcrs        0..15         what code is running
+//!   │   ├── pcrs        locked only   0 the runtime image, 16 its guest
 //!   │   ├── certificate leaf DER      signs this document
 //!   │   ├── cabundle    [DER, …]      root first, chains to AWS
 //!   │   ├── user_data   opt bytes     ← the TLS certificate hash
@@ -131,10 +131,10 @@ pub struct Verified {
 pub struct Expectations {
     /// Required PCR values by index.
     ///
-    /// PCR0 pins the enclave image and is what a client normally checks.
-    /// Higher registers matter for handoffs: a predecessor extends one to
-    /// commit to its successor, so the successor checks *that* index to prove
-    /// it was named. See [`Expectations::pcr`].
+    /// PCR0 pins the runtime image. [`PCR_GUEST`] pins the guest component that
+    /// runtime measured before it could obtain a key. A client needs both,
+    /// because the image does not contain the guest and the runtime is what
+    /// writes the guest register. See [`Expectations::pcr`].
     pub pcrs: BTreeMap<u32, Vec<u8>>,
     /// The nonce the verifier sent. Rejects a replayed document.
     pub nonce: Option<Vec<u8>>,
@@ -609,9 +609,83 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+/// The register the runtime measures its guest component into.
+///
+/// `nitro_nsm::PCR_GUEST` is the device-side copy. It is repeated rather than
+/// imported because this crate must not depend on the device layer; a test in
+/// `enclave-runtime` holds the two together.
+pub const PCR_GUEST: u32 = 16;
+
+/// What a register holds after exactly one extension with `data`, starting
+/// from zero: `SHA384(0⁴⁸ ‖ data)`.
+pub fn pcr_after_one_extend(data: &[u8]) -> [u8; 48] {
+    let mut ctx = digest::Context::new(&digest::SHA384);
+    ctx.update(&[0u8; 48]);
+    ctx.update(data);
+    let mut out = [0u8; 48];
+    out.copy_from_slice(ctx.finish().as_ref());
+    out
+}
+
+/// The [`PCR_GUEST`] value an enclave serving `component` attests.
+///
+/// The runtime extends the register once with `sha256(component)` and locks
+/// it, so the value follows from the component alone — which is what lets a
+/// client, or a key policy, pin a guest it holds a copy of.
+///
+/// It is an identity only **together with PCR0**. The runtime does the
+/// extending, so an enclave running someone else's runtime can put this value
+/// in the register while running anything at all; PCR0 is what says the
+/// runtime that extended it is this one.
+pub fn guest_pcr(component: &[u8]) -> [u8; 48] {
+    pcr_after_one_extend(&sha256(component))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Against a value computed outside this crate —
+    /// `{ head -c 48 /dev/zero; printf abc; } | sha384sum` — because this
+    /// implementation checked against itself would prove nothing.
+    #[test]
+    fn one_extension_is_sha384_over_zeros_then_the_data() {
+        assert_eq!(
+            hex::encode(pcr_after_one_extend(b"abc")),
+            "b1c16eb7634112b7c9d5ebd27e62a2d4528bbfcfd68b62d3afd9ecf98e0f413a\
+             84314acce78317fb69fd895155343e09"
+        );
+    }
+
+    #[test]
+    fn the_guest_register_is_one_extension_with_the_component_hash() {
+        assert_eq!(guest_pcr(b"guest"), pcr_after_one_extend(&sha256(b"guest")));
+        assert_ne!(guest_pcr(b"guest"), guest_pcr(b"another guest"));
+    }
+
+    /// A document that does not list the guest register fails an expectation on
+    /// it, rather than passing as though the check were skipped. That is what
+    /// an enclave that never locked the register looks like.
+    #[test]
+    fn a_guest_expectation_fails_on_a_document_without_the_register() {
+        let chain = crate::testing::TestChain::new().unwrap();
+        let verified = verify(
+            &chain.document(None, None, [0x0e; 48]).unwrap(),
+            &VerifyOptions {
+                trust_root: chain.root_der().to_vec(),
+                now: SystemTime::now(),
+                allow_untrusted_root: false,
+            },
+        )
+        .unwrap();
+        let err = verified
+            .expect(
+                &Expectations::default().pcr(PCR_GUEST, guest_pcr(b"g").to_vec()),
+                SystemTime::now(),
+            )
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no PCR16"), "{err:#}");
+    }
 
     /// The published fingerprint of the AWS Nitro Enclaves root. If the
     /// embedded PEM is ever edited, this fails rather than quietly moving the

@@ -41,12 +41,35 @@
 //!
 //! What remains out of scope, unchanged from `root.rs`: S3 lying about `HEAD`.
 //! That is AWS, whom we already trust for the signature on the receipt itself.
+//!
+//! ## Which code may hold the state
+//!
+//! Not this module's decision. An enclave that gets past opening the key was
+//! released it by KMS, against a policy naming one runtime image (PCR0) and one
+//! guest (PCR16), and changing either is an edit to that policy by whoever
+//! controls the key. A boot machine that also refused pairs would be a second
+//! copy of that decision, able only to disagree with the real one.
+//!
+//! What boot adds is a **record**. The first time a runtime and guest hold this
+//! state, the enclave attests a *pair record* — a document carrying its PCR0
+//! and PCR16 and committing to this `state_root` — and stores it undeletably
+//! under a key derived from the pair. Later boots of that pair find it and
+//! write nothing. The store therefore holds one signed record for each distinct
+//! pair that has ever held the state.
+//!
+//! It records *which* pairs, not *in what order*: returning to an earlier pair
+//! finds that pair's record and adds nothing. The order approvals were given in
+//! lives where they were given, in CloudTrail's record of key-policy edits.
+//!
+//! Under the static development key source there is no policy at all, so
+//! nothing decides which pair may boot. That source protects nothing, and the
+//! image environment that selects it is measured.
 
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use nitro_attestation::{Expectations, Trust, VerifyOptions};
-use nitro_nsm::{AttestationRequest, Nsm, PCR_SUCCESSOR, PCR_ZERO};
+use nitro_attestation::{Expectations, Trust, VerifyOptions, AWS_NITRO_ROOT_G1_PEM};
+use nitro_nsm::{AttestationRequest, Nsm, PCR_GUEST, PCR_ZERO};
 use s3fs_core::backend::{Backend, ObjectLock, PutBlobInput};
 use s3fs_core::{FsError, MasterSecret};
 
@@ -55,8 +78,9 @@ use crate::mount::{Backends, MountConfig, Mounted};
 
 /// `user_data` purpose for the receipt genesis writes.
 const PURPOSE_STATE_ORIGIN: &str = "s3fs-state-origin";
-/// `user_data` purpose for the receipt a predecessor writes to name a successor.
-const PURPOSE_TRANSITION: &str = "s3fs-transition";
+/// `user_data` purpose for the record a runtime and guest leave the first time
+/// they hold this state.
+const PURPOSE_PAIR: &str = "s3fs-pair";
 
 /// Schema string inside the `state_root` pre-image. Bump it and every existing
 /// receipt stops verifying, which is the intended effect of changing what a
@@ -68,11 +92,86 @@ const STATE_ROOT_SCHEMA: &str = "s3fs/state-origin/v1";
 pub enum BootMode {
     /// No receipt and no filesystem: create both.
     Genesis,
-    /// A receipt written by an enclave with this PCR0.
+    /// This runtime and guest have held this state before.
     Resume,
-    /// A receipt written by a different PCR0, with a transition receipt from
-    /// that PCR0 naming this one.
-    Migration,
+    /// The first boot of this runtime and guest on this state: a new guest, a
+    /// new runtime image, or both. Recorded rather than refused — the key
+    /// policy is what allowed it.
+    ///
+    /// Derived from whether this pair's record exists, not by comparing with
+    /// whoever ran genesis, which would call every restart after an upgrade
+    /// another upgrade.
+    Upgrade,
+}
+
+/// The two measurements that say what an enclave is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pair {
+    /// The runtime image, measured by the hypervisor.
+    pub pcr0: [u8; 48],
+    /// The guest component, measured by that runtime into [`PCR_GUEST`] and
+    /// locked before it asked for a key.
+    pub pcr16: [u8; 48],
+}
+
+impl Pair {
+    /// Read both from the device, refusing if the guest was never measured.
+    ///
+    /// The first thing [`boot`] does, before anything is read from the store or
+    /// asked of KMS. An enclave that reached KMS with PCR16 unlocked would
+    /// present an attestation with no guest in it, and could still extend the
+    /// register after being released a key.
+    pub fn read(nsm: &dyn Nsm) -> Result<Self> {
+        let pcr0 = nsm
+            .describe_pcr(0)
+            .context("reading PCR0; the boot machine cannot record what it cannot read")?;
+        let guest = nsm
+            .describe_pcr(PCR_GUEST)
+            .context("reading PCR16, where the guest is measured")?;
+        if !guest.locked {
+            bail!(
+                "PCR16 is not locked, so this enclave has not measured its guest. It must be \
+                 measured and locked before any key is asked for: an attestation carries only \
+                 locked registers, so a key policy pinning the guest would see none. Refusing \
+                 to boot."
+            );
+        }
+        if guest.value == PCR_ZERO {
+            bail!(
+                "PCR16 is locked but was never extended, so it names no guest. Refusing to boot."
+            );
+        }
+        Ok(Pair {
+            pcr0: register(&pcr0.value, 0)?,
+            pcr16: register(&guest.value, PCR_GUEST)?,
+        })
+    }
+
+    /// Where this pair's record lives.
+    ///
+    /// Derived, like the receipt and the sealed key, so "no record" is an
+    /// answer rather than a failure to look in the right place. Both registers
+    /// are SHA-384 and so always 48 bytes, which keeps the concatenation
+    /// unambiguous.
+    pub fn record_key(&self, prefix: &str, fs_uuid: &[u8; 16]) -> String {
+        let mut both = [0u8; 96];
+        both[..48].copy_from_slice(&self.pcr0);
+        both[48..].copy_from_slice(&self.pcr16);
+        format!(
+            "{prefix}origin/{}.pair.{}",
+            hex::encode(fs_uuid),
+            hex::encode(nitro_attestation::sha256(&both))
+        )
+    }
+}
+
+fn register(value: &[u8], index: u16) -> Result<[u8; 48]> {
+    value.try_into().with_context(|| {
+        format!(
+            "PCR{index} is {} bytes; a SHA-384 register is 48",
+            value.len()
+        )
+    })
 }
 
 /// What a boot established, for logging and for the health endpoint.
@@ -81,8 +180,8 @@ pub struct Booted {
     pub mode: BootMode,
     pub mounted: Mounted,
     pub state_root: [u8; 32],
-    /// The PCR0 this enclave is running under.
-    pub pcr0: Vec<u8>,
+    /// The runtime image and guest this enclave is running.
+    pub pair: Pair,
     /// The recovered master secret.
     ///
     /// Returned rather than dropped because per-client filesystems derive
@@ -136,9 +235,12 @@ impl StateIdentity {
     }
 }
 
-/// `user_data` payload of a receipt.
-fn receipt_payload(purpose: &str, state_root: &[u8; 32], successor: Option<&[u8]>) -> Vec<u8> {
-    let mut fields = vec![
+/// `user_data` payload of a receipt or a pair record.
+///
+/// Every receipt already written commits to this encoding, so changing it
+/// would make every existing filesystem unmountable.
+fn receipt_payload(purpose: &str, state_root: &[u8; 32]) -> Vec<u8> {
+    let fields = vec![
         (
             ciborium::Value::Text("purpose".into()),
             ciborium::Value::Text(purpose.to_string()),
@@ -148,12 +250,6 @@ fn receipt_payload(purpose: &str, state_root: &[u8; 32], successor: Option<&[u8]
             ciborium::Value::Bytes(state_root.to_vec()),
         ),
     ];
-    if let Some(pcr0) = successor {
-        fields.push((
-            ciborium::Value::Text("successor_pcr0".into()),
-            ciborium::Value::Bytes(pcr0.to_vec()),
-        ));
-    }
     let mut out = Vec::new();
     ciborium::into_writer(&ciborium::Value::Map(fields), &mut out)
         .expect("writing to a Vec cannot fail");
@@ -171,14 +267,6 @@ fn receipt_key(prefix: &str, fs_uuid: &[u8; 16]) -> String {
 
 fn sealed_key_key(prefix: &str, fs_uuid: &[u8; 16]) -> String {
     format!("{prefix}origin/{}.key", hex::encode(fs_uuid))
-}
-
-fn transition_key(prefix: &str, fs_uuid: &[u8; 16], successor_pcr0: &[u8]) -> String {
-    format!(
-        "{prefix}origin/{}.transition.{}",
-        hex::encode(fs_uuid),
-        hex::encode(successor_pcr0)
-    )
 }
 
 /// How a receipt is checked. QEMU's NSM does not sign, so the harness needs a
@@ -251,18 +339,7 @@ fn open_receipt(
     expected: &Expectations,
 ) -> Result<nitro_attestation::Verified> {
     let verified = match trust {
-        ReceiptTrust::Required => {
-            let verified = nitro_attestation::verify(document, &VerifyOptions::default())
-                .context("verifying the receipt")?;
-            if verified.trust != Trust::ChainVerified {
-                bail!(
-                    "receipt is {:?} rather than chain-verified; this image \
-                     requires a receipt signed by AWS",
-                    verified.trust
-                );
-            }
-            verified
-        }
+        ReceiptTrust::Required => verify_as_signed(document, AWS_NITRO_ROOT_G1_PEM.as_bytes())?,
         // The emulator's NSM does not sign, so there is nothing to verify and
         // the contents are read as-is. Only an image built for the emulator
         // reaches here, and because the image's environment is measured, PCR0
@@ -282,6 +359,41 @@ fn open_receipt(
     Ok(verified)
 }
 
+/// Verify a stored document's signature and chain **as of when it was signed**.
+///
+/// Not as of now. The certificates in an attestation document's chain are
+/// short-lived — far shorter than a filesystem's life — so a receipt checked
+/// against the current time stops verifying soon after it is written, and the
+/// filesystem it guards becomes unmountable by the passage of time: the failure
+/// `max_age` is left unset to avoid, arriving by another route.
+///
+/// The timestamp is part of the signed payload. It is read before the signature
+/// is checked only to choose the moment to check at; `verify` then fails unless
+/// the chain was valid at that moment *and* the signature covers that
+/// timestamp.
+fn verify_as_signed(document: &[u8], trust_root: &[u8]) -> Result<nitro_attestation::Verified> {
+    let signed_at = nitro_attestation::parse(document)
+        .context("parsing the receipt")?
+        .timestamp();
+    let verified = nitro_attestation::verify(
+        document,
+        &VerifyOptions {
+            trust_root: trust_root.to_vec(),
+            now: signed_at,
+            allow_untrusted_root: false,
+        },
+    )
+    .context("verifying the receipt")?;
+    if verified.trust != Trust::ChainVerified {
+        bail!(
+            "receipt is {:?} rather than chain-verified; this image requires a receipt \
+             signed by AWS",
+            verified.trust
+        );
+    }
+    Ok(verified)
+}
+
 /// Decide the mode, resolve the key, and mount or create.
 pub async fn boot(
     backends: &Backends,
@@ -294,10 +406,8 @@ pub async fn boot(
     let fs_uuid = &mount_config.fs_id;
     let roots = &backends.roots;
 
-    let pcr0 = nsm
-        .describe_pcr(0)
-        .context("reading PCR0; the boot machine cannot compare what it cannot read")?
-        .value;
+    // Before anything is read from the store or asked of KMS.
+    let pair = Pair::read(nsm.as_ref())?;
 
     let receipt = maybe_get(roots, &receipt_key(prefix, fs_uuid)).await?;
     let sealed = maybe_get(roots, &sealed_key_key(prefix, fs_uuid))
@@ -305,8 +415,11 @@ pub async fn boot(
         .map(SealedKey::from_bytes);
 
     match (receipt, sealed) {
-        // ---- resume or migration -------------------------------------------
+        // ---- resume or upgrade ---------------------------------------------
         (Some(receipt), Some(sealed)) => {
+            // Under `kms` this is where the key policy decides which runtime
+            // and guest may hold this state, and the only place: a pair it does
+            // not name gets no key and goes no further.
             let master = key_source
                 .open(&sealed)
                 .await
@@ -316,28 +429,42 @@ pub async fn boot(
             let identity = identity_of(&mounted, mount_config, &sealed).await?;
             let state_root = identity.state_root();
 
-            let mode = verify_origin(
-                &receipt,
+            verify_origin(&receipt, boot_config.trust, &state_root)?;
+            let first = record_pair(
+                backends,
+                mount_config,
                 boot_config.trust,
+                nsm.as_ref(),
+                &pair,
                 &state_root,
-                &pcr0,
-                roots,
-                prefix,
-                fs_uuid,
             )
             .await?;
 
             Ok(Booted {
-                mode,
+                mode: if first {
+                    BootMode::Upgrade
+                } else {
+                    BootMode::Resume
+                },
                 mounted,
                 state_root,
-                pcr0,
+                pair,
                 master,
             })
         }
 
         // ---- genesis -------------------------------------------------------
-        (None, None) => genesis(backends, mount_config, nsm, key_source, pcr0).await,
+        (None, None) => {
+            genesis(
+                backends,
+                mount_config,
+                boot_config.trust,
+                nsm,
+                key_source,
+                pair,
+            )
+            .await
+        }
 
         // ---- the attack ----------------------------------------------------
         (Some(_), None) => bail!(
@@ -384,90 +511,137 @@ async fn identity_of(
     })
 }
 
-/// Check the receipt, falling through to the migration path if it was written
-/// by a different image.
-async fn verify_origin(
-    receipt: &[u8],
-    trust: ReceiptTrust,
-    state_root: &[u8; 32],
-    pcr0: &[u8],
-    roots: &Arc<dyn Backend>,
-    prefix: &str,
-    fs_uuid: &[u8; 16],
-) -> Result<BootMode> {
-    let payload = receipt_payload(PURPOSE_STATE_ORIGIN, state_root, None);
-
-    // Whose receipt is it? Parse before verifying so the error can say
-    // "written by another image" rather than "PCR0 mismatch".
-    let parsed = nitro_attestation::parse(receipt).context("parsing the state-origin receipt")?;
-    let author = parsed
-        .pcr(0)
-        .context("the receipt carries no PCR0")?
-        .to_vec();
-
-    if author == pcr0 {
-        open_receipt(
-            receipt,
-            trust,
-            "state-origin",
-            &Expectations::default()
-                .pcr0(pcr0.to_vec())
-                .user_data(payload),
-        )?;
-        return Ok(BootMode::Resume);
-    }
-
-    // A different image wrote this filesystem. It may boot here only if that
-    // image said so, and said so about *this* image specifically.
-    let key = transition_key(prefix, fs_uuid, pcr0);
-    let transition = maybe_get(roots, &key).await?.with_context(|| {
-        format!(
-            "this filesystem was created by enclave image {} and this one is {}. \
-             No transition receipt at {key} authorises the handoff — the \
-             predecessor must run `--authorise-successor {}` first.",
-            hex::encode(&author[..8.min(author.len())]),
-            hex::encode(&pcr0[..8.min(pcr0.len())]),
-            hex::encode(pcr0),
-        )
-    })?;
-
-    // Written by the incumbent, committing to this successor in two
-    // independent places: PCR31, which it had to extend before attesting and
-    // cannot undo, and the payload.
+/// Check the origin receipt names the state that was just loaded.
+///
+/// Not who wrote it. Any runtime and guest may have run genesis, because by
+/// this point KMS has released the key to *this* pair, and that is the decision
+/// that matters — see the module docs. What KMS cannot say is whether the state
+/// loaded is the state genesis recorded, and that is the question here.
+fn verify_origin(receipt: &[u8], trust: ReceiptTrust, state_root: &[u8; 32]) -> Result<()> {
     open_receipt(
-        &transition,
+        receipt,
         trust,
-        "transition",
-        &Expectations::default()
-            .pcr0(author.clone())
-            .pcr(PCR_SUCCESSOR as u32, nitro_nsm::pcr_extend(&PCR_ZERO, pcr0))
-            .user_data(receipt_payload(PURPOSE_TRANSITION, state_root, Some(pcr0))),
+        "state-origin",
+        &Expectations::default().user_data(receipt_payload(PURPOSE_STATE_ORIGIN, state_root)),
     )?;
-
-    tracing::warn!(
-        predecessor = %hex::encode(&author),
-        successor = %hex::encode(pcr0),
-        "migrating: this filesystem was created by a different enclave image"
-    );
-    Ok(BootMode::Migration)
+    Ok(())
 }
 
-/// Create a filesystem and the receipt that authorises every later boot.
+/// Check a pair record says this runtime and guest held this state.
+fn verify_pair_record(
+    document: &[u8],
+    trust: ReceiptTrust,
+    pair: &Pair,
+    state_root: &[u8; 32],
+) -> Result<()> {
+    open_receipt(
+        document,
+        trust,
+        "pair",
+        &Expectations::default()
+            .pcr0(pair.pcr0.to_vec())
+            .pcr(PCR_GUEST as u32, pair.pcr16.to_vec())
+            .user_data(receipt_payload(PURPOSE_PAIR, state_root)),
+    )?;
+    Ok(())
+}
+
+/// Make sure this pair has a record against this state, returning whether this
+/// boot is the pair's first.
 ///
-/// The ordering is load-bearing and only the last step is atomic: mint, seal,
+/// A record that is already there is **verified, not merely found**. Its key
+/// is derivable by anyone who can write to the roots bucket — the parent
+/// included — so an object planted there ahead of a pair's first boot would
+/// otherwise stand in for the real record for good, Object Lock keeping it as
+/// faithfully as it would the genuine one.
+async fn record_pair(
+    backends: &Backends,
+    config: &MountConfig,
+    trust: ReceiptTrust,
+    nsm: &dyn Nsm,
+    pair: &Pair,
+    state_root: &[u8; 32],
+) -> Result<bool> {
+    let key = pair.record_key(&config.bucket_prefix, &config.fs_id);
+
+    if let Some(existing) = maybe_get(&backends.roots, &key).await? {
+        verify_pair_record(&existing, trust, pair, state_root).with_context(|| {
+            format!(
+                "the record at {key} does not describe this runtime and guest holding this \
+                 state. Refusing to boot rather than leave it standing as this pair's record."
+            )
+        })?;
+        return Ok(false);
+    }
+
+    let document = nsm
+        .attest(&AttestationRequest::with_user_data(receipt_payload(
+            PURPOSE_PAIR,
+            state_root,
+        )))
+        .context("asking the NSM for a pair record")?;
+    // Before it is stored. A document that did not carry both registers would
+    // be a record of nothing, locked in place for the retention period — and on
+    // real hardware, this is where a guest register missing from documents
+    // would first show.
+    verify_pair_record(&document, trust, pair, state_root)
+        .context("the NSM's own document does not carry this runtime and guest")?;
+
+    match backends
+        .roots
+        .put_blob_if_not_exists(locked(&key, document, config))
+        .await
+    {
+        Ok(_) => {}
+        // Another first boot of this pair got there first. Its record stands,
+        // provided it says what this one would have.
+        Err(FsError::AlreadyExists) => {
+            let theirs = maybe_get(&backends.roots, &key)
+                .await?
+                .with_context(|| format!("{key} was reported present and then was not"))?;
+            verify_pair_record(&theirs, trust, pair, state_root).with_context(|| {
+                format!(
+                    "another writer's record at {key} does not describe this runtime and \
+                     guest holding this state. Refusing to boot."
+                )
+            })?;
+        }
+        Err(other) => bail!("writing the pair record {key}: {other}"),
+    }
+
+    tracing::info!(
+        pcr0 = %hex::encode(pair.pcr0),
+        pcr16 = %hex::encode(pair.pcr16),
+        record = %key,
+        "first boot of this runtime and guest on this state; recorded"
+    );
+    Ok(true)
+}
+
+/// Create a filesystem, the receipt that authorises every later boot, and the
+/// first pair record.
+///
+/// The ordering is load-bearing and only the last steps are atomic: mint, seal,
 /// persist the key, create the filesystem, then write the receipt with a
-/// conditional PUT. A crash before the last step leaves a filesystem with no
+/// conditional PUT. A crash before the receipt leaves a filesystem with no
 /// receipt, which the next boot refuses — deliberately, because that state is
 /// indistinguishable from a store whose receipt has been hidden.
+///
+/// The pair record comes after the receipt, so the receipt stays the last thing
+/// whose absence means "unfinished". A genesis interrupted between the two
+/// leaves a store the next boot resumes; that boot writes the record and
+/// reports an upgrade, which for once is not one.
 async fn genesis(
     backends: &Backends,
     config: &MountConfig,
+    trust: ReceiptTrust,
     nsm: &Arc<dyn Nsm>,
     key_source: &dyn MasterKeySource,
-    pcr0: Vec<u8>,
+    pair: Pair,
 ) -> Result<Booted> {
     tracing::info!(
-        pcr0 = %hex::encode(&pcr0),
+        pcr0 = %hex::encode(pair.pcr0),
+        pcr16 = %hex::encode(pair.pcr16),
         "no filesystem here: creating one and recording its origin"
     );
 
@@ -500,7 +674,6 @@ async fn genesis(
         .attest(&AttestationRequest::with_user_data(receipt_payload(
             PURPOSE_STATE_ORIGIN,
             &state_root,
-            None,
         )))
         .context("asking the NSM for a state-origin receipt")?;
 
@@ -511,6 +684,8 @@ async fn genesis(
         .await
         .map_err(|e| anyhow::anyhow!("writing the state-origin receipt: {e}"))?;
 
+    record_pair(backends, config, trust, nsm.as_ref(), &pair, &state_root).await?;
+
     tracing::info!(
         state_root = %hex::encode(state_root),
         "genesis complete; this filesystem now has an attested origin"
@@ -520,71 +695,9 @@ async fn genesis(
         mode: BootMode::Genesis,
         mounted,
         state_root,
-        pcr0,
+        pair,
         master,
     })
-}
-
-/// Authorise a successor image, then stop.
-///
-/// Extends PCR31 with the successor's PCR0 — irreversibly, for this enclave's
-/// life — and attests. The document therefore proves two things a later image
-/// can check independently: that the incumbent produced it, and that it had
-/// committed to *this* successor before doing so.
-pub async fn authorise_successor(
-    backends: &Backends,
-    config: &MountConfig,
-    nsm: &Arc<dyn Nsm>,
-    key_source: &dyn MasterKeySource,
-    successor_pcr0: &[u8],
-) -> Result<()> {
-    let sealed = maybe_get(
-        &backends.roots,
-        &sealed_key_key(&config.bucket_prefix, &config.fs_id),
-    )
-    .await?
-    .map(SealedKey::from_bytes)
-    .context("no sealed key here: there is no filesystem to hand over")?;
-
-    let master = key_source.open(&sealed).await?;
-    let mounted = crate::mount::mount_existing(backends, config, &master).await?;
-    let state_root = identity_of(&mounted, config, &sealed).await?.state_root();
-
-    let extended = nsm
-        .extend_pcr(PCR_SUCCESSOR, successor_pcr0)
-        .context("extending PCR31 to name the successor")?;
-    let expected = nitro_nsm::pcr_extend(&PCR_ZERO, successor_pcr0);
-    if extended != expected {
-        bail!(
-            "PCR{PCR_SUCCESSOR} reads {} after extending, expected {}. It was \
-             not zero beforehand, so this enclave has already authorised \
-             something. Restart it and authorise once.",
-            hex::encode(&extended),
-            hex::encode(&expected)
-        );
-    }
-
-    let document = nsm
-        .attest(&AttestationRequest::with_user_data(receipt_payload(
-            PURPOSE_TRANSITION,
-            &state_root,
-            Some(successor_pcr0),
-        )))
-        .context("asking the NSM for a transition receipt")?;
-
-    let key = transition_key(&config.bucket_prefix, &config.fs_id, successor_pcr0);
-    backends
-        .roots
-        .put_blob(locked(&key, document, config))
-        .await
-        .map_err(|e| anyhow::anyhow!("writing the transition receipt: {e}"))?;
-
-    tracing::info!(
-        successor = %hex::encode(successor_pcr0),
-        key = %key,
-        "successor authorised; it may now boot this filesystem once"
-    );
-    Ok(())
 }
 
 /// Everything the boot machine writes goes under the same retention as the
@@ -603,6 +716,7 @@ fn locked(key: &str, body: Vec<u8>, _config: &MountConfig) -> PutBlobInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nitro_nsm::fake::FakeNsm;
 
     fn identity() -> StateIdentity {
         StateIdentity {
@@ -612,6 +726,13 @@ mod tests {
             bucket_prefix: String::new(),
             genesis_root_hash: [2u8; 32],
             sealed_key_sha256: [3u8; 32],
+        }
+    }
+
+    fn pair(pcr0: u8, pcr16: u8) -> Pair {
+        Pair {
+            pcr0: [pcr0; 48],
+            pcr16: [pcr16; 48],
         }
     }
 
@@ -665,36 +786,156 @@ mod tests {
     fn the_payload_distinguishes_its_purposes() {
         let root = [4u8; 32];
         assert_ne!(
-            receipt_payload(PURPOSE_STATE_ORIGIN, &root, None),
-            receipt_payload(PURPOSE_TRANSITION, &root, None),
-            "a state-origin receipt must not verify as a transition receipt"
+            receipt_payload(PURPOSE_STATE_ORIGIN, &root),
+            receipt_payload(PURPOSE_PAIR, &root),
+            "a pair record must not verify as a state-origin receipt"
         );
     }
 
+    /// Byte for byte, what state-origin receipts have always carried. Every
+    /// receipt already written commits to this, so it cannot move without
+    /// making every existing filesystem unmountable.
     #[test]
-    fn a_transition_payload_names_its_successor() {
+    fn the_state_origin_payload_has_not_changed() {
         let root = [4u8; 32];
-        assert_ne!(
-            receipt_payload(PURPOSE_TRANSITION, &root, Some(b"image-a")),
-            receipt_payload(PURPOSE_TRANSITION, &root, Some(b"image-b")),
-            "a handoff to one image must not authorise another"
-        );
+        let mut expected = vec![0xa2];
+        expected.push(0x67);
+        expected.extend_from_slice(b"purpose");
+        expected.push(0x71);
+        expected.extend_from_slice(b"s3fs-state-origin");
+        expected.push(0x6a);
+        expected.extend_from_slice(b"state_root");
+        expected.extend_from_slice(&[0x58, 0x20]);
+        expected.extend_from_slice(&root);
+        assert_eq!(receipt_payload(PURPOSE_STATE_ORIGIN, &root), expected);
     }
 
-    /// Keys must be derivable from the filesystem id alone — that is what
-    /// makes a 404 an answer rather than a failure to look in the right place.
+    /// Keys must be derivable from what the enclave already knows — that is
+    /// what makes a 404 an answer rather than a failure to look in the right
+    /// place.
     #[test]
     fn object_keys_are_derived_and_distinct() {
         let uuid = [7u8; 16];
         let r = receipt_key("p/", &uuid);
         let k = sealed_key_key("p/", &uuid);
-        let t = transition_key("p/", &uuid, b"successor");
+        let p = pair(1, 2).record_key("p/", &uuid);
         assert_ne!(r, k);
-        assert_ne!(r, t);
-        assert_ne!(k, t);
+        assert_ne!(r, p);
+        assert_ne!(k, p);
         assert!(r.starts_with("p/"));
+        assert!(p.starts_with("p/origin/"));
         assert_eq!(r, receipt_key("p/", &uuid), "must be deterministic");
-        assert_ne!(t, transition_key("p/", &uuid, b"other"));
+        assert_eq!(
+            p,
+            pair(1, 2).record_key("p/", &uuid),
+            "must be deterministic"
+        );
+    }
+
+    /// One record per pair, so the key has to change with either register —
+    /// and with which register holds which value.
+    #[test]
+    fn a_pair_record_key_names_both_measurements() {
+        let uuid = [7u8; 16];
+        let base = pair(1, 2).record_key("", &uuid);
+        assert_ne!(pair(9, 2).record_key("", &uuid), base, "another runtime");
+        assert_ne!(pair(1, 9).record_key("", &uuid), base, "another guest");
+        assert_ne!(pair(2, 1).record_key("", &uuid), base, "registers swapped");
+        assert_ne!(
+            pair(1, 2).record_key("", &[8u8; 16]),
+            base,
+            "another filesystem"
+        );
+    }
+
+    #[test]
+    fn a_measured_guest_is_read_back_as_the_pair() {
+        let nsm = FakeNsm::new();
+        let pcr16 = crate::guest::measure_guest(&nsm, b"a guest").unwrap();
+        let read = Pair::read(&nsm).unwrap();
+        assert_eq!(read.pcr16, pcr16);
+        assert_eq!(read.pcr0, [0x10; 48], "the fake's PCR0");
+    }
+
+    /// Boot's first refusal, and the one that keeps an unmeasured guest from
+    /// ever reaching KMS.
+    #[test]
+    fn an_unmeasured_guest_is_not_a_pair() {
+        let err = Pair::read(&FakeNsm::new()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("PCR16 is not locked"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_locked_but_empty_guest_register_is_not_a_pair() {
+        let nsm = FakeNsm::new();
+        nsm.lock_pcr(PCR_GUEST).unwrap();
+        let err = Pair::read(&nsm).unwrap_err();
+        assert!(format!("{err:#}").contains("never extended"), "{err:#}");
+    }
+
+    /// A signed document stamped at `signed_at`, from a chain valid only for
+    /// the hour after `valid_from`.
+    fn stamped(
+        valid_from: std::time::SystemTime,
+        signed_at: std::time::SystemTime,
+    ) -> (nitro_attestation::testing::TestChain, Vec<u8>) {
+        use std::time::{Duration, UNIX_EPOCH};
+        let chain = nitro_attestation::testing::TestChain::with_validity(
+            valid_from,
+            valid_from + Duration::from_secs(3600),
+        )
+        .unwrap();
+        let mut document = nitro_attestation::parse(
+            &chain
+                .document(Some(b"payload".to_vec()), None, [0xab; 48])
+                .unwrap(),
+        )
+        .unwrap();
+        document.timestamp_ms = signed_at.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let receipt = chain.document_from(document).unwrap();
+        (chain, receipt)
+    }
+
+    /// A receipt outlives the certificates that signed it. Judged against the
+    /// current time it would stop verifying soon after it was written, and the
+    /// filesystem it guards with it.
+    #[test]
+    fn a_receipt_is_judged_as_of_when_it_was_signed() {
+        use std::time::{Duration, SystemTime};
+        let long_ago = SystemTime::now() - Duration::from_secs(3600 * 24 * 90);
+        let (chain, receipt) = stamped(long_ago, long_ago + Duration::from_secs(60));
+
+        assert!(
+            nitro_attestation::verify(
+                &receipt,
+                &VerifyOptions {
+                    trust_root: chain.root_der().to_vec(),
+                    now: SystemTime::now(),
+                    allow_untrusted_root: false,
+                },
+            )
+            .is_err(),
+            "the chain has expired, so a check against now must refuse it"
+        );
+        let verified =
+            verify_as_signed(&receipt, chain.root_der()).expect("valid when it was signed");
+        assert_eq!(
+            verified.document.user_data.as_deref(),
+            Some(&b"payload"[..])
+        );
+    }
+
+    /// And the moment a receipt claims has to be one its chain was valid at. A
+    /// document stamped outside that window is refused, whatever the time now.
+    #[test]
+    fn a_receipt_stamped_outside_its_chain_is_refused() {
+        use std::time::{Duration, SystemTime};
+        let long_ago = SystemTime::now() - Duration::from_secs(3600 * 24 * 90);
+        let (chain, receipt) = stamped(long_ago, SystemTime::now());
+        assert!(verify_as_signed(&receipt, chain.root_der()).is_err());
     }
 
     #[test]

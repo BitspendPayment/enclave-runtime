@@ -86,7 +86,20 @@ impl TestChain {
         pcrs.insert(0u32, pcr0.to_vec());
         pcrs.insert(1u32, vec![0x11; 48]);
         pcrs.insert(2u32, vec![0x22; 48]);
+        self.document_with_pcrs(user_data, nonce, pcrs)
+    }
 
+    /// The same, listing exactly the registers given.
+    ///
+    /// A real document lists the registers that are *locked*, so this is how a
+    /// test says which those are — with the guest register, or deliberately
+    /// without it.
+    pub fn document_with_pcrs(
+        &self,
+        user_data: Option<Vec<u8>>,
+        nonce: Option<Vec<u8>>,
+        pcrs: BTreeMap<u32, Vec<u8>>,
+    ) -> Result<Vec<u8>> {
         self.document_from(AttestationDocument {
             module_id: "i-0test-enc0000000000".to_string(),
             timestamp_ms: SystemTime::now()

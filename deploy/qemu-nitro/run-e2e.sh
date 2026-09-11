@@ -8,7 +8,7 @@
 #
 #   host                                        QEMU enclave
 #   ────                                        ────────────
-#   MinIO :9000 ◀── gvproxy ──192.168.127.254──  s3fs mount
+#   MinIO :9000 ◀── gvproxy ──192.168.127.254──  s3fs mount, and the guest
 #   gvproxy --listen vsock://:1024 ────────────▶ gvforwarder → tap0 .2
 #           expose :8443 → 192.168.127.2:443 ──▶ rustls :443
 #   vhost-device-vsock --forward-cid 1
@@ -21,10 +21,13 @@
 #      printed. The measurement a client would pin is the measurement the
 #      reproducible build claimed.
 #   2. user_data binds the certificate from this connection's own handshake,
-#      so the TLS session terminates in the attested enclave. Every response
-#      carries this, including a passkey-signed request to the guest.
+#      so the TLS session terminates in the attested enclave.
 #   3. The guest's counter advances, so writes crossed gvproxy to MinIO and
 #      came back — the filesystem really is mounted over the emulated vsock.
+#   4. The guest came from the store, not the image. The enclave measured the
+#      object it fetched into PCR16 and locked it; the attested PCR16 is the one
+#      the release build computed; and a substituted object boots an enclave
+#      that a client pinning the approved guest refuses.
 #
 # What this harness CANNOT prove, stated up front because it is easy to assume
 # otherwise: QEMU's emulated NSM does not sign attestation documents. Its
@@ -34,8 +37,10 @@
 #
 # The document's *contents* are still worth checking, because they are what the
 # runtime put there: the nonce it was asked for, the PCR0 of the image it is
-# running, and the hash of the certificate it is serving. Those are our code.
-# The signature is AWS hardware's job and needs hardware to test.
+# running, the PCR16 of the guest it measured, and the hash of the certificate
+# it is serving. Those are our code. The signature is AWS hardware's job and
+# needs hardware to test — and so does KMS refusing a substituted guest, since
+# the emulator image cannot use KMS at all.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -106,7 +111,7 @@ cleanup() {
         # shellcheck disable=SC2086
         kill $remaining 2>/dev/null || true
     fi
-    docker rm -f e2e-minio e2e-pebble e2e-qemu e2e-qemu-resume >/dev/null 2>&1 || true
+    docker rm -f e2e-minio e2e-pebble e2e-qemu e2e-qemu-resume e2e-qemu-substitute >/dev/null 2>&1 || true
     return 0
 }
 
@@ -133,6 +138,27 @@ EXPECTED_PCR0="$(jq -r .PCR0 "$EIF_DIR/pcr.json")"
 echo "EIF   $EIF ($(du -h "$EIF" | cut -f1))"
 echo "PCR0  $EXPECTED_PCR0"
 
+# The guest is not in the image. It is built on its own and uploaded to the
+# store, and the enclave measures what it fetches into PCR16 — so the build
+# says what PCR16 should be, the same way `pcr.json` says what PCR0 should be.
+say "building the guest release"
+nix build "$REPO#guest-release" --out-link "$RUNDIR/guest" --print-build-logs 2>&1 | tail -3
+GUEST_DIR="$(readlink -f "$RUNDIR/guest" 2>/dev/null || true)"
+if [[ ! -d "$GUEST_DIR" ]]; then
+    GUEST_DIR="$HOME/.nix-portable$(readlink "$RUNDIR/guest")"
+fi
+[[ -d "$GUEST_DIR" ]] || { echo "cannot resolve the built guest" >&2; exit 1; }
+EXPECTED_PCR16="$(jq -r .PCR16 "$GUEST_DIR/guest-pcr16.json")"
+echo "PCR16 $EXPECTED_PCR16"
+
+# Plain copies the containers can mount, and a second guest that differs from
+# the first only by an appended custom section: a valid component with a
+# different hash, which is all a substituted object needs to be.
+mkdir -p "$RUNDIR/guests"
+install -m 0644 "$GUEST_DIR/guest.wasm" "$RUNDIR/guests/guest.wasm"
+install -m 0644 "$GUEST_DIR/guest.wasm" "$RUNDIR/guests/substitute.wasm"
+printf '\x00\x0b\x0asubstitute' >> "$RUNDIR/guests/substitute.wasm"
+
 # Built with the host's cargo rather than Nix. The verifier is a client-side
 # tool that nothing attests, so it gains nothing from a reproducible build —
 # and a Nix-built dynamic binary links against a glibc in the Nix store, which
@@ -142,6 +168,15 @@ say "building the verifier"
 ( cd "$REPO" && cargo build --release -p nitro-attestation --features cli ) 2>&1 | tail -2
 ATTEST="$REPO/target/release/nitro-attest"
 [[ -x "$ATTEST" ]] || { echo "nitro-attest did not build" >&2; exit 1; }
+
+# The release build measured the guest with a Nix-built nitro-attest; this one
+# was built here. They must agree, or a key policy and a client would pin
+# different numbers for the same guest.
+[[ "$("$ATTEST" --measure "$RUNDIR/guests/guest.wasm" | jq -r .PCR16)" == "$EXPECTED_PCR16" ]] \
+    || { echo "the release build and this verifier disagree about the guest's PCR16" >&2; exit 1; }
+SUBSTITUTE_PCR16="$("$ATTEST" --measure "$RUNDIR/guests/substitute.wasm" | jq -r .PCR16)"
+[[ "$SUBSTITUTE_PCR16" != "$EXPECTED_PCR16" ]] \
+    || { echo "the substitute guest measures the same as the real one" >&2; exit 1; }
 
 # The client half of the WebAuthn gate. Nothing reaches the guest without a
 # fresh assertion bound to that exact request, and a shell script cannot sign
@@ -157,15 +192,15 @@ ENROLLMENT_TOKEN_2="qemu-e2e-enrollment-token-2"
 # one tenant cannot see another's data.
 # `--unsigned-emulator`: QEMU's NSM does not sign its documents at all, so
 # there is no signature to check and nothing here establishes *who* produced
-# one. What the client still checks is what the runtime put in — the nonce and
-# the certificate this connection was served — and those are our code's work.
-# Against real hardware this flag must not appear.
-PASSKEY_ARGS=(--unsigned-emulator)
+# one. What the client still checks is what the runtime put in — the nonce, the
+# certificate this connection was served, and both measurements — and those are
+# our code's work. Against real hardware this flag must not appear.
+PASSKEY_ARGS=(--unsigned-emulator --pcr0 "$EXPECTED_PCR0" --pcr16 "$EXPECTED_PCR16")
 signed()  { "$PASSKEY" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/alice.json" "${PASSKEY_ARGS[@]}" "$@"; }
 signed2() { "$PASSKEY" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/bob.json"   "${PASSKEY_ARGS[@]}" "$@"; }
 
 # ---------------------------------------------------------------------------
-# The store the enclave will mount.
+# The store the enclave will mount, and the guest it will fetch.
 # ---------------------------------------------------------------------------
 say "starting MinIO"
 docker rm -f e2e-minio >/dev/null 2>&1 || true
@@ -180,7 +215,16 @@ docker run --rm --network host --entrypoint sh minio/mc -c "
     mc alias set m http://127.0.0.1:9000 minioadmin minioadmin >/dev/null
     mc mb m/e2e-data >/dev/null 2>&1 || true
     mc mb --with-lock m/e2e-roots >/dev/null 2>&1 || true" >/dev/null
-echo "MinIO ready with e2e-data and e2e-roots"
+
+# Where the emulator image looks: `deployment.guestObject` in e2e-roots.
+upload_guest() {
+    docker run --rm --network host -v "$RUNDIR/guests:/guests:ro" --entrypoint sh minio/mc -c "
+        mc alias set m http://127.0.0.1:9000 minioadmin minioadmin >/dev/null
+        mc cp /guests/$1 m/e2e-roots/guest/guest.wasm >/dev/null" >/dev/null \
+        || { echo "could not upload $1 to the store" >&2; exit 1; }
+}
+upload_guest guest.wasm
+echo "MinIO ready with e2e-data and e2e-roots, and the guest at e2e-roots/guest/guest.wasm"
 
 # ---------------------------------------------------------------------------
 # The parent side: heartbeat, vsock transport, and the network.
@@ -293,19 +337,22 @@ say "booting the enclave"
 # calibrate its TSC and the boot stalls there past any timeout. That is what
 # made this harness fail roughly half its runs while the runtime under test was
 # fine, so the accelerator is named rather than hoped for.
-docker run --rm -d --name e2e-qemu \
-    --device /dev/kvm \
-    --network none \
-    -v "$EIF_DIR:/eif:ro" \
-    -v "$RUNDIR:/run/vsock" \
-    "$IMAGE" \
-    qemu-system-x86_64 \
-        -M nitro-enclave,vsock=chr0,id=e2e \
-        -accel kvm -cpu host \
-        -kernel /eif/s3fs-qemu.eif \
-        -chardev socket,id=chr0,path=/run/vsock/vhost.socket \
-        -m 3G -smp 2 -nographic -no-reboot >/dev/null
-docker logs -f e2e-qemu > "$CONSOLE" 2>&1 &
+boot_enclave() {
+    docker run --rm -d --name "$1" \
+        --device /dev/kvm \
+        --network none \
+        -v "$EIF_DIR:/eif:ro" \
+        -v "$RUNDIR:/run/vsock" \
+        "$IMAGE" \
+        qemu-system-x86_64 \
+            -M nitro-enclave,vsock=chr0,id=e2e \
+            -accel kvm -cpu host \
+            -kernel /eif/s3fs-qemu.eif \
+            -chardev socket,id=chr0,path=/run/vsock/vhost.socket \
+            -m 3G -smp 2 -nographic -no-reboot >/dev/null
+    docker logs -f "$1" > "$2" 2>&1 &
+}
+boot_enclave e2e-qemu "$CONSOLE"
 
 # The runtime colourises its logs, so escape sequences land between a field
 # name and its value — `addr<esc>[0m<esc>[2m=` — and a grep for "addr=" simply
@@ -325,43 +372,51 @@ fail() {
     echo "--- console (last 40) ---" >&2; plain | tail -40 >&2
     echo "--- gvproxy ---" >&2;          tail -10 "$RUNDIR/gvproxy.log" >&2
     echo "--- heartbeat ---" >&2;        cat "$RUNDIR/heartbeat.log" >&2
-    docker rm -f e2e-qemu >/dev/null 2>&1 || true
     exit 1
 }
 
-# The enclave takes its address by DHCP from gvproxy, then mounts over the
-# network before it listens, so this waits on the whole chain rather than on
-# the boot alone.
+# The enclave takes its address by DHCP from gvproxy, fetches and measures its
+# guest, then mounts over the network before it listens, so this waits on the
+# whole chain rather than on the boot alone.
+wait_for_serving() {
+    local ready=""
+    for _ in $(seq "$TIMEOUT"); do
+        # "serving " with the bound address, not the earlier "serving guest" —
+        # that one is logged before the listener exists and racing it produces
+        # a connection-refused that looks like a networking fault.
+        if grep -qE "serving +addr=" <(plain); then ready=1; break; fi
+        grep -qE "Kernel panic|failed to start the guest" <(plain) && fail "the enclave died during boot"
+        sleep 1
+    done
+    [[ -n "$ready" ]] || fail "the enclave never started serving within ${TIMEOUT}s"
+}
 say "waiting for the enclave to come up"
-ready=""
-for _ in $(seq "$TIMEOUT"); do
-    # "serving " with the bound address, not the earlier "serving guest" —
-    # that one is logged before the listener exists and racing it produces a
-    # connection-refused that looks like a networking fault.
-    if grep -qE "serving +addr=" <(plain); then ready=1; break; fi
-    grep -qE "Kernel panic|failed to start the guest" <(plain) && fail "the enclave died during boot"
-    sleep 1
-done
-[[ -n "$ready" ]] || fail "the enclave never started serving within ${TIMEOUT}s"
+wait_for_serving
 
-plain | grep -E "enclave networking is up|mounted |serving +addr=" | tail -3
+plain | grep -E "enclave networking is up|guest measured into PCR16|mounted |serving +addr=" | tail -4
 
-# Forward a host port into the enclave. Done after boot so the enclave can be
-# restarted without restarting the proxy.
-# The forward was set up before boot; what remains is to wait for the
-# certificate. Nothing answers HTTPS until an ACME order completes — directory,
-# account, order, challenge, finalize — so this loop is the issuance path
-# finishing, not just a process starting.
+# Measured before anything asked for a key, and measured as the release build
+# said it would be.
+grep -q "pcr16=$EXPECTED_PCR16" <(plain) \
+    || fail "the enclave did not report measuring the release guest into PCR16"
+
+# Nothing answers HTTPS until an ACME order completes — directory, account,
+# order, challenge, finalize — so this loop is the issuance path finishing, not
+# just a process starting. On a later boot the sealed cache has the
+# certificate already, and it answers at once.
+wait_for_https() {
+    local answered=""
+    for _ in $(seq 90); do
+        if curl -sk --max-time 2 "https://127.0.0.1:$HTTPS_PORT/" >/dev/null 2>&1; then
+            answered=yes
+            break
+        fi
+        sleep 1
+    done
+    [[ -n "$answered" ]]
+}
 say "waiting for Pebble to issue the serving certificate"
-issued=""
-for _ in $(seq 90); do
-    if curl -sk --max-time 2 "https://127.0.0.1:$HTTPS_PORT/" >/dev/null 2>&1; then
-        issued=yes
-        break
-    fi
-    sleep 1
-done
-[[ -n "$issued" ]] || {
+wait_for_https || {
     echo "no certificate was ever issued; the ACME path did not complete" >&2
     echo "--- pebble ---" >&2;  docker logs e2e-pebble 2>&1 | tail -30 >&2
     echo "--- console ---" >&2; plain | grep -i acme | tail -30 >&2
@@ -436,7 +491,7 @@ echo "counter: $first then $second"
 [[ "${second//[^0-9]/}" -eq $(( ${first//[^0-9]/} + 1 )) ]] \
     || fail "the counter did not advance ($first → $second); writes are not reaching MinIO"
 
-say "3/7  the attestation binds this connection's certificate"
+say "3/7  the attestation binds this connection's certificate, runtime and guest"
 # There is no attestation endpoint: the document rides on the `/auth/` exchange,
 # in `x-enclave-attestation`. That is where a client identifies the enclave
 # before approving anything, and it needs no credential — so this is the check a
@@ -445,6 +500,7 @@ say "3/7  the attestation binds this connection's certificate"
     --url "https://127.0.0.1:$HTTPS_PORT/auth/" \
     --unsigned-emulator \
     --pcr0 "$EXPECTED_PCR0" \
+    --guest "$RUNDIR/guests/guest.wasm" \
     | tee "$RUNDIR/attest.log" \
     || fail "attestation verification failed"
 
@@ -473,21 +529,24 @@ signed --dump-proof "$RUNDIR/proof" get --path /counter >/dev/null \
     --nonce "$(cat "$RUNDIR/proof/nonce.hex")" \
     --unsigned-emulator \
     --pcr0 "$EXPECTED_PCR0" \
+    --guest "$RUNDIR/guests/guest.wasm" \
     | tee "$RUNDIR/attest-guest.log" \
     || fail "the challenge exchange's document did not verify"
 
 grep -q "binding    the attested certificate" "$RUNDIR/attest-guest.log" \
     || fail "the document did not bind that connection's certificate"
 
-say "4/7  the attested PCR0 is the one the build produced"
-# `nitro-attest --pcr0` already enforced this, so reaching here means it held.
-# Printing both is what makes the claim checkable by eye rather than taken on
-# trust from an exit code.
-echo "build:    $EXPECTED_PCR0"
-echo "attested: $(grep -oE '^PCR0 +[0-9a-f]+' "$RUNDIR/attest.log" | awk '{print $2}')"
+say "4/7  the attested PCR0 and PCR16 are the ones the builds produced"
+# `nitro-attest --pcr0 --guest` already enforced both, so reaching here means
+# they held. Printing them is what makes the claim checkable by eye rather than
+# taken on trust from an exit code.
+echo "PCR0  build:    $EXPECTED_PCR0"
+echo "      attested: $(grep -oE '^PCR0 +[0-9a-f]+' "$RUNDIR/attest.log" | awk '{print $2}')"
+echo "PCR16 release:  $EXPECTED_PCR16"
+echo "      attested: $(grep -oE '^PCR16 +[0-9a-f]+' "$RUNDIR/attest.log" | awk '{print $2}')"
 
 # ---------------------------------------------------------------------------
-# 5/6 — one instance per request, and one approval per operation.
+# 5/7 — one instance per tenant, and one approval per interaction.
 # ---------------------------------------------------------------------------
 say "5/7  a tenant keeps its instance, and no two tenants share one"
 
@@ -522,17 +581,22 @@ echo "alice reads: $a_sees / bob reads: $b_sees"
 [[ "$a_sees" == "alice" && "$b_sees" == "bob" ]] \
     || fail "one tenant read another's file (alice=$a_sees bob=$b_sees)"
 
-say "5b/7 an approval for one payload does not authorize another"
-# The property the whole binding exists for. An assertion issued for one body,
-# sent with a different one, must be refused — and the substituted body must
-# never reach the filesystem.
-sub="$(signed substitute --path /files/e2e.txt \
-        --approved "approved" --sent "substituted" | head -1)"
-[[ "$sub" == "401" ]] || fail "a substituted body was authorized (status $sub)"
-if signed get --path /files/e2e.txt >/dev/null 2>&1; then
-    fail "the substituted body reached the filesystem"
+say "5b/7 an approval for one route does not authorize another"
+# The property the interaction token exists for. A token names the interaction
+# it was issued for — method, path and query — so spent on any other it is
+# refused, and what it carried never reaches the filesystem.
+#
+# Captured whole and split here rather than piped through `head`: `head` exits
+# after one line, and a client still writing the rest dies of SIGPIPE, which
+# `pipefail` would report as this leg failing.
+sub_out="$(signed substitute --approved /files/approved.txt \
+        --sent /files/substituted.txt --body "substituted")"
+sub="${sub_out%%$'\n'*}"
+[[ "$sub" == "401" ]] || fail "a token was spent on a route it was not issued for (status $sub)"
+if signed get --path /files/substituted.txt >/dev/null 2>&1; then
+    fail "the substituted request reached the filesystem"
 fi
-echo "substituted body refused: 401, and nothing was written"
+echo "a token moved to another route was refused: 401, and nothing was written"
 
 # ---------------------------------------------------------------------------
 # 5c/7 — guest output, in a real enclave.
@@ -606,13 +670,14 @@ echo "guest output arrived framed, tagged by stream, and marked as guest"
 
 
 # ---------------------------------------------------------------------------
-# 6/6 — the boot machine, across a restart.
+# 6/7 — the boot machine, across a restart.
 # ---------------------------------------------------------------------------
 # The first boot found an empty store and created a filesystem. That used to be
 # what happened for *any* store that answered "nothing", including one whose
 # contents had been hidden. The second boot has to recognise the state as its
 # own and resume — which is only possible if the receipt the first boot wrote
-# verifies against the state now present.
+# verifies against the state now present — and, running the same guest, find
+# its pair record and write nothing.
 say "6/7  a second boot resumes rather than starting over"
 
 # `docker logs -f` fills the console file asynchronously, so a single grep can
@@ -625,56 +690,84 @@ for _ in $(seq 60); do
     sleep 1
 done
 [[ -n "$genesis" ]] || fail "the first boot should have been a genesis"
+GENESIS_CONSOLE="$CONSOLE"
 
 docker rm -f e2e-qemu >/dev/null 2>&1 || true
 sleep 2
 
-RESUME_CONSOLE="$RUNDIR/console-resume.log"
-docker run --rm -d --name e2e-qemu-resume \
-    --device /dev/kvm \
-    --network none \
-    -v "$EIF_DIR:/eif:ro" \
-    -v "$RUNDIR:/run/vsock" \
-    "$IMAGE" \
-    qemu-system-x86_64 \
-        -M nitro-enclave,vsock=chr0,id=e2e \
-        -accel kvm -cpu host \
-        -kernel /eif/s3fs-qemu.eif \
-        -chardev socket,id=chr0,path=/run/vsock/vhost.socket \
-        -m 3G -smp 2 -nographic -no-reboot >/dev/null
-docker logs -f e2e-qemu-resume > "$RESUME_CONSOLE" 2>&1 &
+CONSOLE="$RUNDIR/console-resume.log"
+boot_enclave e2e-qemu-resume "$CONSOLE"
 
 resumed=""
 for _ in $(seq "$TIMEOUT"); do
-    grep -q "state origin established" <(plain_of "$RESUME_CONSOLE") && { resumed=1; break; }
-    grep -qE "Kernel panic|failed to start the guest" <(plain_of "$RESUME_CONSOLE") && break
+    grep -q "state origin established" <(plain) && { resumed=1; break; }
+    grep -qE "Kernel panic|failed to start the guest" <(plain) && break
     sleep 1
 done
-if [[ -z "$resumed" ]]; then
-    echo "FAIL: the second boot never established a state origin" >&2
-    plain_of "$RESUME_CONSOLE" | tail -25 >&2
-    docker rm -f e2e-qemu-resume >/dev/null 2>&1 || true
-    exit 1
-fi
+[[ -n "$resumed" ]] || fail "the second boot never established a state origin"
 
-plain_of "$RESUME_CONSOLE" | grep -E "state origin established" | tail -1
-if ! grep -q "mode=Resume" <(plain_of "$RESUME_CONSOLE"); then
-    echo "FAIL: the second boot did not resume — it should not have created anything" >&2
-    plain_of "$RESUME_CONSOLE" | grep -E "mode=|refus" | tail -5 >&2
-    docker rm -f e2e-qemu-resume >/dev/null 2>&1 || true
-    exit 1
-fi
+plain | grep -E "state origin established" | tail -1
+grep -q "mode=Resume" <(plain) \
+    || fail "the second boot did not resume — it should not have created anything"
+grep -q "pcr16=$EXPECTED_PCR16" <(plain) \
+    || fail "the second boot did not measure the same guest"
 
 # Same filesystem, same identity: the receipt names this state and no other.
-first_root="$(plain | grep -oE 'state_root=[0-9a-f]+' | head -1)"
-second_root="$(plain_of "$RESUME_CONSOLE" | grep -oE 'state_root=[0-9a-f]+' | head -1)"
+first_root="$(plain_of "$GENESIS_CONSOLE" | grep -oE 'state_root=[0-9a-f]+' | head -1)"
+second_root="$(plain | grep -oE 'state_root=[0-9a-f]+' | head -1)"
 echo "genesis $first_root"
 echo "resume  $second_root"
 [[ "$first_root" == "$second_root" ]] \
-    || { echo "FAIL: the state_root changed across a restart" >&2; exit 1; }
+    || fail "the state_root changed across a restart"
 
+# ---------------------------------------------------------------------------
+# 7/7 — a substituted guest.
+# ---------------------------------------------------------------------------
+# The parent controls the store the guest is fetched from, so it can replace the
+# object. What it cannot do is make the replacement look like the approved
+# guest: the enclave measures whatever arrives into PCR16 before anything asks
+# for a key. That is shown here from both sides — the enclave records a runtime
+# and guest this state has not held before, and a client pinning the approved
+# guest refuses to talk to it.
+#
+# What this cannot show is KMS refusing it, which is the half that keeps the
+# data out of reach. The emulator image uses the static key source, because KMS
+# will not accept an unsigned document, so this enclave boots and serves. On
+# hardware, under a policy pinning the approved PCR16, the same substitution
+# gets no key and reads nothing.
+say "7/7  a substituted guest is measured, recorded, and refused by a pinned client"
 docker rm -f e2e-qemu-resume >/dev/null 2>&1 || true
-docker rm -f e2e-qemu >/dev/null 2>&1 || true
+upload_guest substitute.wasm
+sleep 2
+
+CONSOLE="$RUNDIR/console-substitute.log"
+boot_enclave e2e-qemu-substitute "$CONSOLE"
+wait_for_serving
+
+grep -q "pcr16=$SUBSTITUTE_PCR16" <(plain) \
+    || fail "the enclave did not measure the object it fetched into PCR16"
+grep -q "mode=Upgrade" <(plain) \
+    || fail "a guest this state had never held was not recorded as an upgrade"
+wait_for_https || fail "the enclave running the substitute never answered HTTPS"
+
+if "$ATTEST" --url "https://127.0.0.1:$HTTPS_PORT/auth/" --unsigned-emulator \
+        --pcr0 "$EXPECTED_PCR0" --guest "$RUNDIR/guests/guest.wasm" \
+        > "$RUNDIR/attest-substitute.log" 2>&1; then
+    fail "a client pinning the approved guest accepted an enclave running another"
+fi
+grep -q "PCR16 mismatch" "$RUNDIR/attest-substitute.log" \
+    || fail "the client refused, but not on PCR16: $(tail -1 "$RUNDIR/attest-substitute.log")"
+echo "a client pinning the approved guest refused: PCR16 mismatch"
+
+# And it is not hiding what it runs: pinned to the substitute, the same client
+# accepts. The enclave attests the guest it fetched, whichever that was.
+"$ATTEST" --url "https://127.0.0.1:$HTTPS_PORT/auth/" --unsigned-emulator \
+    --pcr0 "$EXPECTED_PCR0" --guest "$RUNDIR/guests/substitute.wasm" \
+    > "$RUNDIR/attest-substitute-pinned.log" \
+    || fail "the enclave does not attest the guest it actually fetched"
+echo "it attests the substitute it is running: PCR16 $SUBSTITUTE_PCR16"
+
+docker rm -f e2e-qemu-substitute >/dev/null 2>&1 || true
 
 cat <<EOF
 
@@ -682,15 +775,18 @@ cat <<EOF
   filesystem mounted over vsock through gvproxy, writes durable in MinIO
   the serving certificate was obtained over real ACME and chains to the CA
   TLS terminated in the enclave, certificate hash bound into the document
-  every response carried its own document, the guest's signed request included
   the document's PCR0 matches the reproducible build
+  the guest was fetched from the store, measured into PCR16 and locked, and
+    the attested PCR16 matches the release build
   the guest was unreachable without a passkey assertion
   a passkey enrolled and its signed requests were served
-  an approval for one payload did not authorize another
+  an approval for one route did not authorize another
   a tenant kept its warm instance, and no two tenants shared one
   one tenant could not read another's file
   guest stdout and stderr arrived framed and marked as untrusted
   genesis wrote an attested state origin, and a restart resumed it
+  a substituted guest was measured and recorded as an upgrade, and a client
+    pinning the approved guest refused it
 
 Guest logging is proven only as far as the console, in leg 5c. The enclave can
 also ship guest output to CloudWatch, and nothing here exercises that: this
@@ -700,5 +796,6 @@ and no client is built. That hop needs a real deployment, like the KMS path.
 NOT proven here. QEMU's emulated NSM does not sign attestation documents, so
 no signature and no certificate chain were checked — only the contents the
 runtime asked for. A document from this harness is worth what the connection
-it arrived over is worth. The signature path needs real Nitro hardware.
+it arrived over is worth. The signature path needs real Nitro hardware, and so
+does KMS refusing the key to a substituted guest.
 EOF

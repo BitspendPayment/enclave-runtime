@@ -104,19 +104,30 @@ struct Cli {
     #[arg(long)]
     dump_proof: Option<PathBuf>,
 
-    /// Required PCR0, hex. Pins which enclave image is answering.
+    /// Required PCR0, hex. Pins which runtime image is answering.
     ///
     /// The hypervisor measures this from the image and locks it, so nothing
     /// running inside can choose it — which is what makes it the measurement
-    /// worth trusting. Required unless `--unsigned-emulator`.
+    /// the other one rests on. It does not cover the guest, which is not in the
+    /// image. Required unless `--unsigned-emulator`.
     #[arg(long)]
     pcr0: Option<String>,
 
-    /// The guest component, to check against the document's second hash.
+    /// Required PCR16, hex. Pins which guest the runtime is running.
     ///
-    /// An **additional** check, never a substitute for `--pcr0`: this hash is
-    /// part of `user_data`, which the runtime being attested chose. It is worth
-    /// pinning once you already trust the runtime that reports it.
+    /// The runtime extends this register with the guest's hash and locks it
+    /// before it can obtain a key, so it is the measurement that says which
+    /// application holds your data. It says that only beside `--pcr0`, because
+    /// the runtime is what writes it. Required — or `--guest` — unless
+    /// `--unsigned-emulator`.
+    #[arg(long)]
+    pcr16: Option<String>,
+
+    /// The guest component itself. Computes the PCR16 to require, and checks
+    /// the document's second hash as well.
+    ///
+    /// Never a substitute for `--pcr0`, for the same reason `--pcr16` is not:
+    /// both halves of what it checks are written by the runtime being attested.
     #[arg(long)]
     guest: Option<PathBuf>,
 
@@ -678,6 +689,11 @@ fn connection_proof(
     if let Some(pcr0) = &trust.pcr0 {
         expectations = expectations.pcr0(pcr0.clone());
     }
+    // Missing from the document is a refusal, not a skipped check: a runtime
+    // that never locked the register attests no guest at all.
+    if let Some(pcr16) = &trust.pcr16 {
+        expectations = expectations.pcr(nitro_attestation::PCR_GUEST, pcr16.clone());
+    }
     if let Some(guest) = &trust.guest {
         expectations.user_data =
             Some(nitro_attestation::AttestationHashes::new(presented, guest).serialize());
@@ -699,6 +715,9 @@ struct TrustConfig {
     unsigned_emulator: bool,
     max_age: std::time::Duration,
     pcr0: Option<Vec<u8>>,
+    /// The guest register to require, from `--pcr16` or computed from
+    /// `--guest`.
+    pcr16: Option<Vec<u8>>,
     guest: Option<Vec<u8>>,
 }
 
@@ -708,28 +727,65 @@ impl TrustConfig {
         // *which* one, and an attacker who can run their own gets a document
         // that passes every other check here.
         //
-        // **PCR0 is the only thing that closes that, and `--guest` cannot stand
-        // in for it.** The two are not alternatives, because they do not come
-        // from the same place: PCR0 is measured by the hypervisor from the
-        // image and locked, so no software inside the enclave can choose it.
-        // The guest hash is part of `user_data`, which the *runtime* hands to
-        // the device — so an enclave running an attacker's runtime can claim
-        // your guest hash while running nothing of the kind.
+        // **Two measurements close that, and neither stands in for the other.**
+        // PCR0 is measured by the hypervisor from the image and locked, so no
+        // software inside the enclave can choose it — but the image no longer
+        // contains the guest. PCR16 is the guest, extended and locked by the
+        // runtime before it could obtain a key — but because the runtime writes
+        // it, an enclave running an attacker's runtime can claim your guest's
+        // value while running nothing of the kind. PCR0 says the runtime that
+        // wrote PCR16 is yours; PCR16 says which application it loaded.
         //
-        // `--guest` is worth passing anyway: against a runtime already pinned
-        // by PCR0, it catches that runtime serving a different application. It
-        // is a second check on a trusted measurement, not a substitute for one.
+        // `--guest` is how most callers supply PCR16, and it checks the
+        // document's guest hash as well. Both halves of that come from the
+        // runtime, so it is never a substitute for `--pcr0`.
         //
         // `--unsigned-emulator` is the one exception, and an explicit one: QEMU
         // has no stable PCR0 to pin, and nothing there is signed anyway.
-        if cli.pcr0.is_none() && !cli.unsigned_emulator {
-            bail!(
-                "refusing to talk to an unidentified enclave: pass --pcr0, which is the \
-                 measurement the hypervisor takes of the image and the only one an \
-                 attacker's own enclave cannot claim. --guest is an additional check on \
-                 top of it, not a replacement: the guest hash is chosen by the runtime \
-                 being attested. Against QEMU, pass --unsigned-emulator."
-            );
+        let guest = match &cli.guest {
+            Some(path) => {
+                Some(std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)
+            }
+            None => None,
+        };
+        let measured = guest
+            .as_deref()
+            .map(|component| nitro_attestation::guest_pcr(component).to_vec());
+        let pcr16 = match (&cli.pcr16, measured) {
+            (Some(pinned), measured) => {
+                let pinned = hex::decode(pinned.trim()).context("--pcr16 is not hex")?;
+                if let Some(measured) = measured {
+                    anyhow::ensure!(
+                        measured == pinned,
+                        "--pcr16 and --guest name different guests: the component measures \
+                         to {}",
+                        hex::encode(&measured)
+                    );
+                }
+                Some(pinned)
+            }
+            (None, measured) => measured,
+        };
+
+        if !cli.unsigned_emulator {
+            if cli.pcr0.is_none() {
+                bail!(
+                    "refusing to talk to an unidentified enclave: pass --pcr0, which is the \
+                     measurement the hypervisor takes of the image and the only one an \
+                     attacker's own enclave cannot claim. --guest and --pcr16 are required \
+                     alongside it, not instead of it: the runtime being attested is what \
+                     writes them. Against QEMU, pass --unsigned-emulator."
+                );
+            }
+            if pcr16.is_none() {
+                bail!(
+                    "refusing to talk to an enclave whose guest is unidentified: pass --pcr16, \
+                     or --guest with the component itself. PCR0 measures the runtime image, \
+                     and the guest is not in it — the runtime loads it at boot, measures it \
+                     into PCR16 and locks that register before it can obtain a key. PCR16 is \
+                     the measurement that says which application holds your data."
+                );
+            }
         }
         Ok(TrustConfig {
             root: match &cli.trust_root {
@@ -745,12 +801,8 @@ impl TrustConfig {
                 Some(hex) => Some(hex::decode(hex.trim()).context("--pcr0 is not hex")?),
                 None => None,
             },
-            guest: match &cli.guest {
-                Some(path) => Some(
-                    std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
-                ),
-                None => None,
-            },
+            pcr16,
+            guest,
         })
     }
 }
@@ -857,15 +909,41 @@ mod tests {
             unsigned_emulator: false,
             max_age: std::time::Duration::from_secs(300),
             pcr0: None,
+            pcr16: None,
             guest: None,
         }
     }
 
+    const GUEST: &[u8] = b"a-guest";
+
+    /// The registers an enclave running [`GUEST`] has locked: its image, and
+    /// the guest it measured.
+    fn registers() -> std::collections::BTreeMap<u32, Vec<u8>> {
+        [
+            (0u32, vec![0x5a; 48]),
+            (
+                nitro_attestation::PCR_GUEST,
+                nitro_attestation::guest_pcr(GUEST).to_vec(),
+            ),
+        ]
+        .into()
+    }
+
     /// A response head carrying a document built for `cert` and `nonce`.
     fn head_for(chain: &TestChain, cert: &[u8], nonce: &[u8]) -> String {
-        let user_data = AttestationHashes::new(cert, b"a-guest").serialize();
+        head_with(chain, cert, nonce, registers())
+    }
+
+    /// The same, listing exactly the registers given.
+    fn head_with(
+        chain: &TestChain,
+        cert: &[u8],
+        nonce: &[u8],
+        pcrs: std::collections::BTreeMap<u32, Vec<u8>>,
+    ) -> String {
+        let user_data = AttestationHashes::new(cert, GUEST).serialize();
         let cose = chain
-            .document(Some(user_data), Some(nonce.to_vec()), [0x5a; 48])
+            .document_with_pcrs(Some(user_data), Some(nonce.to_vec()), pcrs)
             .expect("a document");
         format!(
             "HTTP/1.1 200 OK\r\nx-enclave-attestation: {}\r\n",
@@ -1046,62 +1124,148 @@ mod tests {
         );
     }
 
-    /// **`--guest` is not an identity.**
+    fn cli_with(flags: &[&str]) -> Cli {
+        let mut args = vec!["passkey-client", "--url", "https://e.test"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["get", "--path", "/"]);
+        Cli::parse_from(args)
+    }
+
+    fn guest_file(name: &str, bytes: &[u8]) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("passkey-client-{}-{name}.wasm", std::process::id()));
+        std::fs::write(&path, bytes).expect("writing a guest file");
+        path
+    }
+
+    fn refusal(cli: &Cli) -> String {
+        match TrustConfig::from(cli) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("an unidentified enclave was accepted"),
+        }
+    }
+
+    /// **`--guest` alone is not an identity.**
     ///
-    /// The guest hash lives in `user_data`, which the runtime being attested
-    /// supplies — so an attacker running their own enclave signs a genuine
-    /// document claiming whatever guest hash you asked for. Only PCR0, measured
-    /// by the hypervisor and locked, resists that. Accepting `--guest` in its
-    /// place would authenticate the hardware and call it the software.
+    /// It yields a PCR16 and a `user_data` guest hash, and the runtime being
+    /// attested writes both — so an attacker running their own runtime signs a
+    /// genuine document claiming whatever guest you asked for. Only PCR0,
+    /// measured by the hypervisor and locked, says whose runtime wrote them.
     #[test]
-    fn a_guest_hash_alone_is_not_an_identity() {
-        let cli = Cli::parse_from([
-            "passkey-client",
-            "--url",
-            "https://e.test",
-            "--guest",
-            "/dev/null",
-            "get",
-            "--path",
-            "/",
-        ]);
-        assert!(
-            TrustConfig::from(&cli).is_err(),
-            "a guest hash the attested runtime chose was accepted as its identity"
-        );
+    fn a_guest_alone_is_not_an_identity() {
+        let text = refusal(&cli_with(&["--guest", "/dev/null"]));
+        assert!(text.contains("--pcr0"), "{text}");
+    }
+
+    /// **PCR0 alone no longer identifies the guest.** The image does not
+    /// contain it, so a client pinning only the runtime would accept that
+    /// runtime serving any application at all.
+    #[test]
+    fn pinning_the_runtime_alone_does_not_identify_the_guest() {
+        let text = refusal(&cli_with(&["--pcr0", &"ab".repeat(48)]));
+        assert!(text.contains("PCR16"), "{text}");
     }
 
     #[test]
-    fn pinning_the_image_is_what_identifies_it() {
-        let cli = Cli::parse_from([
-            "passkey-client",
-            "--url",
-            "https://e.test",
+    fn pinning_both_measurements_identifies_the_enclave() {
+        let trust = TrustConfig::from(&cli_with(&[
             "--pcr0",
             &"ab".repeat(48),
-            "get",
-            "--path",
-            "/",
+            "--pcr16",
+            &"cd".repeat(48),
+        ]))
+        .expect("both measurements were not accepted");
+        assert_eq!(trust.pcr16, Some(vec![0xcd; 48]));
+    }
+
+    /// The component itself is the usual way to supply PCR16, and it becomes
+    /// exactly the value the runtime would have locked.
+    #[test]
+    fn a_guest_file_becomes_the_register_it_measures_to() {
+        let path = guest_file("measured", GUEST);
+        let trust = TrustConfig::from(&cli_with(&[
+            "--pcr0",
+            &"ab".repeat(48),
+            "--guest",
+            path.to_str().unwrap(),
+        ]));
+        let _ = std::fs::remove_file(&path);
+
+        let trust = trust.expect("a guest file was not accepted");
+        assert_eq!(
+            trust.pcr16,
+            Some(nitro_attestation::guest_pcr(GUEST).to_vec())
+        );
+        assert_eq!(trust.guest.as_deref(), Some(GUEST));
+    }
+
+    #[test]
+    fn a_pcr16_and_a_guest_file_that_disagree_are_refused() {
+        let path = guest_file("disagreeing", GUEST);
+        let cli = cli_with(&[
+            "--pcr0",
+            &"ab".repeat(48),
+            "--pcr16",
+            &"00".repeat(48),
+            "--guest",
+            path.to_str().unwrap(),
         ]);
-        assert!(TrustConfig::from(&cli).is_ok(), "--pcr0 was not accepted");
+        let text = refusal(&cli);
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("different guests"), "{text}");
+    }
+
+    /// **Another guest**, behind the right runtime.
+    #[test]
+    fn a_document_from_another_guest_is_refused() {
+        let chain = TestChain::new().expect("chain");
+        let cert = b"the-leaf";
+        let nonce = [6u8; 20];
+        let mut trust = trust(&chain);
+        trust.pcr0 = Some(vec![0x5a; 48]);
+        trust.pcr16 = Some(nitro_attestation::guest_pcr(b"the approved guest").to_vec());
+        let err = connection_proof(&head_for(&chain, cert, &nonce), &nonce, cert, &trust)
+            .expect_err("a document for another guest was accepted");
+        assert!(format!("{err:#}").contains("PCR16 mismatch"), "{err:#}");
+    }
+
+    /// **No guest at all.** A runtime that never locked the register attests
+    /// documents without it, and a client pinning a guest refuses that rather
+    /// than skipping the check.
+    #[test]
+    fn a_document_that_measured_no_guest_is_refused() {
+        let chain = TestChain::new().expect("chain");
+        let cert = b"the-leaf";
+        let nonce = [7u8; 20];
+        let mut trust = trust(&chain);
+        trust.pcr16 = Some(nitro_attestation::guest_pcr(GUEST).to_vec());
+        let head = head_with(&chain, cert, &nonce, [(0u32, vec![0x5a; 48])].into());
+        let err = connection_proof(&head, &nonce, cert, &trust)
+            .expect_err("a document with no guest register was accepted");
+        assert!(format!("{err:#}").contains("no PCR16"), "{err:#}");
+    }
+
+    #[test]
+    fn a_document_for_the_pinned_runtime_and_guest_is_accepted() {
+        let chain = TestChain::new().expect("chain");
+        let cert = b"the-leaf";
+        let nonce = [8u8; 20];
+        let mut trust = trust(&chain);
+        trust.pcr0 = Some(vec![0x5a; 48]);
+        trust.pcr16 = Some(nitro_attestation::guest_pcr(GUEST).to_vec());
+        trust.guest = Some(GUEST.to_vec());
+        connection_proof(&head_for(&chain, cert, &nonce), &nonce, cert, &trust)
+            .expect("the pinned runtime and guest were refused");
     }
 
     /// The exception is explicit, and only for the one producer that needs it.
     #[test]
     fn the_emulator_exception_must_be_asked_for_by_name() {
-        let cli = Cli::parse_from([
-            "passkey-client",
-            "--url",
-            "https://e.test",
-            "--unsigned-emulator",
-            "get",
-            "--path",
-            "/",
-        ]);
-        let trust = TrustConfig::from(&cli).expect("the emulator exception");
+        let trust =
+            TrustConfig::from(&cli_with(&["--unsigned-emulator"])).expect("the emulator exception");
         assert!(trust.unsigned_emulator);
         assert!(
-            trust.pcr0.is_none(),
+            trust.pcr0.is_none() && trust.pcr16.is_none(),
             "the exception should not invent a measurement"
         );
     }

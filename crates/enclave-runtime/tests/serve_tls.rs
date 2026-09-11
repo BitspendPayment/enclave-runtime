@@ -88,6 +88,10 @@ impl Nsm for SigningNsm {
         anyhow::bail!("this fake does not model PCR extension")
     }
 
+    fn lock_pcr(&self, _index: u16) -> anyhow::Result<()> {
+        anyhow::bail!("this fake does not model PCR locking")
+    }
+
     fn describe(&self) -> String {
         "signing test NSM".into()
     }

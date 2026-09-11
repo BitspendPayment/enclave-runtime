@@ -27,9 +27,26 @@
 //! stronger statement — it says which *code* terminates the connection, which
 //! no CA can attest to. A Let's Encrypt certificate still helps browsers,
 //! which cannot check attestations; this tool does not need it.
+//!
+//! ## Which code: two measurements
+//!
+//! PCR0 measures the runtime image, and the guest is not in it. The runtime
+//! fetches the guest at boot, extends PCR16 with its hash and locks the
+//! register before it can obtain a key. So `--pcr0` says which runtime,
+//! `--guest` or `--pcr16` says which application, and neither says both.
+//!
+//! ```console
+//! $ nitro-attest --measure ./guest.wasm
+//! {"sha256": "…", "PCR16": "…"}
+//! ```
+//!
+//! prints the PCR16 to pin for a component, computed by the same function this
+//! tool verifies with — so the value in a key policy and the value a client
+//! checks cannot disagree.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -75,13 +92,28 @@ struct Cli {
     #[arg(long, requires = "document")]
     nonce: Option<String>,
 
-    /// Required PCR0, hex. Pins which enclave image is running.
-    #[arg(long)]
+    /// Required PCR0, hex. Pins which runtime image is running. Required for
+    /// verification unless `--unsigned-emulator`.
+    #[arg(long, required_unless_present_any = ["measure", "unsigned_emulator"])]
     pcr0: Option<String>,
 
-    /// Guest component to check against the document's second hash.
+    /// Required PCR16, hex. Pins which guest component the runtime measured
+    /// before it could obtain a key. `--guest` computes it from the component.
+    /// Required for verification unless `--guest` or `--unsigned-emulator`.
+    #[arg(long, required_unless_present_any = ["measure", "guest", "unsigned_emulator"])]
+    pcr16: Option<String>,
+
+    /// Guest component to check against: the PCR16 it measures to, and the
+    /// document's second hash.
     #[arg(long)]
     guest: Option<std::path::PathBuf>,
+
+    /// Print the PCR16 an enclave serving this component attests, and exit.
+    ///
+    /// That is the value a KMS key policy pins beside PCR0, and the value a
+    /// client pins with `--pcr16`.
+    #[arg(long, value_name = "COMPONENT", conflicts_with_all = ["url", "document"])]
+    measure: Option<std::path::PathBuf>,
 
     /// Trust root, PEM or DER. Defaults to the embedded AWS Nitro root.
     #[arg(long)]
@@ -101,7 +133,7 @@ struct Cli {
     /// says the document came from an enclave, or from AWS, or from anything
     /// other than whoever answered the connection.
     ///
-    /// What it still checks is what the *runtime* put in: the nonce, PCR0,
+    /// What it still checks is what the *runtime* put in: the nonce, the PCRs,
     /// and whether user_data binds the certificate this connection was
     /// served. Those are our code's job and worth testing. The signature is
     /// AWS hardware's job and cannot be tested here.
@@ -123,8 +155,66 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn verification_requires_both_measurements_before_reading_or_connecting() {
+        for source in [
+            ["--url", "https://example.test"],
+            ["--document", "proof.cose"],
+        ] {
+            for pins in [
+                vec![],
+                vec!["--pcr0", "ab"],
+                vec!["--pcr16", "cd"],
+                vec!["--guest", "guest.wasm"],
+            ] {
+                let mut args = vec!["nitro-attest"];
+                args.extend(source);
+                args.extend(pins);
+                assert_eq!(
+                    Cli::try_parse_from(args).unwrap_err().kind(),
+                    clap::error::ErrorKind::MissingRequiredArgument
+                );
+            }
+            for guest in [["--pcr16", "cd"], ["--guest", "guest.wasm"]] {
+                let mut args = vec!["nitro-attest"];
+                args.extend(source);
+                args.extend(["--pcr0", "ab"]);
+                args.extend(guest);
+                Cli::try_parse_from(args).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn measurement_and_explicit_emulator_mode_need_no_pins() {
+        Cli::try_parse_from(["nitro-attest", "--measure", "guest.wasm"]).unwrap();
+        Cli::try_parse_from([
+            "nitro-attest",
+            "--url",
+            "https://example.test",
+            "--unsigned-emulator",
+        ])
+        .unwrap();
+    }
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(path) = &cli.measure {
+        let component =
+            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        println!(
+            "{{\"sha256\": \"{}\", \"PCR16\": \"{}\"}}",
+            hex::encode(nitro_attestation::sha256(&component)),
+            hex::encode(nitro_attestation::guest_pcr(&component))
+        );
+        return Ok(());
+    }
 
     // 20 bytes, the nitriding convention, and enough that an attacker cannot
     // have a matching document ready.
@@ -145,8 +235,16 @@ fn run() -> Result<()> {
             };
             (decode_document(&raw)?, certificate)
         }
-        _ => bail!("pass --url or --document"),
+        _ => bail!("pass --url, --document, or --measure"),
     };
+
+    let guest = match &cli.guest {
+        Some(path) => {
+            Some(std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)
+        }
+        None => None,
+    };
+    let pcr16 = expected_guest_register(cli.pcr16.as_deref(), guest.as_deref())?;
 
     let trust_root = match &cli.trust_root {
         Some(path) => std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
@@ -192,6 +290,9 @@ fn run() -> Result<()> {
     if let Some(pcr0) = &cli.pcr0 {
         expectations = expectations.pcr0(hex::decode(pcr0.trim()).context("--pcr0 is not hex")?);
     }
+    if let Some(pcr16) = pcr16 {
+        expectations = expectations.pcr(nitro_attestation::PCR_GUEST, pcr16);
+    }
     verified.expect(&expectations, now)?;
 
     let document = &verified.document;
@@ -199,6 +300,13 @@ fn run() -> Result<()> {
     println!(
         "PCR0       {}",
         document.pcr0_hex().unwrap_or_else(|| "(absent)".into())
+    );
+    println!(
+        "PCR16      {}",
+        document
+            .pcr(nitro_attestation::PCR_GUEST)
+            .map(hex::encode)
+            .unwrap_or_else(|| "(absent: no guest was measured)".into())
     );
     println!("timestamp  {:?}", document.timestamp());
     match verified.trust {
@@ -210,18 +318,40 @@ fn run() -> Result<()> {
     check_binding(
         document.user_data.as_deref(),
         server_certificate.as_deref(),
-        &cli,
+        cli.guest.as_deref().zip(guest.as_deref()),
     )?;
 
     println!("\nOK");
     Ok(())
 }
 
+/// The PCR16 to require: from `--pcr16`, from `--guest`, or from both when they
+/// name the same guest.
+fn expected_guest_register(
+    pinned: Option<&str>,
+    component: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>> {
+    let measured = component.map(|c| nitro_attestation::guest_pcr(c).to_vec());
+    let Some(pinned) = pinned else {
+        return Ok(measured);
+    };
+    let pinned = hex::decode(pinned.trim()).context("--pcr16 is not hex")?;
+    if let Some(measured) = measured {
+        if measured != pinned {
+            bail!(
+                "--pcr16 and --guest name different guests: the component measures to {}",
+                hex::encode(&measured)
+            );
+        }
+    }
+    Ok(Some(pinned))
+}
+
 /// The step that ties the TLS session to the attested code.
 fn check_binding(
     user_data: Option<&[u8]>,
     server_certificate: Option<&[u8]>,
-    cli: &Cli,
+    guest: Option<(&Path, &[u8])>,
 ) -> Result<()> {
     let Some(user_data) = user_data else {
         if server_certificate.is_some() {
@@ -254,9 +384,8 @@ fn check_binding(
         println!("binding    the attested certificate is the one serving this connection");
     }
 
-    if let Some(path) = &cli.guest {
-        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let digest = nitro_attestation::sha256(&bytes);
+    if let Some((path, bytes)) = guest {
+        let digest = nitro_attestation::sha256(bytes);
         if digest != hashes.guest {
             bail!(
                 "the enclave is serving a different guest: attested {}, local file {}",
@@ -264,7 +393,10 @@ fn check_binding(
                 hex::encode(digest)
             );
         }
-        println!("guest      matches {}", path.display());
+        println!(
+            "guest      matches {} (PCR16 and user_data)",
+            path.display()
+        );
     }
 
     Ok(())

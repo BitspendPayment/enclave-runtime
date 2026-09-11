@@ -1,19 +1,27 @@
 # Enclave image for `nitro-cli build-enclave`.
 #
-# The guest component ships *inside* this image, which is the whole point: the
-# EIF hash becomes PCR0, so a KMS key policy conditioned on PCR0 attests to
-# exactly which guest code will read the data — not merely to the runtime that
-# loads it. Streaming the guest in at boot would still produce a valid
-# attestation, but it would prove something much weaker.
+# The guest component is NOT in this image. The runtime fetches it at boot from
+# `S3FS_GUEST_OBJECT`, a key in the roots bucket, extends PCR16 with its hash
+# and locks that register before it asks KMS for anything. This image — PCR0 —
+# covers the runtime and *where* the guest comes from; PCR16 covers *what*
+# arrived. A key policy pinning both still attests to exactly which guest code
+# will read the data, not merely to the runtime that loads it.
 #
-# Changing the guest therefore means rebuilding the image and updating the key
-# policy. That friction is the feature.
+# Changing the guest therefore means uploading it and replacing PCR16 in the
+# key policy, not rebuilding this image. The approval was always the feature;
+# the rebuild never was.
 #
 #   docker build -f deploy/Dockerfile -t s3fs-enclave .
 #   nitro-cli build-enclave --docker-uri s3fs-enclave:latest --output-file s3fs.eif
 #   nitro-cli run-enclave --eif-path s3fs.eif --cpu-count 2 --memory 2048
 #
-# `build-enclave` prints PCR0/PCR1/PCR2; PCR0 is what the key policy pins.
+# `build-enclave` prints PCR0/PCR1/PCR2; PCR0 is what the key policy pins for
+# the runtime. The guest is built, measured and uploaded on its own:
+#
+#   (cd examples/guest-http && cargo build --release --target wasm32-wasip2)
+#   GUEST=examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm
+#   nitro-attest --measure "$GUEST"          # the PCR16 the key policy pins
+#   aws s3 cp "$GUEST" s3://<roots bucket>/guest/guest.wasm
 
 # ---- build ------------------------------------------------------------------
 FROM rust:1-bookworm AS build
@@ -26,12 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY . .
 
-RUN rustup target add wasm32-wasip2 \
- && cargo build --release -p enclave-runtime
-
-# The guest. Swap this for your own component; guest-http is the example that
-# needs no C toolchain.
-RUN cd examples/guest-http && cargo build --release --target wasm32-wasip2
+RUN cargo build --release -p enclave-runtime
 
 # ---- the tap forwarder ------------------------------------------------------
 # An enclave has no NIC, so nothing that speaks TCP works until this turns the
@@ -57,12 +60,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /src/target/release/enclave-runtime /usr/local/bin/enclave-runtime
 COPY --from=gvforwarder /gvforwarder /usr/local/bin/gvforwarder
-COPY --from=build /src/examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm \
-                  /enclave/guest.wasm
 
 # Deployment configuration. Every setting also has a flag, but inside an
 # enclave there is no shell to pass one, so these are what actually apply.
-ENV S3FS_GUEST_PATH=/enclave/guest.wasm
+#
+# Where the guest comes from, as a key in S3FS_ROOTS_BUCKET. The location is
+# measured here, by PCR0; what is found there is measured into PCR16 at boot,
+# so the object does not have to be trusted — a substituted one gets no key.
+ENV S3FS_GUEST_OBJECT=guest/guest.wasm
 # Read the Nitro PTP hardware clock and refuse to start without it. The
 # alternative is running on a clock the parent instance sets, which is the
 # party this whole design excludes.
@@ -90,8 +95,8 @@ ENV S3FS_TLS_DOMAINS=enclave.example.com
 # ENV S3FS_MIN_ROOT_SEQ=0                 # freshness floor from outside the store
 #
 # The master secret is minted by KMS inside the enclave and released only
-# against an attestation whose PCR0 matches the key policy. A wrong image does
-# not get a refused mount; it gets no key at all.
+# against an attestation whose PCR0 and PCR16 match the key policy. A wrong
+# image or a wrong guest does not get a refused mount; it gets no key at all.
 ENV S3FS_MASTER_KEY_SOURCE=kms
 # ENV S3FS_KMS_KEY_ID=arn:aws:kms:eu-west-2:...:key/...
 # ENV S3FS_MASTER_KEY_PARAMETER=/enclave-runtime/prod/<fs-id>/master-key

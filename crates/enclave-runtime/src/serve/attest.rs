@@ -382,6 +382,10 @@ mod tests {
                 unreachable!("attestation does not extend PCRs")
             }
 
+            fn lock_pcr(&self, _index: u16) -> anyhow::Result<()> {
+                unreachable!("attestation does not lock PCRs")
+            }
+
             fn describe(&self) -> String {
                 "a deliberately slow test device".into()
             }

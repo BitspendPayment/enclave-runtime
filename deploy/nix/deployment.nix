@@ -9,8 +9,7 @@
 # The consequence is real and worth knowing before you hit it: **changing any
 # value here changes PCR0**. Two deployments are two images, a KMS key policy
 # pinned to one will not release to the other, and clients pin different
-# measurements. That is the same argument as baking the guest in rather than
-# streaming it over vsock — the enclave's identity includes what it operates on.
+# measurements. The enclave's identity includes what it operates on.
 #
 # `S3FS_ID` is not a secret. It is the HKDF salt, so two filesystems under one
 # master secret stay independent, and it must be supplied rather than read from
@@ -54,4 +53,13 @@
   # which names it "/${name_prefix}-${environment}/guest".
   guestLogGroup = "/CHANGE-ME-production/guest";
   guestLogStream = "guest";
+
+  # Where the runtime fetches its guest: a key in `rootsBucket`, used verbatim
+  # (`bucketPrefix` is not applied).
+  #
+  # The key is measured by PCR0 like everything else here. The object behind it
+  # is measured by the enclave into PCR16 at boot, before it asks KMS for a key,
+  # so it need not be trusted: changing the guest is an upload and a key-policy
+  # edit, not a new image. Upload `guest-release/guest.wasm` here.
+  guestObject = "guest/guest.wasm";
 }

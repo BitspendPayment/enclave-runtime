@@ -38,21 +38,40 @@ fn component_path() -> PathBuf {
 /// The auth exchange is now the only place the runtime attests, and it is the
 /// exchange a client uses to identify the enclave before approving anything —
 /// so this harness has to produce documents that verify, not canned bytes.
+///
+/// Its registers behave like the device's: 0–15 locked from the start, 16 free
+/// until the harness measures the guest into it, and documents list only the
+/// locked ones. So PCR16 is in a document here for the reason it is in a real
+/// one — the guest was measured and the register locked.
 #[derive(Debug)]
 struct SigningNsm {
     chain: nitro_attestation::testing::TestChain,
-    pcr0: [u8; 48],
+    pcrs: std::sync::Mutex<Vec<nitro_nsm::Pcr>>,
     /// Counted, so successive draws differ. A device that returned the same
     /// bytes every time would mint one tenant id for every passkey, which is
     /// the isolation property quietly inverted.
     draws: std::sync::atomic::AtomicU64,
 }
 
+/// What `SigningNsm` reports as PCR0, and what a client here pins.
+const PCR0: [u8; 48] = [0x5a; 48];
+
 impl SigningNsm {
     fn new() -> Self {
         SigningNsm {
             chain: nitro_attestation::testing::TestChain::new().expect("test chain"),
-            pcr0: [0x5a; 48],
+            pcrs: std::sync::Mutex::new(
+                (0..32)
+                    .map(|i| nitro_nsm::Pcr {
+                        locked: i < 16,
+                        value: if i == 0 {
+                            PCR0.to_vec()
+                        } else {
+                            nitro_nsm::PCR_ZERO.to_vec()
+                        },
+                    })
+                    .collect(),
+            ),
             draws: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -70,21 +89,43 @@ impl nitro_nsm::Nsm for SigningNsm {
         Ok(())
     }
     fn attest(&self, request: &nitro_nsm::AttestationRequest) -> anyhow::Result<Vec<u8>> {
+        let pcrs = self
+            .pcrs
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, pcr)| pcr.locked)
+            .map(|(index, pcr)| (index as u32, pcr.value.clone()))
+            .collect();
         self.chain
-            .document(request.user_data.clone(), request.nonce.clone(), self.pcr0)
+            .document_with_pcrs(request.user_data.clone(), request.nonce.clone(), pcrs)
     }
     fn describe_pcr(&self, index: u16) -> anyhow::Result<nitro_nsm::Pcr> {
-        Ok(nitro_nsm::Pcr {
-            locked: index < 3,
-            value: if index == 0 {
-                self.pcr0.to_vec()
-            } else {
-                nitro_nsm::PCR_ZERO.to_vec()
-            },
-        })
+        self.pcrs
+            .lock()
+            .unwrap()
+            .get(index as usize)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no PCR{index}"))
     }
-    fn extend_pcr(&self, _index: u16, _data: &[u8]) -> anyhow::Result<Vec<u8>> {
-        anyhow::bail!("this fake does not model PCR extension")
+    fn extend_pcr(&self, index: u16, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut pcrs = self.pcrs.lock().unwrap();
+        let pcr = pcrs
+            .get_mut(index as usize)
+            .ok_or_else(|| anyhow::anyhow!("no PCR{index}"))?;
+        anyhow::ensure!(!pcr.locked, "PCR{index} is read-only");
+        pcr.value = nitro_nsm::pcr_extend(&pcr.value, data);
+        Ok(pcr.value.clone())
+    }
+    fn lock_pcr(&self, index: u16) -> anyhow::Result<()> {
+        let mut pcrs = self.pcrs.lock().unwrap();
+        let pcr = pcrs
+            .get_mut(index as usize)
+            .ok_or_else(|| anyhow::anyhow!("no PCR{index}"))?;
+        anyhow::ensure!(!pcr.locked, "PCR{index} is read-only");
+        pcr.locked = true;
+        Ok(())
     }
     fn describe(&self) -> String {
         "signing test NSM".into()
@@ -119,6 +160,9 @@ async fn start() -> Harness {
     let bytes_for_harness = bytes.clone();
 
     let nsm = Arc::new(SigningNsm::new());
+    // As `main` does, before anything could attest: the documents this server
+    // produces carry PCR16 because the guest it serves was measured into it.
+    enclave_runtime::measure_guest(nsm.as_ref(), &bytes).expect("measuring the guest");
     let entropy: Arc<dyn nitro_nsm::Nsm> = nsm.clone();
     let credentials = Arc::new(FilesystemCredentials::new(fs.clone()));
     let gate = Arc::new(Gate::new(
@@ -695,9 +739,11 @@ async fn the_passkey_client_binary_drives_the_gate() {
     let state = std::env::temp_dir().join(format!("passkey-{}.json", std::process::id()));
     let _ = std::fs::remove_file(&state);
 
+    let pcr16 = hex::encode(nitro_attestation::guest_pcr(&h.guest_bytes));
     let run = |args: Vec<String>| {
         let exe = exe.clone();
         let state = state.clone();
+        let pcr16 = pcr16.clone();
         let url = format!("https://127.0.0.1:{}", h.addr.port());
         async move {
             tokio::task::spawn_blocking(move || {
@@ -708,9 +754,11 @@ async fn the_passkey_client_binary_drives_the_gate() {
                     // this only says "do not require the AWS root", which is
                     // the whole difference between this and production.
                     .arg("--allow-untrusted-root")
-                    // And which enclave, which the client now insists on
-                    // knowing: `SigningNsm` reports this as PCR0.
-                    .args(["--pcr0", &"5a".repeat(48)])
+                    // And which enclave, which the client insists on knowing in
+                    // both halves: `SigningNsm` reports PCR0, and PCR16 holds
+                    // the guest the harness measured into it.
+                    .args(["--pcr0", &hex::encode(PCR0)])
+                    .args(["--pcr16", &pcr16])
                     .args(&args)
                     .output()
                     .expect("running passkey-client");

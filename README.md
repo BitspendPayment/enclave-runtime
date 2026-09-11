@@ -438,13 +438,18 @@ state_root = BLAKE3(CBOR[
 Every later boot recomputes it from what it just loaded and requires the
 receipt to name exactly that. The host cannot forge one, because AWS signs it.
 
-| receipt | store | PCR0 | |
+| receipt | store | this pair's record | |
 |---|---|---|---|
-| absent | empty | — | **genesis** — mint key, seal, create, write receipt |
+| absent | empty | — | **genesis** — mint key, seal, create, write receipt and pair record |
 | absent | present | — | **refuse** — state nobody accounted for |
 | present | empty | — | **refuse** — state has been hidden |
-| present | present | mine | **resume** |
-| present | present | other | **migration**, if authorised |
+| present | present | present, verifies | **resume** — writes nothing |
+| present | present | absent | **upgrade** — attest and write this pair's record |
+| present | present | present, does not verify | **refuse** — something else stands in its place |
+
+The receipt says *which state*. It no longer says *which code*: that is the key
+policy's decision, and the boot machine records it rather than making it — see
+[Upgrades](#upgrades).
 
 QEMU's emulated NSM does not sign — its source says so — so the harness must be
 able to accept an unsigned receipt, and an escape hatch like that is worth
@@ -524,26 +529,87 @@ can read the bucket.
 
 **Sealing is not finished.** `StaticKey` seals by *not* sealing — it writes the
 secret behind a marker saying so, which exercises every boot mode without
-hardware and protects nothing. Real sealing is KMS `Decrypt` with a `Recipient`
-under a policy conditioned on `kms:RecipientAttestation:PCR0`, and that is
-where *"only the correct enclave boots"* is actually enforced: a wrong enclave
-does not get a refused mount, it gets no key at all. It is the next
+hardware and protects nothing. Real sealing is KMS with a `Recipient` under a
+policy conditioned on `kms:RecipientAttestation:PCR0` *and* `:PCR16`, and that
+is where *"only the correct enclave boots"* is actually enforced: a wrong
+enclave does not get a refused mount, it gets no key at all. It is the next
 implementation of one trait and nothing above it changes.
+
+### The guest is measured, not baked in
+
+The guest component used to ship inside the image, so PCR0 covered it and every
+guest change was an image rebuild. It is now fetched at boot from
+`S3FS_GUEST_OBJECT`, a key in the roots bucket, and **measured before anything
+asks for a key**:
+
+```text
+  fetch guest ──▶ extend PCR16 with sha256(guest) ──▶ lock PCR16 ──▶ boot ──▶ KMS
+```
+
+PCR0 covers the runtime and *where* the guest comes from; PCR16 covers *what*
+arrived. The key policy pins both, on `kms:GenerateDataKey` and `kms:Decrypt`:
+
+```json
+"StringEqualsIgnoreCase": {
+  "kms:RecipientAttestation:PCR0":  "<pcr.json .PCR0>",
+  "kms:RecipientAttestation:PCR16": "<guest-release/guest-pcr16.json .PCR16>"
+}
+```
+
+What that buys, and what it does not:
+
+- **The object does not have to be trusted.** The parent can replace it. The
+  replacement measures to a different PCR16, gets no key, and reads nothing.
+- **PCR16 means something only beside PCR0.** The runtime writes it, so an
+  enclave running someone else's runtime can put any value there. PCR0 is what
+  says the runtime that wrote it is this one — which is why a client must pin
+  both, and why `passkey-client` refuses to run without both.
+- **The lock is the point.** An attestation document lists only locked
+  registers. The runtime checks the register is zero and unlocked beforehand,
+  that extending produced exactly `SHA384(0⁴⁸ ‖ sha256(guest))`, and that the
+  device reports it locked with that value afterwards, and refuses to start
+  otherwise.
+- **Measuring a guest is not vetting it.** An approved guest can still write
+  what it reads to stdout, which reaches CloudWatch. Approving a guest is
+  trusting it with the data.
+
+`nix build .#guest-release` produces `guest.wasm` and `guest-pcr16.json`, the
+latter computed by `nitro-attest --measure` — the function clients verify with,
+so the value in the policy and the value a client pins cannot disagree.
 
 ### Upgrades
 
-A resuming enclave demands the receipt carry its own PCR0, so any image change
-would otherwise make the filesystem unmountable. The outgoing image authorises
-the incoming one explicitly:
+**The key policy decides; the boot machine records.** There is no handoff
+between images: an enclave KMS released the key to is, by that fact, allowed to
+hold the state. A guest change is:
 
-```console
-$ enclave-runtime --authorise-successor <new PCR0>   # run against the OLD image
-```
+1. upload the new guest to the object key;
+2. replace PCR16 in the key policy — replace, never add a second value beside
+   it, or the old guest stays approved and returning to it needs nobody's
+   say-so;
+3. restart the enclave.
 
-It extends **PCR31** with the successor's PCR0 — irreversibly, for that
-enclave's life — then attests. The resulting receipt proves both who wrote it
-and that they had committed to that specific successor beforehand, in two
-independent places. A receipt naming one image does not admit another.
+A restart between 1 and 2 fails closed: the enclave measures the new guest, KMS
+refuses the key, nothing is exposed, and the service is down until the policy
+catches up. A runtime change is the same with PCR0.
+
+Each boot looks for a **pair record** under a key derived from
+`sha256(PCR0 ‖ PCR16)`:
+
+- **present** — verified against its signature, both registers and this
+  `state_root`, and the boot is a plain resume that writes nothing;
+- **absent** — the first boot of this runtime and guest on this state. It
+  attests, stores the document under Object Lock, and logs `mode=Upgrade`. Two
+  first boots racing each other leave one record, and both boot.
+
+So the store holds one signed record for each distinct pair that has ever held
+the state, not one per restart. It records *which* pairs, not *in what order*:
+going back to an earlier pair finds that pair's record and writes nothing. The
+order approvals were given in is in CloudTrail's record of key-policy edits.
+
+This replaced `--authorise-successor`, which extended PCR31 to name the next
+image and never locked it — so no document it produced on hardware could have
+carried the register the successor was checked against.
 
 ## Serving HTTP
 
@@ -873,16 +939,23 @@ digests, 68 bytes:
 The certificate hash ties the TLS session to the document; the guest hash says
 which application was behind it.
 
-**These two are not equally trustworthy, and the difference decides how you
-pin.** PCR0 is measured by the hypervisor from the image and locked, so nothing
-running inside the enclave can choose it. The guest hash is part of `user_data`,
-which the *runtime* hands to the device — so an attacker running their own
-enclave produces a genuinely signed document claiming whatever guest hash you
-were going to check for.
+**Pin two measurements, and know which one the other rests on.** PCR0 is
+measured by the hypervisor from the image and locked, so nothing running inside
+the enclave can choose it — but the image no longer contains the guest. PCR16 is
+the guest: the runtime extends it with the component's hash and locks it before
+it can obtain a key. Because the runtime is what writes it, an attacker running
+their own runtime produces a genuinely signed document claiming whatever PCR16,
+and whatever `user_data` guest hash, you were going to check for.
 
-So **pin PCR0**. `--guest` is worth passing on top of it — against a runtime
-already pinned, it catches that runtime serving a different application — but on
-its own it authenticates the hardware and calls it the software.
+So **pin PCR0 and PCR16 together**. PCR0 says the runtime is yours, which is what
+makes its PCR16 mean anything; PCR16 says which application that runtime loaded,
+which PCR0 can no longer say. `--guest` supplies PCR16 from the component and
+checks the `user_data` hash too; without `--pcr0` beside it, it authenticates
+the hardware and calls it the software.
+
+`nitro-attest` requires both measurements when verifying a URL or saved
+document. Only `--measure` and the explicit `--unsigned-emulator` mode are
+exempt.
 
 Verify an endpoint with one command:
 
@@ -891,10 +964,12 @@ $ nitro-attest --url https://enclave.example --pcr0 8cac35ce… \
       --guest ./guest.wasm
 module     i-0abc…-enc0123…
 PCR0       8cac35ce…
+PCR16      4f1d9b0a…
 chain      verified to the AWS Nitro root
 tls hash   3aa2e103…
 guest hash 7ee636bc…
 binding    the attested certificate is the one serving this connection
+guest      matches ./guest.wasm (PCR16 and user_data)
 OK
 ```
 
@@ -1274,21 +1349,29 @@ never been checked together:
 ```
 1/7  the guest is unreachable without a passkey    401 on /, /counter, /memory
 2/7  a passkey enrols, and writes reach MinIO      counter: 1 then 2
-3/7  the attestation binds this connection         binding    the attested
-                                                   certificate is the one
+3/7  the attestation binds this connection,        binding    the attested
+     its runtime and its guest                     certificate is the one
                                                    serving this connection
-3b/7 a signed guest request carries its own proof  binding    …
-4/7  the attested PCR0 is the build's              build:    b3edc9c9…
-                                                   attested: b3edc9c9…
+3b/7 a signed interaction verifies the enclave     binding    …
+4/7  the attested PCR0 and PCR16 are the builds'   PCR0  build:    b3edc9c9…
+                                                         attested: b3edc9c9…
 5/7  a tenant keeps its instance; none are shared  alice 1,2 · bob 1
-5b/7 an approval for one payload authorizes no other
+5b/7 an approval for one route authorizes no other
 5c/7 guest output reaches the console, tagged untrusted
 6/7  a second boot resumes rather than starting over
+7/7  a substituted guest is measured, recorded as an upgrade, and refused
+     by a client pinning the approved one
 ```
 
-Leg 3 verifies the probe route the way a client would before sending anything;
-leg 3b takes the document off the response to a real, passkey-signed guest
-request — the case a separate attestation endpoint could never cover.
+Leg 3 verifies the `/auth/` exchange the way a client would before sending
+anything; leg 3b checks the document from the exchange a real, passkey-signed
+interaction made.
+
+The guest is not in the image: the harness builds `.#guest-release`, uploads
+`guest.wasm` to MinIO, and checks the PCR16 the enclave attests against
+`guest-pcr16.json`. Leg 7 then replaces the object and restarts. The enclave
+boots — the emulator has no KMS to refuse it a key — with a PCR16 that
+`nitro-attest --guest <the approved guest>` rejects.
 
 The enclave gets an address by DHCP over the emulated vsock, mounts the
 Merkle-anchored filesystem from MinIO on the host through gvproxy, obtains a

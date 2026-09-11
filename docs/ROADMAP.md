@@ -44,19 +44,23 @@ The key policy binds release to the PCRs:
 ```json
 {
   "Effect": "Allow",
-  "Action": "kms:Decrypt",
+  "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
   "Condition": {
     "StringEqualsIgnoreCase": {
-      "kms:RecipientAttestation:PCR0": "<enclave image hash>"
+      "kms:RecipientAttestation:PCR0": "<runtime image hash>",
+      "kms:RecipientAttestation:PCR16": "<guest measurement>"
     }
   }
 }
 ```
 
-Because the guest component is baked into the image (see M10), PCR0 covers
-*both* the runtime and the guest. The key is released only to exactly this
-code — that is the whole argument, and it is why the guest must not be
-loaded over vsock.
+PCR0 covers the runtime image, and the guest is not in it. The runtime fetches
+the guest at boot, extends PCR16 with its hash and locks the register before it
+asks for the key, so the key is still released only to exactly this code —
+runtime *and* guest — while a guest change is a policy edit rather than an
+image rebuild. Neither condition is enough alone: PCR0 alone admits any guest,
+and PCR16 alone admits any runtime that writes the right value into the
+register.
 
 **3. A vsock HTTP client.** An enclave has no network except vsock, so both
 KMS and S3 go through a proxy on the parent. This needs a seam that does not
@@ -205,9 +209,10 @@ inherits that environment minus anything under `AWS_` or `S3FS_` — credentials
 and the runtime's own settings — which is the one rule that keeps the master
 key away from the code the enclave exists to contain.
 
-`deploy/Dockerfile` builds an image with the guest at `/enclave/guest.wasm`, so
-PCR0 covers it. That is what will let M8's key policy attest to the code that
-reads the data rather than only to the runtime that loads it.
+`deploy/Dockerfile` builds an image without the guest. The runtime fetches it
+from the roots bucket at boot, measures it into PCR16 and locks the register
+before it asks for a key, so M8's key policy — PCR0 and PCR16 — attests to the
+code that reads the data rather than only to the runtime that loads it.
 
 ### What M8 changes here
 

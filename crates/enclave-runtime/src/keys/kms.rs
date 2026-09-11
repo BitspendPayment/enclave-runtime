@@ -1,5 +1,5 @@
 //! The production key source: KMS releases the master secret only to an
-//! enclave whose PCR0 matches the key policy.
+//! enclave whose runtime (PCR0) and guest (PCR16) match the key policy.
 //!
 //! ## What this changes
 //!
@@ -15,10 +15,17 @@
 //! The parent forwards bytes it has no key for.
 //!
 //! The enforcement is the KMS key policy, not this code:
-//! `kms:RecipientAttestation:PCR0` pinned to the approved image means a wrong
-//! enclave does not get a refused mount — it gets **no key at all**. That is
-//! the difference between an enclave checking itself and something outside it
-//! doing the checking.
+//! `kms:RecipientAttestation:PCR0` pinned to the approved runtime image and
+//! `kms:RecipientAttestation:PCR16` pinned to the approved guest mean a wrong
+//! enclave — wrong in either half — does not get a refused mount; it gets **no
+//! key at all**. That is the difference between an enclave checking itself and
+//! something outside it doing the checking.
+//!
+//! Both conditions belong on `kms:GenerateDataKey`, which genesis calls, as
+//! well as on `kms:Decrypt`, which every later boot calls. Leave one
+//! unconditioned and anything holding the role can call it: an unconditioned
+//! `GenerateDataKey` hands the parent a data key in the clear, which it can
+//! plant as a new filesystem's key before an enclave ever runs genesis.
 //!
 //! ## Where the pieces live
 //!
@@ -258,7 +265,7 @@ impl KmsAttestedKey {
 #[async_trait]
 impl MasterKeySource for KmsAttestedKey {
     fn describe(&self) -> &'static str {
-        "KMS, released on PCR0 attestation"
+        "KMS, released on PCR0 and PCR16 attestation"
     }
 
     async fn mint(&self) -> Result<(MasterSecret, SealedKey)> {

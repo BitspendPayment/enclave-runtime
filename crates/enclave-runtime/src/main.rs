@@ -7,13 +7,14 @@
 //! `ENV` lines in the image's Dockerfile are the deployment configuration; the
 //! flags exist so the same binary stays drivable by hand while developing.
 //!
-//! The guest component is loaded from a known path — `/enclave/guest.wasm` by
-//! default — because it ships *inside* the enclave image. That is what puts it
-//! under PCR0, and it is the whole argument for the design: the KMS key policy
-//! that releases the filesystem key then attests to exactly which code will
-//! read the data, not merely to the runtime that loads it. Streaming the guest
-//! in over vsock would leave a valid attestation proving something much
-//! weaker.
+//! The guest component is **not** in the image. The runtime fetches it at boot
+//! from `--guest-object`, a key in the roots bucket, then measures it into PCR16
+//! and locks that register before it asks KMS for anything — see
+//! [`enclave_runtime::guest`]. PCR0 covers the runtime and *where* the guest
+//! comes from; PCR16 covers *what* arrived. A key policy pinning both releases
+//! the filesystem key to exactly this runtime running exactly this guest, so an
+//! attestation still says which code will read the data — and changing the
+//! guest is a policy edit rather than an image rebuild.
 //!
 //! Argument parsing over [`enclave_runtime`], which is the same crate: the
 //! library half is everything below this file, and lives beside it rather than
@@ -21,7 +22,7 @@
 //!
 //! The master secret comes from `--master-key-source`, which has no default:
 //! `kms` mints it inside the enclave and lets KMS release it only against an
-//! attestation whose PCR0 matches the key policy, and `static` takes it from
+//! attestation whose PCR0 and PCR16 match the key policy, and `static` takes it from
 //! configuration for development and for the QEMU harness. Supplying a
 //! plaintext key under `kms` is refused rather than ignored — a key in an
 //! environment variable is visible to the parent instance, exactly the party
@@ -34,14 +35,11 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use enclave_runtime::{
-    open_clock, open_entropy, read_component, serve_component, AcmeConfig, ClockSource,
-    GuestEnvPolicy, GuestEnvironment, MasterKeySource, MountConfig, NetworkConfig, NetworkMode,
+    open_clock, open_entropy, serve_component, AcmeConfig, ClockSource, GuestEnvPolicy,
+    GuestEnvironment, GuestSource, MasterKeySource, MountConfig, NetworkConfig, NetworkMode,
     RandomSource, ReceiptTrust, ServeConfig, TlsMode, DEFAULT_GVFORWARDER, DEFAULT_NSM_DEVICE,
     DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
-
-/// Where the guest lives inside the enclave image.
-const DEFAULT_GUEST_PATH: &str = "/enclave/guest.wasm";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -50,10 +48,21 @@ const DEFAULT_GUEST_PATH: &str = "/enclave/guest.wasm";
     long_about = None
 )]
 struct Cli {
-    /// Guest component to run. Ships inside the enclave image, so its hash is
-    /// covered by PCR0 along with this binary.
-    #[arg(long, env = "S3FS_GUEST_PATH", default_value = DEFAULT_GUEST_PATH)]
-    guest_path: PathBuf,
+    /// Guest component to run, as a key in the roots bucket. What an enclave
+    /// image uses.
+    ///
+    /// Fetched at boot, measured into PCR16 and locked before any key is asked
+    /// for. The key is baked into the image, so PCR0 covers where the guest
+    /// comes from; PCR16 covers what arrived. The object itself need not be
+    /// trusted: a substituted one measures to a different PCR16, which a key
+    /// policy pinning the approved guest releases nothing to.
+    #[arg(long, env = "S3FS_GUEST_OBJECT")]
+    guest_object: Option<String>,
+
+    /// Guest component to run, from a local file. For development and tests,
+    /// and measured exactly as an object is. Give this or `--guest-object`.
+    #[arg(long, env = "S3FS_GUEST_PATH")]
+    guest_path: Option<PathBuf>,
 
     /// Bucket holding the data slabs.
     #[arg(long, env = "S3FS_BUCKET")]
@@ -71,11 +80,11 @@ struct Cli {
     /// Where the master secret comes from.
     ///
     /// `kms` mints it inside the enclave and lets KMS release it only against
-    /// an attestation whose PCR0 matches the key policy — so a wrong image
-    /// gets no key at all, rather than a refused mount. `static` takes it from
-    /// `--master-key` and stores it unsealed; it exists for development and
-    /// for the QEMU harness, whose emulated NSM cannot produce a document KMS
-    /// would accept.
+    /// an attestation whose PCR0 and PCR16 match the key policy — so a wrong
+    /// image or a wrong guest gets no key at all, rather than a refused mount.
+    /// `static` takes it from `--master-key` and stores it unsealed; it exists
+    /// for development and for the QEMU harness, whose emulated NSM cannot
+    /// produce a document KMS would accept.
     ///
     /// No default. This is the one setting that should never be inherited by
     /// omission, and because the image environment is measured, PCR0 records
@@ -93,7 +102,8 @@ struct Cli {
     master_key: Option<String>,
 
     /// The customer master key that releases this filesystem's secret. Its
-    /// policy — `kms:RecipientAttestation:PCR0` — is the security control.
+    /// policy — `kms:RecipientAttestation:PCR0` and `:PCR16`, on both
+    /// `GenerateDataKey` and `Decrypt` — is the security control.
     #[arg(long, env = "S3FS_KMS_KEY_ID")]
     kms_key_id: Option<String>,
 
@@ -364,15 +374,6 @@ struct Cli {
     )]
     enrollment_tokens: Vec<String>,
 
-    /// Authorise a successor enclave image, by PCR0, then exit.
-    ///
-    /// Run against the *outgoing* image. It extends PCR31 with the successor's
-    /// PCR0 — irreversibly, for this enclave's life — and attests, so the
-    /// resulting receipt proves both who wrote it and that they had committed
-    /// to this specific successor before doing so.
-    #[arg(long, env = "S3FS_AUTHORISE_SUCCESSOR", value_name = "PCR0_HEX")]
-    authorise_successor: Option<String>,
-
     /// Report on the configured clock and entropy source and exit, without
     /// mounting or running anything. For diagnosing a deployment, and the only
     /// thing the emulator harness needs — it touches no storage.
@@ -500,6 +501,36 @@ impl Cli {
         }
     }
 
+    /// Where the guest comes from: exactly one of the two settings.
+    ///
+    /// An empty setting counts as unset, for the layering reason
+    /// `guest_log_config` gives.
+    fn guest_source(&self) -> Result<GuestSource> {
+        let object = self
+            .guest_object
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        let path = self
+            .guest_path
+            .as_ref()
+            .filter(|path| !path.as_os_str().is_empty());
+        match (object, path) {
+            (Some(key), None) => Ok(GuestSource::Object {
+                key: key.to_string(),
+            }),
+            (None, Some(path)) => Ok(GuestSource::Path(path.clone())),
+            (None, None) => anyhow::bail!(
+                "no guest to run: set --guest-object, a key in the roots bucket, or outside \
+                 an enclave --guest-path"
+            ),
+            (Some(_), Some(_)) => anyhow::bail!(
+                "--guest-object and --guest-path are both set. They name two guests, and \
+                 there is no safe way to guess which was meant."
+            ),
+        }
+    }
+
     fn mount_config(&self) -> Result<MountConfig> {
         Ok(MountConfig {
             bucket: self.bucket.clone(),
@@ -593,26 +624,30 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     })?;
 
     let keys = enclave_runtime::open_key_source(&cli.master_key_config()?, entropy.clone())?;
+    // Resolved before anything touches the network, so a runtime given no
+    // guest, or two, says so rather than failing somewhere later.
+    let guest_source = cli.guest_source()?;
     tracing::info!(
         key_source = keys.describe(),
-        guest = %cli.guest_path.display(),
+        guest = %guest_source,
         "starting"
     );
 
     let mount_config = cli.mount_config()?;
     let backends = enclave_runtime::connect(&mount_config).await?;
 
-    // Authorising a successor is not a way to start serving: it extends a PCR
-    // irreversibly and writes a receipt, then stops. Doing it in the same
-    // process that goes on to serve would mean an enclave running with a
-    // register it changed halfway through its own life.
-    if let Some(successor) = &cli.authorise_successor {
-        let pcr0 = hex::decode(successor.trim())
-            .map_err(|_| anyhow::anyhow!("--authorise-successor is not hex"))?;
-        enclave_runtime::authorise_successor(&backends, &mount_config, &entropy, &keys, &pcr0)
-            .await?;
-        return Ok(enclave_runtime::GuestOutcome::Success);
-    }
+    // The guest, before anything asks for a key. KMS releases the key against
+    // an attestation carrying PCR16, so PCR16 has to be final by then: measured,
+    // and locked so nothing can extend it afterwards. These same bytes are what
+    // get compiled and served below, so what was measured is what runs.
+    let component = enclave_runtime::fetch_guest(&guest_source, &backends.roots).await?;
+    let guest_pcr = enclave_runtime::measure_guest(entropy.as_ref(), &component)?;
+    tracing::info!(
+        guest = %guest_source,
+        guest_sha256 = %hex::encode(nitro_attestation::sha256(&component)),
+        pcr16 = %hex::encode(guest_pcr),
+        "guest measured into PCR16 and locked"
+    );
 
     // Decide whether this enclave is entitled to the state it is about to
     // load, before it loads any of it.
@@ -629,18 +664,14 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
 
     tracing::info!(
         mode = ?booted.mode,
-        pcr0 = %hex::encode(&booted.pcr0),
+        pcr0 = %hex::encode(booted.pair.pcr0),
+        pcr16 = %hex::encode(booted.pair.pcr16),
         state_root = %hex::encode(booted.state_root),
         "state origin established"
     );
 
     let mounted = booted.mounted;
     let fs = mounted.fs.clone();
-
-    // Read the guest before building the environment so a missing component —
-    // the likeliest misconfiguration inside an image — fails immediately and
-    // names the path it looked at.
-    let component = read_component(&cli.guest_path)?;
 
     let env = cli.env_policy().build()?;
 
@@ -1173,14 +1204,36 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    /// There is no default guest. The image used to carry one at a fixed path;
+    /// it carries a key in the roots bucket instead, and a runtime given
+    /// neither says what is missing rather than guessing.
     #[test]
-    fn the_guest_path_defaults_to_the_image_location() {
+    fn a_guest_source_is_required() {
         let cli = cli_from(&["--bucket", "b", "--master-key", &"aa".repeat(32)]);
-        assert_eq!(cli.guest_path, PathBuf::from(DEFAULT_GUEST_PATH));
+        let err = cli.guest_source().unwrap_err();
+        assert!(format!("{err:#}").contains("--guest-object"), "{err:#}");
     }
 
     #[test]
-    fn a_flag_overrides_the_environment_default() {
+    fn a_guest_object_is_a_key_in_the_roots_bucket() {
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--guest-object",
+            "guest/guest.wasm",
+        ]);
+        assert_eq!(
+            cli.guest_source().unwrap(),
+            GuestSource::Object {
+                key: "guest/guest.wasm".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_guest_path_is_for_local_runs() {
         let cli = cli_from(&[
             "--bucket",
             "b",
@@ -1189,7 +1242,45 @@ mod tests {
             "--guest-path",
             "/tmp/other.wasm",
         ]);
-        assert_eq!(cli.guest_path, PathBuf::from("/tmp/other.wasm"));
+        assert_eq!(
+            cli.guest_source().unwrap(),
+            GuestSource::Path(PathBuf::from("/tmp/other.wasm"))
+        );
+    }
+
+    #[test]
+    fn two_guest_sources_are_refused() {
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--guest-object",
+            "guest/guest.wasm",
+            "--guest-path",
+            "/tmp/other.wasm",
+        ]);
+        assert!(cli.guest_source().is_err());
+    }
+
+    /// The image environment is layered, and "" is how a layer says "not this
+    /// one" — the same rule as the guest log settings.
+    #[test]
+    fn an_empty_guest_setting_counts_as_unset() {
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--guest-object",
+            "",
+            "--guest-path",
+            "/tmp/other.wasm",
+        ]);
+        assert_eq!(
+            cli.guest_source().unwrap(),
+            GuestSource::Path(PathBuf::from("/tmp/other.wasm"))
+        );
     }
 
     /// The explicit model, which is what `--no-inherit-env` leaves you with:

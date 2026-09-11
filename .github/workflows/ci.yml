@@ -25,6 +25,15 @@ jobs:
         run: cargo build --workspace --all-targets
       - name: cargo test (lib)
         run: cargo test --workspace --lib
+      # Integration suites run only where they are named, and this one ran
+      # nowhere. It is the boot machine — genesis, resume, upgrades and the
+      # refusals — over the in-memory backend, and needs no guest built.
+      - name: boot machine
+        run: cargo test -p enclave-runtime --test boot_origin
+      # Which measurements the client insists on before it approves anything.
+      # A binary's unit tests are not part of `--lib`.
+      - name: passkey client
+        run: cargo test -p enclave-runtime --features testing --bin passkey-client
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -93,6 +102,8 @@ jobs:
 
       - name: build the verifier CLI
         run: cargo build -p nitro-attestation --features cli
+      - name: verifier measurement requirements
+        run: cargo test -p nitro-attestation --features cli --bin nitro-attest
 
   minio-integration:
     name: MinIO integration tests

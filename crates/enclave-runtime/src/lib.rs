@@ -14,6 +14,7 @@
 //!
 //! ```text
 //!   mount   config          ──▶ Arc<Fs>          two backends, verified root
+//!   guest   object or file  ──▶ PCR16, locked    before any key is asked for
 //!   net     vsock + tap     ──▶ a network        gvforwarder against gvproxy
 //!   env     GuestEnvPolicy  ──▶ Vec<(K, V)>      inherit minus a denylist
 //!   linker  wasmtime-wasi   ──▶ Linker<State>    everything but filesystem
@@ -35,6 +36,7 @@ pub mod boot;
 pub mod clock;
 pub mod env;
 pub mod flag;
+pub mod guest;
 pub mod guest_io;
 pub mod keys;
 pub mod linker;
@@ -54,10 +56,11 @@ pub use auth::{
     InteractionScope, RateLimiter, TokenStore, AUTH_PREFIX, DEFAULT_CAPACITY,
     DEFAULT_TOKEN_CAPACITY,
 };
-pub use boot::{authorise_successor, boot, BootConfig, BootMode, Booted, ReceiptTrust};
+pub use boot::{boot, BootConfig, BootMode, Booted, Pair, ReceiptTrust};
 pub use clock::{open_clock, ClockSource, HostClock, PtpClock, TrustedClock, DEFAULT_PTP_DEVICE};
 pub use env::GuestEnvPolicy;
 pub use flag::parse_bool_flag;
+pub use guest::{fetch_guest, measure_guest, GuestSource, MAX_GUEST_BYTES};
 pub use guest_io::cloudwatch::{
     boot_marker as guest_log_boot_marker, open_stream as open_guest_log_stream,
     start as start_guest_log_forwarder, CloudWatchConfig, CloudWatchDestination, CloudWatchLogSink,

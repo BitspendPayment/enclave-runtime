@@ -22,9 +22,9 @@
 //! ## Two sources
 //!
 //! [`KmsAttestedKey`] is the real one: KMS releases the secret only to an
-//! enclave whose PCR0 matches the key policy, encrypted to a key that exists
-//! only inside that enclave for that boot. The host proxies the call and never
-//! sees plaintext.
+//! enclave whose runtime (PCR0) and guest (PCR16) match the key policy,
+//! encrypted to a key that exists only inside that enclave for that boot. The
+//! host proxies the call and never sees plaintext.
 //!
 //! [`StaticKey`] seals by *not* sealing. It exists because the QEMU harness
 //! cannot use the real one — an emulated NSM does not sign its attestations,

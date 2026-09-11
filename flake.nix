@@ -53,9 +53,13 @@
       # Losing either fails deep in the build naming something else entirely —
       # the WIT one surfaces as `could not find 'wasi' in 'bindings'`.
       srcFilter = path: type:
-        (lib.hasSuffix ".pem" path)
+        # Guests are separate workspaces. Including their sources here changes
+        # the runtime's store path (and its image's PCR0) on guest-only edits.
+        !(lib.hasPrefix "${toString ./.}/examples/" (toString path)
+          || toString path == "${toString ./.}/examples")
+        && ((lib.hasSuffix ".pem" path)
         || (lib.hasSuffix ".wit" path)
-        || (craneLib.filterCargoSources path type);
+        || (craneLib.filterCargoSources path type));
 
       workspaceSrc = lib.cleanSourceWith {
         src = ./.;
@@ -133,6 +137,24 @@
       guest-http = craneLib.buildPackage (guestArgs // {
         cargoArtifacts = guestDeps;
       });
+
+      # What an operator uploads to the roots bucket, and the PCR16 a key policy
+      # pins for it. The guest is not in the enclave image: the runtime fetches
+      # `deployment.guestObject` at boot and measures it into PCR16.
+      #
+      # `guest-pcr16.json` comes from `nitro-attest --measure`, the function a
+      # client verifies with, so the number in the policy and the number a
+      # client checks cannot disagree.
+      guest-release = pkgs.runCommand "guest-release"
+        { nativeBuildInputs = [ nitro-attest pkgs.jq ]; }
+        ''
+          mkdir -p $out
+          cp ${guest-http}/bin/guest-http.wasm $out/guest.wasm
+          nitro-attest --measure $out/guest.wasm > $out/guest-pcr16.json
+          jq -e '.PCR16 | length == 96' $out/guest-pcr16.json > /dev/null \
+            || { echo "nitro-attest did not report a PCR16" >&2; exit 1; }
+          echo "PCR16 $(jq -r .PCR16 $out/guest-pcr16.json)"
+        '';
 
       # ---- the self-test payload -------------------------------------------
       # Static musl, so the entropy harness keeps its tiny ramdisk with no
@@ -251,9 +273,10 @@
 
       runtimeImage = {
         name = "s3fs";
+        # No guest here. It is fetched from the store at boot and measured
+        # into PCR16 — see `guest-release` and S3FS_GUEST_OBJECT below.
         payload = {
           "enclave-runtime" = "${enclave-runtime}/bin/enclave-runtime";
-          "guest.wasm" = "${guest-http}/bin/guest-http.wasm";
           "usr/local/bin/gvforwarder" = "${gvproxy-static}/bin/gvforwarder";
         };
         closureRoots = [ enclave-runtime busybox pkgs.cacert ];
@@ -274,7 +297,12 @@
           # own bin directory goes on PATH — no symlinks, and the lease script
           # it execs resolves through the same closure.
           PATH = "${busybox}/bin:/usr/local/bin";
-          S3FS_GUEST_PATH = "/guest.wasm";
+          # Where the guest comes from — not the guest, which is not in the
+          # image. The runtime fetches this key from the roots bucket, extends
+          # PCR16 with the object's hash and locks the register before it asks
+          # KMS for a key. The location is measured here, by PCR0; what arrives
+          # is measured there, by PCR16, so the object need not be trusted.
+          S3FS_GUEST_OBJECT = deployment.guestObject;
           S3FS_HTTP_LISTEN = "0.0.0.0:443";
           # ACME, not self-signed: a platform authenticator will not attest
           # against a certificate a browser does not trust, so a self-signed one
@@ -300,8 +328,9 @@
           S3FS_RECEIPT_TRUST = "required";
 
           # The master secret is minted by KMS inside the enclave and released
-          # only against an attestation whose PCR0 matches the key policy. A
-          # wrong image does not get a refused mount — it gets no key at all.
+          # only against an attestation whose PCR0 and PCR16 match the key
+          # policy. A wrong image or a wrong guest does not get a refused
+          # mount — it gets no key at all.
           #
           # S3FS_MASTER_KEY is deliberately absent, and the runtime *refuses*
           # to start if it is set alongside this: a key from configuration is a
@@ -337,7 +366,7 @@
     in
     {
       packages.${system} = {
-        inherit enclave-runtime guest-http nsm-selftest nitro-attest eif-build blobs;
+        inherit enclave-runtime guest-http guest-release nsm-selftest nitro-attest eif-build blobs;
 
         # Both ends of the vsock from one package: `make build` emits gvproxy
         # for the parent and gvforwarder for the enclave, so they cannot drift.
@@ -353,7 +382,9 @@
         # The production image.
         eif = callEif runtimeImage;
 
-        # The same runtime and guest, configured for the emulator.
+        # The same runtime, configured for the emulator. Neither image contains
+        # the guest: the e2e uploads `guest-release` to MinIO, at the key
+        # `deployment.guestObject` names, and the enclave measures it there.
         #
         # A different image, and therefore a *different PCR0* — which is the
         # honest outcome: an enclave image is its configuration as much as its
@@ -381,7 +412,7 @@
             S3FS_CLOCK_SOURCE = "host";
             # QEMU's NSM does not sign attestation documents, so a receipt it
             # produced has no signature to check. Contents are still verified —
-            # PCR0, PCR31 and the state_root — which is the whole boot machine
+            # PCR0, PCR16 and the state_root — which is the whole boot machine
             # minus the one part that needs real hardware.
             S3FS_RECEIPT_TRUST = "unsigned-emulator";
             # A directory per client, which the e2e exercises with two client
