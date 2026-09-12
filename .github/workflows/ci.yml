@@ -6,219 +6,112 @@ on:
   pull_request:
     branches: [main]
 
+# Two pushes to one pull request used to run two complete fans to completion,
+# and only the second was ever read.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Four stages, each a checkout, a toolchain, and one script. The scripts are the
+# recipes: they live in scripts/ so a job can be run locally with the same
+# command CI uses, and so deploy/qemu-nitro/run-e2e.sh can share them instead of
+# keeping a second copy that has to agree.
+#
+# There are deliberately no `needs:` edges. Gating the long jobs behind the
+# short one would put its minutes on the front of the critical path to save
+# runner time only on runs that were failing anyway; cancel-in-progress above
+# removes the waste that actually dominates, which is superseded runs.
 jobs:
-  build:
-    name: build + test
+  unit:
+    name: fmt, clippy, unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo build
-        run: cargo build --workspace --all-targets
-      - name: cargo test (lib)
-        run: cargo test --workspace --lib
-      # Integration suites run only where they are named, and this one ran
-      # nowhere. It is the boot machine — genesis, resume, upgrades and the
-      # refusals — over the in-memory backend, and needs no guest built.
-      - name: boot machine
-        run: cargo test -p enclave-runtime --test boot_origin
-      # Which measurements the client insists on before it approves anything.
-      # A binary's unit tests are not part of `--lib`.
-      - name: passkey client
-        run: cargo test -p enclave-runtime --features testing --bin passkey-client
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+          shared-key: host
+      - run: scripts/ci-check.sh
 
-  serve-http:
-    name: Serving a wasi:http guest
+  bench:
+    name: benchmarks
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Writing the tracked history back to gh-pages on main.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust
         with:
-          components: clippy
-          targets: wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
+          shared-key: guests
+          workspaces: |
+            . -> target
+            examples/guest-http -> target
+      - run: scripts/ci-bench.sh
 
-      # Needs no C toolchain and no Docker: the tests run the real component
-      # through the real linker over the in-memory backend, so the whole
-      # dispatch path is covered on every push rather than only where MinIO is
-      # available.
-      - name: build the HTTP guest
-        working-directory: examples/guest-http
-        run: cargo build --release --target wasm32-wasip2
-
-      - name: background tasks
-        run: |
-          cmp wit/tasks/tasks.wit examples/guest-http/wit/tasks.wit
-          cargo test -p enclave-runtime --lib tasks::tests -- --include-ignored
-
-      - name: serve integration tests
-        run: cargo test -p enclave-runtime --test serve_guest -- --include-ignored
-
-      # The milestone's central claim: a client opens a real TLS connection and
-      # checks that the attestation document binds the certificate it just saw.
-      - name: TLS termination and the attestation binding
-        run: cargo test -p enclave-runtime --test serve_tls -- --include-ignored
-
-      # There is no test glob here, so a suite that is not named runs nowhere.
-      # This one guards the transport: h2 is negotiated for the clients that
-      # ask, and every client that does not is untouched.
-      - name: HTTP/2 negotiation, and HTTP/1.1 beside it
-        run: cargo test -p enclave-runtime --test serve_h2 -- --include-ignored
-
-      - name: build the gRPC guest
-        working-directory: examples/guest-grpc
-        run: cargo build --release --target wasm32-wasip2
-
-      # Both directions open at once: the guest answering while the client is
-      # still sending, backpressure, trailers, and what an open stream costs
-      # the tenant holding it.
-      - name: bidirectional gRPC streaming
-        run: cargo test -p enclave-runtime --test serve_grpc -- --include-ignored
-
-      # The same guest driven by tonic over TLS, so the guest's hand-written
-      # framing is checked against an implementation from outside this repo.
-      - name: gRPC on the wire, with a real client
-        run: cargo test -p enclave-runtime --test serve_grpc_wire -- --include-ignored
-
-      # `serve_auth` ran in no job at all until now, which is not a gap anyone
-      # could afford: it is the suite for the whole authorization model —
-      # challenge, assertion, token, scope, tenant isolation — and the only one
-      # that checks an attestation document against the connection it came in
-      # on. The client binary is built first because one of its tests drives
-      # the real thing rather than a stand-in, and skips silently without it.
-      - name: build the passkey client
-        run: cargo build --release -p enclave-runtime --features testing --bin passkey-client
-
-      - name: interaction tokens, end to end
-        run: cargo test -p enclave-runtime --test serve_auth -- --include-ignored
-
-      - name: guest logging
-        run: cargo test -p enclave-runtime --test guest_logs -- --include-ignored
-
-      - name: build the verifier CLI
-        run: cargo build -p nitro-attestation --features cli
-      - name: verifier measurement requirements
-        run: cargo test -p nitro-attestation --features cli --bin nitro-attest
-
-  minio-integration:
-    name: MinIO integration tests
-    runs-on: ubuntu-latest
-    # The tests start their own MinIO via testcontainers; a service container
-    # here would be unused. The previous one was also malformed and never ran.
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo test (minio integration)
-        run: cargo test -p s3fs-core --features aws --test minio_integration -- --ignored --test-threads=1
-
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: benchmark-action/github-action-benchmark@v1
         with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
+          tool: cargo
+          output-file-path: bench.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # History is written only from main. A pull request compares against
+          # it and says so in the log, but must not rewrite the baseline.
+          auto-push: ${{ github.ref == 'refs/heads/main' }}
+          save-data-file: ${{ github.ref == 'refs/heads/main' }}
+          # A shared runner's neighbours move these numbers more than most
+          # commits do, so a regression is reported and never fails the build.
+          # Tightening this is worth doing once there is enough history to know
+          # what the noise floor actually is.
+          alert-threshold: "200%"
+          comment-on-alert: true
+          fail-on-alert: false
 
-  guest-sqlite:
-    name: SQLite conformance + benchmark
+  # There is deliberately no SQLite job. The runtime measures its guest into
+  # PCR16 before it will serve, and that reads the NSM — which a hosted runner
+  # does not have, so the binary refuses to start there at all. The workload
+  # lives on in scripts/ci-sqlite.sh for a machine with an enclave.
+  e2e:
+    name: the whole stack, in an emulated enclave
     runs-on: ubuntu-latest
+    # The integration suites, then a cold Nix build of the image, then the
+    # emulated boot. This is the only integration signal, so it carries the
+    # suites that used to have their own job.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: ./.github/actions/rust
         with:
-          targets: wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
-
-      - name: install wasi-sdk
-        run: |
-          curl -sSL -o wasi-sdk.tar.gz \
-            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
-          mkdir -p "$HOME/wasi-sdk"
-          tar xf wasi-sdk.tar.gz -C "$HOME/wasi-sdk" --strip-components=1
-
-      - name: build the SQLite guest
-        working-directory: examples/guest-sqlite
+          shared-key: guests
+          workspaces: |
+            . -> target
+            examples/guest-http -> target
+            examples/guest-grpc -> target
+      - uses: actions/cache@v4
+        with:
+          path: target/qemu-nitro/tools
+          # The pinned version lives in the script, so the key follows the
+          # script rather than being a second place to update.
+          key: vhost-device-vsock-${{ hashFiles('scripts/ci-e2e.sh') }}
+      - run: scripts/ci-e2e.sh
         env:
-          CC_wasm32_wasip2: /home/runner/wasi-sdk/bin/clang
-          AR_wasm32_wasip2: /home/runner/wasi-sdk/bin/ar
-          CFLAGS_wasm32_wasip2: "--sysroot=/home/runner/wasi-sdk/share/wasi-sysroot -DSQLITE_THREADSAFE=0 -DHAVE_USLEEP=1"
-        run: cargo build --release --target wasm32-wasip2
-
-      - name: build enclave-runtime
-        run: cargo build --release -p enclave-runtime
-
-      - name: start MinIO
-        run: |
-          docker run -d --rm --name ci-minio-sql -p 9002:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
-          for i in $(seq 1 60); do
-            curl -sf http://127.0.0.1:9002/minio/health/ready && break
-            sleep 1
-          done
-          docker run --rm --network host --entrypoint sh minio/mc -c "
-            mc alias set m http://127.0.0.1:9002 minioadmin minioadmin
-            mc mb m/sql-data
-            mc mb --with-lock m/sql-roots"
-
-      # A real C database driving the filesystem: page-granular random I/O, a
-      # rollback journal created and unlinked per transaction, VACUUM rewriting
-      # the whole file, and PRAGMA integrity_check to say whether the bytes came
-      # back correct. Also prints the benchmark table.
-      # The runtime serves `wasi:http/proxy` and nothing else, so the workload
-      # is asked for with a request rather than run as a process. TLS off and
-      # no relying party configured: this job is about SQLite over the block
-      # store, not about the gate, which `serve-http` covers.
-      - name: run the SQLite workload
-        env:
-          SQLITE_SCALE: "20000"
-          S3FS_MASTER_KEY: "00000000000000000000000000000000000000000000000000000000000000ef"
-          S3FS_BUCKET: sql-data
-          S3FS_ROOTS_BUCKET: sql-roots
-          S3FS_ENDPOINT: http://127.0.0.1:9002
-          S3FS_FORCE_PATH_STYLE: "1"
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          AWS_REGION: us-east-1
-          S3FS_GUEST_PATH: examples/guest-sqlite/target/wasm32-wasip2/release/guest-sqlite.wasm
-          S3FS_TLS: "off"
-          S3FS_HTTP_LISTEN: 127.0.0.1:8080
-        run: |
-          set -euo pipefail
-          ./target/release/enclave-runtime > runtime.log 2>&1 &
-          runtime=$!
-          trap 'kill "$runtime" 2>/dev/null || true' EXIT
-
-          for _ in $(seq 1 60); do
-            curl -sf -o /dev/null http://127.0.0.1:8080/ && break
-            kill -0 "$runtime" 2>/dev/null || { echo "the runtime exited:"; cat runtime.log; exit 1; }
-            sleep 1
-          done
-
-          # No --max-time: the workload is a long request by design, and the
-          # runtime's own --request-timeout is what bounds it.
-          out=$(curl -sf http://127.0.0.1:8080/)
-          echo "$out"
-          echo "$out" | grep -qx OK
-
-          # The timing table went to the guest's stdout, which the runtime
-          # frames into its own log records.
-          echo "--- runtime log ---"
-          cat runtime.log
-
-      - name: stop MinIO
-        if: always()
-        run: docker rm -f ci-minio-sql || true
+          # A runner boots the emulated enclave more slowly than a workstation,
+          # and the default is tuned for the latter.
+          TIMEOUT: 480
+      # Nested virtualisation on hosted runners works but is not something
+      # GitHub supports, so this is the job most likely to fail for reasons
+      # outside this repository. Its logs are the only way to tell that apart
+      # from a real regression.
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-logs
+          path: |
+            target/qemu-nitro/e2e/*.log
+          if-no-files-found: ignore

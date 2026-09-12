@@ -17,6 +17,11 @@ WebAuthn authentication and tenant isolation. In the Nix deployment, set
 change changes PCR0; rebuilding the example guest changes PCR16. Update the
 approved measurements through your normal deployment process.
 
+The emulator image turns it on independently, in `eif-qemu`'s environment in
+`flake.nix`, so the end-to-end harness can exercise this path. That override
+changes only the emulator's PCR0 — which the harness checks against its own
+build rather than a published number — and leaves the production default alone.
+
 | Setting | Default | Purpose |
 |---|---:|---|
 | `S3FS_BACKGROUND_CONCURRENCY` | 1 | Maximum active background workers |
@@ -141,6 +146,19 @@ Build and test:
 
 ```sh
 cargo build --manifest-path examples/guest-http/Cargo.toml --release --target wasm32-wasip2
+# One serve_auth test drives the real client binary as a subprocess. Without it
+# that test skips with a notice instead of failing, which reports green for a
+# test that never ran.
+cargo build --release -p enclave-runtime --features testing --bin passkey-client
 cargo test -p enclave-runtime --lib tasks::tests -- --include-ignored
-cargo test -p enclave-runtime --test serve_auth scheduled_work -- --include-ignored
+# The whole suite, deliberately unfiltered: a name filter here silently stopped
+# covering this feature once a second scheduling test was added under a
+# different name.
+cargo test -p enclave-runtime --test serve_auth -- --include-ignored
 ```
+
+Inside an enclave, step `6/8` of [`deploy/qemu-nitro/run-e2e.sh`](../deploy/qemu-nitro/run-e2e.sh)
+schedules work through the real passkey client and waits for it to finish. That
+is the only place this path runs against a real scheduler, a mounted filesystem
+and a certificate the enclave obtained itself — everything above it is in
+process, where the standing-authorization claim is made by a stand-in.

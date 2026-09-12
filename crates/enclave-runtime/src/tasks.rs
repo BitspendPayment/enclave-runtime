@@ -680,6 +680,68 @@ mod tests {
             Status::Failed
         );
     }
+    /// The same backoff, but driven by a guest that really fails.
+    ///
+    /// `retries_back_off_and_eventually_stop` hands the error to `finish`
+    /// directly, so the component is never asked. That shape cannot show the
+    /// two things this one is for: that a failure *inside* the guest reaches
+    /// the queue at all, and that the occurrence keeps its run id across every
+    /// retry — the at-least-once promise, checked against a real guest rather
+    /// than against a synthetic error.
+    #[tokio::test]
+    #[ignore = "requires built guest-http component"]
+    async fn a_guest_that_returns_an_error_retries_until_the_occurrence_is_failed() {
+        let (q, clock) = queue(Default::default()).await;
+        let handle = guest(&q).await;
+        q.enqueue([1; 16], "job".into(), b"fail".to_vec(), 0, None)
+            .await
+            .unwrap();
+        let run_id = q.status([1; 16], "job").await.unwrap().run_id();
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let task = q.due().await.unwrap();
+            assert_eq!(task.run_id(), run_id, "a retry was given a new run id");
+            let result = handle.run_background(&q, &task).await;
+            let error = format!("{:#}", result.as_ref().expect_err("the guest failed"));
+            assert!(
+                error.contains("example task failure"),
+                "the guest's own message did not survive the host round trip: {error}"
+            );
+            q.finish(&task, result).await.unwrap();
+            let record = q.status([1; 16], "job").await.unwrap();
+            assert_eq!(record.attempts, attempt);
+            assert!(q.due().await.is_none());
+            clock.0.store(record.run_at, Ordering::Relaxed);
+        }
+
+        assert!(q.due().await.is_none());
+        assert_eq!(
+            q.status([1; 16], "job").await.unwrap().status,
+            Status::Failed
+        );
+
+        // The guest writes one file per run id, and only on success. Nothing
+        // here ever succeeded, so nothing should be there — which is what
+        // separates five real invocations from one cached result replayed five
+        // times. The directory itself exists because the guest creates it
+        // before it looks at the payload.
+        let root = crate::tenant::existing_tenant_root(&q.fs, [1; 16])
+            .await
+            .unwrap();
+        let dir = q.fs.lookup_at(&root, "http-example").await.unwrap();
+        let tasks = q.fs.lookup_at(&dir, "tasks").await.unwrap();
+        let names: Vec<String> =
+            q.fs.read_dir(&tasks)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("job")),
+            "a task that only ever failed still wrote a result: {names:?}"
+        );
+    }
     #[tokio::test]
     async fn recurring_checks_coalesce_and_do_not_replay_missed_intervals() {
         let (q, clock) = queue(Default::default()).await;
@@ -898,6 +960,91 @@ mod tests {
         );
     }
 
+    /// Recurrence, through the scheduler's own sleep and wake.
+    ///
+    /// `recurring_checks_coalesce_and_do_not_replay_missed_intervals` drives
+    /// `due` and `finish` by hand against a frozen clock, which is the only way
+    /// to ask about coalescing — and is also exactly what removes the thing
+    /// under test here: that the running loop re-arms itself and fires a second
+    /// time with nobody poking it.
+    ///
+    /// So this one takes `HostClock` deliberately. Under the tests' frozen
+    /// clock the loop would sleep the interval in real time and then find
+    /// nothing due, because `now()` never moved — and wait for ever.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires built guest-http component"]
+    async fn a_recurring_task_fires_again_through_the_running_scheduler() {
+        let backend = Arc::new(MemoryBackend::new());
+        let fs = Fs::create(
+            backend.clone(),
+            backend,
+            &MasterSecret::from_bytes([9; 32]),
+            [1; 16],
+            Arc::new(Config::default()),
+        )
+        .await
+        .unwrap();
+        crate::tenant::tenant_root_by_id(&fs, [1; 16])
+            .await
+            .unwrap();
+        let q = TaskQueue::open(
+            fs,
+            Arc::new(WallClockAdapter::new(Box::new(HostClock)).unwrap()),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let handle = guest(&q).await;
+
+        // The minimum the queue accepts, so the second occurrence is a second
+        // away rather than a test that waits on nothing.
+        q.enqueue([1; 16], "beat".into(), b"tick".to_vec(), 0, Some(1000))
+            .await
+            .unwrap();
+        let worker = tokio::spawn(q.clone().run(handle));
+
+        // Two files with distinct run ids, rather than `occurrence == 1`: a
+        // counter moving only proves a record was rewritten, where two files
+        // prove the guest's handler was entered a second time.
+        let names = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                assert!(!worker.is_finished(), "scheduler stopped");
+                if let Ok(root) = crate::tenant::existing_tenant_root(&q.fs, [1; 16]).await {
+                    if let Ok(dir) = q.fs.lookup_at(&root, "http-example").await {
+                        if let Ok(tasks) = q.fs.lookup_at(&dir, "tasks").await {
+                            let names: Vec<String> =
+                                q.fs.read_dir(&tasks)
+                                    .await
+                                    .unwrap()
+                                    .into_iter()
+                                    .map(|e| e.name)
+                                    .filter(|n| n.starts_with("beat"))
+                                    .collect();
+                            if names.len() >= 2 {
+                                return names;
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("a recurring task never fired a second time");
+
+        worker.abort();
+        let _ = worker.await;
+
+        let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "two occurrences shared one run id: {names:?}"
+        );
+        // A success resets the attempt count. A recurrence that had been
+        // quietly retrying would say otherwise.
+        assert_eq!(q.status([1; 16], "beat").await.unwrap().attempts, 0);
+    }
     #[tokio::test]
     #[ignore = "requires built guest-http component"]
     async fn busy_tenant_does_not_consume_a_retry_or_block_other_tenants() {

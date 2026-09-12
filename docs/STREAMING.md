@@ -82,9 +82,9 @@ thing between a compromised client and whatever the guest will do.
 
 ### What a stolen token buys
 
-It is single-use, expires in `--interaction-token-ttl-secs` (60s by default), is
-bound to one route, and issuing one is rate-limited per credential. Spending one
-gets: one interaction with that tenant's guest, and whatever the guest will do
+It is single-use, expires in `--interaction-token-ttl-secs` (60s by default), and
+is bound to one route. Spending one gets: one interaction with that tenant's
+guest, and whatever the guest will do
 without a further check. It gets nothing about another tenant, and no replay —
 the token is gone the moment it is used.
 

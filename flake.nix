@@ -364,9 +364,9 @@
           S3FS_WEBAUTHN_RP_ID = deployment.rpId;
           S3FS_WEBAUTHN_ORIGIN = "https://" + deployment.rpId;
           #
-          # S3FS_ENROLLMENT_TOKEN is deliberately NOT set here. It authorizes
-          # creating a tenant, so baking one into the image would put a
-          # permanent invite in every copy of it. Supply one per enrollment.
+          # Registration is open: anyone who can reach the port may create a
+          # tenant of their own. There is nothing to provision, and nothing an
+          # image could leak by carrying it.
         };
       };
 
@@ -450,6 +450,13 @@
             S3FS_TLS_DOMAINS = "enclave.test";
             S3FS_ACME_DIRECTORY = "https://192.168.127.254:14000/dir";
             S3FS_ACME_CA = "/pebble-ca.pem";
+            # The e2e schedules work and waits for it to run. Production leaves
+            # this off in deployment.nix; turning it on here changes only the
+            # emulator's PCR0, and the harness checks PCR0 against its own
+            # `nix build` rather than against a published number, so nothing
+            # downstream moves. The guest is guest-http, which exports the
+            # `run-task` the runtime refuses to start without when this is set.
+            S3FS_BACKGROUND_TASKS = "true";
             # Off. Inherited from the production image, and there is no AWS
             # here to send to: the harness's credentials are MinIO's, which
             # CloudWatch would reject. Empty means off — the same shape as the
@@ -463,10 +470,6 @@
             # feature provides rather than a real one.
             S3FS_WEBAUTHN_RP_ID = "enclave.test";
             S3FS_WEBAUTHN_ORIGIN = "https://enclave.test";
-            # Two, so the harness can enrol two tenants and show that neither
-            # sees the other. A token is single-use by design and there is
-            # deliberately no way to mint one over the wire.
-            S3FS_ENROLLMENT_TOKEN = "qemu-e2e-enrollment-token,qemu-e2e-enrollment-token-2";
             S3FS_ENDPOINT = "http://192.168.127.254:9000";
             S3FS_FORCE_PATH_STYLE = "1";
             S3FS_BUCKET = "e2e-data";

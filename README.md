@@ -30,7 +30,7 @@ Four workspace crates plus example guests:
 | [`examples/guest-http`](examples/guest-http/) | The guest the serving path is tested against: reads and writes the filesystem, and is deliberately stateful so a second request proves the first one's writes committed. |
 | [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Runs on request; needs wasi-sdk to build. |
 
-**Test coverage:** `cargo test --workspace` runs 648 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the per-response attestation binding. A further 52 skip themselves without MinIO, enclave hardware, or a `wasm32-wasip2` build of the example guest; reach those with `--features testing -- --include-ignored`, which is also what gives the TLS suites a self-signed certificate to serve, since a production build has no way to mint one.
+**Test coverage:** `cargo test --workspace` runs 705 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the per-response attestation binding. A further 80 skip themselves without MinIO, enclave hardware, or a `wasm32-wasip2` build of the example guest; reach those with `--features testing -- --include-ignored`, which is also what gives the TLS suites a self-signed certificate to serve, since a production build has no way to mint one.
 
 ## Quick start: run a Wasm guest against MinIO
 
@@ -797,18 +797,22 @@ same origin, and if the enclave will not serve it the parent instance or a CDN
 must, and a malicious parent serving a malicious page defeats everything
 downstream. This design assumes a mobile client.
 
-#### Enrollment
+#### Registration
 
-Registering a passkey creates a tenant, so it is gated by a single-use token an
-operator provisions (`--enrollment-token`). The token authorizes **creating a
-tenant and nothing else** — it cannot reach existing data, approve a
-transaction, or add a passkey to somebody else's account.
+Registration is open. Anyone who can reach `/auth/register/options` may present
+a passkey and get a tenant, with no invitation, token or operator approval in
+the way.
 
-That distinction carries weight, because inside an enclave the token arrives
-through the parent instance, which is the party the enclave exists to exclude.
-A parent that steals one can make a tenant of its own; it still cannot read
-anyone else's, because reading needs a passkey it does not hold. Enrollment
-gates resource creation; passkeys gate access.
+What that grants is deliberately narrow: a **new, empty tenant and nothing
+else**. It cannot reach an existing tenant's data, approve a transaction, or add
+a passkey to somebody else's account — each of those still needs an assertion
+from a credential already registered there. Registration gates nothing;
+passkeys gate access.
+
+The cost of that choice is admission control over resource creation. A tenant is
+a directory the enclave keeps, and a slot against `--max-tenants`, so anyone who
+can open a connection can consume both. An operator who needs to bound that has
+to do it in front of the enclave, because the runtime no longer does.
 
 The tenant id is 32 bytes minted from the NSM, stored beside the credential —
 not derived from it, so one tenant can hold several passkeys.
@@ -830,13 +834,6 @@ once started.
 See [docs/STREAMING.md](docs/STREAMING.md) for the failure modes and what the
 runtime does not promise — there is no retry, no resumption, no deduplication
 and no exactly-once execution.
-
-#### Limits
-
-Asking for a challenge is what makes a phone buzz, so it is rate-limited per
-credential. Not per address: the enclave sits behind gvproxy, so every client
-arrives from the same peer and an address limit would throttle everyone
-together and single nobody out.
 
 ### A directory per client
 
@@ -1356,19 +1353,23 @@ under QEMU's `nitro-enclave` machine with a real gvproxy, and asserts what had
 never been checked together:
 
 ```
-1/7  the guest is unreachable without a passkey    401 on /, /counter, /memory
-2/7  a passkey enrols, and writes reach MinIO      counter: 1 then 2
-3/7  the attestation binds this connection,        binding    the attested
+1/8  the guest is unreachable without a passkey    401 on /, /counter, /memory
+2/8  a passkey registers, and writes reach MinIO   counter: 1 then 2
+2b/8 signed requests drive real filesystem work    8 files written, read,
+                                                   overwritten and re-read
+3/8  the attestation binds this connection,        binding    the attested
      its runtime and its guest                     certificate is the one
                                                    serving this connection
-3b/7 a signed interaction verifies the enclave     binding    …
-4/7  the attested PCR0 and PCR16 are the builds'   PCR0  build:    b3edc9c9…
+3b/8 a signed interaction verifies the enclave     binding    …
+4/8  the attested PCR0 and PCR16 are the builds'   PCR0  build:    b3edc9c9…
                                                          attested: b3edc9c9…
-5/7  a tenant keeps its instance; none are shared  alice 1,2 · bob 1
-5b/7 an approval for one route authorizes no other
-5c/7 guest output reaches the console, tagged untrusted
-6/7  a second boot resumes rather than starting over
-7/7  a substituted guest is measured, recorded as an upgrade, and refused
+5/8  a tenant keeps its instance; none are shared  alice 1,2 · bob 1
+5b/8 an approval for one route authorizes no other
+5c/8 guest output reaches the console, tagged untrusted
+6/8  work approved once runs later, unsigned       scheduled work ran for its
+                                                   owner alone
+7/8  a second boot resumes rather than starting over
+8/8  a substituted guest is measured, recorded as an upgrade, and refused
      by a client pinning the approved one
 ```
 

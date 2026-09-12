@@ -5,9 +5,10 @@
 //! convenience. A guest able to answer under `/auth/` could hand out its own
 //! challenges and verify its own assertions, which is the same as having none.
 //!
-//! Nothing here performs a cosigner action or touches a tenant's directory.
-//! The most any of it does is create a tenant — and only against a single-use
-//! token an operator provisioned.
+//! Nothing here performs a cosigner action or touches an *existing* tenant's
+//! directory. The most any of it does is create a new tenant, which anyone may
+//! do: registration is open, and what it grants is an empty tenant and nothing
+//! else.
 //!
 //! ## Why registration is two calls
 //!
@@ -27,9 +28,7 @@ use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
 
 use super::credential::{FilesystemCredentials, StoredCredential};
-use super::enrollment::EnrollmentTokens;
 use super::gate::Gate;
-use super::ratelimit::RateLimiter;
 use super::token::InteractionScope;
 
 /// The prefix the guest can never see.
@@ -42,9 +41,16 @@ const MAX_REGISTRATIONS: usize = 64;
 /// Ceiling on an `/auth/*` request body.
 const MAX_BODY: usize = 16 * 1024;
 
+/// Registration is open, so nothing here is required. The only thing a caller
+/// may supply is what to call the credential.
+///
+/// `deny_unknown_fields` for the same reason `RequestOptionsRequest` has it: an
+/// older client still sending `enrollment_token` is told that it means nothing
+/// now, rather than having it quietly ignored and believing it was admitted on
+/// the strength of one.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegisterOptionsRequest {
-    enrollment_token: String,
     #[serde(default)]
     display_name: Option<String>,
 }
@@ -133,13 +139,9 @@ impl std::fmt::Debug for AuthEndpoints {
 pub struct AuthEndpoints {
     gate: Arc<Gate>,
     credentials: Arc<FilesystemCredentials>,
-    enrollment: EnrollmentTokens,
     entropy: Arc<dyn nitro_nsm::Nsm>,
     fs: Arc<s3fs_core::Fs>,
     registrations: Mutex<HashMap<[u8; 16], PendingRegistration>>,
-    /// Bounds how often one credential can make a phone buzz — see
-    /// [`RateLimiter`] for why the key is a credential and not an address.
-    challenges: RateLimiter,
 }
 
 impl AuthEndpoints {
@@ -150,18 +152,12 @@ impl AuthEndpoints {
         entropy: Arc<dyn nitro_nsm::Nsm>,
     ) -> Self {
         AuthEndpoints {
-            enrollment: EnrollmentTokens::new(fs.clone()),
             gate,
             credentials,
             entropy,
             fs,
             registrations: Mutex::new(HashMap::new()),
-            challenges: RateLimiter::default(),
         }
-    }
-
-    pub fn enrollment(&self) -> &EnrollmentTokens {
-        &self.enrollment
     }
 
     fn random_id(&self) -> anyhow::Result<[u8; 16]> {
@@ -213,18 +209,13 @@ impl AuthEndpoints {
             return problem(hyper::StatusCode::BAD_REQUEST, "malformed request");
         };
 
-        // Spent before anything else, so a failure later does not hand the
-        // token back. A wasted token is an operator inconvenience; a reusable
-        // one is an open door.
-        match self.enrollment.spend(&request.enrollment_token).await {
-            Ok(true) => {}
-            Ok(false) => return problem(hyper::StatusCode::FORBIDDEN, "enrollment is not open"),
-            Err(e) => {
-                tracing::error!(error = format!("{e:#}"), "reading enrollment tokens");
-                return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
-            }
-        }
-
+        // Registration is open: anyone who can reach this route may create a
+        // tenant. What that grants is deliberately narrow — a *new*, empty
+        // tenant and nothing else. It cannot reach an existing tenant's data,
+        // approve anything, or add a passkey to somebody else's account, all of
+        // which still need an assertion from a credential already registered
+        // there. Admission control over resource creation is what was given up
+        // here; access control was not.
         let name = request.display_name.as_deref().unwrap_or("cosigner");
         let (options, state) =
             match self
@@ -432,20 +423,6 @@ impl AuthEndpoints {
         let Some(credential_id) = decode(&request.credential_id) else {
             return problem(hyper::StatusCode::BAD_REQUEST, "malformed credential id");
         };
-        // Before the credential is even looked up, so a refusal costs nothing
-        // and reveals nothing. This is the request that puts a biometric
-        // prompt in front of a person, and it is the one an attacker would
-        // repeat until they tapped approve out of habit.
-        if !self.challenges.allow(&credential_id) {
-            tracing::warn!(
-                credential = %hex::encode(&credential_id[..8.min(credential_id.len())]),
-                "rate-limited challenge requests"
-            );
-            return problem(
-                hyper::StatusCode::TOO_MANY_REQUESTS,
-                "too many challenge requests",
-            );
-        }
 
         let record = match self.credentials_lookup(&credential_id).await {
             Ok(Some(record)) if record.active => record,
@@ -547,8 +524,6 @@ mod tests {
     use s3fs_core::backend::memory::MemoryBackend;
     use s3fs_core::{Config, Fs, MasterSecret};
 
-    const TOKEN: &str = "an-invite-code-long-enough";
-
     struct Fixture {
         endpoints: AuthEndpoints,
         fs: Arc<Fs>,
@@ -579,7 +554,6 @@ mod tests {
         ));
         let entropy: Arc<dyn nitro_nsm::Nsm> = Arc::new(nitro_nsm::fake::FakeNsm::new());
         let endpoints = AuthEndpoints::new(gate, credentials.clone(), fs.clone(), entropy);
-        endpoints.enrollment().seed(TOKEN).await.unwrap();
         Fixture {
             endpoints,
             fs,
@@ -603,12 +577,7 @@ mod tests {
 
     /// Register a passkey the way a client does, and get its tenant back.
     async fn register(f: &Fixture, auth: &SoftwareAuthenticator) -> (u16, serde_json::Value) {
-        let (status, options) = post(
-            f,
-            "/auth/register/options",
-            serde_json::json!({ "enrollment_token": TOKEN }),
-        )
-        .await;
+        let (status, options) = post(f, "/auth/register/options", serde_json::json!({})).await;
         if status != 200 {
             return (status, options);
         }
@@ -627,7 +596,7 @@ mod tests {
         .await
     }
 
-    /// The whole enrollment path: token, options, response, tenant.
+    /// The whole registration path: options, response, tenant.
     #[tokio::test]
     async fn registration_creates_a_tenant() {
         let f = fixture().await;
@@ -655,20 +624,27 @@ mod tests {
             .contains(&tenant_hex.to_string()));
     }
 
-    /// One token, one tenant. Otherwise a leaked invite mints them without end.
+    /// Registration is open, and each one stands alone: a second, unrelated
+    /// passkey registers too and lands in a tenant of its own rather than
+    /// joining the first.
     #[tokio::test]
-    async fn an_enrollment_token_works_once() {
+    async fn registration_is_open_and_each_one_is_a_new_tenant() {
         let f = fixture().await;
-        assert_eq!(
-            register(&f, &SoftwareAuthenticator::new(RP_ID)).await.0,
-            200
+        let (first_status, first) = register(&f, &SoftwareAuthenticator::new(RP_ID)).await;
+        assert_eq!(first_status, 200, "{first}");
+        let (second_status, second) = register(&f, &SoftwareAuthenticator::new(RP_ID)).await;
+        assert_eq!(second_status, 200, "{second}");
+        assert_ne!(
+            first["tenant_id"], second["tenant_id"],
+            "a second registration joined the first one's tenant"
         );
-        let (status, _) = register(&f, &SoftwareAuthenticator::new(RP_ID)).await;
-        assert_eq!(status, 403, "a spent token registered a second tenant");
     }
 
+    /// An older client still sending an enrollment token is told the field
+    /// means nothing now, rather than being quietly admitted as though one had
+    /// been checked.
     #[tokio::test]
-    async fn registration_without_a_token_is_refused() {
+    async fn a_registration_still_carrying_an_enrollment_token_is_refused() {
         let f = fixture().await;
         let (status, _) = post(
             &f,
@@ -676,7 +652,7 @@ mod tests {
             serde_json::json!({ "enrollment_token": "not-a-real-token-but-long" }),
         )
         .await;
-        assert_eq!(status, 403);
+        assert_eq!(status, 400);
     }
 
     /// A registration response for a challenge that was never issued.
@@ -700,12 +676,7 @@ mod tests {
     #[tokio::test]
     async fn a_registration_id_cannot_be_retried() {
         let f = fixture().await;
-        let (_, options) = post(
-            &f,
-            "/auth/register/options",
-            serde_json::json!({ "enrollment_token": TOKEN }),
-        )
-        .await;
+        let (_, options) = post(&f, "/auth/register/options", serde_json::json!({})).await;
         let auth = SoftwareAuthenticator::new(RP_ID);
 
         // Wrong challenge: fails.
@@ -785,39 +756,6 @@ mod tests {
         let unknown = ask(&f, &[0xff; 32]).await;
         assert_eq!(revoked.0, 403);
         assert_eq!(revoked, unknown, "the refusals differ and leak existence");
-    }
-
-    /// Asking for challenges is what makes a phone buzz, so it is limited —
-    /// otherwise an attacker prompts a user until they approve out of habit.
-    #[tokio::test]
-    async fn challenge_requests_are_rate_limited() {
-        let f = fixture().await;
-        let auth = SoftwareAuthenticator::new(RP_ID);
-        assert_eq!(register(&f, &auth).await.0, 200);
-
-        async fn ask(f: &Fixture, credential_id: &[u8]) -> u16 {
-            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-            post(
-                f,
-                "/auth/request/options",
-                serde_json::json!({
-                    "credential_id": b64.encode(credential_id),
-                    "method": "POST",
-                    "path": "/sign",
-                }),
-            )
-            .await
-            .0
-        }
-
-        let mut refused = false;
-        for _ in 0..(crate::auth::ratelimit::DEFAULT_PER_CREDENTIAL + 5) {
-            if ask(&f, auth.credential_id()).await == 429 {
-                refused = true;
-                break;
-            }
-        }
-        assert!(refused, "a credential could ask for prompts without limit");
     }
 
     /// Everything outside `/auth/` is somebody else's business.

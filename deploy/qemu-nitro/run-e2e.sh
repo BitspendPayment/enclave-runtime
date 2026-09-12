@@ -185,9 +185,6 @@ SUBSTITUTE_PCR16="$("$ATTEST" --measure "$RUNDIR/guests/substitute.wasm" | jq -r
     --bin passkey-client ) 2>&1 | tail -2
 PASSKEY="$REPO/target/release/passkey-client"
 [[ -x "$PASSKEY" ]] || { echo "passkey-client did not build" >&2; exit 1; }
-# Must match S3FS_ENROLLMENT_TOKEN in the emulator image.
-ENROLLMENT_TOKEN="qemu-e2e-enrollment-token"
-ENROLLMENT_TOKEN_2="qemu-e2e-enrollment-token-2"
 # Two identities, each with its own passkey file, so the harness can show that
 # one tenant cannot see another's data.
 # `--unsigned-emulator`: QEMU's NSM does not sign its documents at all, so
@@ -203,18 +200,9 @@ signed2() { "$PASSKEY" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/bo
 # The store the enclave will mount, and the guest it will fetch.
 # ---------------------------------------------------------------------------
 say "starting MinIO"
-docker rm -f e2e-minio >/dev/null 2>&1 || true
-docker run -d --rm --name e2e-minio -p 9000:9000 \
-    -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-    minio/minio server /data >/dev/null
-for _ in $(seq 1 60); do
-    curl -sf http://127.0.0.1:9000/minio/health/ready >/dev/null && break
-    sleep 1
-done
-docker run --rm --network host --entrypoint sh minio/mc -c "
-    mc alias set m http://127.0.0.1:9000 minioadmin minioadmin >/dev/null
-    mc mb m/e2e-data >/dev/null 2>&1 || true
-    mc mb --with-lock m/e2e-roots >/dev/null 2>&1 || true" >/dev/null
+# The same recipe the SQLite CI job uses. It lived here in full until both
+# copies had to agree with nothing making them agree.
+"$REPO/scripts/minio-up.sh" e2e-minio 9000 e2e-data e2e-roots
 
 # Where the emulator image looks: `deployment.guestObject` in e2e-roots.
 upload_guest() {
@@ -308,7 +296,7 @@ docker run -d --rm --name e2e-pebble \
     "$PEBBLE_IMAGE" -config /pebble-config.json >/dev/null \
     || { echo "Pebble did not start" >&2; exit 1; }
 
-for _ in $(seq 60); do
+for _ in $(seq "$TIMEOUT"); do
     curl -sk --max-time 2 "https://127.0.0.1:14000/dir" >/dev/null 2>&1 && break
     sleep 1
 done
@@ -406,7 +394,10 @@ grep -q "pcr16=$EXPECTED_PCR16" <(plain) \
 # certificate already, and it answers at once.
 wait_for_https() {
     local answered=""
-    for _ in $(seq 90); do
+    # Bounded by TIMEOUT rather than a literal: a full ACME order on a slow
+    # machine is the longest wait here, and a fixed 90 was a CI-only failure
+    # waiting to be discovered on a busy runner.
+    for _ in $(seq "$TIMEOUT"); do
         if curl -sk --max-time 2 "https://127.0.0.1:$HTTPS_PORT/" >/dev/null 2>&1; then
             answered=yes
             break
@@ -456,7 +447,7 @@ echo "issued by $issuer"
 # ---------------------------------------------------------------------------
 # The assertions.
 # ---------------------------------------------------------------------------
-say "1/7  the guest is unreachable without a passkey assertion"
+say "1/8  the guest is unreachable without a passkey assertion"
 # The rule, at the front because everything after it depends on it holding:
 # nothing reaches the guest without a fresh assertion bound to that request.
 #
@@ -480,10 +471,9 @@ code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 \
     || fail "a request with no nonce answered $code; it should be refused before routing"
 echo "un-nonced requests refused: 400"
 
-say "2/7  a passkey enrols and its signed requests reach the guest"
+say "2/8  a passkey enrols and its signed requests reach the guest"
 rm -f "$RUNDIR/alice.json" "$RUNDIR/bob.json"
-signed enrol --token "$ENROLLMENT_TOKEN" >/dev/null \
-    || fail "enrollment failed; is S3FS_ENROLLMENT_TOKEN set in the image?"
+signed enrol >/dev/null || fail "registration failed"
 
 first="$(signed get --path /counter)" || fail "no answer from the guest"
 second="$(signed get --path /counter)" || fail "no answer from the guest"
@@ -491,7 +481,41 @@ echo "counter: $first then $second"
 [[ "${second//[^0-9]/}" -eq $(( ${first//[^0-9]/} + 1 )) ]] \
     || fail "the counter did not advance ($first → $second); writes are not reaching MinIO"
 
-say "3/7  the attestation binds this connection's certificate, runtime and guest"
+say "2b/8 signed requests drive a real amount of filesystem work"
+# Two round trips to /counter prove the mount answers. They do not prove much
+# about the filesystem underneath it, which is the part with a Merkle block
+# store, encryption and a root record behind it.
+#
+# So: a spread of files written, read back, overwritten and read again, each one
+# a separate signed interaction — which is also the only way this harness can
+# exercise the store, since every request has to pass the gate. Enough to force
+# real block allocation and rewriting; not so much that the ceremony cost
+# dominates the run.
+FILES=8
+for i in $(seq 1 "$FILES"); do
+    signed post --path "/files/work-$i.txt" --body "contents $i" >/dev/null \
+        || fail "writing /files/work-$i.txt failed"
+done
+for i in $(seq 1 "$FILES"); do
+    got="$(signed get --path "/files/work-$i.txt")" || fail "reading /files/work-$i.txt failed"
+    [[ "$got" == "contents $i" ]] \
+        || fail "/files/work-$i.txt read back as \"$got\""
+done
+# Overwriting in place is the case that rewrites blocks rather than appending
+# new ones, and the one a copy-on-write store can get wrong while every fresh
+# write still looks correct.
+for i in $(seq 1 "$FILES"); do
+    signed post --path "/files/work-$i.txt" --body "rewritten $i" >/dev/null \
+        || fail "overwriting /files/work-$i.txt failed"
+done
+for i in $(seq 1 "$FILES"); do
+    got="$(signed get --path "/files/work-$i.txt")" || fail "re-reading /files/work-$i.txt failed"
+    [[ "$got" == "rewritten $i" ]] \
+        || fail "/files/work-$i.txt kept a stale value \"$got\" after being overwritten"
+done
+echo "$FILES files written, read, overwritten and re-read through the gate"
+
+say "3/8  the attestation binds this connection's certificate, runtime and guest"
 # There is no attestation endpoint: the document rides on the `/auth/` exchange,
 # in `x-enclave-attestation`. That is where a client identifies the enclave
 # before approving anything, and it needs no credential — so this is the check a
@@ -507,7 +531,7 @@ say "3/7  the attestation binds this connection's certificate, runtime and guest
 grep -q "binding    the attested certificate" "$RUNDIR/attest.log" \
     || fail "the document did not bind the certificate this connection was served"
 
-say "3b/7 a signed interaction verifies the enclave before it trusts it"
+say "3b/8 a signed interaction verifies the enclave before it trusts it"
 # The proof comes from the `/auth/` exchange, not from the guest's response:
 # that exchange is where a client identifies the enclave, before it hands over
 # an assertion and before the interaction runs. Guest responses deliberately
@@ -536,7 +560,7 @@ signed --dump-proof "$RUNDIR/proof" get --path /counter >/dev/null \
 grep -q "binding    the attested certificate" "$RUNDIR/attest-guest.log" \
     || fail "the document did not bind that connection's certificate"
 
-say "4/7  the attested PCR0 and PCR16 are the ones the builds produced"
+say "4/8  the attested PCR0 and PCR16 are the ones the builds produced"
 # `nitro-attest --pcr0 --guest` already enforced both, so reaching here means
 # they held. Printing them is what makes the claim checkable by eye rather than
 # taken on trust from an exit code.
@@ -546,9 +570,9 @@ echo "PCR16 release:  $EXPECTED_PCR16"
 echo "      attested: $(grep -oE '^PCR16 +[0-9a-f]+' "$RUNDIR/attest.log" | awk '{print $2}')"
 
 # ---------------------------------------------------------------------------
-# 5/7 — one instance per tenant, and one approval per interaction.
+# 5/8 — one instance per tenant, and one approval per interaction.
 # ---------------------------------------------------------------------------
-say "5/7  a tenant keeps its instance, and no two tenants share one"
+say "5/8  a tenant keeps its instance, and no two tenants share one"
 
 # `/memory` counts in the guest's linear memory and writes nowhere. What it
 # answers is the whole per-tenant model in one number.
@@ -565,8 +589,7 @@ echo "alice memory: $m1 then $m2"
 [[ "${m2//[^0-9]/}" -eq $(( ${m1//[^0-9]/} + 1 )) ]] \
     || fail "a tenant's instance was not kept between its requests ($m1, $m2)"
 
-signed2 enrol --token "$ENROLLMENT_TOKEN_2" >/dev/null \
-    || fail "the second enrollment failed"
+signed2 enrol >/dev/null || fail "the second registration failed"
 b1="$(signed2 get --path /memory)"
 echo "bob memory: $b1"
 [[ "${b1//[^0-9]/}" -eq 1 ]] \
@@ -581,7 +604,7 @@ echo "alice reads: $a_sees / bob reads: $b_sees"
 [[ "$a_sees" == "alice" && "$b_sees" == "bob" ]] \
     || fail "one tenant read another's file (alice=$a_sees bob=$b_sees)"
 
-say "5b/7 an approval for one route does not authorize another"
+say "5b/8 an approval for one route does not authorize another"
 # The property the interaction token exists for. A token names the interaction
 # it was issued for — method, path and query — so spent on any other it is
 # refused, and what it carried never reaches the filesystem.
@@ -599,7 +622,7 @@ fi
 echo "a token moved to another route was refused: 401, and nothing was written"
 
 # ---------------------------------------------------------------------------
-# 5c/7 — guest output, in a real enclave.
+# 5c/8 — guest output, in a real enclave.
 # ---------------------------------------------------------------------------
 # The guest's stdout and stderr are no longer inherited: the runtime frames them
 # into lines and emits them as its own structured events. Unit tests prove the
@@ -608,7 +631,7 @@ echo "a token moved to another route was refused: 401, and nothing was written"
 #
 # What matters is that guest text arrives *marked as guest text*. It is chosen
 # by the guest, so it must never be mistakable for something the runtime said.
-say "5c/7 guest output reaches the console tagged as untrusted"
+say "5c/8 guest output reaches the console tagged as untrusted"
 signed get --path /log >/dev/null || fail "the guest refused to log"
 
 # Wait for the guest's *last* line, not its first.
@@ -623,7 +646,7 @@ signed get --path /log >/dev/null || fail "the guest refused to log"
 # after the response, and after stderr was flushed during the request. Once it
 # is here, everything else already is.
 tail_seen=""
-for _ in $(seq 30); do
+for _ in $(seq "$TIMEOUT"); do
     grep -q 'guest_message="no trailing newline"' <(plain) && { tail_seen=1; break; }
     sleep 1
 done
@@ -670,7 +693,54 @@ echo "guest output arrived framed, tagged by stream, and marked as guest"
 
 
 # ---------------------------------------------------------------------------
-# 6/7 — the boot machine, across a restart.
+# 6/8 — work that outlives the interaction that asked for it.
+# ---------------------------------------------------------------------------
+# Everything above is request and response: a client signs, the guest answers,
+# and the approval is spent by the time the connection closes. Background work
+# is the one place that shape does not hold. The assertion authorises an
+# enqueue, and what it authorised runs later on the enclave's own schedule —
+# with nobody signing anything at that moment, because there is no one there to
+# sign. That is the whole of standing authority, and it is the part a
+# request/response test cannot reach.
+#
+# Worth proving in an enclave rather than only in-process: the scheduler runs
+# against the mounted filesystem and the per-tenant lock, and neither of those
+# is what a unit test exercises.
+say "6/8  work approved once runs later, without a second assertion"
+
+signed post --path /tasks/e2e-job --body "scheduled work" >/dev/null \
+    || fail "the scheduled task was refused"
+
+# The work belongs to the passkey that asked for it. Bob holds a perfectly good
+# credential and is still told there is no such task, because a task id is
+# scoped to its tenant rather than being a name everyone shares.
+if signed2 get --path /tasks/e2e-job >/dev/null 2>&1; then
+    fail "a second tenant could see another tenant's task"
+fi
+
+# Polled, not slept on. The first occurrence is due immediately, but
+# "immediately" still means a worker picking it up, instantiating the guest, and
+# writing the result through the filesystem to MinIO.
+completed=""
+for _ in $(seq "$TIMEOUT"); do
+    record="$(signed get --path /tasks/e2e-job)" || fail "the task record became unreadable"
+    case "$(jq -r .status <<<"$record")" in
+        completed) completed=1; break ;;
+        failed)    fail "the scheduled task failed: $record" ;;
+    esac
+    sleep 1
+done
+[[ -n "$completed" ]] || fail "the scheduled task never ran within ${TIMEOUT}s"
+
+# And it ran the work actually asked for, rather than merely reaching a terminal
+# state. The result is the payload the guest echoed back, carried as bytes.
+result="$(jq -r '.result | implode' <<<"$record")"
+[[ "$result" == "scheduled work" ]] \
+    || fail "the task completed but produced \"$result\""
+echo "scheduled work ran for its owner alone, with no second assertion signed"
+
+# ---------------------------------------------------------------------------
+# 7/8 — the boot machine, across a restart.
 # ---------------------------------------------------------------------------
 # The first boot found an empty store and created a filesystem. That used to be
 # what happened for *any* store that answered "nothing", including one whose
@@ -678,14 +748,14 @@ echo "guest output arrived framed, tagged by stream, and marked as guest"
 # own and resume — which is only possible if the receipt the first boot wrote
 # verifies against the state now present — and, running the same guest, find
 # its pair record and write nothing.
-say "6/7  a second boot resumes rather than starting over"
+say "7/8  a second boot resumes rather than starting over"
 
 # `docker logs -f` fills the console file asynchronously, so a single grep can
 # run before the line it is looking for has been written — the assertions above
 # reach the enclave over the network and do not wait for its console. Poll,
 # with a bound, the way the readiness check above already does.
 genesis=""
-for _ in $(seq 60); do
+for _ in $(seq "$TIMEOUT"); do
     grep -q 'mode=Genesis' <(plain) && { genesis=1; break; }
     sleep 1
 done
@@ -721,7 +791,7 @@ echo "resume  $second_root"
     || fail "the state_root changed across a restart"
 
 # ---------------------------------------------------------------------------
-# 7/7 — a substituted guest.
+# 8/8 — a substituted guest.
 # ---------------------------------------------------------------------------
 # The parent controls the store the guest is fetched from, so it can replace the
 # object. What it cannot do is make the replacement look like the approved
@@ -735,7 +805,7 @@ echo "resume  $second_root"
 # will not accept an unsigned document, so this enclave boots and serves. On
 # hardware, under a policy pinning the approved PCR16, the same substitution
 # gets no key and reads nothing.
-say "7/7  a substituted guest is measured, recorded, and refused by a pinned client"
+say "8/8  a substituted guest is measured, recorded, and refused by a pinned client"
 docker rm -f e2e-qemu-resume >/dev/null 2>&1 || true
 upload_guest substitute.wasm
 sleep 2
@@ -784,6 +854,8 @@ cat <<EOF
   a tenant kept its warm instance, and no two tenants shared one
   one tenant could not read another's file
   guest stdout and stderr arrived framed and marked as untrusted
+  work approved by one interaction ran later, for its owner alone, with no
+    second assertion signed
   genesis wrote an attested state origin, and a restart resumed it
   a substituted guest was measured and recorded as an upgrade, and a client
     pinning the approved guest refused it

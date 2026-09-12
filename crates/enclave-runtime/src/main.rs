@@ -371,22 +371,6 @@ struct Cli {
     #[arg(long, env = "S3FS_MAX_INTERACTION_SECS", default_value_t = 300)]
     max_interaction_secs: u64,
 
-    /// Single-use enrollment tokens, seeded at boot if not already there.
-    /// Repeatable, or comma-separated.
-    ///
-    /// It authorizes **creating a tenant** and nothing else: it cannot reach
-    /// an existing tenant's data, approve a transaction, or add a passkey to
-    /// somebody else's account. That matters because inside an enclave this
-    /// value reaches the runtime through the parent instance — the party the
-    /// enclave exists to exclude. A parent that steals it can make a tenant of
-    /// its own; it still cannot read anyone else's.
-    #[arg(
-        long = "enrollment-token",
-        env = "S3FS_ENROLLMENT_TOKEN",
-        value_delimiter = ','
-    )]
-    enrollment_tokens: Vec<String>,
-
     /// Report on the configured clock and entropy source and exit, without
     /// mounting or running anything. For diagnosing a deployment, and the only
     /// thing the emulator harness needs — it touches no storage.
@@ -785,16 +769,11 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
                 fs.clone(),
                 entropy.clone(),
             ));
-            for token in &cli.enrollment_tokens {
-                auth.enrollment().seed(token).await?;
-            }
-            if !cli.enrollment_tokens.is_empty() {
-                tracing::info!(
-                    tokens = cli.enrollment_tokens.len(),
-                    "enrollment tokens are available"
-                );
-            }
-            tracing::info!(rp_id, origin, "requiring a passkey assertion per request");
+            tracing::info!(
+                rp_id,
+                origin,
+                "registration is open to anyone; requiring a passkey assertion per request"
+            );
             Some((auth, gate))
         }
         (None, None) => None,

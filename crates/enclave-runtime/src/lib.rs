@@ -54,8 +54,7 @@ pub mod wasi;
 pub use auth::SoftwareAuthenticator;
 pub use auth::{
     build_relying_party, AuthEndpoints, ChallengeStore, FilesystemCredentials, Gate,
-    InteractionScope, RateLimiter, TokenStore, AUTH_PREFIX, DEFAULT_CAPACITY,
-    DEFAULT_TOKEN_CAPACITY,
+    InteractionScope, TokenStore, AUTH_PREFIX, DEFAULT_CAPACITY, DEFAULT_TOKEN_CAPACITY,
 };
 pub use boot::{boot, BootConfig, BootMode, Booted, Pair, ReceiptTrust};
 pub use clock::{open_clock, ClockSource, HostClock, PtpClock, TrustedClock, DEFAULT_PTP_DEVICE};

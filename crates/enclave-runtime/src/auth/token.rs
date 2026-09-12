@@ -23,8 +23,8 @@
 //! # Why the store never holds a token
 //!
 //! Entries are keyed by `sha256(token)`. Possession of the store is not
-//! possession of a token — the same reason [`crate::auth::EnrollmentTokens`]
-//! names its files by their hash rather than their contents.
+//! possession of a token — the same reason a password file stores hashes
+//! rather than the passwords themselves.
 //!
 //! Nothing here survives a restart, and nothing should: an approval that
 //! outlived the enclave that issued it would be an approval nobody could

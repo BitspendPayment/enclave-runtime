@@ -24,9 +24,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const RP_ID: &str = "enclave.test";
 const ORIGIN: &str = "https://enclave.test";
-/// Two, so a test can enrol two tenants. A token is single-use by design, and
-/// there is deliberately no way to mint one over the wire.
-const TOKENS: [&str; 2] = ["an-invite-code-long-enough", "a-second-invite-code-long"];
 
 fn component_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -184,9 +181,6 @@ async fn start_with_background(background: bool) -> Harness {
         fs.clone(),
         entropy.clone(),
     ));
-    for token in TOKENS {
-        auth.enrollment().seed(token).await.expect("seeding");
-    }
 
     // Detached deliberately: the collector runs for as long as this
     // environment can send, which is what a test wants. Production drains it
@@ -423,14 +417,9 @@ async fn post_json(
 }
 
 /// Register a passkey and return it, ready to sign for requests.
-async fn enrol(addr: std::net::SocketAddr, token: &str) -> SoftwareAuthenticator {
+async fn enrol(addr: std::net::SocketAddr) -> SoftwareAuthenticator {
     let auth = SoftwareAuthenticator::new(RP_ID);
-    let (status, options) = post_json(
-        addr,
-        "/auth/register/options",
-        serde_json::json!({ "enrollment_token": token }),
-    )
-    .await;
+    let (status, options) = post_json(addr, "/auth/register/options", serde_json::json!({})).await;
     assert_eq!(status, 200, "{options}");
     let challenge = options["options"]["publicKey"]["challenge"]
         .as_str()
@@ -537,7 +526,7 @@ async fn the_guest_is_unreachable_without_an_assertion() {
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn a_signed_request_reaches_the_guest() {
     let h = start().await;
-    let auth = enrol(h.addr, TOKENS[0]).await;
+    let auth = enrol(h.addr).await;
 
     let (status, body) = signed(h.addr, &auth, "GET", "/counter", "").await;
     assert_eq!(status, 200, "{body}");
@@ -554,7 +543,7 @@ async fn a_signed_request_reaches_the_guest() {
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn the_guest_is_told_the_resolved_tenant() {
     let h = start().await;
-    let alice = enrol(h.addr, TOKENS[0]).await;
+    let alice = enrol(h.addr).await;
 
     let (status, seen) = signed(h.addr, &alice, "GET", "/whoami", "").await;
     assert_eq!(status, 200);
@@ -575,7 +564,7 @@ async fn the_guest_is_told_the_resolved_tenant() {
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn a_token_cannot_be_moved_to_another_interaction() {
     let h = start().await;
-    let auth = enrol(h.addr, TOKENS[0]).await;
+    let auth = enrol(h.addr).await;
 
     // Approved for writing one file.
     let token = token_for(h.addr, &auth, "POST", "/files/approved.txt").await;
@@ -604,7 +593,7 @@ async fn a_token_cannot_be_moved_to_another_interaction() {
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn a_token_cannot_be_replayed() {
     let h = start().await;
-    let auth = enrol(h.addr, TOKENS[0]).await;
+    let auth = enrol(h.addr).await;
     let token = token_for(h.addr, &auth, "GET", "/counter").await;
     let headers = [("authorization", format!("Bearer {token}"))];
 
@@ -619,8 +608,8 @@ async fn a_token_cannot_be_replayed() {
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn two_passkeys_are_two_tenants() {
     let h = start().await;
-    let alice = enrol(h.addr, TOKENS[0]).await;
-    let bob = enrol(h.addr, TOKENS[1]).await;
+    let alice = enrol(h.addr).await;
+    let bob = enrol(h.addr).await;
 
     let (_, alice_id) = signed(h.addr, &alice, "GET", "/whoami", "").await;
     let (_, bob_id) = signed(h.addr, &bob, "GET", "/whoami", "").await;
@@ -649,36 +638,16 @@ async fn two_passkeys_are_two_tenants() {
     assert_eq!(seen_by_bob, "bob's", "one tenant read another's file");
 }
 
-/// A token is spent by the registration it starts, whether or not that
-/// registration finishes.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn an_enrollment_token_is_spent_once() {
-    let h = start().await;
-    let _ = enrol(h.addr, TOKENS[0]).await;
-    let (status, _) = post_json(
-        h.addr,
-        "/auth/register/options",
-        serde_json::json!({ "enrollment_token": TOKENS[0] }),
-    )
-    .await;
-    assert_eq!(status, 403, "a spent enrollment token registered again");
-}
-
 /// `/auth/*` answers without an assertion — it has to, or nobody could ever
 /// get one — and it performs no cosigner action.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn auth_routes_answer_without_an_assertion() {
     let h = start().await;
-    let (status, _) = post_json(
-        h.addr,
-        "/auth/register/options",
-        serde_json::json!({ "enrollment_token": "wrong-but-long-enough-token" }),
-    )
-    .await;
-    // Refused on its merits, not for lack of an assertion.
-    assert_eq!(status, 403);
+    let (status, _) = post_json(h.addr, "/auth/register/options", serde_json::json!({})).await;
+    // Answered on its merits, not refused for lack of an assertion: this is the
+    // one route that must work before any credential exists.
+    assert_eq!(status, 200);
 
     let (status, _) = post_json(h.addr, "/auth/nonsense", serde_json::json!({})).await;
     assert_eq!(status, 404);
@@ -724,6 +693,70 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
     }
 }
 
+/// Where the real client binary is, or `None` when it has not been built.
+///
+/// Prints the build line and returns `None` rather than failing, because a
+/// suite that cannot find it has nothing to say about the client — but a
+/// *silent* skip reports green for a test that never ran, so it says so.
+fn client_binary() -> Option<PathBuf> {
+    let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/passkey-client");
+    if exe.exists() {
+        return Some(exe);
+    }
+    eprintln!(
+        "skipping: build it with\n  cargo build --release -p enclave-runtime \\\n    --features testing --bin passkey-client"
+    );
+    None
+}
+
+/// A passkey file of this test's own.
+///
+/// Tagged, not just keyed on the process id: these tests share one process, and
+/// one state file between them would mean one test's credential answering
+/// another's challenges.
+fn client_state(tag: &str) -> PathBuf {
+    let state = std::env::temp_dir().join(format!("passkey-{}-{tag}.json", std::process::id()));
+    let _ = std::fs::remove_file(&state);
+    state
+}
+
+/// One invocation of the real client, as a subprocess, against this harness.
+///
+/// Every call is a fresh process that re-reads its passkey, re-runs the whole
+/// three-trip ceremony, and re-checks the attestation — which is what a shell
+/// script driving this binary does, and the reason it is worth spawning rather
+/// than calling in-process.
+async fn client(h: &Harness, state: &std::path::Path, args: Vec<String>) -> (bool, String, String) {
+    let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/passkey-client");
+    let state = state.to_path_buf();
+    let pcr16 = hex::encode(nitro_attestation::guest_pcr(&h.guest_bytes));
+    let url = format!("https://127.0.0.1:{}", h.addr.port());
+    tokio::task::spawn_blocking(move || {
+        let out = std::process::Command::new(&exe)
+            .args(["--url", &url, "--state", state.to_str().unwrap()])
+            // The harness signs with a `TestChain`, which roots at itself
+            // rather than AWS. The chain is still verified — this only says
+            // "do not require the AWS root", which is the whole difference
+            // between this and production.
+            .arg("--allow-untrusted-root")
+            // And which enclave, which the client insists on knowing in both
+            // halves: `SigningNsm` reports PCR0, and PCR16 holds the guest the
+            // harness measured into it.
+            .args(["--pcr0", &hex::encode(PCR0)])
+            .args(["--pcr16", &pcr16])
+            .args(&args)
+            .output()
+            .expect("running passkey-client");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    })
+    .await
+    .unwrap()
+}
+
 /// The `passkey-client` binary, against a real server — the same path the QEMU
 /// harness takes.
 ///
@@ -734,56 +767,13 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 #[ignore = "needs examples/guest-http built and the passkey-client binary"]
 async fn the_passkey_client_binary_drives_the_gate() {
     let h = start().await;
-    let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/passkey-client");
-    if !exe.exists() {
-        eprintln!(
-            "skipping: build it with\n  cargo build --release -p enclave-runtime \\\n    --features testing --bin passkey-client"
-        );
+    if client_binary().is_none() {
         return;
     }
-    let state = std::env::temp_dir().join(format!("passkey-{}.json", std::process::id()));
-    let _ = std::fs::remove_file(&state);
+    let state = client_state("gate");
+    let run = |args: Vec<String>| client(&h, &state, args);
 
-    let pcr16 = hex::encode(nitro_attestation::guest_pcr(&h.guest_bytes));
-    let run = |args: Vec<String>| {
-        let exe = exe.clone();
-        let state = state.clone();
-        let pcr16 = pcr16.clone();
-        let url = format!("https://127.0.0.1:{}", h.addr.port());
-        async move {
-            tokio::task::spawn_blocking(move || {
-                let out = std::process::Command::new(&exe)
-                    .args(["--url", &url, "--state", state.to_str().unwrap()])
-                    // The harness signs with a `TestChain`, which roots at
-                    // itself rather than AWS. The chain is still verified —
-                    // this only says "do not require the AWS root", which is
-                    // the whole difference between this and production.
-                    .arg("--allow-untrusted-root")
-                    // And which enclave, which the client insists on knowing in
-                    // both halves: `SigningNsm` reports PCR0, and PCR16 holds
-                    // the guest the harness measured into it.
-                    .args(["--pcr0", &hex::encode(PCR0)])
-                    .args(["--pcr16", &pcr16])
-                    .args(&args)
-                    .output()
-                    .expect("running passkey-client");
-                (
-                    out.status.success(),
-                    String::from_utf8_lossy(&out.stdout).to_string(),
-                    String::from_utf8_lossy(&out.stderr).to_string(),
-                )
-            })
-            .await
-            .unwrap()
-        }
-    };
-
-    let (ok, _, err) = run(vec![
-        "enrol".into(),
-        "--token".into(),
-        TOKENS[0].to_string(),
-    ])
-    .await;
+    let (ok, _, err) = run(vec!["enrol".into()]).await;
     assert!(ok, "enrol failed: {err}");
 
     let (ok, body, err) = run(vec!["get".into(), "--path".into(), "/counter".into()]).await;
@@ -819,6 +809,72 @@ async fn the_passkey_client_binary_drives_the_gate() {
     let _ = std::fs::remove_file(&state);
 }
 
+/// **Standing authority: one ceremony, and work that runs after it.**
+///
+/// Everything else in this file is request and response — the client signs, the
+/// guest answers, and the approval is spent by the time the connection closes.
+/// Background work is the one place that shape does not hold: the assertion
+/// authorises an enqueue, and what it authorised runs later, with nobody there
+/// to sign anything at the moment it does.
+///
+/// `scheduled_work_requires_authentication_and_runs_for_its_owner` makes that
+/// claim with the in-process authenticator. This one makes it with the real
+/// binary, out of process, which is the thing a person actually holds — and
+/// because every poll below is a fresh process that re-reads its passkey, the
+/// credential surviving between invocations is part of what is under test.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built and the passkey-client binary"]
+async fn the_passkey_client_binary_schedules_work_that_later_runs_for_it() {
+    let h = start_with_background(true).await;
+    if client_binary().is_none() {
+        return;
+    }
+    let state = client_state("tasks");
+    let run = |args: Vec<String>| client(&h, &state, args);
+
+    let (ok, _, err) = run(vec!["enrol".into()]).await;
+    assert!(ok, "enrol failed: {err}");
+
+    // The approval is spent here, on this route, and never again.
+    let (ok, out, err) = run(vec![
+        "post".into(),
+        "--path".into(),
+        "/tasks/client-job".into(),
+        "--body".into(),
+        "client work".into(),
+    ])
+    .await;
+    assert!(ok, "the enqueue was refused: stdout={out:?} stderr={err:?}");
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let (ok, body, err) = run(vec![
+                "get".into(),
+                "--path".into(),
+                "/tasks/client-job".into(),
+            ])
+            .await;
+            assert!(ok, "the task record became unreadable: {err}");
+            let record: serde_json::Value = serde_json::from_str(&body)
+                .unwrap_or_else(|e| panic!("not a task record: {e}: {body}"));
+            match record["status"].as_str() {
+                Some("completed") => {
+                    // The work that was actually asked for, not merely a
+                    // terminal state.
+                    assert_eq!(record["result"], serde_json::json!(b"client work".to_vec()));
+                    break;
+                }
+                Some("failed") => panic!("the scheduled task failed: {body}"),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        }
+    })
+    .await
+    .expect("the work a signed interaction scheduled never ran");
+
+    let _ = std::fs::remove_file(&state);
+}
+
 /// **The exchange a client uses to identify the enclave.**
 ///
 /// `/auth/request/options` is the first trip of three, and the one that goes
@@ -834,7 +890,7 @@ async fn the_passkey_client_binary_drives_the_gate() {
 async fn the_challenge_exchange_is_attested_and_binds_its_connection() {
     use base64::Engine as _;
     let h = start().await;
-    let auth = enrol(h.addr, TOKENS[0]).await;
+    let auth = enrol(h.addr).await;
 
     let nonce = raw_nonce();
     let (status, head, presented) = https_full(
@@ -896,7 +952,7 @@ async fn the_challenge_exchange_is_attested_and_binds_its_connection() {
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn a_guest_response_is_not_attested() {
     let h = start().await;
-    let auth = enrol(h.addr, TOKENS[0]).await;
+    let auth = enrol(h.addr).await;
     let token = token_for(h.addr, &auth, "GET", "/counter").await;
 
     let nonce = raw_nonce();
@@ -916,7 +972,11 @@ async fn a_guest_response_is_not_attested() {
     );
 }
 
-#[tokio::test]
+// Multi-threaded like every other test in this file. With background work
+// enabled the scheduler runs the guest on one runtime while this test polls it
+// over a socket on the same one; on a current-thread runtime those share a
+// single thread, which is a latent flake rather than a design.
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires built guest-http component"]
 async fn scheduled_work_requires_authentication_and_runs_for_its_owner() {
     let h = start_with_background(true).await;
@@ -926,8 +986,8 @@ async fn scheduled_work_requires_authentication_and_runs_for_its_owner() {
             .0,
         401
     );
-    let alice = enrol(h.addr, TOKENS[0]).await;
-    let bob = enrol(h.addr, TOKENS[1]).await;
+    let alice = enrol(h.addr).await;
+    let bob = enrol(h.addr).await;
     assert_eq!(
         signed(h.addr, &alice, "POST", "/tasks/job", "alice work")
             .await

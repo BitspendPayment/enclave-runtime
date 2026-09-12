@@ -35,9 +35,7 @@
 pub mod authenticator;
 pub mod challenge;
 pub mod credential;
-pub mod enrollment;
 pub mod gate;
-pub mod ratelimit;
 pub mod routes;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -47,12 +45,10 @@ mod token;
 pub use authenticator::SoftwareAuthenticator;
 pub use challenge::{ChallengeError, ChallengeStore, DEFAULT_CAPACITY, DEFAULT_TTL};
 pub use credential::{mint_tenant_id, FilesystemCredentials, StoredCredential};
-pub use enrollment::EnrollmentTokens;
 pub use gate::{
     Authenticated, CredentialRecord, CredentialStore, Denied, Gate, Verified, AUTHORIZATION_HEADER,
     AUTH_HEADERS,
 };
-pub use ratelimit::RateLimiter;
 pub use routes::{AuthEndpoints, AUTH_PREFIX};
 pub use token::{
     InteractionScope, TokenError, TokenStore, DEFAULT_CAPACITY as DEFAULT_TOKEN_CAPACITY,

@@ -1,7 +1,7 @@
 //! `passkey-client` — drive the enclave's WebAuthn gate from a script.
 //!
 //! ```console
-//! $ passkey-client --url https://127.0.0.1:8443 enrol --token <invite>
+//! $ passkey-client --url https://127.0.0.1:8443 enrol
 //! $ passkey-client --url https://127.0.0.1:8443 get --path /counter
 //! ```
 //!
@@ -161,11 +161,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Register a new passkey against an enrollment token.
-    Enrol {
-        #[arg(long)]
-        token: String,
-    },
+    /// Register a new passkey, which creates a new tenant.
+    Enrol,
     /// A signed GET.
     Get {
         #[arg(long)]
@@ -211,9 +208,9 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| format!("https://{}", cli.rp_id));
 
     match &cli.command {
-        Command::Enrol { token } => {
+        Command::Enrol => {
             let authenticator = SoftwareAuthenticator::new(&cli.rp_id);
-            enrol(&cli, &origin, &authenticator, token)?;
+            enrol(&cli, &origin, &authenticator)?;
             save(&cli, &authenticator)?;
             println!("enrolled");
         }
@@ -294,13 +291,9 @@ fn save(cli: &Cli, a: &SoftwareAuthenticator) -> Result<()> {
         .with_context(|| format!("writing {}", cli.state.display()))
 }
 
-fn enrol(cli: &Cli, origin: &str, a: &SoftwareAuthenticator, token: &str) -> Result<()> {
-    let (options, opened_on) = post_json(
-        cli,
-        "/auth/register/options",
-        &serde_json::json!({ "enrollment_token": token }),
-        None,
-    )?;
+fn enrol(cli: &Cli, origin: &str, a: &SoftwareAuthenticator) -> Result<()> {
+    let (options, opened_on) =
+        post_json(cli, "/auth/register/options", &serde_json::json!({}), None)?;
     let opened_on = opened_on.expect("an unpinned exchange is always checked");
     let challenge = options["options"]["publicKey"]["challenge"]
         .as_str()

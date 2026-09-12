@@ -1,0 +1,38 @@
+name: Rust toolchain and cache
+description: >
+  Install the toolchain rust-toolchain.toml names, and restore the cargo cache
+  for this job's workspaces.
+
+inputs:
+  shared-key:
+    description: >
+      Cache scope. Jobs sharing a key share one cache, so group jobs that build
+      the same artifacts and separate ones that do not.
+    required: true
+  workspaces:
+    description: >
+      Cargo workspaces to cache, one per line, as `path -> target`. The examples
+      are each their own workspace and are invisible to the default `.`.
+    required: false
+    default: "."
+
+runs:
+  using: composite
+  steps:
+    # rust-toolchain.toml is the single source of truth for the channel, the
+    # components and the wasm target. rustup honours it the moment cargo runs
+    # inside the repo, so `rustup show` installs exactly what it names — and a
+    # toolchain change stays a one-file edit rather than one edit per job that
+    # can silently drift from the file.
+    - run: rustup show
+      shell: bash
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        workspaces: ${{ inputs.workspaces }}
+        # Pull requests restore but never save. Four jobs each saving a
+        # multi-gigabyte cache is what pushes the repository past the 10 GB
+        # limit, and the eviction that follows throws away the entry the next
+        # run needed. main writes the cache every branch then restores.
+        save-if: ${{ github.ref == 'refs/heads/main' }}
