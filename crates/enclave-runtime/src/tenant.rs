@@ -98,6 +98,14 @@ pub async fn tenant_root_by_id(fs: &Arc<Fs>, tenant_id: [u8; 16]) -> Result<Tena
     })
 }
 
+/// Background work must never create a tenant whose directory is missing.
+pub async fn existing_tenant_root(fs: &Arc<Fs>, tenant_id: [u8; 16]) -> Result<Arc<Inode>> {
+    let parent = fs.lookup_at(&fs.root(), TENANTS_DIR).await?;
+    fs.lookup_at(&parent, &hex::encode(tenant_id))
+        .await
+        .context("scheduled tenant no longer exists")
+}
+
 /// Open a directory, creating it if it is not there.
 ///
 /// `AlreadyExists` is success, not failure: two requests racing to first

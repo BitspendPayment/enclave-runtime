@@ -27,6 +27,46 @@ use std::path::{Component, Path, PathBuf};
 
 use wstd::http::{Body, Error, Request, Response, StatusCode};
 
+mod tasks {
+    wit_bindgen::generate!({ path: "wit", world: "background" });
+}
+struct Background;
+impl tasks::Guest for Background {
+    fn run_task(task_id: String, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        // This example's effect is one durable file per occurrence. Retrying
+        // the same occurrence reads that result instead of repeating its work.
+        let dir = format!("{STATE_DIR}/tasks");
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = format!("{dir}/{task_id}");
+        match fs::read(&path) {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if payload == b"fail" {
+            return Err("example task failure".into());
+        }
+        if payload == b"spin" {
+            loop {
+                std::hint::spin_loop();
+            }
+        }
+        if payload == b"check-authority"
+            && tasks::enclave::tasks::queue::enqueue("unauthorized", b"nested", 0, None).is_ok()
+        {
+            return Err("background invocation granted itself work".into());
+        }
+        let temp = format!("{path}.tmp");
+        let mut file = fs::File::create(&temp).map_err(|e| e.to_string())?;
+        file.write_all(&payload).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
+        fs::rename(&temp, &path).map_err(|e| e.to_string())?;
+        Ok(payload)
+    }
+}
+tasks::export!(Background with_types_in tasks);
+
 /// Where this guest keeps its state. A directory rather than the root, so it
 /// is obvious in a bucket listing which objects came from the example.
 const STATE_DIR: &str = "/http-example";
@@ -61,6 +101,54 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
                 })
             ),
         )),
+        ("POST", p) if p.starts_with("/tasks/") => {
+            let id = &p[7..];
+            let time_header = |name: &str| -> Result<Option<u64>, String> {
+                req.headers()
+                    .get(name)
+                    .map(|value| {
+                        value
+                            .to_str()
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .ok_or_else(|| format!("{name} must be an unsigned millisecond value"))
+                    })
+                    .transpose()
+            };
+            let (at, interval) = match (
+                time_header("x-task-run-at"),
+                time_header("x-task-interval-ms"),
+            ) {
+                (Ok(at), Ok(interval)) => (at.unwrap_or(0), interval),
+                (Err(error), _) | (_, Err(error)) => {
+                    return Ok(text(StatusCode::BAD_REQUEST, error))
+                }
+            };
+            let payload = req.body_mut().bytes_contents().await?;
+            Ok(
+                match tasks::enclave::tasks::queue::enqueue(id, &payload, at, interval) {
+                    Ok(()) => text(StatusCode::ACCEPTED, id.to_string()),
+                    Err(e) => text(StatusCode::BAD_REQUEST, e),
+                },
+            )
+        }
+        ("GET", p) if p.starts_with("/tasks/") => {
+            Ok(match tasks::enclave::tasks::queue::status(&p[7..]) {
+                Ok(record) => text(StatusCode::OK, record),
+                Err(e) => text(StatusCode::NOT_FOUND, e),
+            })
+        }
+        ("DELETE", p) if p.starts_with("/tasks/") => {
+            let id = &p[7..];
+            let result = match id.strip_suffix("/forget") {
+                Some(id) => tasks::enclave::tasks::queue::forget(id),
+                None => tasks::enclave::tasks::queue::cancel(id),
+            };
+            Ok(match result {
+                Ok(()) => text(StatusCode::OK, "ok".to_string()),
+                Err(e) => text(StatusCode::BAD_REQUEST, e),
+            })
+        }
         ("GET", "/env") => Ok(text(StatusCode::OK, environment())),
         // Whatever the runtime says about the caller. A guest can only ever
         // read this header, never write it, and the runtime overwrites it on

@@ -139,6 +139,10 @@ struct Harness {
 }
 
 async fn start() -> Harness {
+    start_with_background(false).await
+}
+
+async fn start_with_background(background: bool) -> Harness {
     let backend = Arc::new(MemoryBackend::new());
     let fs = Fs::create(
         backend.clone(),
@@ -203,6 +207,7 @@ async fn start() -> Harness {
             &bytes,
             guest,
             ServeConfig {
+                background_tasks: background.then(Default::default),
                 addr,
                 certificate: Some(enclave_runtime::CertificateSlot::fixed(Arc::new(tls))),
                 acme: None,
@@ -909,4 +914,44 @@ async fn a_guest_response_is_not_attested() {
         !head.to_ascii_lowercase().contains("x-enclave-attestation:"),
         "a guest response carried a document:\n{head}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires built guest-http component"]
+async fn scheduled_work_requires_authentication_and_runs_for_its_owner() {
+    let h = start_with_background(true).await;
+    assert_eq!(
+        https(h.addr, "POST", "/tasks/job", &[], "unapproved")
+            .await
+            .0,
+        401
+    );
+    let alice = enrol(h.addr, TOKENS[0]).await;
+    let bob = enrol(h.addr, TOKENS[1]).await;
+    assert_eq!(
+        signed(h.addr, &alice, "POST", "/tasks/job", "alice work")
+            .await
+            .0,
+        202
+    );
+    assert_eq!(signed(h.addr, &bob, "GET", "/tasks/job", "").await.0, 404);
+    assert_eq!(
+        signed(h.addr, &bob, "DELETE", "/tasks/job", "").await.0,
+        400
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (status, body) = signed(h.addr, &alice, "GET", "/tasks/job", "").await;
+            assert_eq!(status, 200, "{body}");
+            let record: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if record["status"] == "completed" {
+                assert_eq!(record["result"], serde_json::json!(b"alice work".to_vec()));
+                break;
+            }
+            assert_ne!(record["status"], "failed", "{body}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("scheduled task did not finish");
 }

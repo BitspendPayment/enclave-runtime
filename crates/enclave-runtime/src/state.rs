@@ -12,6 +12,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 /// `wasi:cli`, clocks, random, sockets) and `S3WasiView` (so [`crate::wasi`]
 /// can serve `wasi:filesystem`).
 pub struct State {
+    pub(crate) tasks: Option<crate::tasks::TaskContext>,
     wasi: WasiCtx,
     table: ResourceTable,
     fs: Arc<Fs>,
@@ -38,6 +39,7 @@ impl State {
         clock: Arc<crate::clock::WallClockAdapter>,
     ) -> Self {
         State {
+            tasks: None,
             wasi,
             scope,
             table: ResourceTable::new(),

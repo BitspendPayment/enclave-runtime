@@ -611,6 +611,15 @@ This replaced `--authorise-successor`, which extended PCR31 to name the next
 image and never locked it — so no document it produced on hardware could have
 carried the register the successor was checked against.
 
+## Background tasks
+
+The runtime can run durable tasks for individual tenants, including recurring
+checks, with bounded concurrency and execution deadlines. Tasks survive enclave
+restarts and run under the same tenant isolation and lock as interactive calls.
+The feature is opt-in and requires an authenticated guest implementing the
+versioned background interface. See [Background tasks](docs/BACKGROUND_TASKS.md)
+for configuration, the guest API, delivery guarantees, and the HTTP example.
+
 ## Serving HTTP
 
 The runtime terminates HTTPS itself and hands the guest plaintext. This follows

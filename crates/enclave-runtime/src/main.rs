@@ -48,6 +48,19 @@ use enclave_runtime::{
     long_about = None
 )]
 struct Cli {
+    /// Enable durable background tasks. Requires authentication and a guest
+    /// exporting run-task from enclave:tasks/background@0.1.0.
+    #[arg(long, env = "S3FS_BACKGROUND_TASKS", default_value = "false", value_parser = enclave_runtime::parse_bool_flag, action = clap::ArgAction::Set)]
+    background_tasks: bool,
+    #[arg(long, env = "S3FS_BACKGROUND_CONCURRENCY", default_value_t = 1)]
+    background_concurrency: usize,
+    #[arg(long, env = "S3FS_BACKGROUND_TIMEOUT_SECS", default_value_t = 30)]
+    background_timeout_secs: u64,
+    #[arg(long, env = "S3FS_BACKGROUND_MAX_RECORDS", default_value_t = 1024)]
+    background_max_records: usize,
+    #[arg(long, env = "S3FS_BACKGROUND_PER_TENANT", default_value_t = 64)]
+    background_per_tenant: usize,
+
     /// Guest component to run, as a key in the roots bucket. What an enclave
     /// image uses.
     ///
@@ -906,6 +919,14 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         &component,
         guest,
         ServeConfig {
+            background_tasks: cli
+                .background_tasks
+                .then(|| enclave_runtime::tasks::TaskLimits {
+                    concurrency: cli.background_concurrency,
+                    timeout: Duration::from_secs(cli.background_timeout_secs),
+                    max_records: cli.background_max_records,
+                    per_tenant: cli.background_per_tenant,
+                }),
             addr: cli.http_listen,
             certificate: None,
             acme,

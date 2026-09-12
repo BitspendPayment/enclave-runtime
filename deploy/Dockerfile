@@ -68,6 +68,10 @@ COPY --from=gvforwarder /gvforwarder /usr/local/bin/gvforwarder
 # measured here, by PCR0; what is found there is measured into PCR16 at boot,
 # so the object does not have to be trusted — a substituted one gets no key.
 ENV S3FS_GUEST_OBJECT=guest/guest.wasm
+# Opt in for a guest implementing enclave:tasks/background@0.1.0, with WebAuthn
+# configured. See docs/BACKGROUND_TASKS.md for standing authorization semantics.
+# ENV S3FS_BACKGROUND_TASKS=true
+# ENV S3FS_BACKGROUND_CONCURRENCY=1
 # Read the Nitro PTP hardware clock and refuse to start without it. The
 # alternative is running on a clock the parent instance sets, which is the
 # party this whole design excludes.

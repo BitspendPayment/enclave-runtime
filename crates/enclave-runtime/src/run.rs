@@ -107,6 +107,10 @@ impl GuestEnvironment {
         &self.fs
     }
 
+    pub fn clock(&self) -> &Arc<WallClockAdapter> {
+        &self.clock
+    }
+
     /// Build a fresh [`State`] whose guest sees `scope` as `/`.
     ///
     /// Everything else — the filesystem, the clock, the entropy source, the

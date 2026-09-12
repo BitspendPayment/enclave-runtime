@@ -21,6 +21,7 @@ wstd = "0.6"
 # `Body::from_stream` takes a `futures_lite::Stream`, and `unfold` is the
 # shortest way to write one without a generator.
 futures-lite = "2"
+wit-bindgen = "0.51"
 
 [profile.release]
 opt-level = "s"

@@ -188,6 +188,7 @@ async fn start() -> Harness {
             &bytes,
             guest,
             ServeConfig {
+                background_tasks: None,
                 addr,
                 certificate: Some(enclave_runtime::CertificateSlot::fixed(identity)),
                 acme: None,

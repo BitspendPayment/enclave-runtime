@@ -62,4 +62,10 @@
   # so it need not be trusted: changing the guest is an upload and a key-policy
   # edit, not a new image. Upload `guest-release/guest.wasm` here.
   guestObject = "guest/guest.wasm";
+
+  # Opt in only for a guest implementing enclave:tasks/background@0.1.0.
+  # Each task is authorized by an authenticated tenant interaction. Queued
+  # work survives restarts; only this active enclave may own its scheduler.
+  backgroundTasks = false;
+  backgroundConcurrency = 1;
 }

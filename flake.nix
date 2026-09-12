@@ -126,7 +126,12 @@
       guestArgs = {
         pname = "guest-http";
         version = "0.1.0";
-        src = craneLib.cleanCargoSource ./examples/guest-http;
+        src = lib.cleanSourceWith {
+          src = ./examples/guest-http;
+          filter = path: type:
+            lib.hasSuffix ".wit" path || craneLib.filterCargoSources path type;
+          name = "guest-source";
+        };
         strictDeps = true;
         CARGO_BUILD_TARGET = "wasm32-wasip2";
         cargoExtraArgs = "--locked";
@@ -303,6 +308,8 @@
           # KMS for a key. The location is measured here, by PCR0; what arrives
           # is measured there, by PCR16, so the object need not be trusted.
           S3FS_GUEST_OBJECT = deployment.guestObject;
+          S3FS_BACKGROUND_TASKS = lib.boolToString deployment.backgroundTasks;
+          S3FS_BACKGROUND_CONCURRENCY = toString deployment.backgroundConcurrency;
           S3FS_HTTP_LISTEN = "0.0.0.0:443";
           # ACME, not self-signed: a platform authenticator will not attest
           # against a certificate a browser does not trust, so a self-signed one

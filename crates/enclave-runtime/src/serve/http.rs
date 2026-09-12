@@ -41,6 +41,8 @@ use nitro_nsm::Nsm;
 /// How the guest is served.
 #[derive(Debug)]
 pub struct ServeConfig {
+    /// Opt-in standing authorization for tenant-bound durable tasks.
+    pub background_tasks: Option<crate::tasks::TaskLimits>,
     /// Address to accept on.
     pub addr: SocketAddr,
     /// Where TLS connections take their serving identity. `None` serves
@@ -99,6 +101,7 @@ impl Default for ServeConfig {
     /// the one that cannot surprise anybody.
     fn default() -> Self {
         ServeConfig {
+            background_tasks: None,
             addr: ([0, 0, 0, 0], 8080).into(),
             certificate: None,
             acme: None,
@@ -166,6 +169,8 @@ pub struct GuestInstance {
 /// request to arrive.
 pub struct ServeHandle {
     pre: ProxyPre<State>,
+    background_pre: InstancePre<State>,
+    tasks: Option<Arc<crate::tasks::TaskQueue>>,
     guest: Arc<GuestEnvironment>,
     /// One request at a time for callers with no resolved tenant.
     ///
@@ -223,28 +228,30 @@ impl ServeHandle {
     ///
     /// Epoch interruption is what makes a spinning guest interruptible at all:
     /// without it, wasm that never yields cannot be stopped, and
-    /// `tokio::task::abort` has no await point to act on. The returned task
-    /// advances the epoch forever and is detached — it must outlive every
-    /// request, and there is nothing to join it back to.
+    /// `tokio::task::abort` has no await point to act on. A dedicated thread
+    /// advances the epoch independently of Tokio workers and exits when the
+    /// last engine handle is dropped.
     pub fn engine_with_watchdog() -> Result<Engine> {
         let mut config = wasmtime::Config::new();
         config.epoch_interruption(true);
         let engine = Engine::new(&config)?;
 
         let ticker = engine.weak();
-        tokio::task::spawn(async move {
-            let mut interval = tokio::time::interval(EPOCH_TICK);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                // A weak handle, so this task cannot keep a dropped engine
-                // alive — it simply stops when the engine goes.
-                match ticker.upgrade() {
-                    Some(engine) => engine.increment_epoch(),
-                    None => break,
+        // The ticker must run even when guest CPU loops occupy every Tokio
+        // worker. An async ticker on that same executor cannot guarantee it.
+        std::thread::Builder::new()
+            .name("guest-epoch".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(EPOCH_TICK);
+                    // A weak handle, so this thread cannot keep a dropped engine
+                    // alive — it simply stops when the engine goes.
+                    match ticker.upgrade() {
+                        Some(engine) => engine.increment_epoch(),
+                        None => break,
+                    }
                 }
-            }
-        });
+            })?;
         Ok(engine)
     }
 
@@ -262,11 +269,13 @@ impl ServeHandle {
             .instantiate_pre(&component)
             .map_err(|e| anyhow::anyhow!(e.to_string()))
             .context("pre-instantiating guest component")?;
-        let pre = ProxyPre::new(instance_pre)
+        let pre = ProxyPre::new(instance_pre.clone())
             .map_err(|e| anyhow::anyhow!(e.to_string()))
             .context("guest does not export wasi:http/incoming-handler")?;
 
         Ok(ServeHandle {
+            background_pre: instance_pre,
+            tasks: None,
             pre,
             guest: Arc::new(guest),
             anonymous: Arc::new(tokio::sync::Mutex::new(())),
@@ -286,6 +295,67 @@ impl ServeHandle {
     pub fn with_tenancy(mut self, tenancy: Arc<Tenancy>) -> Self {
         self.tenancy = Some(tenancy);
         self
+    }
+
+    pub fn with_tasks(mut self, queue: Arc<crate::tasks::TaskQueue>) -> Result<Self> {
+        anyhow::ensure!(
+            self.tenancy.is_some(),
+            "background tasks require tenant isolation"
+        );
+        self.tasks = Some(queue);
+        Ok(self)
+    }
+
+    /// An internal component export, never an HTTP route or a fabricated token.
+    /// A fresh instance shares the tenant lock; drop its warm HTTP instance so
+    /// no cached database handles survive a background mutation.
+    pub(crate) async fn run_background(
+        &self,
+        queue: &Arc<crate::tasks::TaskQueue>,
+        task: &crate::tasks::Task,
+    ) -> Result<Option<Vec<u8>>> {
+        let tenancy = self
+            .tenancy
+            .as_ref()
+            .context("background tasks require tenants")?;
+        let checkout = tenancy.pool.checkout(&task.tenant);
+        let Ok(mut guard) = checkout.slot().tenant().clone().try_lock_owned() else {
+            return Ok(None);
+        };
+        if !queue.begin(task).await? {
+            return Ok(Some(Vec::new()));
+        }
+        if let Some(tenant) = guard.as_mut() {
+            tenant.instance = None;
+        }
+        let work = async {
+            let scope = crate::tenant::existing_tenant_root(self.guest.fs(), task.tenant).await?;
+            let state = self.guest.new_state_scoped(scope)?;
+            let mut store = Store::new(self.pre.engine(), state);
+            // Yield every tick, even in CPU-only loops, so the wall deadline
+            // can cancel both guest code and async host calls.
+            store.set_epoch_deadline(1);
+            store.epoch_deadline_async_yield_and_update(1);
+            let instance = self.background_pre.instantiate_async(&mut store).await?;
+            store.data_mut().tasks = Some(crate::tasks::TaskContext {
+                queue: queue.clone(),
+                tenant: task.tenant,
+                interactive: false,
+            });
+            let run = instance
+                .get_typed_func::<(String, Vec<u8>), (std::result::Result<Vec<u8>, String>,)>(
+                    &mut store, "run-task",
+                )?;
+            let (result,) = run
+                .call_async(&mut store, (task.run_id(), task.payload.clone()))
+                .await?;
+            let bytes = result.map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(bytes.len() <= 64 * 1024, "task result exceeds 64 KiB");
+            Ok(Some(bytes))
+        };
+        tokio::time::timeout(queue.limits.timeout, work)
+            .await
+            .context("background task deadline exceeded")?
     }
 
     /// Override the response-head deadline.
@@ -435,6 +505,12 @@ impl ServeHandle {
         tenant.requests += 1;
 
         let instance = tenant.instance.as_mut().expect("just built");
+        instance.store.data_mut().tasks =
+            self.tasks.as_ref().map(|queue| crate::tasks::TaskContext {
+                queue: queue.clone(),
+                tenant: tenant_id,
+                interactive: true,
+            });
         // Reset every request: the epoch deadline is absolute, so a reused
         // store would otherwise inherit whatever the last request left. The
         // same is true of the progress this call will be judged on.
@@ -618,6 +694,15 @@ impl ServeHandle {
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
             .context("instantiating the guest")?;
+        if self.tasks.is_some() {
+            let instance = self.background_pre.instantiate_async(&mut store).await?;
+            instance
+                .get_typed_func::<(String, Vec<u8>), (std::result::Result<Vec<u8>, String>,)>(
+                    &mut store, "run-task",
+                )
+                .map_err(|e| anyhow::anyhow!(e.to_string()))
+                .context("background tasks require the run-task export")?;
+        }
         Ok(())
         // The store and the instance drop here. Nothing is kept: an instance
         // that outlived this call would be an instance two requests could
@@ -1100,6 +1185,16 @@ impl Server {
 
     /// Accept connections until the process is stopped.
     pub async fn run(self) -> Result<()> {
+        // Dropping the server cancels the scheduler and its owned worker set.
+        // A scheduler storage error stops serving instead of losing wakeups.
+        let mut scheduler = tokio::task::JoinSet::new();
+        if let Some(queue) = &self.guest.tasks {
+            anyhow::ensure!(
+                self.gate.is_some(),
+                "background tasks require authentication"
+            );
+            scheduler.spawn(queue.clone().run(self.guest.clone()));
+        }
         let listener = TcpListener::bind(self.addr)
             .await
             .with_context(|| format!("binding {}", self.addr))?;
@@ -1128,7 +1223,13 @@ impl Server {
         let tls = self.tls.map(Arc::new);
 
         loop {
-            let (client, peer) = listener.accept().await.context("accepting connection")?;
+            let (client, peer) = tokio::select! {
+                accepted = listener.accept() => accepted.context("accepting connection")?,
+                ended = scheduler.join_next(), if !scheduler.is_empty() => {
+                    ended.context("scheduler disappeared")???;
+                    anyhow::bail!("scheduler unexpectedly stopped");
+                }
+            };
             let routes = Routes {
                 guest: self.guest.clone(),
                 auth: self.auth.clone(),
@@ -1244,6 +1345,19 @@ pub async fn serve_component(
         .with_max_interaction(config.max_interaction);
     if let Some(tenancy) = &config.tenancy {
         handle = handle.with_tenancy(tenancy.clone());
+    }
+    if let Some(limits) = config.background_tasks.take() {
+        anyhow::ensure!(
+            config.authentication.is_some(),
+            "background tasks require authentication"
+        );
+        let queue = crate::tasks::TaskQueue::open(
+            handle.environment().fs().clone(),
+            handle.environment().clock().clone(),
+            limits,
+        )
+        .await?;
+        handle = handle.with_tasks(queue)?;
     }
 
     // Before the listener binds. A guest that will not instantiate should stop
