@@ -30,7 +30,7 @@ Four workspace crates plus example guests:
 | [`examples/guest-http`](examples/guest-http/) | The guest the serving path is tested against: reads and writes the filesystem, and is deliberately stateful so a second request proves the first one's writes committed. |
 | [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Runs on request; needs wasi-sdk to build. |
 
-**Test coverage:** `cargo test --workspace` runs 705 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the per-response attestation binding. A further 80 skip themselves without MinIO, enclave hardware, or a `wasm32-wasip2` build of the example guest; reach those with `--features testing -- --include-ignored`, which is also what gives the TLS suites a self-signed certificate to serve, since a production build has no way to mint one.
+**Test coverage:** `cargo test --workspace` runs 753 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the per-response attestation binding. A further 80 skip themselves without MinIO, enclave hardware, or a `wasm32-wasip2` build of the example guest; reach those with `--features testing -- --include-ignored`, which is also what gives the TLS suites a self-signed certificate to serve, since a production build has no way to mint one.
 
 ## Quick start: run a Wasm guest against MinIO
 
@@ -619,6 +619,24 @@ restarts and run under the same tenant isolation and lock as interactive calls.
 The feature is opt-in and requires an authenticated guest implementing the
 versioned background interface. See [Background tasks](docs/BACKGROUND_TASKS.md)
 for configuration, the guest API, delivery guarantees, and the HTTP example.
+
+## Notifications
+
+A guest can wake its tenant's devices through Firebase Cloud Messaging — for
+work that finished, or an approval somebody is waiting on. The guest cannot
+reach the network itself, so the runtime holds the credential and sends on its
+behalf.
+
+**A wake signal carries no content.** No title, no body, no `notification`
+object: the payload crosses the parent instance and Google, which are the two
+parties this design excludes from a tenant's data, so what travels is an opaque
+category and a tenant-local reference. The app wakes and fetches the detail over
+its own attested connection.
+
+Enrolling a device is an interactive-only call; raising a wake is not, because
+a background task telling its owner to come and look is the point. See
+[Notifications](docs/NOTIFICATIONS.md) for the settings, the guest API, delivery
+behaviour, and what a stolen credential does and does not buy.
 
 ## Serving HTTP
 

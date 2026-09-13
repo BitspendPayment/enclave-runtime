@@ -310,6 +310,12 @@
           S3FS_GUEST_OBJECT = deployment.guestObject;
           S3FS_BACKGROUND_TASKS = lib.boolToString deployment.backgroundTasks;
           S3FS_BACKGROUND_CONCURRENCY = toString deployment.backgroundConcurrency;
+          # Push notifications. Empty means off. The credential is named, never
+          # carried: baking a service-account key into the image would put it in
+          # every copy of the image and pin it to a PCR0 it has no reason to
+          # move with.
+          S3FS_FCM_PROJECT_ID = deployment.fcmProjectId;
+          S3FS_FCM_SERVICE_ACCOUNT_PARAMETER = deployment.fcmServiceAccountParameter;
           S3FS_HTTP_LISTEN = "0.0.0.0:443";
           # ACME, not self-signed: a platform authenticator will not attest
           # against a certificate a browser does not trust, so a self-signed one
@@ -457,6 +463,18 @@
             # downstream moves. The guest is guest-http, which exports the
             # `run-task` the runtime refuses to start without when this is set.
             S3FS_BACKGROUND_TASKS = "true";
+            # Notifications, against a stub on the host rather than Google —
+            # which is unreachable from here and would refuse an invented
+            # registration token anyway. What the e2e checks is what the
+            # *runtime* sends, and the stub records exactly that.
+            #
+            # A literal credential, not an SSM parameter: there is no SSM here.
+            # It is a throwaway key in a test image, and the `http://` endpoint
+            # is the same downgrade `--guest-log-endpoint` already is. PCR0
+            # records that this image was built with both.
+            S3FS_FCM_PROJECT_ID = "e2e";
+            S3FS_FCM_SERVICE_ACCOUNT = builtins.readFile ./deploy/qemu-nitro/fcm/service-account.json;
+            S3FS_FCM_ENDPOINT = "http://192.168.127.254:9101";
             # Off. Inherited from the production image, and there is no AWS
             # here to send to: the harness's credentials are MinIO's, which
             # CloudWatch would reject. Empty means off — the same shape as the

@@ -13,6 +13,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 /// can serve `wasi:filesystem`).
 pub struct State {
     pub(crate) tasks: Option<crate::tasks::TaskContext>,
+    pub(crate) notify: Option<crate::notify::NotifyContext>,
     wasi: WasiCtx,
     table: ResourceTable,
     fs: Arc<Fs>,
@@ -40,6 +41,7 @@ impl State {
     ) -> Self {
         State {
             tasks: None,
+            notify: None,
             wasi,
             scope,
             table: ResourceTable::new(),

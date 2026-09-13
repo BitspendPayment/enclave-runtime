@@ -68,4 +68,14 @@
   # work survives restarts; only this active enclave may own its scheduler.
   backgroundTasks = false;
   backgroundConcurrency = 1;
+
+  # Push notifications, off unless both are set. `fcmProjectId` is the Firebase
+  # project; the service account itself is read at boot from this SSM parameter
+  # rather than baked in, so it rotates without moving PCR0.
+  #
+  # What a parent that steals that credential gets is the ability to ring
+  # doorbells: a wake signal carries no content, and reading anything still
+  # needs a key KMS releases only against a matching PCR0 and PCR16.
+  fcmProjectId = "";
+  fcmServiceAccountParameter = "";
 }

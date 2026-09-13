@@ -42,6 +42,7 @@ pub mod keys;
 pub mod linker;
 pub mod mount;
 pub mod net;
+pub mod notify;
 pub mod random;
 pub mod run;
 pub mod serve;
@@ -78,6 +79,11 @@ pub use linker::build_linker;
 pub use mount::{connect, create, mount_existing, parse_fs_id, Backends, MountConfig, Mounted};
 pub use net::{bring_up, Network, NetworkConfig, NetworkMode, DEFAULT_GVFORWARDER};
 pub use nitro_nsm::{Nsm, NsmDevice, DEFAULT_NSM_DEVICE};
+pub use notify::{
+    start as start_notify_forwarder, DeviceRegistry, FcmClient, FcmTransport, Notifier,
+    NotifyConfig, NotifyContext, NotifyForwarder, SendError, ServiceAccount,
+    NOTIFY_STARTUP_PROBE_TIMEOUT,
+};
 pub use random::{open_entropy, GuestRandom, HostEntropy, RandomSource};
 pub use run::{read_component, GuestEnvironment, GuestOutcome, EXIT_RUNTIME_FAILURE};
 pub use serve::{

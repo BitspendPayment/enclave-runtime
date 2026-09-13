@@ -202,6 +202,7 @@ async fn start_with_background(background: bool) -> Harness {
             guest,
             ServeConfig {
                 background_tasks: background.then(Default::default),
+                notify: None,
                 addr,
                 certificate: Some(enclave_runtime::CertificateSlot::fixed(Arc::new(tls))),
                 acme: None,

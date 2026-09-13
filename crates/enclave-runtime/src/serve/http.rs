@@ -43,6 +43,10 @@ use nitro_nsm::Nsm;
 pub struct ServeConfig {
     /// Opt-in standing authorization for tenant-bound durable tasks.
     pub background_tasks: Option<crate::tasks::TaskLimits>,
+    /// Opt-in push notifications. The registry and the forwarder are opened
+    /// here rather than by the caller, because both need the mounted
+    /// filesystem and the trusted clock, and this is where those exist.
+    pub notify: Option<crate::notify::NotifyConfig>,
     /// Address to accept on.
     pub addr: SocketAddr,
     /// Where TLS connections take their serving identity. `None` serves
@@ -102,6 +106,7 @@ impl Default for ServeConfig {
     fn default() -> Self {
         ServeConfig {
             background_tasks: None,
+            notify: None,
             addr: ([0, 0, 0, 0], 8080).into(),
             certificate: None,
             acme: None,
@@ -171,6 +176,7 @@ pub struct ServeHandle {
     pre: ProxyPre<State>,
     background_pre: InstancePre<State>,
     tasks: Option<Arc<crate::tasks::TaskQueue>>,
+    notify: Option<Arc<crate::notify::Notifier>>,
     guest: Arc<GuestEnvironment>,
     /// One request at a time for callers with no resolved tenant.
     ///
@@ -276,6 +282,7 @@ impl ServeHandle {
         Ok(ServeHandle {
             background_pre: instance_pre,
             tasks: None,
+            notify: None,
             pre,
             guest: Arc::new(guest),
             anonymous: Arc::new(tokio::sync::Mutex::new(())),
@@ -303,6 +310,20 @@ impl ServeHandle {
             "background tasks require tenant isolation"
         );
         self.tasks = Some(queue);
+        Ok(self)
+    }
+
+    /// Let the guest wake its tenant's devices.
+    ///
+    /// Tenant isolation is required for the same reason tasks require it: a
+    /// device belongs to a tenant, and without tenancy there is no tenant to
+    /// bind an enrolment to.
+    pub fn with_notify(mut self, notifier: Arc<crate::notify::Notifier>) -> Result<Self> {
+        anyhow::ensure!(
+            self.tenancy.is_some(),
+            "notifications require tenant isolation"
+        );
+        self.notify = Some(notifier);
         Ok(self)
     }
 
@@ -342,6 +363,14 @@ impl ServeHandle {
                 tenant: task.tenant,
                 interactive: false,
             });
+            store.data_mut().notify =
+                self.notify
+                    .as_ref()
+                    .map(|notifier| crate::notify::NotifyContext {
+                        notifier: notifier.clone(),
+                        tenant: task.tenant,
+                        interactive: false,
+                    });
             let run = instance
                 .get_typed_func::<(String, Vec<u8>), (std::result::Result<Vec<u8>, String>,)>(
                     &mut store, "run-task",
@@ -511,6 +540,14 @@ impl ServeHandle {
                 tenant: tenant_id,
                 interactive: true,
             });
+        instance.store.data_mut().notify =
+            self.notify
+                .as_ref()
+                .map(|notifier| crate::notify::NotifyContext {
+                    notifier: notifier.clone(),
+                    tenant: tenant_id,
+                    interactive: true,
+                });
         // Reset every request: the epoch deadline is absolute, so a reused
         // store would otherwise inherit whatever the last request left. The
         // same is true of the progress this call will be judged on.
@@ -1359,6 +1396,54 @@ pub async fn serve_component(
         .await?;
         handle = handle.with_tasks(queue)?;
     }
+    let mut notify_forwarder = None;
+    if let Some(notify) = config.notify.take() {
+        anyhow::ensure!(
+            config.authentication.is_some(),
+            "notifications require authentication: the tenant a wake belongs to comes \
+             from a verified assertion, and without a gate there is none"
+        );
+        let registry =
+            crate::notify::DeviceRegistry::open(handle.environment().fs().clone()).await?;
+        // Plaintext only where an endpoint override asked for it, which is the
+        // emulator harness pointing at a local stub.
+        let plaintext = notify
+            .endpoint
+            .as_deref()
+            .is_some_and(|e| e.starts_with("http://"));
+        let transport = Arc::new(crate::notify::HttpsTransport::new(plaintext)?);
+        let mut client = crate::notify::FcmClient::new(notify, transport);
+
+        let clock = handle.environment().clock().clone();
+        let now = {
+            use wasmtime_wasi::HostWallClock;
+            clock.now().as_millis().min(u64::MAX as u128) as u64
+        };
+        // Bounded, and never fatal for a transient failure. A push service
+        // must not be what decides whether the enclave binds its listener —
+        // but a credential that will never work is a deployment mistake, and
+        // finding it now beats finding it the first time somebody needed a
+        // wake signal.
+        match tokio::time::timeout(
+            crate::notify::NOTIFY_STARTUP_PROBE_TIMEOUT,
+            client.probe(now),
+        )
+        .await
+        {
+            Ok(Ok(())) => tracing::info!("notifications are configured and the credential works"),
+            Ok(Err(crate::notify::SendError::Refused(detail))) => {
+                anyhow::bail!("the FCM credential was rejected: {detail}")
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "could not reach FCM at startup; wake signals will retry")
+            }
+            Err(_) => tracing::warn!("FCM did not answer at startup; wake signals will retry"),
+        }
+
+        let (notifier, forwarder) = crate::notify::start(registry, clock, client);
+        notify_forwarder = Some(forwarder);
+        handle = handle.with_notify(notifier)?;
+    }
 
     // Before the listener binds. A guest that will not instantiate should stop
     // the enclave, not the first client unlucky enough to arrive.
@@ -1431,7 +1516,13 @@ pub async fn serve_component(
         }
     }
 
-    server.run().await
+    let served = server.run().await;
+    // Drained after serving, so a wake raised by the last request still has its
+    // chance to land. Bounded by the forwarder's own flush deadline.
+    if let Some(forwarder) = notify_forwarder {
+        forwarder.shutdown().await;
+    }
+    served
 }
 
 #[cfg(test)]

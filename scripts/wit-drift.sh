@@ -6,10 +6,13 @@
 # exactly the thing that drifts unnoticed: both sides still compile, and the
 # mismatch surfaces much later as a runtime trap in a component that looked fine.
 #
-# A loop rather than the single hard-coded `cmp` this replaces. Today only
-# guest-http vendors anything, so the old check was complete — but the next
-# guest to vendor a copy would have been silently uncovered, and nothing would
-# have said so.
+# Only `wit/deps/` is checked, which is not a shortcut but the rule WIT itself
+# imposes: every file directly in a guest's `wit/` belongs to that guest's own
+# package, and foreign packages must live under `deps/`. So `deps/` is exactly
+# the vendored set, and a guest's own world file is correctly ignored.
+#
+# A loop rather than the single hard-coded `cmp` this replaces. The next guest
+# to vendor a copy would otherwise have been silently uncovered.
 
 set -euo pipefail
 
@@ -48,12 +51,12 @@ while IFS= read -r copy; do
         diff -u "${canonical[0]}" "$copy" >&2 || true
         status=1
     fi
-done < <(find examples -type f -path '*/wit/*.wit' -not -path '*/target/*' | sort)
+done < <(find examples -type f -path '*/wit/deps/*.wit' -not -path '*/target/*' | sort)
 
 # A check that silently covers nothing is worse than no check, because it still
 # reports green. If the vendored copies move, this says so instead.
 if (( found == 0 )); then
-    echo "no vendored WIT found under examples/*/wit/ — this check has stopped checking anything" >&2
+    echo "no vendored WIT found under examples/*/wit/deps/ — this check has stopped checking anything" >&2
     exit 1
 fi
 

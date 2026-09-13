@@ -123,6 +123,7 @@ async fn start() -> std::net::SocketAddr {
             guest,
             ServeConfig {
                 background_tasks: None,
+                notify: None,
                 addr,
                 certificate: Some(enclave_runtime::CertificateSlot::fixed(identity)),
                 acme: None,

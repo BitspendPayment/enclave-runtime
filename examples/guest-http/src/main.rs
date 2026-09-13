@@ -27,11 +27,11 @@ use std::path::{Component, Path, PathBuf};
 
 use wstd::http::{Body, Error, Request, Response, StatusCode};
 
-mod tasks {
-    wit_bindgen::generate!({ path: "wit", world: "background" });
+mod bindings {
+    wit_bindgen::generate!({ path: "wit", world: "app", generate_all });
 }
 struct Background;
-impl tasks::Guest for Background {
+impl bindings::Guest for Background {
     fn run_task(task_id: String, payload: Vec<u8>) -> Result<Vec<u8>, String> {
         // This example's effect is one durable file per occurrence. Retrying
         // the same occurrence reads that result instead of repeating its work.
@@ -51,10 +51,23 @@ impl tasks::Guest for Background {
                 std::hint::spin_loop();
             }
         }
-        if payload == b"check-authority"
-            && tasks::enclave::tasks::queue::enqueue("unauthorized", b"nested", 0, None).is_ok()
-        {
-            return Err("background invocation granted itself work".into());
+        if payload == b"check-authority" {
+            if bindings::enclave::tasks::queue::enqueue("unauthorized", b"nested", 0, None).is_ok()
+            {
+                return Err("background invocation granted itself work".into());
+            }
+            // Enrolling a device is standing authority to reach somebody, so
+            // background work must not be able to do it.
+            //
+            // Only the refusal is asserted here. The other half — that a wake
+            // *is* allowed from background — cannot be checked in the same
+            // breath, because `wake` also fails when no sender is configured,
+            // which is how most tests run. It is proven where it actually
+            // matters instead: the wake raised at the end of this function, in
+            // leg 6b of the QEMU harness.
+            if bindings::enclave::notify::notify::register_device(&"z".repeat(64)).is_ok() {
+                return Err("background invocation enrolled a device".into());
+            }
         }
         let temp = format!("{path}.tmp");
         let mut file = fs::File::create(&temp).map_err(|e| e.to_string())?;
@@ -62,10 +75,22 @@ impl tasks::Guest for Background {
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
         fs::rename(&temp, &path).map_err(|e| e.to_string())?;
+
+        // Tell the owner there is something to come back for. The run id is
+        // `<id>:<generation>:<occurrence>` and only the first part is a label,
+        // so that is what travels — and it is a reference, not a message: the
+        // app fetches the detail over its own attested connection.
+        //
+        // Best effort on purpose. A wake that cannot be queued must not fail
+        // work that has already been committed.
+        let reference = task_id.split(':').next().unwrap_or("task");
+        if let Err(e) = bindings::enclave::notify::notify::wake("task-done", Some(reference)) {
+            eprintln!("could not raise a wake for {reference}: {e}");
+        }
         Ok(payload)
     }
 }
-tasks::export!(Background with_types_in tasks);
+bindings::export!(Background with_types_in bindings);
 
 /// Where this guest keeps its state. A directory rather than the root, so it
 /// is obvious in a bucket listing which objects came from the example.
@@ -126,14 +151,14 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
             };
             let payload = req.body_mut().bytes_contents().await?;
             Ok(
-                match tasks::enclave::tasks::queue::enqueue(id, &payload, at, interval) {
+                match bindings::enclave::tasks::queue::enqueue(id, &payload, at, interval) {
                     Ok(()) => text(StatusCode::ACCEPTED, id.to_string()),
                     Err(e) => text(StatusCode::BAD_REQUEST, e),
                 },
             )
         }
         ("GET", p) if p.starts_with("/tasks/") => {
-            Ok(match tasks::enclave::tasks::queue::status(&p[7..]) {
+            Ok(match bindings::enclave::tasks::queue::status(&p[7..]) {
                 Ok(record) => text(StatusCode::OK, record),
                 Err(e) => text(StatusCode::NOT_FOUND, e),
             })
@@ -141,11 +166,35 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
         ("DELETE", p) if p.starts_with("/tasks/") => {
             let id = &p[7..];
             let result = match id.strip_suffix("/forget") {
-                Some(id) => tasks::enclave::tasks::queue::forget(id),
-                None => tasks::enclave::tasks::queue::cancel(id),
+                Some(id) => bindings::enclave::tasks::queue::forget(id),
+                None => bindings::enclave::tasks::queue::cancel(id),
             };
             Ok(match result {
                 Ok(()) => text(StatusCode::OK, "ok".to_string()),
+                Err(e) => text(StatusCode::BAD_REQUEST, e),
+            })
+        }
+        // Enrolling is an ordinary signed interaction, so it needs no route of
+        // the runtime's own: the gate already stands in front of this one.
+        ("POST", "/devices") => {
+            let body = req.body_mut().bytes_contents().await?;
+            let token = String::from_utf8_lossy(&body);
+            Ok(match bindings::enclave::notify::notify::register_device(token.trim()) {
+                Ok(()) => text(StatusCode::OK, "enrolled".to_string()),
+                Err(e) => text(StatusCode::BAD_REQUEST, e),
+            })
+        }
+        // A count, never the tokens: one is a capability to wake that device
+        // from anywhere, and the runtime does not hand them back.
+        ("GET", "/devices") => Ok(match bindings::enclave::notify::notify::devices() {
+            Ok(count) => text(StatusCode::OK, format!("{count}\n")),
+            Err(e) => text(StatusCode::BAD_REQUEST, e),
+        }),
+        ("DELETE", "/devices") => {
+            let body = req.body_mut().bytes_contents().await?;
+            let token = String::from_utf8_lossy(&body);
+            Ok(match bindings::enclave::notify::notify::forget_device(token.trim()) {
+                Ok(()) => text(StatusCode::OK, "forgotten".to_string()),
                 Err(e) => text(StatusCode::BAD_REQUEST, e),
             })
         }

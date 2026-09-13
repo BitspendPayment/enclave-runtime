@@ -70,10 +70,10 @@ command -v nix >/dev/null || { echo "nix is not on PATH; see deploy/nix/README.m
 # build no matter that it is right there on disk. The failure lands deep inside
 # the EIF derivation as a bare "cp: cannot stat", naming a store path that does
 # not contain it — true, and useless. Checked here instead.
-for f in ca.pem cert.pem key.pem; do
-    git -C "$REPO" ls-files --error-unmatch "deploy/qemu-nitro/pebble/$f" >/dev/null 2>&1 || {
-        echo "deploy/qemu-nitro/pebble/$f is not tracked by git, so nix cannot see it." >&2
-        echo "  git add deploy/qemu-nitro/pebble/" >&2
+for f in pebble/ca.pem pebble/cert.pem pebble/key.pem fcm/service-account.json; do
+    git -C "$REPO" ls-files --error-unmatch "deploy/qemu-nitro/$f" >/dev/null 2>&1 || {
+        echo "deploy/qemu-nitro/$f is not tracked by git, so nix cannot see it." >&2
+        echo "  git add deploy/qemu-nitro/" >&2
         exit 1
     }
 done
@@ -223,6 +223,19 @@ say "starting the parent-side services"
 # boots and then nothing happens at all.
 python3 "$REPO/deploy/qemu-nitro/heartbeat.py" 9000 > "$RUNDIR/heartbeat.log" 2>&1 &
 pids+=($!)
+
+# Firebase is not reachable from here and would refuse an invented registration
+# token if it were. The stub answers the two endpoints the runtime calls and
+# records every message, so the harness can assert on what the runtime *sent*.
+FCM_RECORD="$RUNDIR/fcm-messages.jsonl"
+python3 "$REPO/deploy/qemu-nitro/fcm-stub.py" "$FCM_RECORD" > "$RUNDIR/fcm-stub.log" 2>&1 &
+pids+=($!)
+for _ in $(seq 50); do
+    curl -sf -o /dev/null -X POST --data '{}' http://127.0.0.1:9101/token && break
+    sleep 0.1
+done
+curl -sf -o /dev/null -X POST --data '{}' http://127.0.0.1:9101/token \
+    || { echo "the FCM stub never answered:" >&2; cat "$RUNDIR/fcm-stub.log" >&2; exit 1; }
 
 # forward-cid 1 turns the guest's vsock connections into host vsock loopback
 # connections, which is the only arrangement that reaches a listener for the
@@ -708,6 +721,15 @@ echo "guest output arrived framed, tagged by stream, and marked as guest"
 # is what a unit test exercises.
 say "6/8  work approved once runs later, without a second assertion"
 
+# Enrolled first, or there is nobody to wake when the task finishes. This is an
+# ordinary signed interaction: enrolling is interactive-only, so it could not
+# have been done by the background work itself.
+FCM_TOKEN="e2e-device:APA91bEnclaveRuntimeHarnessToken0123456789"
+signed post --path /devices --body "$FCM_TOKEN" >/dev/null \
+    || fail "enrolling a device was refused"
+[[ "$(signed get --path /devices)" == "1" ]] \
+    || fail "the device did not enrol"
+
 signed post --path /tasks/e2e-job --body "scheduled work" >/dev/null \
     || fail "the scheduled task was refused"
 
@@ -738,6 +760,39 @@ result="$(jq -r '.result | implode' <<<"$record")"
 [[ "$result" == "scheduled work" ]] \
     || fail "the task completed but produced \"$result\""
 echo "scheduled work ran for its owner alone, with no second assertion signed"
+
+say "6b/8 the finished task woke its owner, and told Google nothing"
+# The wake was raised inside `run-task`, by background work, with nobody signing
+# anything at that moment — and it left the enclave as a *data-only* message.
+#
+# That absence is the property: an FCM payload crosses the parent instance and
+# then Google, so a title or a body would disclose to both exactly what this
+# enclave exists to keep from them. The app wakes and fetches the detail over
+# its own attested connection.
+recorded=""
+for _ in $(seq "$TIMEOUT"); do
+    [[ -s "$FCM_RECORD" ]] && { recorded=1; break; }
+    sleep 1
+done
+[[ -n "$recorded" ]] || fail "the finished task never woke anybody"
+
+wake="$(head -1 "$FCM_RECORD")"
+echo "$wake" | jq -e '.message.notification == null' >/dev/null \
+    || fail "the wake carried a notification block: $wake"
+[[ "$(echo "$wake" | jq -r '.message.data.category')" == "task-done" ]] \
+    || fail "unexpected category: $wake"
+[[ "$(echo "$wake" | jq -r '.message.data.ref')" == "e2e-job" ]] \
+    || fail "the wake did not name the task: $wake"
+[[ "$(echo "$wake" | jq -r '.message.token')" == "$FCM_TOKEN" ]] \
+    || fail "the wake went to a device nobody enrolled: $wake"
+[[ "$(echo "$wake" | jq -r '.message.apns.payload.aps."content-available"')" == "1" ]] \
+    || fail "the wake would not have woken an iOS app: $wake"
+
+# And nothing a person would read went with it. The only strings in `data` are
+# the two labels the guest chose and a schema version.
+keys="$(echo "$wake" | jq -r '.message.data | keys | join(",")')"
+[[ "$keys" == "category,ref,v" ]] || fail "the wake carried more than its labels: $keys"
+echo "a data-only wake reached the enrolled device: category=task-done ref=e2e-job"
 
 # ---------------------------------------------------------------------------
 # 7/8 — the boot machine, across a restart.
@@ -856,6 +911,8 @@ cat <<EOF
   guest stdout and stderr arrived framed and marked as untrusted
   work approved by one interaction ran later, for its owner alone, with no
     second assertion signed
+  that finished task woke an enrolled device with a data-only message that
+    carried no title, no body and nothing a person would read
   genesis wrote an attested state origin, and a restart resumed it
   a substituted guest was measured and recorded as an upgrade, and a client
     pinning the approved guest refused it

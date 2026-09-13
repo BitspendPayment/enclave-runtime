@@ -32,7 +32,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::Parser;
 use enclave_runtime::{
     open_clock, open_entropy, serve_component, AcmeConfig, ClockSource, GuestEnvPolicy,
@@ -40,6 +40,85 @@ use enclave_runtime::{
     RandomSource, ReceiptTrust, ServeConfig, TlsMode, DEFAULT_GVFORWARDER, DEFAULT_NSM_DEVICE,
     DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
+
+/// Where the FCM credential comes from, once the settings have been checked.
+enum FcmCredential {
+    /// Already parsed, because it was supplied literally and parsing it needed
+    /// nothing but the bytes.
+    Account(Box<enclave_runtime::ServiceAccount>),
+    /// A name to resolve against SSM, once there is a network.
+    Parameter(String),
+}
+
+/// Notification settings, as far as they can be decided without I/O.
+struct NotifySettings {
+    project_id: String,
+    credential: FcmCredential,
+    endpoint: Option<String>,
+}
+
+/// Read a parameter, decrypting a SecureString if that is what it is.
+///
+/// Its own small client rather than the one `keys` builds: that one is
+/// configured from a `MasterKeyConfig` and exists to fetch a KMS ciphertext,
+/// and threading an unrelated credential through it would tie two things
+/// together that have no reason to change at the same time.
+async fn read_ssm_parameter(cli: &Cli, name: &str) -> Result<String> {
+    use aws_sdk_ssm::config::{BehaviorVersion, Credentials, Region};
+
+    let region = Region::new(cli.region.clone());
+    let mut builder = aws_sdk_ssm::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(region.clone())
+        // Bounded, because this runs before the listener binds. A parameter
+        // store that accepts a connection and then says nothing would mean an
+        // enclave that never serves at all.
+        .timeout_config(
+            aws_sdk_ssm::config::timeout::TimeoutConfig::builder()
+                .operation_timeout(Duration::from_secs(5))
+                .connect_timeout(Duration::from_secs(3))
+                .build(),
+        );
+    if let Some(endpoint) = &cli.ssm_endpoint {
+        builder = builder.endpoint_url(endpoint);
+    }
+    // Static credentials when they were configured, and the default chain
+    // otherwise — which inside an enclave reaches the parent's instance role
+    // through gvproxy. Naming one is not optional: `Config::builder()` starts
+    // empty and resolves neither on its own, so leaving this out is not a
+    // default, it is no credentials at all.
+    builder = match (
+        cli.access_key_id.as_deref(),
+        cli.secret_access_key.as_deref(),
+    ) {
+        (Some(akid), Some(sak)) => builder.credentials_provider(Credentials::new(
+            akid,
+            sak,
+            cli.session_token.clone(),
+            None,
+            "s3fs-static",
+        )),
+        _ => builder.credentials_provider(
+            aws_config::default_provider::credentials::DefaultCredentialsChain::builder()
+                .region(region)
+                .build()
+                .await,
+        ),
+    };
+    let client = aws_sdk_ssm::Client::from_conf(builder.build());
+    let response = client
+        .get_parameter()
+        .name(name)
+        .with_decryption(true)
+        .send()
+        .await
+        .with_context(|| format!("reading SSM parameter {name}"))?;
+    response
+        .parameter()
+        .and_then(|p| p.value())
+        .map(str::to_string)
+        .with_context(|| format!("SSM parameter {name} has no value"))
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -305,6 +384,38 @@ struct Cli {
     #[arg(long, env = "S3FS_GUEST_LOG_ENDPOINT")]
     guest_log_endpoint: Option<String>,
 
+    /// The Firebase project wake signals are sent for.
+    ///
+    /// Empty means notifications are off — the same layering rule the guest
+    /// log settings follow, so an image can carry the setting and a deployment
+    /// can blank it.
+    #[arg(long, env = "S3FS_FCM_PROJECT_ID")]
+    fcm_project_id: Option<String>,
+
+    /// The service-account JSON itself. Development and local runs.
+    ///
+    /// Inside an enclave this arrives through the parent instance, which is the
+    /// party the enclave excludes. What a stolen credential buys is the ability
+    /// to ring doorbells: wake signals carry no data, and reading any of it
+    /// still needs a key KMS releases only to a matching PCR0/PCR16.
+    #[arg(long, env = "S3FS_FCM_SERVICE_ACCOUNT")]
+    fcm_service_account: Option<String>,
+
+    /// An SSM parameter holding that JSON. The production source.
+    ///
+    /// Keeps the secret out of the measured image and out of the launch
+    /// invocation, and lets it rotate without moving PCR0.
+    #[arg(long, env = "S3FS_FCM_SERVICE_ACCOUNT_PARAMETER")]
+    fcm_service_account_parameter: Option<String>,
+
+    /// Point the FCM client somewhere else. For tests and the emulator.
+    ///
+    /// A downgrade path: an `http://` endpoint hands wake signals to whatever
+    /// is listening. PCR0 records which image was built, which is the only
+    /// reason this is acceptable.
+    #[arg(long, env = "S3FS_FCM_ENDPOINT")]
+    fcm_endpoint: Option<String>,
+
     /// Clients kept warm at once.
     ///
     /// A warm client costs a wasm linear memory and nothing else — the
@@ -467,6 +578,55 @@ impl Cli {
     /// `--webauthn-rp-id`/`--webauthn-origin`. Everything that *does* need the
     /// network is decided at startup instead, where a transient failure can be
     /// told apart from a mistake.
+    /// Everything about notifications that can be decided without a network.
+    ///
+    /// The literal credential is parsed here, key and all: a malformed service
+    /// account must fail at boot rather than the first time somebody is waiting
+    /// to be woken, and proving it parses needs nothing but the bytes.
+    fn notify_settings(&self) -> Result<Option<NotifySettings>> {
+        let set = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let project = set(&self.fcm_project_id);
+        let literal = set(&self.fcm_service_account);
+        let parameter = set(&self.fcm_service_account_parameter);
+
+        // Empty means off, not malformed.
+        if project.is_none() && literal.is_none() && parameter.is_none() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            !(literal.is_some() && parameter.is_some()),
+            "--fcm-service-account and --fcm-service-account-parameter are alternatives. \
+             Refused rather than resolved by precedence: a deployment that set both has \
+             one of them wrong, and guessing which would be the wrong help."
+        );
+        let Some(project_id) = project else {
+            anyhow::bail!(
+                "an FCM credential was given without --fcm-project-id, so there is no \
+                 project to send for"
+            );
+        };
+        let credential = match (literal, parameter) {
+            (Some(json), _) => FcmCredential::Account(Box::new(
+                enclave_runtime::ServiceAccount::parse(&json).context("--fcm-service-account")?,
+            )),
+            (_, Some(name)) => FcmCredential::Parameter(name),
+            (None, None) => anyhow::bail!(
+                "--fcm-project-id was set without a service account, so nothing can be sent"
+            ),
+        };
+        Ok(Some(NotifySettings {
+            project_id,
+            credential,
+            endpoint: set(&self.fcm_endpoint),
+        }))
+    }
+
     fn guest_log_config(&self) -> Result<Option<enclave_runtime::CloudWatchConfig>> {
         // Empty means off, not malformed. The image environment is layered —
         // the QEMU image inherits production's and overrides what it cannot
@@ -886,6 +1046,32 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         }
     }
 
+    // Resolved before the listener binds, so a credential that cannot be
+    // fetched is a boot failure rather than a surprise on the first wake.
+    let notify = match cli.notify_settings()? {
+        None => None,
+        Some(settings) => {
+            let service_account = match settings.credential {
+                FcmCredential::Account(account) => *account,
+                FcmCredential::Parameter(name) => {
+                    let json = read_ssm_parameter(&cli, &name).await?;
+                    enclave_runtime::ServiceAccount::parse(&json).with_context(|| {
+                        format!("the FCM service account in SSM parameter {name}")
+                    })?
+                }
+            };
+            tracing::info!(
+                project = %settings.project_id,
+                "notifications are enabled; wake signals carry no content"
+            );
+            Some(enclave_runtime::NotifyConfig {
+                project_id: settings.project_id,
+                service_account,
+                endpoint: settings.endpoint,
+            })
+        }
+    };
+
     // Before the listener binds, so no request can produce guest output
     // before there is a task consuming it. Held for the server's
     // lifetime and drained explicitly below.
@@ -898,6 +1084,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         &component,
         guest,
         ServeConfig {
+            notify,
             background_tasks: cli
                 .background_tasks
                 .then(|| enclave_runtime::tasks::TaskLimits {
@@ -1118,6 +1305,112 @@ mod tests {
     }
 
     /// Console-only is the default, and takes no client and no credentials.
+    #[test]
+    fn notifications_are_off_unless_configured() {
+        let cli = cli_from(&["--bucket", "b", "--master-key", &"aa".repeat(32)]);
+        assert!(cli.notify_settings().expect("valid").is_none());
+    }
+
+    fn account_json() -> String {
+        serde_json::json!({
+            "type": "service_account",
+            "project_id": "enclave-test",
+            "private_key_id": "kid-1",
+            "private_key": include_str!("notify/testdata/service-account-key.pem"),
+            "client_email": "wake@enclave-test.iam.gserviceaccount.com",
+        })
+        .to_string()
+    }
+
+    /// An image carries the setting; a deployment blanks it. Empty is off, not
+    /// malformed — the same rule the guest log settings follow.
+    #[test]
+    fn an_empty_setting_turns_notifications_off() {
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--fcm-project-id",
+            "",
+            "--fcm-service-account",
+            "",
+        ]);
+        assert!(cli.notify_settings().expect("valid").is_none());
+    }
+
+    #[test]
+    fn a_literal_service_account_is_parsed_at_startup_rather_than_on_first_use() {
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--fcm-project-id",
+            "enclave-test",
+            "--fcm-service-account",
+            &account_json(),
+        ]);
+        let settings = cli.notify_settings().expect("valid").expect("configured");
+        assert_eq!(settings.project_id, "enclave-test");
+        assert!(matches!(settings.credential, FcmCredential::Account(_)));
+
+        // And a broken one fails here, not later.
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--fcm-project-id",
+            "enclave-test",
+            "--fcm-service-account",
+            "{\"type\":\"service_account\"}",
+        ]);
+        assert!(cli.notify_settings().is_err());
+    }
+
+    /// Refused rather than resolved by precedence: a deployment that set both
+    /// has one of them wrong, and guessing which is the wrong kind of help.
+    #[test]
+    fn two_credential_sources_are_refused_rather_than_ranked() {
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--fcm-project-id",
+            "p",
+            "--fcm-service-account",
+            &account_json(),
+            "--fcm-service-account-parameter",
+            "/prod/fcm",
+        ]);
+        assert!(cli.notify_settings().is_err());
+    }
+
+    #[test]
+    fn a_half_configured_notifier_is_refused_without_touching_the_network() {
+        let project_only = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--fcm-project-id",
+            "p",
+        ]);
+        assert!(project_only.notify_settings().is_err());
+
+        let credential_only = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &"aa".repeat(32),
+            "--fcm-service-account-parameter",
+            "/prod/fcm",
+        ]);
+        assert!(credential_only.notify_settings().is_err());
+    }
+
     #[test]
     fn guest_logging_is_console_only_unless_configured() {
         let cli = cli_from(&["--bucket", "b", "--master-key", &"aa".repeat(32)]);

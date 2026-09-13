@@ -173,6 +173,7 @@ async fn start_inner(slot: Option<enclave_runtime::CertificateSlot>) -> Harness 
             guest,
             ServeConfig {
                 background_tasks: None,
+                notify: None,
                 addr,
                 certificate,
                 acme: None,
