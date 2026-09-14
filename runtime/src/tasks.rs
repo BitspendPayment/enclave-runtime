@@ -791,7 +791,7 @@ mod tests {
         pool: Arc<crate::Tenancy>,
     ) -> Arc<crate::serve::ServeHandle> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm");
+            .join("../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm");
         let bytes = std::fs::read(path).expect("build examples/guest-http for wasm32-wasip2");
         let (logs, _collector) = crate::guest_io::start(Arc::new(crate::TracingLogSink));
         let env = crate::GuestEnvironment::new(

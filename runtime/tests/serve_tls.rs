@@ -34,7 +34,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn component_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm")
+        .join("../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm")
 }
 
 /// An NSM that signs for real, echoing back whatever it was asked to bind.

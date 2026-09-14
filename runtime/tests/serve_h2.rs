@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn component_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm")
+        .join("../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm")
 }
 
 /// Every request carries one, whether or not the deployment attests.

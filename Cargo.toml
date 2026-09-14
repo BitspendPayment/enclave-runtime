@@ -4,7 +4,7 @@ members = [
     "crates/nitro-attestation",
     "crates/nitro-nsm",
     "crates/s3fs-core",
-    "crates/enclave-runtime",
+    "runtime",
 ]
 
 [workspace.package]

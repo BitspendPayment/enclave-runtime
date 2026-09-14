@@ -51,7 +51,7 @@ fn runtime() -> Runtime {
 
 fn component_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm")
+        .join("../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm")
 }
 
 fn component_bytes() -> Vec<u8> {

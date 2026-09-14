@@ -32,7 +32,7 @@ use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
 fn component_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm")
+        .join("../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm")
 }
 
 /// Keeps every record, in arrival order.

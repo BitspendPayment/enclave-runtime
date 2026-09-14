@@ -35,7 +35,7 @@ type OpenBody = http_body_util::StreamBody<tokio_stream::wrappers::ReceiverStrea
 
 fn component_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/guest-grpc/target/wasm32-wasip2/release/guest-grpc.wasm")
+        .join("../examples/guest-grpc/target/wasm32-wasip2/release/guest-grpc.wasm")
 }
 
 const SIGN: &str = "/enclave.cosign.v1.SigningSession/Sign";

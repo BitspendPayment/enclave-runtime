@@ -27,7 +27,7 @@ const ORIGIN: &str = "https://enclave.test";
 
 fn component_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm")
+        .join("../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm")
 }
 
 /// An NSM that signs for real, echoing back whatever it was asked to bind.
@@ -700,7 +700,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 /// suite that cannot find it has nothing to say about the client — but a
 /// *silent* skip reports green for a test that never ran, so it says so.
 fn client_binary() -> Option<PathBuf> {
-    let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/passkey-client");
+    let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/release/passkey-client");
     if exe.exists() {
         return Some(exe);
     }
@@ -728,7 +728,7 @@ fn client_state(tag: &str) -> PathBuf {
 /// script driving this binary does, and the reason it is worth spawning rather
 /// than calling in-process.
 async fn client(h: &Harness, state: &std::path::Path, args: Vec<String>) -> (bool, String, String) {
-    let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/passkey-client");
+    let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/release/passkey-client");
     let state = state.to_path_buf();
     let pcr16 = hex::encode(nitro_attestation::guest_pcr(&h.guest_bytes));
     let url = format!("https://127.0.0.1:{}", h.addr.port());

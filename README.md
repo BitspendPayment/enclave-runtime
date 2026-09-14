@@ -26,7 +26,7 @@ Four workspace crates plus example guests:
 | [`s3fs-core`](crates/s3fs-core/) | The engine. `Backend` trait with in-memory and AWS S3 backends; a copy-on-write block store (`store::*`) with encrypted blocks, an indirect-block tree, a dnode array, and the transaction-group commit protocol; POSIX semantics on top (`Fs`). **Zero wasmtime dependency** — usable from any host. |
 | [`nitro-nsm`](crates/nitro-nsm/) | `/dev/nsm`: entropy and attestation requests. Its own crate so it links into a small static binary for an enclave image. |
 | [`nitro-attestation`](crates/nitro-attestation/) | Parses and verifies attestation documents, and the `nitro-attest` client. Depends on nothing else here — a verifier has no `/dev/nsm` and is often not Linux. |
-| [`enclave-runtime`](crates/enclave-runtime/) | Everything above the engine: `wasi:filesystem@0.2.x`, the linker, the guest-environment policy, the vsock tap device, TLS termination and per-response attestation — plus the binary that ties them together. A library beside the binary so integration tests can reach it. |
+| [`enclave-runtime`](runtime/) | Everything above the engine: `wasi:filesystem@0.2.x`, the linker, the guest-environment policy, the vsock tap device, TLS termination and per-response attestation — plus the binary that ties them together. A library beside the binary so integration tests can reach it. |
 | [`examples/guest-http`](examples/guest-http/) | The guest the serving path is tested against: reads and writes the filesystem, and is deliberately stateful so a second request proves the first one's writes committed. |
 | [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Runs on request; needs wasi-sdk to build. |
 
@@ -678,7 +678,7 @@ enclave exists to exclude.
 It exports `wasi:http/incoming-handler` and receives a **parsed request**. It
 never sees a socket, a connection, a certificate or a TLS record. It cannot
 open one either: the linker grants no `wasi:sockets` permission, and
-`wasi:http/outgoing-handler` is wired to an [`EgressPolicy`](crates/enclave-runtime/src/serve/mod.rs)
+`wasi:http/outgoing-handler` is wired to an [`EgressPolicy`](runtime/src/serve/mod.rs)
 that refuses every request.
 
 That refusal is explicit rather than incidental. `wasmtime-wasi-http`'s

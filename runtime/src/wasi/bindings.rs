@@ -7,7 +7,7 @@
 //! and `wasi:filesystem/types/directory-entry-stream`.
 
 wasmtime::component::bindgen!({
-    path: "../../wit",
+    path: "../wit",
     world: "enclave-runtime",
     imports: { default: async | trappable },
     trappable_error_type: {

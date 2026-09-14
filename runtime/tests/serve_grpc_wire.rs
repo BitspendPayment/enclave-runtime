@@ -26,7 +26,7 @@ use s3fs_core::{Config, Fs, MasterSecret};
 
 fn component_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/guest-grpc/target/wasm32-wasip2/release/guest-grpc.wasm")
+        .join("../examples/guest-grpc/target/wasm32-wasip2/release/guest-grpc.wasm")
 }
 
 // --- the messages, decoded by prost on this side ----------------------------
