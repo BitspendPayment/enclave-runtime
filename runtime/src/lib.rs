@@ -52,6 +52,9 @@ pub mod tenant;
 pub mod wasi;
 
 #[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
+#[cfg(any(test, feature = "testing"))]
 pub use auth::SoftwareAuthenticator;
 pub use auth::{
     build_relying_party, AuthEndpoints, ChallengeStore, FilesystemCredentials, Gate,

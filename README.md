@@ -1420,12 +1420,33 @@ test-shaped concession left is `S3FS_ACME_CA`, which points the enclave at
 Pebble's root for the directory's own HTTPS — a flag a production binary does
 not have.
 
-**What it does not prove.** QEMU's emulated NSM does not sign attestation
-documents — its source says *"we don't actually sign the data, so we use -1 as
-the 'alg' value"*, and -1 is not a COSE algorithm identifier. So no signature
-and no certificate chain are checked, only the contents the runtime put there.
-`nitro-attest --unsigned-emulator` says so on every run. The signature path
-needs real Nitro hardware.
+**The signature is real, the key is not.** QEMU's emulated NSM does not sign
+anything — its source says *"we don't actually sign the data, so we use -1 as
+the 'alg' value"*, and -1 is not a COSE algorithm identifier. So the emulator
+image mints a certificate chain at boot and re-signs the documents the device
+produced, contents untouched, and reports the root on its console. Clients then
+run their whole verification path — COSE ES384, the chain, the validity windows,
+the pinned root, both PCRs — which is what they will run against hardware.
+
+What that does *not* establish is who produced a document: the key is inside an
+image its operator controls, so a verified document here means "this image said
+so" rather than "a Nitro enclave with this measurement said so". Closing that
+gap needs real hardware, and so does KMS refusing a key to a substituted guest.
+
+### A development enclave
+
+The same stack, left running, serving a component of your own:
+
+```bash
+deploy/qemu-nitro/dev-enclave.sh --guest path/to/your-component.wasm
+```
+
+[`dev-enclave.sh`](deploy/qemu-nitro/dev-enclave.sh) and `run-e2e.sh` share
+their bring-up in [`deploy/qemu-nitro/lib.sh`](deploy/qemu-nitro/lib.sh), so what
+a client is developed against is what CI checks. It prints the URL and the three
+values a client pins — PCR0, PCR16 and the trust root — and waits.
+[`docs/DEV_ENCLAVE.md`](docs/DEV_ENCLAVE.md) has the rest, including what is and
+is not real about it.
 
 ### What the enclave consumer still owns
 

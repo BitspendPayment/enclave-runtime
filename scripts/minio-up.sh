@@ -18,8 +18,15 @@ port="${2:?host port}"
 data="${3:?data bucket}"
 roots="${4:?roots bucket}"
 
+# Optional, and applied to every container this starts. A caller that cleans up
+# by label — deploy/qemu-nitro/lib.sh does, so that the list of containers to
+# remove cannot fall out of step with the list it starts — otherwise leaves this
+# one running, because it is the one container it did not start itself.
+label=()
+[[ -n "${MINIO_LABEL:-}" ]] && label=(--label "$MINIO_LABEL")
+
 docker rm -f "$container" >/dev/null 2>&1 || true
-docker run -d --rm --name "$container" -p "$port:9000" \
+docker run -d --rm --name "$container" -p "$port:9000" "${label[@]}" \
     -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
     minio/minio server /data >/dev/null
 
@@ -42,7 +49,7 @@ fi
 
 # Tolerant of buckets that already exist: this script is also how a developer
 # restarts a store between runs, and "already there" is success.
-docker run --rm --network host --entrypoint sh minio/mc -c "
+docker run --rm --network host "${label[@]}" --entrypoint sh minio/mc -c "
     mc alias set m http://127.0.0.1:$port minioadmin minioadmin >/dev/null
     mc mb m/$data >/dev/null 2>&1 || true
     mc mb --with-lock m/$roots >/dev/null 2>&1 || true" >/dev/null \

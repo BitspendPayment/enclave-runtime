@@ -310,7 +310,19 @@ fn run() -> Result<()> {
     );
     println!("timestamp  {:?}", document.timestamp());
     match verified.trust {
-        Trust::ChainVerified => println!("chain      verified to the AWS Nitro root"),
+        // Which root, not just that there was one. `ChainVerified` means the
+        // presented root equalled the pinned one — and the pinned one is AWS's
+        // only when `--trust-root` was not given. Saying "the AWS Nitro root"
+        // unconditionally told an operator verifying against a test root that
+        // they had verified against AWS, which is the one thing this line is
+        // for.
+        Trust::ChainVerified => match &cli.trust_root {
+            None => println!("chain      verified to the AWS Nitro root"),
+            Some(path) => println!(
+                "chain      verified to the root pinned in {} — NOT AWS's",
+                path.display()
+            ),
+        },
         Trust::SelfSigned => println!("chain      SELF-SIGNED — proves nothing about AWS hardware"),
         Trust::Unsigned => println!("chain      UNSIGNED — nothing verified; contents only"),
     }

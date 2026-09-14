@@ -546,6 +546,25 @@ struct Cli {
     #[arg(long, env = "S3FS_ACME_CA")]
     acme_ca: Option<PathBuf>,
 
+    /// Re-sign attestation documents with a certificate chain minted at boot.
+    ///
+    /// **Only in a `testing` build, and only useful under an emulator.** QEMU's
+    /// NSM produces documents with genuine contents — the real PCR0 of the
+    /// image, the PCR16 the runtime measured — inside an envelope it does not
+    /// sign: its source says *"we don't actually sign the data, so we use -1 as
+    /// the 'alg' value"*, and -1 is not a COSE algorithm. A client meeting one
+    /// has to pass `--unsigned-emulator`, which skips the signature, the chain
+    /// and the validity windows entirely.
+    ///
+    /// With this set, the runtime asks the device for a document and re-signs
+    /// that same payload, so a client pins the reported root and runs every
+    /// check it would run against hardware. It proves nothing about *who*
+    /// produced a document — the key is minted inside an image its operator
+    /// controls — which is why a production binary has no such flag.
+    #[cfg(any(test, feature = "testing"))]
+    #[arg(long, env = "S3FS_COSIGN_ATTESTATIONS", value_parser = enclave_runtime::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
+    cosign_attestations: bool,
+
     /// How the enclave reaches the network.
     ///
     /// `gvproxy` runs the tap forwarder against the parent's gvproxy, which is
@@ -764,6 +783,46 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
 
     let clock = open_clock(cli.clock_source, &cli.ptp_device)?;
     let entropy = open_entropy(cli.random_source, &cli.nsm_device)?;
+
+    /// Wrap the device so its documents carry a signature, if this build can.
+    ///
+    /// Two definitions rather than a runtime branch, for the reason `--acme-ca`
+    /// has two: a production binary has no flag to read, so no deployment can
+    /// talk it into signing attestations with a key it minted itself.
+    #[cfg(any(test, feature = "testing"))]
+    fn cosign(
+        cli: &Cli,
+        entropy: std::sync::Arc<dyn nitro_nsm::Nsm>,
+    ) -> Result<std::sync::Arc<dyn nitro_nsm::Nsm>> {
+        use base64::Engine as _;
+
+        if !cli.cosign_attestations {
+            return Ok(entropy);
+        }
+        let cosigning = enclave_runtime::testing::CosigningNsm::wrap(entropy)?;
+        // At `warn`, and printed in full. A client cannot check anything
+        // without this value, and it is minted fresh at every boot — so it has
+        // to leave by the one channel the parent already reads, and it has to
+        // stand out from the boot log around it.
+        tracing::warn!(
+            trust_root = %base64::engine::general_purpose::STANDARD.encode(cosigning.trust_root()),
+            "attestation documents are signed with a chain minted at boot, not by Nitro \
+             hardware; a client must pin the root below, and it means only that this image \
+             produced the document"
+        );
+        Ok(std::sync::Arc::new(cosigning))
+    }
+
+    #[cfg(not(any(test, feature = "testing")))]
+    fn cosign(
+        _cli: &Cli,
+        entropy: std::sync::Arc<dyn nitro_nsm::Nsm>,
+    ) -> Result<std::sync::Arc<dyn nitro_nsm::Nsm>> {
+        Ok(entropy)
+    }
+
+    let entropy = cosign(&cli, entropy)?;
+
     if cli.self_check {
         clock_check(clock.as_ref())?;
         println!();

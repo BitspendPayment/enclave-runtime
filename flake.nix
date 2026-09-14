@@ -423,10 +423,32 @@
           name = "s3fs-qemu";
           env = runtimeImage.env // {
             S3FS_CLOCK_SOURCE = "host";
-            # QEMU's NSM does not sign attestation documents, so a receipt it
-            # produced has no signature to check. Contents are still verified —
-            # PCR0, PCR16 and the state_root — which is the whole boot machine
-            # minus the one part that needs real hardware.
+
+            # QEMU's NSM does not sign at all: its source says "we don't
+            # actually sign the data, so we use -1 as the 'alg' value", and -1
+            # is not a COSE algorithm. A client meeting one of its documents has
+            # to skip the signature, the chain and the validity windows — most
+            # of what a client does, and precisely the part worth exercising
+            # before it meets hardware.
+            #
+            # So the runtime re-signs what the device produced, contents
+            # untouched, with a chain it mints at boot. It says nothing about
+            # *who* produced a document — the key is inside an image its
+            # operator controls — but it means the client code developed against
+            # the emulator is the code that runs against Nitro, rather than a
+            # relaxed variant of it. The root is reported on the console at
+            # startup; `deploy/qemu-nitro/lib.sh` captures it for the clients.
+            #
+            # Testing-only, like `S3FS_ACME_CA`: the production binary has no
+            # such flag, so no deployment can sign its own attestations.
+            S3FS_COSIGN_ATTESTATIONS = "1";
+
+            # And receipts stay content-checked, because that chain is minted
+            # fresh at every boot. A receipt signed at genesis names a root the
+            # next boot no longer has, so requiring a signature here would turn
+            # every restart into a refusal to resume. Contents are still
+            # verified — PCR0, PCR16 and the state_root — which is the whole
+            # boot machine minus the one part that needs real hardware.
             S3FS_RECEIPT_TRUST = "unsigned-emulator";
             # A directory per client, which the e2e exercises with two client
             # certificates. Concurrency has to rise with it or every client
