@@ -39,10 +39,13 @@ set -euo pipefail
 GUEST_WASM=""
 PREFIX="${PREFIX:-dev}"
 HTTPS_PORT="${HTTPS_PORT:-8443}"
+WEBAUTHN_RP_ID=""
+WEBAUTHN_ALLOWED_ORIGINS=""
 
 usage() {
     cat >&2 <<EOF
 usage: ${0##*/} [--guest COMPONENT.wasm] [--port PORT] [--name NAME]
+                     [--rp-id DOMAIN] [--allowed-origin ORIGIN]...
 
   --guest   a wasm component to serve. Without one, the example guest in
             examples/guest-http is built and used.
@@ -50,6 +53,15 @@ usage: ${0##*/} [--guest COMPONENT.wasm] [--port PORT] [--name NAME]
   --name    names this run's containers and its directory under
             target/qemu-nitro. Default $PREFIX. It keeps runs apart on disk;
             only one can be up at a time.
+  --rp-id   the WebAuthn relying party the image is built with. Default
+            enclave.test. A phone creates a passkey only for a domain whose
+            /.well-known/assetlinks.json names the app, so testing an app means
+            passing that domain. Independent of the certificate, which stays
+            enclave.test. A different image, so a different PCR0.
+  --allowed-origin
+            an origin assertions may claim besides https://<rp id>. Repeatable.
+            An Android app claims android:apk-key-hash:<unpadded base64url
+            SHA-256 of its signing certificate>.
 EOF
     exit 2
 }
@@ -66,6 +78,11 @@ while [[ $# -gt 0 ]]; do
         --guest) need "$1" "${2:-}"; GUEST_WASM="$2"; shift 2 ;;
         --port)  need "$1" "${2:-}"; HTTPS_PORT="$2"; shift 2 ;;
         --name)  need "$1" "${2:-}"; PREFIX="$2";     shift 2 ;;
+        --rp-id) need "$1" "${2:-}"; WEBAUTHN_RP_ID="$2"; shift 2 ;;
+        --allowed-origin)
+                 need "$1" "${2:-}"
+                 WEBAUTHN_ALLOWED_ORIGINS="${WEBAUTHN_ALLOWED_ORIGINS:+$WEBAUTHN_ALLOWED_ORIGINS,}$2"
+                 shift 2 ;;
         -h|--help) usage ;;
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
@@ -84,7 +101,20 @@ if [[ -n "$GUEST_WASM" ]]; then
         || { echo "no such component: $GUEST_WASM" >&2; exit 1; }
 fi
 
-export GUEST_WASM PREFIX HTTPS_PORT
+# Both end up inside a Nix expression, so they are held to exactly the shapes they can take.
+[[ -z "$WEBAUTHN_RP_ID" || "$WEBAUTHN_RP_ID" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
+    || { echo "--rp-id must be a domain name" >&2; exit 1; }
+IFS=, read -ra origins <<<"$WEBAUTHN_ALLOWED_ORIGINS"
+for o in "${origins[@]}"; do
+    [[ "$o" =~ ^(https://[a-z0-9.-]+(:[0-9]+)?|android:apk-key-hash:[A-Za-z0-9_-]{43})$ ]] \
+        || { echo "--allowed-origin $o: expected https://<host> or android:apk-key-hash:<43 characters>" >&2; exit 1; }
+done
+if [[ -n "$WEBAUTHN_ALLOWED_ORIGINS" && -z "$WEBAUTHN_RP_ID" ]]; then
+    echo "--allowed-origin needs --rp-id: an app's origin is only ever vouched for by its own domain" >&2
+    exit 1
+fi
+
+export GUEST_WASM PREFIX HTTPS_PORT WEBAUTHN_RP_ID WEBAUTHN_ALLOWED_ORIGINS
 # shellcheck source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
@@ -107,7 +137,8 @@ cat <<EOF
 == the enclave is up ==
 
   url      https://127.0.0.1:$HTTPS_PORT
-  host     enclave.test   (the name on the certificate, and the WebAuthn RP id)
+  host     enclave.test   (the name on the certificate)
+  rp id    ${WEBAUTHN_RP_ID:-enclave.test}${WEBAUTHN_ALLOWED_ORIGINS:+   allowing $WEBAUTHN_ALLOWED_ORIGINS}
 
 What a client has to pin. All three, and none of them stands in for another:
 PCR0 is the image, taken by the hypervisor and unforgeable from inside; PCR16 is
@@ -130,7 +161,7 @@ request, which is the only way anything reaches the guest:
   $PASSKEY \\
       --url https://127.0.0.1:$HTTPS_PORT --state $RUNDIR/alice.json \\
       --trust-root $TRUST_ROOT \\
-      --pcr0 $EXPECTED_PCR0 --pcr16 $EXPECTED_PCR16 \\
+      --pcr0 $EXPECTED_PCR0 --pcr16 $EXPECTED_PCR16 --rp-id ${WEBAUTHN_RP_ID:-enclave.test} \\
       get --path /counter
 
 The path /counter is one the example guest serves; against your own component,

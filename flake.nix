@@ -377,8 +377,138 @@
         };
       };
 
+      # The runtime configured for the emulator, as a function of the relying
+      # party so a client developer can boot one their app can sign for:
+      #
+      #   nix build --impure --expr '(builtins.getFlake "git+file://$PWD").lib.x86_64-linux.eifQemu
+      #     { rpId = "example.com"; allowedOrigins = [ "android:apk-key-hash:..." ]; }'
+      #
+      # which is what `dev-enclave.sh --rp-id --allowed-origin` does. The
+      # defaults are `packages.eif-qemu`, the image the e2e boots.
+      eifQemu = { rpId ? "enclave.test", allowedOrigins ? [ ] }: callEif (runtimeImage // {
+        payload = runtimeImage.payload // {
+          "enclave-runtime" = "${enclave-runtime-testing}/bin/enclave-runtime";
+          # Pebble's ACME API is served under a certificate no public root
+          # signed, so its root ships *inside* the image and is covered by
+          # PCR0 like every other piece of configuration. A test root in a
+          # test image: the production EIF has no such file, and the
+          # production binary has no flag that would read one.
+          "pebble-ca.pem" = ./deploy/qemu-nitro/pebble/ca.pem;
+        };
+        closureRoots = [ enclave-runtime-testing busybox pkgs.cacert ];
+        name = "s3fs-qemu";
+        env = runtimeImage.env // {
+          S3FS_CLOCK_SOURCE = "host";
+
+          # QEMU's NSM does not sign at all: its source says "we don't
+          # actually sign the data, so we use -1 as the 'alg' value", and -1
+          # is not a COSE algorithm. A client meeting one of its documents has
+          # to skip the signature, the chain and the validity windows — most
+          # of what a client does, and precisely the part worth exercising
+          # before it meets hardware.
+          #
+          # So the runtime re-signs what the device produced, contents
+          # untouched, with a chain it mints at boot. It says nothing about
+          # *who* produced a document — the key is inside an image its
+          # operator controls — but it means the client code developed against
+          # the emulator is the code that runs against Nitro, rather than a
+          # relaxed variant of it. The root is reported on the console at
+          # startup; `deploy/qemu-nitro/lib.sh` captures it for the clients.
+          #
+          # Testing-only, like `S3FS_ACME_CA`: the production binary has no
+          # such flag, so no deployment can sign its own attestations.
+          S3FS_COSIGN_ATTESTATIONS = "1";
+
+          # And receipts stay content-checked, because that chain is minted
+          # fresh at every boot. A receipt signed at genesis names a root the
+          # next boot no longer has, so requiring a signature here would turn
+          # every restart into a refusal to resume. Contents are still
+          # verified — PCR0, PCR16 and the state_root — which is the whole
+          # boot machine minus the one part that needs real hardware.
+          S3FS_RECEIPT_TRUST = "unsigned-emulator";
+          # A directory per client, which the e2e exercises with two client
+          # certificates. Concurrency has to rise with it or every client
+          # still queues behind every other and the per-client locks buy
+          # nothing.
+          # And it cannot use KMS at all, for the same reason: KMS verifies
+          # the attestation document carrying the enclave's recipient public
+          # key, and will not accept one that is unsigned. So the emulator
+          # keeps the development key source. PCR0 differs between the two
+          # images, so a client can tell which it is talking to.
+          S3FS_MASTER_KEY_SOURCE = "static";
+          # Real ACME, against a Pebble running on the host — the same code
+          # path production takes, which is the whole reason to prefer it.
+          #
+          # This image used to serve a self-signed certificate, because there
+          # is no public domain here and nothing Let's Encrypt could reach, so
+          # an order failed forever and stalled every handshake rather than
+          # failing loudly. The consequence was worse than the workaround: the
+          # e2e proved a TLS mode a production build cannot even parse. Pebble
+          # removes the reason, so the mode went with it.
+          #
+          # `enclave.test` resolves, inside the Pebble container, to the host
+          # loopback where gvproxy forwards :443 into this enclave — so the
+          # TLS-ALPN-01 challenge arrives on the same port the service uses,
+          # which is exactly the arrangement production runs.
+          S3FS_TLS = "acme";
+          S3FS_TLS_DOMAINS = "enclave.test";
+          S3FS_ACME_DIRECTORY = "https://192.168.127.254:14000/dir";
+          S3FS_ACME_CA = "/pebble-ca.pem";
+          # The e2e schedules work and waits for it to run. Production leaves
+          # this off in deployment.nix; turning it on here changes only the
+          # emulator's PCR0, and the harness checks PCR0 against its own
+          # `nix build` rather than against a published number, so nothing
+          # downstream moves. The guest is guest-http, which exports the
+          # `run-task` the runtime refuses to start without when this is set.
+          S3FS_BACKGROUND_TASKS = "true";
+          # Notifications, against a stub on the host rather than Google —
+          # which is unreachable from here and would refuse an invented
+          # registration token anyway. What the e2e checks is what the
+          # *runtime* sends, and the stub records exactly that.
+          #
+          # A literal credential, not an SSM parameter: there is no SSM here.
+          # It is a throwaway key in a test image, and the `http://` endpoint
+          # is the same downgrade `--guest-log-endpoint` already is. PCR0
+          # records that this image was built with both.
+          S3FS_FCM_PROJECT_ID = "e2e";
+          S3FS_FCM_SERVICE_ACCOUNT = builtins.readFile ./deploy/qemu-nitro/fcm/service-account.json;
+          S3FS_FCM_ENDPOINT = "http://192.168.127.254:9101";
+          # Off. Inherited from the production image, and there is no AWS
+          # here to send to: the harness's credentials are MinIO's, which
+          # CloudWatch would reject. Empty means off — the same shape as the
+          # TLS override above, and the reason `guest_log_config` treats an
+          # empty setting as unset rather than as a typo.
+          S3FS_GUEST_LOG_GROUP = "";
+          S3FS_GUEST_LOG_STREAM = "";
+          # The gate, with a relying party the harness can drive. The e2e
+          # exercises it with the software passkey the `testing` feature
+          # provides, so the default is a name nothing else answers to.
+          #
+          # A developer testing a phone app against this passes their own: a
+          # platform authenticator creates a passkey only for an rp id whose
+          # domain publishes assetlinks.json naming the app, and the app claims
+          # `android:apk-key-hash:<hash>` rather than the web origin. The rp id
+          # is independent of the certificate's name, which stays enclave.test.
+          S3FS_WEBAUTHN_RP_ID = rpId;
+          S3FS_WEBAUTHN_ORIGIN = "https://${rpId}";
+          S3FS_ENDPOINT = "http://192.168.127.254:9000";
+          S3FS_FORCE_PATH_STYLE = "1";
+          S3FS_BUCKET = "e2e-data";
+          S3FS_ROOTS_BUCKET = "e2e-roots";
+          S3FS_MASTER_KEY = "00000000000000000000000000000000000000000000000000000000000000ab";
+          AWS_ACCESS_KEY_ID = "minioadmin";
+          AWS_SECRET_ACCESS_KEY = "minioadmin";
+          AWS_REGION = "us-east-1";
+          RUST_LOG = "info,s3fs=debug";
+        } // nixpkgs.lib.optionalAttrs (allowedOrigins != [ ]) {
+          S3FS_WEBAUTHN_ALLOWED_ORIGINS = nixpkgs.lib.concatStringsSep "," allowedOrigins;
+        };
+      });
+
     in
     {
+      lib.${system} = { inherit eifQemu; };
+
       packages.${system} = {
         inherit enclave-runtime guest-http guest-release nsm-selftest nitro-attest eif-build blobs;
 
@@ -410,118 +540,7 @@
         # store is MinIO on the host, reachable at gvproxy's host address.
         # The credentials here are test values in a test image; nothing that
         # matters is protected by them.
-        eif-qemu = callEif (runtimeImage // {
-          payload = runtimeImage.payload // {
-            "enclave-runtime" = "${enclave-runtime-testing}/bin/enclave-runtime";
-            # Pebble's ACME API is served under a certificate no public root
-            # signed, so its root ships *inside* the image and is covered by
-            # PCR0 like every other piece of configuration. A test root in a
-            # test image: the production EIF has no such file, and the
-            # production binary has no flag that would read one.
-            "pebble-ca.pem" = ./deploy/qemu-nitro/pebble/ca.pem;
-          };
-          closureRoots = [ enclave-runtime-testing busybox pkgs.cacert ];
-          name = "s3fs-qemu";
-          env = runtimeImage.env // {
-            S3FS_CLOCK_SOURCE = "host";
-
-            # QEMU's NSM does not sign at all: its source says "we don't
-            # actually sign the data, so we use -1 as the 'alg' value", and -1
-            # is not a COSE algorithm. A client meeting one of its documents has
-            # to skip the signature, the chain and the validity windows — most
-            # of what a client does, and precisely the part worth exercising
-            # before it meets hardware.
-            #
-            # So the runtime re-signs what the device produced, contents
-            # untouched, with a chain it mints at boot. It says nothing about
-            # *who* produced a document — the key is inside an image its
-            # operator controls — but it means the client code developed against
-            # the emulator is the code that runs against Nitro, rather than a
-            # relaxed variant of it. The root is reported on the console at
-            # startup; `deploy/qemu-nitro/lib.sh` captures it for the clients.
-            #
-            # Testing-only, like `S3FS_ACME_CA`: the production binary has no
-            # such flag, so no deployment can sign its own attestations.
-            S3FS_COSIGN_ATTESTATIONS = "1";
-
-            # And receipts stay content-checked, because that chain is minted
-            # fresh at every boot. A receipt signed at genesis names a root the
-            # next boot no longer has, so requiring a signature here would turn
-            # every restart into a refusal to resume. Contents are still
-            # verified — PCR0, PCR16 and the state_root — which is the whole
-            # boot machine minus the one part that needs real hardware.
-            S3FS_RECEIPT_TRUST = "unsigned-emulator";
-            # A directory per client, which the e2e exercises with two client
-            # certificates. Concurrency has to rise with it or every client
-            # still queues behind every other and the per-client locks buy
-            # nothing.
-            # And it cannot use KMS at all, for the same reason: KMS verifies
-            # the attestation document carrying the enclave's recipient public
-            # key, and will not accept one that is unsigned. So the emulator
-            # keeps the development key source. PCR0 differs between the two
-            # images, so a client can tell which it is talking to.
-            S3FS_MASTER_KEY_SOURCE = "static";
-            # Real ACME, against a Pebble running on the host — the same code
-            # path production takes, which is the whole reason to prefer it.
-            #
-            # This image used to serve a self-signed certificate, because there
-            # is no public domain here and nothing Let's Encrypt could reach, so
-            # an order failed forever and stalled every handshake rather than
-            # failing loudly. The consequence was worse than the workaround: the
-            # e2e proved a TLS mode a production build cannot even parse. Pebble
-            # removes the reason, so the mode went with it.
-            #
-            # `enclave.test` resolves, inside the Pebble container, to the host
-            # loopback where gvproxy forwards :443 into this enclave — so the
-            # TLS-ALPN-01 challenge arrives on the same port the service uses,
-            # which is exactly the arrangement production runs.
-            S3FS_TLS = "acme";
-            S3FS_TLS_DOMAINS = "enclave.test";
-            S3FS_ACME_DIRECTORY = "https://192.168.127.254:14000/dir";
-            S3FS_ACME_CA = "/pebble-ca.pem";
-            # The e2e schedules work and waits for it to run. Production leaves
-            # this off in deployment.nix; turning it on here changes only the
-            # emulator's PCR0, and the harness checks PCR0 against its own
-            # `nix build` rather than against a published number, so nothing
-            # downstream moves. The guest is guest-http, which exports the
-            # `run-task` the runtime refuses to start without when this is set.
-            S3FS_BACKGROUND_TASKS = "true";
-            # Notifications, against a stub on the host rather than Google —
-            # which is unreachable from here and would refuse an invented
-            # registration token anyway. What the e2e checks is what the
-            # *runtime* sends, and the stub records exactly that.
-            #
-            # A literal credential, not an SSM parameter: there is no SSM here.
-            # It is a throwaway key in a test image, and the `http://` endpoint
-            # is the same downgrade `--guest-log-endpoint` already is. PCR0
-            # records that this image was built with both.
-            S3FS_FCM_PROJECT_ID = "e2e";
-            S3FS_FCM_SERVICE_ACCOUNT = builtins.readFile ./deploy/qemu-nitro/fcm/service-account.json;
-            S3FS_FCM_ENDPOINT = "http://192.168.127.254:9101";
-            # Off. Inherited from the production image, and there is no AWS
-            # here to send to: the harness's credentials are MinIO's, which
-            # CloudWatch would reject. Empty means off — the same shape as the
-            # TLS override above, and the reason `guest_log_config` treats an
-            # empty setting as unset rather than as a typo.
-            S3FS_GUEST_LOG_GROUP = "";
-            S3FS_GUEST_LOG_STREAM = "";
-            # The gate, with a relying party the harness can drive. A platform
-            # authenticator would refuse this self-signed certificate, so the
-            # e2e exercises the gate with the software passkey the `testing`
-            # feature provides rather than a real one.
-            S3FS_WEBAUTHN_RP_ID = "enclave.test";
-            S3FS_WEBAUTHN_ORIGIN = "https://enclave.test";
-            S3FS_ENDPOINT = "http://192.168.127.254:9000";
-            S3FS_FORCE_PATH_STYLE = "1";
-            S3FS_BUCKET = "e2e-data";
-            S3FS_ROOTS_BUCKET = "e2e-roots";
-            S3FS_MASTER_KEY = "00000000000000000000000000000000000000000000000000000000000000ab";
-            AWS_ACCESS_KEY_ID = "minioadmin";
-            AWS_SECRET_ACCESS_KEY = "minioadmin";
-            AWS_REGION = "us-east-1";
-            RUST_LOG = "info,s3fs=debug";
-          };
-        });
+        eif-qemu = eifQemu { };
 
         # The entropy harness's image: no closure, no network, nothing but the
         # device check.

@@ -212,9 +212,32 @@ nix_build() {
     tail -3 "$log"
 }
 
+nix_expr() {
+    local what="$1" link="$2" expr="$3" log="$RUNDIR/nix-eif-qemu.log"
+    if ! nix build --impure --expr "$expr" --out-link "$link" --print-build-logs > "$log" 2>&1; then
+        echo "nix build of $what failed:" >&2
+        grep -E 'error(\[|:)' "$log" | head -20 >&2 || true
+        echo "  full log: $log" >&2
+        exit 1
+    fi
+    tail -3 "$log"
+}
+
 enclave_build_image() {
     say "building the enclave image"
-    nix_build eif-qemu "$RUNDIR/eif"
+    if [[ -n "${WEBAUTHN_RP_ID:-}" ]]; then
+        # The same image with another relying party. Not a package — flake outputs take no
+        # arguments — so the flake's `lib.eifQemu` is called directly, which reading the flake by
+        # path needs --impure for. dev-enclave.sh has already held both values to shapes that
+        # cannot break out of the string.
+        local origins="" o
+        IFS=, read -ra list <<<"${WEBAUTHN_ALLOWED_ORIGINS:-}"
+        for o in "${list[@]}"; do origins+=" \"$o\""; done
+        nix_expr "eif-qemu for $WEBAUTHN_RP_ID" "$RUNDIR/eif" \
+            "((builtins.getFlake \"git+file://$REPO\").lib.\${builtins.currentSystem}.eifQemu { rpId = \"$WEBAUTHN_RP_ID\"; allowedOrigins = [$origins ]; })"
+    else
+        nix_build eif-qemu "$RUNDIR/eif"
+    fi
     EIF_DIR="$(resolve_out_link "$RUNDIR/eif")"
     EIF="$EIF_DIR/s3fs-qemu.eif"
     EXPECTED_PCR0="$(jq -r .PCR0 "$EIF_DIR/pcr.json")"
@@ -547,7 +570,8 @@ enclave_trust_root() {
     # "pinned" root pins nothing. Without it the presented root must equal this
     # one — the same comparison a client makes against AWS's — and passing
     # --pcr0 and --pcr16 becomes mandatory.
-    PASSKEY_ARGS=(--trust-root "$TRUST_ROOT" --pcr0 "$EXPECTED_PCR0" --pcr16 "$EXPECTED_PCR16")
+    PASSKEY_ARGS=(--trust-root "$TRUST_ROOT" --pcr0 "$EXPECTED_PCR0" --pcr16 "$EXPECTED_PCR16"
+        --rp-id "${WEBAUTHN_RP_ID:-enclave.test}")
 }
 
 # Nothing answers HTTPS until an ACME order completes — directory, account,
