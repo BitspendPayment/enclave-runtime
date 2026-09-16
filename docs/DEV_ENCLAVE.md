@@ -135,6 +135,13 @@ identifies the enclave before it approves anything.
 | `--guest COMPONENT.wasm` | the component to serve. Without one, the example in `examples/guest-http` is built |
 | `--port PORT` | host port forwarded to the enclave's `:443`. Default 8443 |
 | `--name NAME` | names this run's containers and its directory under `target/qemu-nitro`. It keeps runs apart on disk; only one can be up at a time, because MinIO's port and the enclave's vsock CID are fixed |
+| `--rp-id DOMAIN` | the WebAuthn relying party the image is built with. Default `enclave.test`; a phone app needs a domain whose `assetlinks.json` names it |
+| `--allowed-origin ORIGIN` | an origin assertions may claim besides `https://<rp id>`, repeatable — `android:apk-key-hash:<hash>` for an Android app |
+| `--keep-store` | keep the store in `target/qemu-nitro/<name>-store` and resume it on the next start with that name — see [Restarting](#restarting) |
+| `--fresh` | with `--keep-store`, discard the kept store first |
+| `--guest-egress ORIGIN` | an origin the guest may send requests to, `http(s)://host[:port]`, repeatable. None by default. The machine running the script is `192.168.127.254` from inside the enclave |
+| `--background-timeout SECS` | how long one background task may run; the runtime's default is 30 |
+| `--guest-env NAME=VALUE` | a variable for the guest, repeatable — e.g. the address of the origin it may reach |
 
 Everything the run produced lives under `target/qemu-nitro/<name>/`: the console
 log, the trust root, the passkey state files, and `fcm-messages.jsonl` — every
@@ -142,10 +149,27 @@ notification the guest raised, since Firebase is stubbed locally.
 
 ## Restarting
 
-Stop it and start it again with the new component. That is a fresh start, not a
-reload: the store is rebuilt, so the enclave boots into genesis rather than
-resuming, and PCR16 changes. A client still pinning the old measurement will
-refuse the new enclave, which is the behaviour you want to see.
+Stop it and start it again with the new component. By default that is a fresh
+start, not a reload: the store is rebuilt, so the enclave boots into genesis
+rather than resuming, and PCR16 changes. A client still pinning the old
+measurement will refuse the new enclave, which is the behaviour you want to see.
+
+With `--keep-store` the store survives. MinIO's data lives in
+`target/qemu-nitro/<name>-store/minio` instead of inside its container, so the
+next start with the same name finds the receipt and the store together and
+**resumes**: every tenant, passkey and file a guest wrote is still there. A new
+component is an **upgrade** of that store — the boot machine records the new
+pair — not a new one. Two things still change every boot, and clients have to
+re-read them: the trust root, minted fresh by design, and PCR16 whenever the
+component did.
+
+Pebble also starts a new CA every time, while a kept store holds the certificate
+an earlier Pebble issued and serves it until renewal. So with `--keep-store`
+every root and intermediate seen is kept in the store directory, and
+`pebble-root.pem` holds all of them — trust that whole file. The store directory
+also carries an `id`, stable across restarts, for clients that keep state per
+store. `--fresh` (with `--keep-store`) deletes the directory and starts over;
+so does deleting it by hand while the enclave is down.
 
 ## If it does not start
 

@@ -41,11 +41,17 @@ PREFIX="${PREFIX:-dev}"
 HTTPS_PORT="${HTTPS_PORT:-8443}"
 WEBAUTHN_RP_ID=""
 WEBAUTHN_ALLOWED_ORIGINS=""
+GUEST_EGRESS_ORIGINS=""
+BACKGROUND_TIMEOUT_SECS=""
+GUEST_ENV=""
 
 usage() {
     cat >&2 <<EOF
 usage: ${0##*/} [--guest COMPONENT.wasm] [--port PORT] [--name NAME]
                      [--rp-id DOMAIN] [--allowed-origin ORIGIN]...
+                     [--keep-store [--fresh]]
+                     [--guest-egress ORIGIN]... [--background-timeout SECS]
+                     [--guest-env NAME=VALUE]...
 
   --guest   a wasm component to serve. Without one, the example guest in
             examples/guest-http is built and used.
@@ -62,6 +68,23 @@ usage: ${0##*/} [--guest COMPONENT.wasm] [--port PORT] [--name NAME]
             an origin assertions may claim besides https://<rp id>. Repeatable.
             An Android app claims android:apk-key-hash:<unpadded base64url
             SHA-256 of its signing certificate>.
+  --keep-store
+            keep the store — tenants, passkeys, everything guests wrote — in
+            target/qemu-nitro/<name>-store, so the next start with the same name
+            resumes it instead of booting into genesis. A new guest is an
+            upgrade of the same store. The trust root and the attestation chain
+            are still new every boot, so clients re-read their pins.
+  --fresh   with --keep-store, discard the kept store first.
+  --guest-egress ORIGIN
+            an origin the guest may send requests to, as http(s)://host[:port].
+            Repeatable. None by default, and then the guest has no outbound
+            network. The host running this script is 192.168.127.254 from
+            inside the enclave. A different image, so a different PCR0.
+  --background-timeout SECS
+            how long one background task may run (the runtime's default is 30).
+  --guest-env NAME=VALUE
+            a variable for the guest, e.g. ASP_URL=http://192.168.127.254:7070.
+            Repeatable. Baked into the image, so measured by PCR0.
 EOF
     exit 2
 }
@@ -79,6 +102,14 @@ while [[ $# -gt 0 ]]; do
         --port)  need "$1" "${2:-}"; HTTPS_PORT="$2"; shift 2 ;;
         --name)  need "$1" "${2:-}"; PREFIX="$2";     shift 2 ;;
         --rp-id) need "$1" "${2:-}"; WEBAUTHN_RP_ID="$2"; shift 2 ;;
+        --keep-store) KEEP_STORE=1; shift ;;
+        --guest-egress)
+                 need "$1" "${2:-}"
+                 GUEST_EGRESS_ORIGINS="${GUEST_EGRESS_ORIGINS:+$GUEST_EGRESS_ORIGINS,}$2"
+                 shift 2 ;;
+        --background-timeout) need "$1" "${2:-}"; BACKGROUND_TIMEOUT_SECS="$2"; shift 2 ;;
+        --guest-env) need "$1" "${2:-}"; GUEST_ENV="${GUEST_ENV:+$GUEST_ENV,}$2"; shift 2 ;;
+        --fresh) FRESH_STORE=1; shift ;;
         --allowed-origin)
                  need "$1" "${2:-}"
                  WEBAUTHN_ALLOWED_ORIGINS="${WEBAUTHN_ALLOWED_ORIGINS:+$WEBAUTHN_ALLOWED_ORIGINS,}$2"
@@ -109,12 +140,32 @@ for o in "${origins[@]}"; do
     [[ "$o" =~ ^(https://[a-z0-9.-]+(:[0-9]+)?|android:apk-key-hash:[A-Za-z0-9_-]{43})$ ]] \
         || { echo "--allowed-origin $o: expected https://<host> or android:apk-key-hash:<43 characters>" >&2; exit 1; }
 done
+IFS=, read -ra egress <<<"$GUEST_EGRESS_ORIGINS"
+for o in "${egress[@]}"; do
+    [[ "$o" =~ ^https?://[a-z0-9.-]+(:[0-9]{1,5})?$ ]] \
+        || { echo "--guest-egress $o: expected http(s)://host[:port]" >&2; exit 1; }
+done
+IFS=, read -ra guest_env <<<"$GUEST_ENV"
+for kv in "${guest_env[@]}"; do
+    [[ "$kv" =~ ^[A-Z_][A-Z0-9_]*=[A-Za-z0-9:/._-]*$ ]] \
+        || { echo "--guest-env $kv: expected NAME=VALUE (letters, digits and :/._- in the value)" >&2; exit 1; }
+    [[ "$kv" != S3FS_* && "$kv" != AWS_* ]] \
+        || { echo "--guest-env $kv: S3FS_ and AWS_ variables are withheld from guests" >&2; exit 1; }
+done
+[[ -z "$BACKGROUND_TIMEOUT_SECS" || "$BACKGROUND_TIMEOUT_SECS" =~ ^[1-9][0-9]{0,5}$ ]] \
+    || { echo "--background-timeout must be a number of seconds" >&2; exit 1; }
 if [[ -n "$WEBAUTHN_ALLOWED_ORIGINS" && -z "$WEBAUTHN_RP_ID" ]]; then
     echo "--allowed-origin needs --rp-id: an app's origin is only ever vouched for by its own domain" >&2
     exit 1
 fi
 
-export GUEST_WASM PREFIX HTTPS_PORT WEBAUTHN_RP_ID WEBAUTHN_ALLOWED_ORIGINS
+if [[ -n "${FRESH_STORE:-}" && -z "${KEEP_STORE:-}" ]]; then
+    echo "--fresh only means something with --keep-store: without it every start is fresh" >&2
+    exit 1
+fi
+
+export GUEST_WASM PREFIX HTTPS_PORT WEBAUTHN_RP_ID WEBAUTHN_ALLOWED_ORIGINS KEEP_STORE FRESH_STORE \
+    GUEST_EGRESS_ORIGINS BACKGROUND_TIMEOUT_SECS GUEST_ENV
 # shellcheck source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
@@ -132,6 +183,14 @@ enclave_bring_up
 say "enrolling a passkey, so there is something to try"
 signed enrol >/dev/null || fail "the enclave refused to enrol a passkey"
 
+if [[ -n "${KEEP_STORE:-}" ]]; then
+    store_note="The store in $STORE_DIR is kept: it resumes, with its tenants and
+their data, and the new guest is an upgrade of it. --fresh discards it."
+else
+    store_note="That is a fresh start, not a reload: the store is rebuilt, so the
+enclave boots into genesis rather than resuming. --keep-store keeps it."
+fi
+
 cat <<EOF
 
 == the enclave is up ==
@@ -139,6 +198,7 @@ cat <<EOF
   url      https://127.0.0.1:$HTTPS_PORT
   host     enclave.test   (the name on the certificate)
   rp id    ${WEBAUTHN_RP_ID:-enclave.test}${WEBAUTHN_ALLOWED_ORIGINS:+   allowing $WEBAUTHN_ALLOWED_ORIGINS}
+  egress   ${GUEST_EGRESS_ORIGINS:-none — the guest has no outbound network}
 
 What a client has to pin. All three, and none of them stands in for another:
 PCR0 is the image, taken by the hypervisor and unforgeable from inside; PCR16 is
@@ -179,11 +239,11 @@ Store:    http://127.0.0.1:9000  (minioadmin/minioadmin, buckets $DATA_BUCKET an
 Wakes:    $FCM_RECORD  (every notification the guest raised, as JSON)
 
 To run a new build of your guest, stop this and start it again with the new
-component. That is a fresh start, not a reload: the store under $RUNDIR is
-rebuilt, so the enclave boots into genesis rather than resuming, and PCR16
-changes — a client still pinning the old one will refuse it, which is the point.
+component. $store_note PCR16 changes either way, and the trust root is new every
+boot — a client still pinning the old ones will refuse this enclave, which is the
+point.
 
-  $REPO/deploy/qemu-nitro/dev-enclave.sh --guest <new.wasm>
+  $REPO/deploy/qemu-nitro/dev-enclave.sh --guest <new.wasm>${KEEP_STORE:+ --keep-store}
 
 Ctrl-C to stop everything.
 EOF

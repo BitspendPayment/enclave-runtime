@@ -46,6 +46,13 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="${WORK:-$REPO/target/qemu-nitro}"
 PREFIX="${PREFIX:-e2e}"
 RUNDIR="${RUNDIR:-$WORK/$PREFIX}"
+
+# The store, when it is kept across runs: MinIO's data, and every Pebble root
+# and intermediate that has issued a certificate the store may still hold.
+# Beside RUNDIR rather than in it, because RUNDIR is cleared on every start.
+STORE_DIR="$WORK/$PREFIX-store"
+KEEP_STORE="${KEEP_STORE:-}"
+FRESH_STORE="${FRESH_STORE:-}"
 IMAGE="${QEMU_IMAGE:-s3fs-qemu-nitro:latest}"
 TIMEOUT="${TIMEOUT:-240}"
 CONSOLE="$RUNDIR/console.log"
@@ -225,16 +232,33 @@ nix_expr() {
 
 enclave_build_image() {
     say "building the enclave image"
-    if [[ -n "${WEBAUTHN_RP_ID:-}" ]]; then
-        # The same image with another relying party. Not a package — flake outputs take no
-        # arguments — so the flake's `lib.eifQemu` is called directly, which reading the flake by
-        # path needs --impure for. dev-enclave.sh has already held both values to shapes that
-        # cannot break out of the string.
-        local origins="" o
-        IFS=, read -ra list <<<"${WEBAUTHN_ALLOWED_ORIGINS:-}"
-        for o in "${list[@]}"; do origins+=" \"$o\""; done
-        nix_expr "eif-qemu for $WEBAUTHN_RP_ID" "$RUNDIR/eif" \
-            "((builtins.getFlake \"git+file://$REPO\").lib.\${builtins.currentSystem}.eifQemu { rpId = \"$WEBAUTHN_RP_ID\"; allowedOrigins = [$origins ]; })"
+    if [[ -n "${WEBAUTHN_RP_ID:-}${GUEST_EGRESS_ORIGINS:-}${BACKGROUND_TIMEOUT_SECS:-}${GUEST_ENV:-}" ]]; then
+        # The same image configured differently. Not a package — flake outputs take no arguments —
+        # so the flake's `lib.eifQemu` is called directly, which reading the flake by path needs
+        # --impure for. dev-enclave.sh has already held every value to a shape that cannot break
+        # out of the string.
+        nix_list() {
+            local out="" o
+            IFS=, read -ra items <<<"$1"
+            for o in "${items[@]}"; do out+=" \"$o\""; done
+            printf '[%s ]' "$out"
+        }
+        local args=""
+        [[ -n "${WEBAUTHN_RP_ID:-}" ]] && args+=" rpId = \"$WEBAUTHN_RP_ID\";"
+        [[ -n "${WEBAUTHN_ALLOWED_ORIGINS:-}" ]] \
+            && args+=" allowedOrigins = $(nix_list "$WEBAUTHN_ALLOWED_ORIGINS");"
+        [[ -n "${GUEST_EGRESS_ORIGINS:-}" ]] \
+            && args+=" guestEgressOrigins = $(nix_list "$GUEST_EGRESS_ORIGINS");"
+        [[ -n "${BACKGROUND_TIMEOUT_SECS:-}" ]] \
+            && args+=" backgroundTimeoutSecs = $BACKGROUND_TIMEOUT_SECS;"
+        if [[ -n "${GUEST_ENV:-}" ]]; then
+            local env_attrs="" kv
+            IFS=, read -ra kvs <<<"$GUEST_ENV"
+            for kv in "${kvs[@]}"; do env_attrs+=" ${kv%%=*} = \"${kv#*=}\";"; done
+            args+=" guestEnv = {$env_attrs };"
+        fi
+        nix_expr "eif-qemu (${args# })" "$RUNDIR/eif" \
+            "((builtins.getFlake \"git+file://$REPO\").lib.\${builtins.currentSystem}.eifQemu {$args })"
     else
         nix_build eif-qemu "$RUNDIR/eif"
     fi
@@ -325,11 +349,30 @@ signed2() { "$PASSKEY" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/bo
 # The store the enclave will mount, and the guest it will fetch.
 # ---------------------------------------------------------------------------
 enclave_start_store() {
-    say "starting MinIO"
+    local data_dir=""
+    if [[ -n "$KEEP_STORE" ]]; then
+        if [[ -n "$FRESH_STORE" && -d "$STORE_DIR" ]]; then
+            # The same guard RUNDIR has: this is the other line that destroys.
+            case "$STORE_DIR" in
+                "$WORK"/?*-store) ;;
+                *) echo "refusing to clear $STORE_DIR: not a store under $WORK" >&2; exit 1 ;;
+            esac
+            say "clearing the kept store"
+            rm -rf "$STORE_DIR"
+        fi
+        mkdir -p "$STORE_DIR"
+        # A stable name for this store, for clients that keep state per store:
+        # the trust root changes every boot, so it cannot be that.
+        [[ -s "$STORE_DIR/id" ]] || openssl rand -hex 16 > "$STORE_DIR/id"
+        data_dir="$STORE_DIR/minio"
+        say "starting MinIO on the kept store ($STORE_DIR)"
+    else
+        say "starting MinIO"
+    fi
     # The same recipe the SQLite CI job used. It lived in run-e2e.sh in full
     # until both copies had to agree with nothing making them agree.
     MINIO_LABEL="$LABEL" "$REPO/scripts/minio-up.sh" \
-        "$PREFIX-minio" 9000 "$DATA_BUCKET" "$ROOTS_BUCKET"
+        "$PREFIX-minio" 9000 "$DATA_BUCKET" "$ROOTS_BUCKET" $data_dir
     upload_guest guest.wasm
     echo "MinIO ready with $DATA_BUCKET and $ROOTS_BUCKET, and the guest at $ROOTS_BUCKET/guest/guest.wasm"
 }
@@ -602,6 +645,16 @@ enclave_check_certificate() {
         || { echo "could not fetch Pebble's root" >&2; exit 1; }
     curl -sk --max-time 5 "https://127.0.0.1:15000/intermediates/0" > "$RUNDIR/pebble-int.pem" \
         || { echo "could not fetch Pebble's intermediate" >&2; exit 1; }
+    if [[ -n "$KEEP_STORE" ]]; then
+        # Pebble mints a new CA every start, but a kept store holds the
+        # certificate an earlier Pebble issued and serves it until renewal. So
+        # every root and intermediate seen is kept, and clients are handed all
+        # of them: the served chain verifies whichever one issued it.
+        keep_pem "$RUNDIR/pebble-root.pem" "$STORE_DIR/pebble-roots.pem"
+        keep_pem "$RUNDIR/pebble-int.pem" "$STORE_DIR/pebble-ints.pem"
+        cp "$STORE_DIR/pebble-roots.pem" "$RUNDIR/pebble-root.pem"
+        cp "$STORE_DIR/pebble-ints.pem" "$RUNDIR/pebble-int.pem"
+    fi
     echo | openssl s_client -connect "127.0.0.1:$HTTPS_PORT" -servername enclave.test -showcerts \
         2>/dev/null | sed -n '/BEGIN CERT/,/END CERT/p' > "$RUNDIR/served-chain.pem"
     [[ -s "$RUNDIR/served-chain.pem" ]] || { echo "the enclave presented no certificate" >&2; exit 1; }
@@ -623,6 +676,12 @@ enclave_check_certificate() {
         || { echo "the certificate is not for enclave.test: $names" >&2; exit 1; }
     [[ "$issuer" == *Pebble* ]] \
         || { echo "the certificate was not issued by Pebble: $issuer" >&2; exit 1; }
+}
+
+# Append the certificate in $1 to the bundle $2 unless it is already there.
+keep_pem() {
+    touch "$2"
+    grep -qF "$(sed -n 2p "$1")" "$2" || cat "$1" >> "$2"
 }
 
 # Everything above, in the one order that works. The ordering constraints are

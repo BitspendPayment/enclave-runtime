@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Start MinIO and create the two buckets the runtime expects.
 #
-#   minio-up.sh <container> <host-port> <data-bucket> <roots-bucket>
+#   minio-up.sh <container> <host-port> <data-bucket> <roots-bucket> [data-dir]
+#
+# Without data-dir the store lives inside the container and goes with it, which
+# is what tests want. With one it lives in that host directory and outlives the
+# container, so a later start with the same directory serves the same store.
 #
 # The SQLite CI job and deploy/qemu-nitro/run-e2e.sh each carried their own copy
 # of this. Two recipes that have to agree, with nothing making them agree, is
@@ -17,6 +21,7 @@ container="${1:?container name}"
 port="${2:?host port}"
 data="${3:?data bucket}"
 roots="${4:?roots bucket}"
+data_dir="${5:-}"
 
 # Optional, and applied to every container this starts. A caller that cleans up
 # by label — deploy/qemu-nitro/lib.sh does, so that the list of containers to
@@ -24,9 +29,15 @@ roots="${4:?roots bucket}"
 # one running, because it is the one container it did not start itself.
 label=()
 [[ -n "${MINIO_LABEL:-}" ]] && label=(--label "$MINIO_LABEL")
+volume=()
+if [[ -n "$data_dir" ]]; then
+    mkdir -p "$data_dir"
+    # As the invoking user, so the directory can be deleted without root.
+    volume=(-v "$data_dir:/data" --user "$(id -u):$(id -g)")
+fi
 
 docker rm -f "$container" >/dev/null 2>&1 || true
-docker run -d --rm --name "$container" -p "$port:9000" "${label[@]}" \
+docker run -d --rm --name "$container" -p "$port:9000" "${label[@]}" "${volume[@]}" \
     -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
     minio/minio server /data >/dev/null
 
