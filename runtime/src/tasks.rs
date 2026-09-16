@@ -172,6 +172,9 @@ impl TaskQueue {
                 };
                 task.error = Some("enclave stopped during execution".into());
                 queue.write(&task).await?;
+                tracing::warn!(tenant = %hex::encode(task.tenant), task = %task.id,
+                    status = ?task.status, attempts = task.attempts,
+                    "background task attempt interrupted by a restart");
             }
             if task.status == Status::Pending {
                 // Recovery jitter prevents a fleet of overdue tasks firing together.
@@ -380,7 +383,9 @@ impl TaskQueue {
                 }
             }
             Err(e) => {
-                current.error = Some(e.to_string().chars().take(512).collect());
+                // `{:#}` keeps the causes: a trap or a deadline is otherwise
+                // recorded as its outermost context and nothing of why.
+                current.error = Some(format!("{e:#}").chars().take(512).collect());
                 current.status = if current.attempts >= MAX_ATTEMPTS {
                     Status::Failed
                 } else {
@@ -393,9 +398,18 @@ impl TaskQueue {
             Ok(None) => unreachable!(),
         }
         self.write(&current).await?;
-        tracing::info!(tenant = %hex::encode(current.tenant), task = %current.id,
-            status = ?current.status, attempts = current.attempts,
-            "background task recorded");
+        // A failure is logged with its reason. The record is sealed, so
+        // otherwise the only thing an operator sees is that five attempts
+        // failed. The text is what the guest could already print to its own
+        // log; `?` escapes it so it cannot forge lines of its own.
+        match &current.error {
+            Some(error) => tracing::warn!(tenant = %hex::encode(current.tenant),
+                task = %current.id, status = ?current.status, attempts = current.attempts,
+                error = ?error, "background task attempt failed"),
+            None => tracing::info!(tenant = %hex::encode(current.tenant), task = %current.id,
+                status = ?current.status, attempts = current.attempts,
+                "background task recorded"),
+        }
         if current.status == Status::Pending {
             r.due.insert((current.run_at, k.clone()));
         }
@@ -678,6 +692,21 @@ mod tests {
         assert_eq!(
             q.status([1; 16], "job").await.unwrap().status,
             Status::Failed
+        );
+    }
+    /// The recorded error names why, not only the outermost context.
+    #[tokio::test]
+    async fn a_failure_records_its_cause() {
+        let (q, _) = queue(Default::default()).await;
+        add(&q, 1, "job", 0).await;
+        let task = q.due().await.unwrap();
+        q.begin(&task).await.unwrap();
+        let error = anyhow::anyhow!("co-signer refused the run id").context("run-task failed");
+        q.finish(&task, Err(error)).await.unwrap();
+        let record = q.status([1; 16], "job").await.unwrap();
+        assert_eq!(
+            record.error.as_deref(),
+            Some("run-task failed: co-signer refused the run id")
         );
     }
     /// The same backoff, but driven by a guest that really fails.
