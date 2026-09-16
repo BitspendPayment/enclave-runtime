@@ -174,7 +174,10 @@ aws-sdk-cloudwatchlogs = { version = "1.131.0", default-features = false, featur
 # instance's IMDS. Named explicitly rather than relied on as a fallback, so it
 # is obvious *which* identity guest logs are written with.
 aws-config = { workspace = true, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
-webauthn-rs = "0.5.5"
+# The feature adds no code beyond one registration constructor — see
+# `auth::routes`. Without it, options ask for a non-discoverable credential,
+# which Android below 14 creates outside Password Manager where nothing finds it.
+webauthn-rs = { version = "0.5.5", features = ["workaround-google-passkey-specific-issues"] }
 serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
 

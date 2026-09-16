@@ -217,18 +217,30 @@ impl AuthEndpoints {
         // there. Admission control over resource creation is what was given up
         // here; access control was not.
         let name = request.display_name.as_deref().unwrap_or("cosigner");
-        let (options, state) =
-            match self
-                .gate
-                .webauthn()
-                .start_passkey_registration(Uuid::new_v4(), name, name, None)
-            {
-                Ok(pair) => pair,
-                Err(e) => {
-                    tracing::error!(error = %e, "starting registration");
-                    return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
-                }
-            };
+        // A discoverable platform passkey (`residentKey: required`,
+        // `authenticatorAttachment: platform`), not webauthn-rs's default of
+        // `residentKey: discouraged` with no attachment. Android below 14 takes
+        // the default literally and makes a non-discoverable security-key
+        // credential outside Password Manager, which sign-in then cannot find.
+        // Clients are native apps, never a browser, so nothing is given up by
+        // ruling out roaming security keys and cross-device registration. It
+        // also drops credProtect, which Android does not support and a platform
+        // passkey does not need.
+        let (options, state) = match self
+            .gate
+            .webauthn()
+            .start_google_passkey_in_google_password_manager_only_registration(
+                Uuid::new_v4(),
+                name,
+                name,
+                None,
+            ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!(error = %e, "starting registration");
+                return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+            }
+        };
 
         let Ok(id) = self.random_id() else {
             return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
@@ -594,6 +606,24 @@ mod tests {
             }),
         )
         .await
+    }
+
+    /// Options ask for a passkey sign-in can find. With webauthn-rs's defaults,
+    /// Android below 14 made a credential One Tap reports as "Cannot find a
+    /// matching credential".
+    #[tokio::test]
+    async fn registration_asks_for_a_discoverable_platform_passkey() {
+        let f = fixture().await;
+        let (status, body) = post(&f, "/auth/register/options", serde_json::json!({})).await;
+        assert_eq!(status, 200, "{body}");
+        let selection = &body["options"]["publicKey"]["authenticatorSelection"];
+        assert_eq!(selection["residentKey"], "required", "{selection}");
+        assert_eq!(selection["requireResidentKey"], true, "{selection}");
+        assert_eq!(
+            selection["authenticatorAttachment"], "platform",
+            "{selection}"
+        );
+        assert_eq!(selection["userVerification"], "required", "{selection}");
     }
 
     /// The whole registration path: options, response, tenant.
