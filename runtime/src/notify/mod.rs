@@ -1,9 +1,11 @@
 //! Waking a tenant's devices, without telling anyone what happened.
 //!
-//! A guest cannot reach its user between requests, and it cannot reach the
-//! network at all — [`crate::serve::EgressPolicy`] refuses every outgoing
-//! request a guest makes. So the runtime holds the push credential and sends on
-//! the guest's behalf, and the guest gets a host import instead of a socket.
+//! A guest cannot reach its user between requests, and by default it cannot
+//! reach the network at all — [`crate::serve::EgressPolicy`] refuses every
+//! outgoing request a guest makes, and a deployment that opens any names only
+//! specific origins, never a push service. So the runtime holds the push
+//! credential and sends on the guest's behalf, and the guest gets a host import
+//! instead of a socket.
 //!
 //! # A wake signal carries nothing
 //!
@@ -36,7 +38,7 @@ pub mod transport;
 pub use device::{DeviceRegistry, StoredDevice, MAX_DEVICES, MAX_DEVICES_PER_TENANT};
 pub use fcm::{FcmClient, FcmTransport, NotifyConfig, SendError};
 pub use oauth::{AccessToken, ServiceAccount, TokenResponse};
-pub use transport::HttpsTransport;
+pub use transport::{web_pki_client_config, HttpsTransport};
 
 /// Wakes waiting to be sent. Beyond this the oldest are dropped: a wake is a
 /// hint, and a backlog of stale hints is worth less than a fresh one.

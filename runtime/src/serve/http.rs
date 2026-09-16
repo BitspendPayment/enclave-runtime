@@ -87,6 +87,9 @@ pub struct ServeConfig {
     /// development and QEMU arrangement, and [`serve_component`] says so
     /// loudly at startup rather than leaving it to be noticed.
     pub authentication: Option<(Arc<AuthEndpoints>, Arc<Gate>)>,
+    /// What guests may reach over `wasi:http`. [`EgressPolicy::Denied`] unless
+    /// the deployment names origins.
+    pub egress: crate::serve::EgressPolicy,
 }
 
 impl Default for ServeConfig {
@@ -118,6 +121,7 @@ impl Default for ServeConfig {
             // for, never inherited.
             tenancy: None,
             authentication: None,
+            egress: crate::serve::EgressPolicy::Denied,
         }
     }
 }
@@ -177,6 +181,7 @@ pub struct ServeHandle {
     background_pre: InstancePre<State>,
     tasks: Option<Arc<crate::tasks::TaskQueue>>,
     notify: Option<Arc<crate::notify::Notifier>>,
+    egress: crate::serve::EgressPolicy,
     guest: Arc<GuestEnvironment>,
     /// One request at a time for callers with no resolved tenant.
     ///
@@ -283,6 +288,7 @@ impl ServeHandle {
             background_pre: instance_pre,
             tasks: None,
             notify: None,
+            egress: crate::serve::EgressPolicy::Denied,
             pre,
             guest: Arc::new(guest),
             anonymous: Arc::new(tokio::sync::Mutex::new(())),
@@ -327,6 +333,14 @@ impl ServeHandle {
         Ok(self)
     }
 
+    /// Let guests reach the origins [`crate::serve::EgressPolicy`] names — for
+    /// requests and background tasks alike, since renewing something on a
+    /// schedule is exactly the work that happens with nobody connected.
+    pub fn with_egress(mut self, egress: crate::serve::EgressPolicy) -> Self {
+        self.egress = egress;
+        self
+    }
+
     /// An internal component export, never an HTTP route or a fabricated token.
     /// A fresh instance shares the tenant lock; drop its warm HTTP instance so
     /// no cached database handles survive a background mutation.
@@ -363,6 +377,7 @@ impl ServeHandle {
                 tenant: task.tenant,
                 interactive: false,
             });
+            store.data_mut().set_egress(self.egress.clone());
             store.data_mut().notify =
                 self.notify
                     .as_ref()
@@ -540,6 +555,7 @@ impl ServeHandle {
                 tenant: tenant_id,
                 interactive: true,
             });
+        instance.store.data_mut().set_egress(self.egress.clone());
         instance.store.data_mut().notify =
             self.notify
                 .as_ref()
@@ -1379,7 +1395,8 @@ pub async fn serve_component(
     let engine = ServeHandle::engine_with_watchdog()?;
     let mut handle = ServeHandle::new(&engine, component_bytes, guest)?
         .with_timeout(config.request_timeout)
-        .with_max_interaction(config.max_interaction);
+        .with_max_interaction(config.max_interaction)
+        .with_egress(config.egress.clone());
     if let Some(tenancy) = &config.tenancy {
         handle = handle.with_tenancy(tenancy.clone());
     }

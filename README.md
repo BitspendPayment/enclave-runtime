@@ -676,8 +676,8 @@ enclave exists to exclude.
 ### What the guest gets, and does not
 
 It exports `wasi:http/incoming-handler` and receives a **parsed request**. It
-never sees a socket, a connection, a certificate or a TLS record. It cannot
-open one either: the linker grants no `wasi:sockets` permission, and
+never sees a socket, a connection, a certificate or a TLS record. By default it
+cannot open one either: the linker grants no `wasi:sockets` permission, and
 `wasi:http/outgoing-handler` is wired to an [`EgressPolicy`](runtime/src/serve/mod.rs)
 that refuses every request.
 
@@ -685,6 +685,19 @@ That refusal is explicit rather than incidental. `wasmtime-wasi-http`'s
 `default-send-request` feature is off, which turns `send_request` from a
 defaulted method into one this crate must write — so the answer is a decision
 with a test, not a consequence of which crate features happened to be on.
+
+**A deployment can name origins a guest may reach**, and nothing else —
+`guestEgressOrigins` in [`deploy/nix/deployment.nix`](deploy/nix/deployment.nix),
+`S3FS_GUEST_EGRESS_ORIGINS` to the runtime. It exists for guests whose job needs
+one service, such as a wallet cosigner renewing funds with its ASP from a
+background task, where the alternative is routing through a phone that may be
+off. Origins are compared exactly (scheme, host, port), HTTPS is verified against
+the same web PKI roots the runtime's own clients use, requests go over HTTP/1.1,
+and a request to anything else is refused as before. The list is image
+environment, so PCR0 covers it: a client learns where a guest can send traffic
+from the same attestation that tells it what the guest is. It is still a channel
+out of the enclave carrying whatever the guest puts in it — name only services
+the guest has to reach.
 
 `examples/guest-http` is the worked example.
 

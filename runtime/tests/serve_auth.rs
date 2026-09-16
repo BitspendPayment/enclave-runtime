@@ -211,6 +211,7 @@ async fn start_with_background(background: bool) -> Harness {
                 max_interaction: std::time::Duration::from_secs(300),
                 tenancy: Some(Arc::new(Tenancy::new(PoolLimits::default()))),
                 authentication: Some((auth, gate)),
+                egress: Default::default(),
             },
         )
         .await;

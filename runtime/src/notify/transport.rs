@@ -44,7 +44,10 @@ impl std::fmt::Debug for HttpsTransport {
     }
 }
 
-fn client_config() -> Result<rustls::ClientConfig> {
+/// The runtime's one client TLS configuration: aws-lc-rs, safe protocol versions, and the
+/// `webpki-roots` anchors compiled into the image. Shared with guest egress (`serve::egress`) so
+/// there is still one root store to audit, not two.
+pub fn web_pki_client_config() -> Result<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     Ok(rustls::ClientConfig::builder_with_provider(
@@ -61,7 +64,7 @@ impl HttpsTransport {
     /// runtime at a local stub. It is the same downgrade `--guest-log-endpoint`
     /// already is, and PCR0 records which image was built.
     pub fn new(allow_plaintext: bool) -> Result<Self> {
-        let builder = hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(client_config()?);
+        let builder = hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(web_pki_client_config()?);
         let connector = if allow_plaintext {
             builder
                 .https_or_http()

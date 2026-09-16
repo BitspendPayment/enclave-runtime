@@ -476,6 +476,21 @@ struct Cli {
     )]
     webauthn_allowed_origins: Vec<String>,
 
+    /// An origin guests may send `wasi:http` requests to, as
+    /// `https://host[:port]` — or `http://host:port`, for a local stack.
+    /// Repeatable. None by default, and then a guest has no outbound network at
+    /// all.
+    ///
+    /// Compared exactly: scheme, host and port. It is a channel out of the
+    /// enclave carrying whatever the guest puts in it, so name only services
+    /// the guest has to reach. Image environment, so PCR0 covers the list.
+    #[arg(
+        long = "guest-egress-origin",
+        env = "S3FS_GUEST_EGRESS_ORIGINS",
+        value_delimiter = ','
+    )]
+    guest_egress_origins: Vec<String>,
+
     /// Seconds a challenge is good for.
     ///
     /// Long enough for a person to look at a prompt and present a finger,
@@ -994,6 +1009,17 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         .filter(|o| !o.is_empty())
         .map(str::to_string)
         .collect();
+    // Parsed before anything serves: a malformed origin refuses the boot rather
+    // than quietly admitting less, or more, than the image says.
+    let egress = enclave_runtime::serve::EgressPolicy::from_allowlist(
+        enclave_runtime::serve::EgressAllowlist::parse(&cli.guest_egress_origins)
+            .context("parsing --guest-egress-origin")?,
+    );
+    if let enclave_runtime::serve::EgressPolicy::Allowlist(list) = &egress {
+        let origins: Vec<String> = list.origins().map(|o| o.to_string()).collect();
+        tracing::warn!(?origins, "guests may send requests to these origins");
+    }
+
     let authentication = match (&cli.webauthn_rp_id, &cli.webauthn_origin) {
         (Some(rp_id), Some(origin)) => {
             let credentials =
@@ -1197,6 +1223,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             max_interaction: Duration::from_secs(cli.max_interaction_secs),
             tenancy,
             authentication,
+            egress,
         },
     )
     .await;

@@ -374,7 +374,16 @@
           # Registration is open: anyone who can reach the port may create a
           # tenant of their own. There is nothing to provision, and nothing an
           # image could leak by carrying it.
-        };
+        }
+        # Set only when used, so an image that names no origins and keeps the
+        # default timeout is the image it was before these settings existed.
+        // lib.optionalAttrs (deployment.guestEgressOrigins != [ ]) {
+          S3FS_GUEST_EGRESS_ORIGINS = lib.concatStringsSep "," deployment.guestEgressOrigins;
+        }
+        // lib.optionalAttrs (deployment.backgroundTimeoutSecs != null) {
+          S3FS_BACKGROUND_TIMEOUT_SECS = toString deployment.backgroundTimeoutSecs;
+        }
+        // deployment.guestEnv;
       };
 
       # The runtime configured for the emulator, as a function of the relying
@@ -385,7 +394,17 @@
       #
       # which is what `dev-enclave.sh --rp-id --allowed-origin` does. The
       # defaults are `packages.eif-qemu`, the image the e2e boots.
-      eifQemu = { rpId ? "enclave.test", allowedOrigins ? [ ] }: callEif (runtimeImage // {
+      eifQemu = {
+        rpId ? "enclave.test",
+        allowedOrigins ? [ ],
+        # Origins the guest may reach — see `guestEgressOrigins` in
+        # deploy/nix/deployment.nix. The dev stack's host is 192.168.127.254.
+        guestEgressOrigins ? [ ],
+        backgroundTimeoutSecs ? null,
+        # Variables for the guest, e.g. the address of the service it may reach. The guest inherits
+        # the image environment minus `AWS_*` and `S3FS_*`, so a plain name reaches it.
+        guestEnv ? { },
+      }: callEif (runtimeImage // {
         payload = runtimeImage.payload // {
           "enclave-runtime" = "${enclave-runtime-testing}/bin/enclave-runtime";
           # Pebble's ACME API is served under a certificate no public root
@@ -502,7 +521,11 @@
           RUST_LOG = "info,s3fs=debug";
         } // nixpkgs.lib.optionalAttrs (allowedOrigins != [ ]) {
           S3FS_WEBAUTHN_ALLOWED_ORIGINS = nixpkgs.lib.concatStringsSep "," allowedOrigins;
-        };
+        } // nixpkgs.lib.optionalAttrs (guestEgressOrigins != [ ]) {
+          S3FS_GUEST_EGRESS_ORIGINS = nixpkgs.lib.concatStringsSep "," guestEgressOrigins;
+        } // nixpkgs.lib.optionalAttrs (backgroundTimeoutSecs != null) {
+          S3FS_BACKGROUND_TIMEOUT_SECS = toString backgroundTimeoutSecs;
+        } // guestEnv;
       });
 
     in

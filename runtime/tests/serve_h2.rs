@@ -132,6 +132,7 @@ async fn start() -> std::net::SocketAddr {
                 max_interaction: std::time::Duration::from_secs(300),
                 tenancy: None,
                 authentication: None,
+                egress: Default::default(),
             },
         )
         .await;
