@@ -458,6 +458,24 @@ struct Cli {
     #[arg(long, env = "S3FS_WEBAUTHN_ORIGIN")]
     webauthn_origin: Option<String>,
 
+    /// A further origin assertions may claim. Repeatable.
+    ///
+    /// For native apps, which do not claim `https://<rp id>`. An Android app
+    /// claims `android:apk-key-hash:<hash>`: the unpadded base64url SHA-256 of
+    /// its signing certificate. Debug, upload and Play App Signing keys each
+    /// have their own, so a deployment usually lists the one Play signs with.
+    /// Android lets an app claim it only after the app is vouched for by
+    /// `https://<rp id>/.well-known/assetlinks.json`.
+    ///
+    /// Compared exactly, like `--webauthn-origin`. Baked into the image, so
+    /// PCR0 records which apps an enclave accepts assertions from.
+    #[arg(
+        long = "webauthn-allowed-origin",
+        env = "S3FS_WEBAUTHN_ALLOWED_ORIGINS",
+        value_delimiter = ','
+    )]
+    webauthn_allowed_origins: Vec<String>,
+
     /// Seconds a challenge is good for.
     ///
     /// Long enough for a person to look at a prompt and present a finger,
@@ -966,12 +984,22 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     // id and the origin or neither: a gate with no origin to compare
     // against would accept assertions from any page that could reach
     // it.
+    //
+    // Empty entries are dropped, not refused: an image built with no
+    // extra origins still sets the variable, to nothing.
+    let allowed_origins: Vec<String> = cli
+        .webauthn_allowed_origins
+        .iter()
+        .map(|o| o.trim())
+        .filter(|o| !o.is_empty())
+        .map(str::to_string)
+        .collect();
     let authentication = match (&cli.webauthn_rp_id, &cli.webauthn_origin) {
         (Some(rp_id), Some(origin)) => {
             let credentials =
                 std::sync::Arc::new(enclave_runtime::FilesystemCredentials::new(fs.clone()));
             let gate = std::sync::Arc::new(enclave_runtime::Gate::new(
-                enclave_runtime::build_relying_party(rp_id, origin)?,
+                enclave_runtime::build_relying_party(rp_id, origin, &allowed_origins)?,
                 enclave_runtime::ChallengeStore::new(
                     Duration::from_secs(cli.challenge_ttl_secs),
                     enclave_runtime::DEFAULT_CAPACITY,
@@ -991,11 +1019,20 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             tracing::info!(
                 rp_id,
                 origin,
+                allowed_origins = ?allowed_origins,
                 "registration is open to anyone; requiring a passkey assertion per request"
             );
             Some((auth, gate))
         }
-        (None, None) => None,
+        (None, None) => {
+            anyhow::ensure!(
+                allowed_origins.is_empty(),
+                "--webauthn-allowed-origin was given without --webauthn-rp-id and \
+                 --webauthn-origin. With no relying party, authentication is off and \
+                 the origin would be silently ignored."
+            );
+            None
+        }
         _ => anyhow::bail!(
             "--webauthn-rp-id and --webauthn-origin must be given together. A gate \
              with no origin to compare against would accept an assertion from any \

@@ -162,6 +162,70 @@ mod tests {
             .is_err());
     }
 
+    /// An Android app claims `android:apk-key-hash:…`, never `https://<rp id>`.
+    /// Allowed, it registers and authenticates; any other app is still refused.
+    #[test]
+    fn an_allowed_android_app_registers_and_authenticates_and_no_other_app_does() {
+        const APP: &str = "android:apk-key-hash:47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU";
+        const OTHER_APP: &str = "android:apk-key-hash:bjQLnP-zepicpUTmu3gKLHiQHT-zNzh2hRGjBhevoB0";
+        let rp = Relying {
+            webauthn: crate::build_relying_party(RP_ID, ORIGIN, &[APP.into()])
+                .expect("relying party"),
+        };
+        let auth = SoftwareAuthenticator::new(RP_ID);
+
+        let (options, state) = rp
+            .webauthn
+            .start_passkey_registration(Uuid::new_v4(), "tester", "Tester", None)
+            .unwrap();
+        let response: RegisterPublicKeyCredential =
+            serde_json::from_value(auth.register(&Relying::challenge_of(&options), APP)).unwrap();
+        let passkey = rp
+            .webauthn
+            .finish_passkey_registration(&response, &state)
+            .expect("the app's registration verifies");
+
+        let assert_from = |origin: &str| {
+            let (options, state) = rp
+                .webauthn
+                .start_passkey_authentication(std::slice::from_ref(&passkey))
+                .unwrap();
+            let response: PublicKeyCredential =
+                serde_json::from_value(auth.assert(&Relying::challenge_for(&options), origin))
+                    .unwrap();
+            rp.webauthn.finish_passkey_authentication(&response, &state)
+        };
+        assert_from(APP).expect("the app's assertion verifies");
+        assert_from(ORIGIN).expect("the web origin still verifies");
+        assert!(
+            assert_from(OTHER_APP).is_err(),
+            "an app signed with another key must not borrow the passkey"
+        );
+    }
+
+    /// Without the setting, what the app sends is refused — the blocker this
+    /// setting exists to lift.
+    #[test]
+    fn an_android_app_is_refused_unless_allowed() {
+        let rp = Relying::new();
+        let auth = SoftwareAuthenticator::new(RP_ID);
+        let passkey = rp.register(&auth);
+
+        let (options, state) = rp
+            .webauthn
+            .start_passkey_authentication(std::slice::from_ref(&passkey))
+            .unwrap();
+        let response: PublicKeyCredential = serde_json::from_value(auth.assert(
+            &Relying::challenge_for(&options),
+            "android:apk-key-hash:47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+        ))
+        .unwrap();
+        assert!(rp
+            .webauthn
+            .finish_passkey_authentication(&response, &state)
+            .is_err());
+    }
+
     /// Signing something other than the challenge it was given.
     #[test]
     fn an_assertion_over_the_wrong_challenge_is_refused() {

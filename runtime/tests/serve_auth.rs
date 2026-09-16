@@ -167,7 +167,7 @@ async fn start_with_background(background: bool) -> Harness {
     let entropy: Arc<dyn nitro_nsm::Nsm> = nsm.clone();
     let credentials = Arc::new(FilesystemCredentials::new(fs.clone()));
     let gate = Arc::new(Gate::new(
-        enclave_runtime::build_relying_party(RP_ID, ORIGIN).expect("relying party"),
+        enclave_runtime::build_relying_party(RP_ID, ORIGIN, &[]).expect("relying party"),
         ChallengeStore::new(std::time::Duration::from_secs(60), 256),
         credentials.clone(),
         enclave_runtime::TokenStore::new(

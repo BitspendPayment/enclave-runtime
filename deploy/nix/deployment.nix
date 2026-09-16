@@ -42,6 +42,18 @@
   # key.
   rpId = "CHANGE-ME.example.com";
 
+  # Origins other than `https://${rpId}` that assertions may claim — native
+  # apps, which never claim the web origin. An Android app claims
+  # "android:apk-key-hash:<hash>", the unpadded base64url SHA-256 of the
+  # certificate it is signed with; for a Play release that is the app signing
+  # key, not the upload key. `keytool` prints the colon-separated hex form of
+  # the same digest, which must be converted — the runtime refuses it at boot.
+  #
+  # Android lets an app claim this only if
+  # `https://${rpId}/.well-known/assetlinks.json` lists it, so that file must
+  # be served too. Measured by PCR0 like `rpId`: adding an app is a new image.
+  webauthnAllowedOrigins = [ ];
+
   # Where guest stdout and stderr go, on top of the enclave console.
   #
   # Both must already exist — `deploy/tofu` creates them, and the enclave holds

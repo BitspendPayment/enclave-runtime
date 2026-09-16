@@ -168,7 +168,7 @@ impl Enclave {
 
         let credentials = Arc::new(FilesystemCredentials::new(fs.clone()));
         let gate = Arc::new(Gate::new(
-            crate::build_relying_party(RP_ID, ORIGIN)?,
+            crate::build_relying_party(RP_ID, ORIGIN, &[])?,
             ChallengeStore::new(std::time::Duration::from_secs(60), 256),
             credentials.clone(),
             crate::TokenStore::new(

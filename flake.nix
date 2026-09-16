@@ -369,6 +369,7 @@
           # and it must be browser-trusted, hence ACME rather than self-signed.
           S3FS_WEBAUTHN_RP_ID = deployment.rpId;
           S3FS_WEBAUTHN_ORIGIN = "https://" + deployment.rpId;
+          S3FS_WEBAUTHN_ALLOWED_ORIGINS = lib.concatStringsSep "," deployment.webauthnAllowedOrigins;
           #
           # Registration is open: anyone who can reach the port may create a
           # tenant of their own. There is nothing to provision, and nothing an
