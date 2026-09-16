@@ -99,10 +99,19 @@ unpublished temporary files; corrupt published records stop startup.
 
 Delivery is **at least once**. An execution intent is persisted before calling
 the guest, and the result is persisted after the callback returns. A crash
-between an effect and its completion record can repeat the callback. The run ID
-contains a random task generation plus an occurrence number; it stays the same
-across retries, and changes for a later recurring occurrence or a new task after
-`forget`. Deduplicate effects by this ID. Commit guest filesystem writes before
+between an effect and its completion record can repeat the callback. The `task-id`
+passed to `run-task` is this run ID, **not** the ID the task was enqueued under:
+
+```text
+<id>:<generation>:<occurrence>      e.g. nightly-sync:9f86d081884c7d659a2feaa0c55ad015:3
+```
+
+`generation` is 32 hex digits minted at enqueue and `occurrence` counts a
+recurring task's runs from 0. Because an ID cannot contain `:`, the enqueued ID
+is everything before the first `:` — a guest that checks `task-id` against the
+ID it enqueued will refuse every run. The run ID stays the same across retries,
+and changes for a later recurring occurrence or a new task after `forget`.
+Deduplicate effects by the whole run ID. Commit guest filesystem writes before
 returning success. External effects need their own idempotency mechanism.
 
 Failed attempts retry with exponential backoff, up to five attempts per
