@@ -1,5 +1,5 @@
-//! A proof, on every response, that this connection is terminated by this
-//! enclave.
+//! A proof, on every `/auth/*` response, that this connection is terminated by
+//! this enclave.
 //!
 //! ```text
 //!   client nonce ──┐
@@ -12,9 +12,26 @@
 //! That the enclave holding the private key for **the certificate this
 //! connection was served** is alive now, and saw a nonce the client chose. A
 //! client checks it by hashing the certificate from its *own* handshake and
-//! comparing. Putting that on every response, rather than behind a separate
-//! attestation route, is what makes it need no second round trip and stops it
-//! drifting from the connection it describes.
+//! comparing. Putting that on the auth exchange itself, rather than behind a
+//! separate attestation route, is what makes it need no second round trip and
+//! stops it drifting from the connection it describes.
+//!
+//! # Which responses carry one
+//!
+//! Every response to a path under `/auth/`, whatever its method or status — the
+//! challenge, the token, a refusal, and a 405 for `GET /auth/`, which is how a
+//! client attests the enclave without asking it for anything (`nitro-attest`
+//! does exactly that). The document is made before routing, so it cannot
+//! depend on what the route answers.
+//!
+//! Nothing else carries one. A guest response is served on a connection whose
+//! certificate the client already verified on the auth exchange and pinned, and
+//! TLS proves the peer still holds that certificate's key — so a second
+//! document would only spend an NSM signature to repeat the first. The header
+//! is stripped from those responses, so a guest cannot supply one of its own.
+//!
+//! A request without a valid `x-enclave-nonce` is refused with a 400 before
+//! routing, and carries no document either: there is no client nonce to bind.
 //!
 //! # What it does not prove
 //!

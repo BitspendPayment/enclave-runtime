@@ -140,7 +140,9 @@ on. Given the document bytes from `x-enclave-attestation`:
    connection was served**. That is what ties the document to the channel you
    are on; without it, a verified document proves an enclave exists somewhere,
    not that you are talking to it.
-6. **Nonce**, if you sent one, echoed back.
+6. **Nonce** — the one you sent, echoed back. It is not optional: every request
+   must carry `x-enclave-nonce` (unpadded base64url, 8–64 bytes), and one
+   without it is refused with a 400 before routing, with no document.
 7. **Age.** The document carries the enclave's own timestamp. Reject an old one.
 
 Why both registers, since it is the usual question: PCR0 is measured by the
@@ -152,7 +154,18 @@ says the runtime that wrote PCR16 is yours; PCR16 says which application it
 loaded. Neither substitutes for the other.
 
 Guest responses deliberately carry no document. By then you have pinned the
-certificate, and TLS proves the peer still holds its key.
+certificate, and TLS proves the peer still holds its key — so **refuse any
+connection that serves a different certificate**, and attest again before using
+it. A certificate renewal looks exactly like that, and so does an interception;
+a fresh document is what tells them apart.
+
+### Attesting without a request
+
+Every response under `/auth/` carries a document, whatever its status. To
+attest the enclave without asking it for anything — at startup, or after the
+certificate changed — send `GET /auth/` with a nonce: the answer is a 405, and
+the document on it is the point. `nitro-attest --url https://<host>` does exactly
+this.
 
 ### What the guest sees
 

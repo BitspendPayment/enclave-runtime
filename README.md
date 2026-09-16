@@ -26,11 +26,11 @@ Four workspace crates plus example guests:
 | [`s3fs-core`](crates/s3fs-core/) | The engine. `Backend` trait with in-memory and AWS S3 backends; a copy-on-write block store (`store::*`) with encrypted blocks, an indirect-block tree, a dnode array, and the transaction-group commit protocol; POSIX semantics on top (`Fs`). **Zero wasmtime dependency** — usable from any host. |
 | [`nitro-nsm`](crates/nitro-nsm/) | `/dev/nsm`: entropy and attestation requests. Its own crate so it links into a small static binary for an enclave image. |
 | [`nitro-attestation`](crates/nitro-attestation/) | Parses and verifies attestation documents, and the `nitro-attest` client. Depends on nothing else here — a verifier has no `/dev/nsm` and is often not Linux. |
-| [`enclave-runtime`](runtime/) | Everything above the engine: `wasi:filesystem@0.2.x`, the linker, the guest-environment policy, the vsock tap device, TLS termination and per-response attestation — plus the binary that ties them together. A library beside the binary so integration tests can reach it. |
+| [`enclave-runtime`](runtime/) | Everything above the engine: `wasi:filesystem@0.2.x`, the linker, the guest-environment policy, the vsock tap device, TLS termination and attestation of the auth exchange — plus the binary that ties them together. A library beside the binary so integration tests can reach it. |
 | [`examples/guest-http`](examples/guest-http/) | The guest the serving path is tested against: reads and writes the filesystem, and is deliberately stateful so a second request proves the first one's writes committed. |
 | [`examples/guest-sqlite`](examples/guest-sqlite/) | SQLite conformance and benchmark workload — DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, `ALTER TABLE`, `VACUUM`, `integrity_check`. Runs on request; needs wasi-sdk to build. |
 
-**Test coverage:** `cargo test --workspace` runs 753 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the per-response attestation binding. A further 80 skip themselves without MinIO, enclave hardware, or a `wasm32-wasip2` build of the example guest; reach those with `--features testing -- --include-ignored`, which is also what gives the TLS suites a self-signed certificate to serve, since a production build has no way to mint one.
+**Test coverage:** `cargo test --workspace` runs 753 tests — unit tests across the workspace, a MinIO integration suite (real S3 wire protocol, Object Lock retention, remount, tamper detection, rollback floor), a boot-machine suite that walks every row of the state-origin table, and two suites that serve a real component over TLS and check the attestation binding. A further 80 skip themselves without MinIO, enclave hardware, or a `wasm32-wasip2` build of the example guest; reach those with `--features testing -- --include-ignored`, which is also what gives the TLS suites a self-signed certificate to serve, since a production build has no way to mint one.
 
 ## Quick start: run a Wasm guest against MinIO
 
@@ -938,20 +938,33 @@ request is served. The filesystem is the register.
 ### The attestation binding
 
 The TLS key is generated inside the enclave and never leaves it. **Every
-response carries a fresh attestation document** binding a nonce the client
-chose and the SHA-256 of the certificate *that connection* was served, so a
-client ties the connection in its hand to the code it attested without a second
-round trip.
+`/auth/*` response carries a fresh attestation document** binding a nonce the
+client chose and the SHA-256 of the certificate *that connection* was served, so
+a client ties the connection in its hand to the code it attested without a
+second round trip.
 
 | Header | |
 |---|---|
 | `x-enclave-nonce` | request. base64url, no padding; 8–64 bytes decoded. **Required on every request**, whether or not the runtime attests — so a client behaves the same either way and a deployment cannot quietly stop attesting. Missing or malformed is a 400, before the guest is invoked. |
 | `x-enclave-attestation` | response. base64 COSE_Sign1. Runtime-owned: it is `insert`ed, never appended, so a guest that sets it is overwritten. The response is also forced to `cache-control: no-store` — a cached document is a replayed one. |
 
-Every response gets one: the guest's, an auth exchange, and a gate refusal
-alike. The document is generated *before* the request is routed,
-because it binds nothing the guest produces; if the NSM refuses, the request
-fails with a 503 and the guest is never invoked.
+Every response under `/auth/` gets one, whatever it says: the challenge, the
+token, a refusal, and a 405 for `GET /auth/` — which is how a client attests the
+enclave without asking it for anything, and what `nitro-attest --url` requests
+when given no path. The document is generated *before* the request is routed,
+because it binds nothing the route produces; if the NSM refuses, the request
+fails with a 503 and nothing is routed.
+
+**Guest responses carry none.** A client identifies the enclave on the auth
+exchange and pins the certificate that exchange attested; the operation that
+follows runs on a connection serving that certificate, and TLS proves the peer
+still holds its key. A second document would repeat the first at the cost of an
+NSM signature, and the device is the throughput ceiling. The header is stripped
+from guest responses, so a guest cannot put one of its own there. A client that
+pins the certificate this way must refuse a connection serving any other.
+
+A request without a valid nonce is refused with a 400 before routing, and gets
+no document: there is no client nonce to bind.
 
 `user_data` follows nitriding's layout — two multihash-prefixed SHA-256
 digests, 68 bytes:

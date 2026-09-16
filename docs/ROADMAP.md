@@ -30,7 +30,7 @@ in M1.
 issues the `Attestation` request and [`nitro-attestation`](../crates/nitro-attestation/src/lib.rs)
 parses and verifies the COSE_Sign1 that comes back, against the AWS Nitro root.
 The runtime already binds its TLS certificate and the guest into `user_data`
-and puts a document on every response, in `x-enclave-attestation`.
+and puts a document on every `/auth/*` response, in `x-enclave-attestation`.
 
 What M8 still needs from this layer is the `public_key` field, which is
 currently always absent: KMS `Decrypt` with `Recipient` returns the plaintext

@@ -59,7 +59,7 @@ pub struct ServeConfig {
     pub certificate: Option<CertificateSlot>,
     /// A running ACME client, instead of a fixed certificate.
     pub acme: Option<crate::serve::acme::Acme>,
-    /// NSM to sign each response's attestation document.
+    /// NSM to sign the attestation document on each `/auth/*` response.
     ///
     /// Only useful alongside `tls`: the document binds the serving
     /// certificate, and without one there is nothing to bind. Supplying it
@@ -1484,7 +1484,7 @@ pub async fn serve_component(
                 // device, so an NSM that will not answer is found now.
                 match attestor.verify_fits().await {
                     Ok(bytes) => {
-                        tracing::info!(document_header_bytes = bytes, "attesting every response")
+                        tracing::info!(document_header_bytes = bytes, "attesting every /auth response")
                     }
                     Err(e) => anyhow::bail!(
                         "this runtime cannot attest its responses: {e}. Every request would \
