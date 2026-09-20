@@ -13,6 +13,8 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 /// can serve `wasi:filesystem`).
 pub struct State {
     pub(crate) tasks: Option<crate::tasks::TaskContext>,
+    /// The connections the runtime holds for this tenant — see [`crate::stream`].
+    pub(crate) streams: Option<crate::stream::StreamContext>,
     pub(crate) notify: Option<crate::notify::NotifyContext>,
     wasi: WasiCtx,
     table: ResourceTable,
@@ -43,6 +45,7 @@ impl State {
     ) -> Self {
         State {
             tasks: None,
+            streams: None,
             notify: None,
             wasi,
             scope,

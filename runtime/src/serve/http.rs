@@ -180,6 +180,8 @@ pub struct ServeHandle {
     pre: ProxyPre<State>,
     background_pre: InstancePre<State>,
     tasks: Option<Arc<crate::tasks::TaskQueue>>,
+    /// Connections this runtime holds for guests — see [`crate::stream`].
+    streams: Option<Arc<crate::stream::StreamRegistry>>,
     notify: Option<Arc<crate::notify::Notifier>>,
     egress: crate::serve::EgressPolicy,
     guest: Arc<GuestEnvironment>,
@@ -287,6 +289,7 @@ impl ServeHandle {
         Ok(ServeHandle {
             background_pre: instance_pre,
             tasks: None,
+            streams: None,
             notify: None,
             egress: crate::serve::EgressPolicy::Denied,
             pre,
@@ -319,6 +322,27 @@ impl ServeHandle {
         Ok(self)
     }
 
+    /// Let the runtime hold outbound connections on a guest's behalf.
+    ///
+    /// Tenant isolation is required for the same reason tasks require it: a
+    /// connection belongs to a tenant, and the invocations its messages cause
+    /// run in that tenant's filesystem. Without tenancy there is nobody to
+    /// attribute either to.
+    pub fn with_streams(mut self, registry: Arc<crate::stream::StreamRegistry>) -> Result<Self> {
+        anyhow::ensure!(
+            self.tenancy.is_some(),
+            "held connections require tenant isolation"
+        );
+        self.streams = Some(registry);
+        Ok(self)
+    }
+
+    /// The registry, for the interactive path: a guest serving its owner's
+    /// request must be able to open and close connections.
+    pub(crate) fn streams(&self) -> Option<&Arc<crate::stream::StreamRegistry>> {
+        self.streams.as_ref()
+    }
+
     /// Let the guest wake its tenant's devices.
     ///
     /// Tenant isolation is required for the same reason tasks require it: a
@@ -342,6 +366,77 @@ impl ServeHandle {
     }
 
     /// An internal component export, never an HTTP route or a fabricated token.
+    /// One message from a held connection, as one guest invocation.
+    ///
+    /// The same shape as [`Self::run_background`] and for the same reasons: a
+    /// fresh instance, the tenant's lock, a wall deadline. What differs is only
+    /// what woke it — a counterparty rather than a clock — and that it may reply.
+    ///
+    /// `interactive` is FALSE. A message arriving over a connection is not its
+    /// owner asking for something, so it cannot open connections or schedule
+    /// work, exactly as a background run cannot.
+    pub(crate) async fn run_message(
+        &self,
+        streams: &Arc<crate::stream::StreamRegistry>,
+        tenant: [u8; 16],
+        id: &str,
+        message_id: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let tenancy = self
+            .tenancy
+            .as_ref()
+            .context("held connections require tenants")?;
+        let checkout = tenancy.pool.checkout(&tenant);
+        let mut guard = checkout.slot().tenant().clone().lock_owned().await;
+        if let Some(t) = guard.as_mut() {
+            t.instance = None;
+        }
+        let work = async {
+            let scope = crate::tenant::existing_tenant_root(self.guest.fs(), tenant).await?;
+            let state = self.guest.new_state_scoped(scope)?;
+            let mut store = Store::new(self.pre.engine(), state);
+            store.set_epoch_deadline(1);
+            store.epoch_deadline_async_yield_and_update(1);
+            let instance = self.background_pre.instantiate_async(&mut store).await?;
+            store.data_mut().streams = Some(crate::stream::StreamContext {
+                registry: streams.clone(),
+                tenant,
+                interactive: false,
+            });
+            store.data_mut().set_egress(self.egress.clone());
+            store.data_mut().notify =
+                self.notify
+                    .as_ref()
+                    .map(|notifier| crate::notify::NotifyContext {
+                        notifier: notifier.clone(),
+                        tenant,
+                        interactive: false,
+                    });
+            let run = instance
+                .get_typed_func::<(String, String, Vec<u8>), (std::result::Result<Vec<u8>, String>,)>(
+                    &mut store,
+                    "on-message",
+                )
+                .map_err(|e| anyhow::anyhow!(e.to_string()))
+                .context("held connections require the on-message export")?;
+            let (result,) = run
+                .call_async(&mut store, (id.to_string(), message_id.to_string(), payload))
+                .await?;
+            let bytes = result.map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                bytes.len() <= crate::stream::MAX_MESSAGE,
+                "reply exceeds the message ceiling"
+            );
+            Ok(bytes)
+        };
+        // The same wall clock that bounds an interaction. A guest parked in a
+        // host call executes no wasm, so the epoch alone would never reach it.
+        tokio::time::timeout(self.timeout, work)
+            .await
+            .context("the guest took too long to answer a message")?
+    }
+
     /// A fresh instance shares the tenant lock; drop its warm HTTP instance so
     /// no cached database handles survive a background mutation.
     pub(crate) async fn run_background(
@@ -549,6 +644,17 @@ impl ServeHandle {
         tenant.requests += 1;
 
         let instance = tenant.instance.as_mut().expect("just built");
+        instance.store.data_mut().streams =
+            self.streams
+                .as_ref()
+                .map(|registry| crate::stream::StreamContext {
+                    registry: registry.clone(),
+                    tenant: tenant_id,
+                    // Its owner is here, so this invocation may open and close
+                    // connections — unlike one caused by a message arriving on
+                    // one, which may only reply.
+                    interactive: true,
+                });
         instance.store.data_mut().tasks =
             self.tasks.as_ref().map(|queue| crate::tasks::TaskContext {
                 queue: queue.clone(),
@@ -1248,6 +1354,18 @@ impl Server {
             );
             scheduler.spawn(queue.clone().run(self.guest.clone()));
         }
+        // The supervisors, started from what is already on disk. This is what
+        // re-establishes a connection after a restart — no guest is involved and
+        // nothing is scheduled; the records are the instruction and this reads
+        // them. See [`crate::stream`].
+        if let Some(streams) = &self.guest.streams {
+            anyhow::ensure!(
+                self.gate.is_some(),
+                "held connections require authentication"
+            );
+            streams.set_egress(self.guest.egress.clone()).await;
+            scheduler.spawn(streams.clone().run(self.guest.clone()));
+        }
         let listener = TcpListener::bind(self.addr)
             .await
             .with_context(|| format!("binding {}", self.addr))?;
@@ -1412,6 +1530,16 @@ pub async fn serve_component(
         )
         .await?;
         handle = handle.with_tasks(queue)?;
+    }
+    // Held connections, whenever there is a tenant to attribute one to and a gate to authenticate
+    // that tenant. No flag of its own: the registry is a directory and a supervisor loop over
+    // whatever records exist, and a guest that never asks for a connection has neither. What a
+    // guest may REACH is still the egress allowlist's to say, checked on every dial and every
+    // send — so enabling this widens nothing.
+    if config.tenancy.is_some() && config.authentication.is_some() {
+        let registry =
+            crate::stream::StreamRegistry::open_registry(handle.environment().fs().clone()).await?;
+        handle = handle.with_streams(registry)?;
     }
     let mut notify_forwarder = None;
     if let Some(notify) = config.notify.take() {

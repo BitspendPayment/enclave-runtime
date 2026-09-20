@@ -36,7 +36,7 @@ use tokio::time::timeout;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::p2::{
     bindings::http::types::ErrorCode,
-    body::HyperOutgoingBody,
+    body::{HyperIncomingBody, HyperOutgoingBody},
     hyper_request_error,
     types::{HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig},
 };
@@ -164,6 +164,34 @@ impl EgressAllowlist {
         (origin.tls == config.use_tls && self.origins.contains(&origin)).then_some(origin)
     }
 
+    /// Send from the RUNTIME's own code rather than on a guest's behalf.
+    ///
+    /// Same connection, same TLS, same allowlist — the caller has already had
+    /// `origin` admitted. What differs is only the shape of the answer: a guest
+    /// gets a `wasi:http` future it will poll, and the runtime gets a response
+    /// it can await. Used by [`crate::stream`], which holds connections that no
+    /// guest could hold for itself.
+    pub async fn send_direct(
+        &self,
+        origin: Origin,
+        request: hyper::Request<HyperOutgoingBody>,
+        first_byte_timeout: std::time::Duration,
+    ) -> std::result::Result<HeldResponse, ErrorCode> {
+        let config = OutgoingRequestConfig {
+            use_tls: origin.tls,
+            connect_timeout: std::time::Duration::from_secs(10),
+            first_byte_timeout,
+            // A held stream is quiet between events; a service that has said
+            // nothing for this long is one worth reconnecting to.
+            between_bytes_timeout: std::time::Duration::from_secs(300),
+        };
+        let incoming = send(origin, self.tls.clone(), request, config).await?;
+        Ok(HeldResponse {
+            response: incoming.resp,
+            _worker: incoming.worker,
+        })
+    }
+
     /// Send `request` to `origin`, which [`Self::admits`] has already approved.
     pub fn send(
         &self,
@@ -177,6 +205,21 @@ impl EgressAllowlist {
         });
         HostFutureIncomingResponse::pending(handle)
     }
+}
+
+/// A response, with the connection that is still feeding it.
+///
+/// The body of a `hyper` response is fed by a task driving the connection, and that task is
+/// abort-on-drop. Handing back the response alone therefore ends the body the moment the call
+/// returns — for a request/response exchange nobody notices, because the whole body is already
+/// buffered, but for a stream held open it means the stream ends immediately and cleanly. That is
+/// not a hypothetical: it is what `send_direct` did, and the symptom was a service being dialled
+/// once a second for ever with no failures recorded and nothing ever delivered.
+///
+/// So the worker rides along, and the caller keeps this alive for as long as it reads.
+pub struct HeldResponse {
+    pub response: hyper::Response<HyperIncomingBody>,
+    _worker: Option<wasmtime_wasi::runtime::AbortOnDropJoinHandle<()>>,
 }
 
 async fn send(

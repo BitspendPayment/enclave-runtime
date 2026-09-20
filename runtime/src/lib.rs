@@ -47,6 +47,7 @@ pub mod random;
 pub mod run;
 pub mod serve;
 pub mod state;
+pub mod stream;
 pub mod tasks;
 pub mod tenant;
 pub mod wasi;

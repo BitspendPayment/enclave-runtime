@@ -97,6 +97,7 @@ pub fn build_linker(engine: &wasmtime::Engine) -> Result<Linker<State>> {
     add_wasi_minus_filesystem(&mut linker)?;
     crate::wasi::add_filesystem_to_linker(&mut linker)?;
     crate::tasks::add_to_linker(&mut linker)?;
+    crate::stream::add_to_linker(&mut linker)?;
     crate::notify::add_to_linker(&mut linker)?;
     Ok(linker)
 }
