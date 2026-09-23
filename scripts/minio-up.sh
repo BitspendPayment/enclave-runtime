@@ -37,7 +37,10 @@ if [[ -n "$data_dir" ]]; then
 fi
 
 docker rm -f "$container" >/dev/null 2>&1 || true
-docker run -d --rm --name "$container" -p "$port:9000" "${label[@]}" "${volume[@]}" \
+# MINIO_BIND publishes the port on one address only — 127.0.0.1 on a host that is reachable from
+# the internet, where the store's well-known credentials would otherwise be everyone's. The enclave
+# still reaches it: gvproxy delivers its host address, 192.168.127.254, to the host's loopback.
+docker run -d --rm --name "$container" -p "${MINIO_BIND:+$MINIO_BIND:}$port:9000" "${label[@]}" "${volume[@]}" \
     -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
     minio/minio server /data >/dev/null
 

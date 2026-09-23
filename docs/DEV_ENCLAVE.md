@@ -147,6 +147,51 @@ Everything the run produced lives under `target/qemu-nitro/<name>/`: the console
 log, the trust root, the passkey state files, and `fcm-messages.jsonl` — every
 notification the guest raised, since Firebase is stubbed locally.
 
+## On a public host
+
+The same stack runs on a machine the internet can reach, which is how a client is tested against
+something other than a laptop — a phone on a mobile network, a staging deployment. **It is test
+infrastructure, not a trust boundary.** Everything in [What is not real](#what-is-not-real) still
+holds and matters more once the host is not yours alone: whoever controls the host can read every
+tenant's data (the master key is static and public in `flake.nix`) and sign any attestation document
+(the chain is minted inside the image). Put test money behind it, never real money.
+
+What changes:
+
+| flag | |
+|---|---|
+| `--domain NAME` | serve `NAME` with a certificate from Let's Encrypt, validated over TLS-ALPN-01. `NAME` must resolve to the host and `--port` must be 443, reachable from the internet. Pebble is not started |
+| `--acme-staging` | Let's Encrypt's staging CA. Prove issuance with it first: production allows five duplicate certificates a week, and nothing trusts a staging one |
+| `--acme-contact EMAIL` | the contact registered with the CA |
+| `--fcm-project ID --fcm-service-account FILE` | real Firebase notifications instead of the stub. The key is baked into the image, so it lands in the builder's Nix store and the EIF |
+| `--memory SIZE` | the enclave's memory (QEMU `-m`). Default `3G`; the runtime with a small guest runs in `1536M` |
+| `--store-bind ADDR` | publish MinIO on one address, e.g. `127.0.0.1`. Its credentials are the defaults; the enclave still reaches it through gvproxy |
+| `--publish-hook CMD` | run `CMD <run dir>` once the enclave is up. The trust root is new every boot, so whatever clients read their pins from needs the new one |
+| `--pack DIR` / `--prebuilt DIR` | build here, run there — below |
+
+The host needs KVM (bare metal, or an instance with nested virtualisation — on EC2 the c8i, m8i and
+r8i families), `vsock_loopback`, Docker, `python3`, `jq`, `curl`, `openssl`, and for an unprivileged
+user on :443, `sysctl net.ipv4.ip_unprivileged_port_start=443`.
+
+### Build here, run there
+
+Building needs Nix, cargo and this checkout; running needs none of them. `--pack DIR` builds the
+image with the image options given, plus every host binary — gvproxy (static), `nitro-attest`,
+`passkey-client` and `vhost-device-vsock` (libc only) — into `DIR`, records the image options in
+`DIR/image.env`, and stops. On the host:
+
+```
+dev-enclave.sh --prebuilt DIR --guest component.wasm --port 443 --keep-store ...
+```
+
+needs only `deploy/qemu-nitro/` and `scripts/minio-up.sh` from this repository beside it, and the
+QEMU image loaded (`QEMU_IMAGE` names it). Image options are refused with `--prebuilt`: the image is
+what was packed. The build image carries QEMU's compilers; copying `/usr/local` into a slim Debian
+image is about 100 MB compressed, against 3.7 GB.
+
+The attestation chain the emulator mints is valid for 30 days, so a long-running host has to be
+restarted within that — with `--keep-store`, a restart costs nothing but new pins.
+
 ## Restarting
 
 Stop it and start it again with the new component. By default that is a fresh

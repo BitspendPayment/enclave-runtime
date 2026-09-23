@@ -404,6 +404,17 @@
         # Variables for the guest, e.g. the address of the service it may reach. The guest inherits
         # the image environment minus `AWS_*` and `S3FS_*`, so a plain name reaches it.
         guestEnv ? { },
+        # The certificate. The defaults are Pebble on the harness host, for `enclave.test`. An emulator
+        # on a public host passes its real name and a real CA instead — `dev-enclave.sh --domain` —
+        # with `acmeCa = null`, since a public CA's API needs no trust root shipped in the image.
+        tlsDomains ? [ "enclave.test" ],
+        acmeDirectory ? "https://192.168.127.254:14000/dir",
+        acmeCa ? "/pebble-ca.pem",
+        acmeContacts ? [ ],
+        # Real notifications: `{ projectId; serviceAccountFile; }`, the file a Firebase service
+        # account's JSON key. Null keeps the stub. The credential is baked into the image like every
+        # other setting here, so it lands in the Nix store and the EIF of whoever builds this.
+        fcm ? null,
       }: callEif (runtimeImage // {
         payload = runtimeImage.payload // {
           "enclave-runtime" = "${enclave-runtime-testing}/bin/enclave-runtime";
@@ -470,9 +481,8 @@
           # TLS-ALPN-01 challenge arrives on the same port the service uses,
           # which is exactly the arrangement production runs.
           S3FS_TLS = "acme";
-          S3FS_TLS_DOMAINS = "enclave.test";
-          S3FS_ACME_DIRECTORY = "https://192.168.127.254:14000/dir";
-          S3FS_ACME_CA = "/pebble-ca.pem";
+          S3FS_TLS_DOMAINS = nixpkgs.lib.concatStringsSep "," tlsDomains;
+          S3FS_ACME_DIRECTORY = acmeDirectory;
           # The e2e schedules work and waits for it to run. Production leaves
           # this off in deployment.nix; turning it on here changes only the
           # emulator's PCR0, and the harness checks PCR0 against its own
@@ -491,7 +501,6 @@
           # records that this image was built with both.
           S3FS_FCM_PROJECT_ID = "e2e";
           S3FS_FCM_SERVICE_ACCOUNT = builtins.readFile ./deploy/qemu-nitro/fcm/service-account.json;
-          S3FS_FCM_ENDPOINT = "http://192.168.127.254:9101";
           # Off. Inherited from the production image, and there is no AWS
           # here to send to: the harness's credentials are MinIO's, which
           # CloudWatch would reject. Empty means off — the same shape as the
@@ -519,6 +528,16 @@
           AWS_SECRET_ACCESS_KEY = "minioadmin";
           AWS_REGION = "us-east-1";
           RUST_LOG = "info,s3fs=debug";
+        } // nixpkgs.lib.optionalAttrs (acmeCa != null) {
+          S3FS_ACME_CA = acmeCa;
+        } // nixpkgs.lib.optionalAttrs (acmeContacts != [ ]) {
+          S3FS_ACME_CONTACTS = nixpkgs.lib.concatStringsSep "," acmeContacts;
+        } // nixpkgs.lib.optionalAttrs (fcm == null) {
+          S3FS_FCM_ENDPOINT = "http://192.168.127.254:9101";
+        } // nixpkgs.lib.optionalAttrs (fcm != null) {
+          S3FS_FCM_PROJECT_ID = fcm.projectId;
+          # One line: the image's environment file is `KEY=value` per line.
+          S3FS_FCM_SERVICE_ACCOUNT = builtins.toJSON (builtins.fromJSON (builtins.readFile fcm.serviceAccountFile));
         } // nixpkgs.lib.optionalAttrs (allowedOrigins != [ ]) {
           S3FS_WEBAUTHN_ALLOWED_ORIGINS = nixpkgs.lib.concatStringsSep "," allowedOrigins;
         } // nixpkgs.lib.optionalAttrs (guestEgressOrigins != [ ]) {

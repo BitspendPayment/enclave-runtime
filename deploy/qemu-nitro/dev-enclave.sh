@@ -44,6 +44,16 @@ WEBAUTHN_ALLOWED_ORIGINS=""
 GUEST_EGRESS_ORIGINS=""
 BACKGROUND_TIMEOUT_SECS=""
 GUEST_ENV=""
+TLS_DOMAIN=""
+ACME_STAGING=""
+ACME_CONTACT=""
+FCM_PROJECT=""
+FCM_SERVICE_ACCOUNT=""
+QEMU_MEMORY="${QEMU_MEMORY:-3G}"
+STORE_BIND=""
+PUBLISH_HOOK=""
+PACK_DIR=""
+BUNDLE=""
 
 usage() {
     cat >&2 <<EOF
@@ -52,6 +62,10 @@ usage: ${0##*/} [--guest COMPONENT.wasm] [--port PORT] [--name NAME]
                      [--keep-store [--fresh]]
                      [--guest-egress ORIGIN]... [--background-timeout SECS]
                      [--guest-env NAME=VALUE]...
+                     [--domain NAME [--acme-staging] [--acme-contact EMAIL]]
+                     [--fcm-project ID --fcm-service-account FILE]
+                     [--memory SIZE] [--store-bind ADDR] [--publish-hook CMD]
+                     [--pack DIR | --prebuilt DIR]
 
   --guest   a wasm component to serve. Without one, the example guest in
             examples/guest-http is built and used.
@@ -85,6 +99,36 @@ usage: ${0##*/} [--guest COMPONENT.wasm] [--port PORT] [--name NAME]
   --guest-env NAME=VALUE
             a variable for the guest, e.g. ASP_URL=http://192.168.127.254:7070.
             Repeatable. Baked into the image, so measured by PCR0.
+
+  For an emulator on a public host — test infrastructure, not a trust boundary: whoever runs the
+  host can read every tenant's data and sign attestation documents. See docs/DEV_ENCLAVE.md.
+
+  --domain NAME
+            serve NAME with a certificate from Let's Encrypt, validated over
+            TLS-ALPN-01 on this host's --port, which therefore has to be 443 and
+            reachable from the internet, with NAME resolving here. No Pebble.
+  --acme-staging
+            Let's Encrypt's staging CA: prove the setup before spending the
+            production CA's rate limit. Its certificates are trusted by nothing.
+  --acme-contact EMAIL
+            the address Let's Encrypt sends expiry notices to.
+  --fcm-project ID --fcm-service-account FILE
+            real Firebase notifications, with that service account's JSON key,
+            instead of the stub. The key is baked into the image.
+  --memory SIZE
+            the enclave's memory, as QEMU's -m. Default $QEMU_MEMORY.
+  --store-bind ADDR
+            publish MinIO on ADDR only, e.g. 127.0.0.1 — its credentials are
+            the well-known defaults.
+  --publish-hook CMD
+            run CMD with this run's directory once the enclave is up: the trust
+            root is new every boot, so whatever pins it needs the new one.
+  --pack DIR
+            build the image and every host binary into DIR and stop. Image
+            options apply; run options do not.
+  --prebuilt DIR
+            run from a DIR --pack made, on a host with Docker, KVM and vsock but
+            no Nix, cargo or git. Image options are fixed by the pack and refused.
 EOF
     exit 2
 }
@@ -114,6 +158,16 @@ while [[ $# -gt 0 ]]; do
                  need "$1" "${2:-}"
                  WEBAUTHN_ALLOWED_ORIGINS="${WEBAUTHN_ALLOWED_ORIGINS:+$WEBAUTHN_ALLOWED_ORIGINS,}$2"
                  shift 2 ;;
+        --domain) need "$1" "${2:-}"; TLS_DOMAIN="$2"; shift 2 ;;
+        --acme-staging) ACME_STAGING=1; shift ;;
+        --acme-contact) need "$1" "${2:-}"; ACME_CONTACT="$2"; shift 2 ;;
+        --fcm-project) need "$1" "${2:-}"; FCM_PROJECT="$2"; shift 2 ;;
+        --fcm-service-account) need "$1" "${2:-}"; FCM_SERVICE_ACCOUNT="$2"; shift 2 ;;
+        --memory) need "$1" "${2:-}"; QEMU_MEMORY="$2"; shift 2 ;;
+        --store-bind) need "$1" "${2:-}"; STORE_BIND="$2"; shift 2 ;;
+        --publish-hook) need "$1" "${2:-}"; PUBLISH_HOOK="$2"; shift 2 ;;
+        --pack) need "$1" "${2:-}"; PACK_DIR="$2"; shift 2 ;;
+        --prebuilt) need "$1" "${2:-}"; BUNDLE="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
@@ -159,15 +213,57 @@ if [[ -n "$WEBAUTHN_ALLOWED_ORIGINS" && -z "$WEBAUTHN_RP_ID" ]]; then
     exit 1
 fi
 
+[[ -z "$TLS_DOMAIN" || "$TLS_DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
+    || { echo "--domain must be a domain name" >&2; exit 1; }
+[[ -z "$ACME_STAGING$ACME_CONTACT" || -n "$TLS_DOMAIN$BUNDLE" ]] \
+    || { echo "--acme-staging and --acme-contact need --domain: Pebble takes neither" >&2; exit 1; }
+[[ -z "$ACME_CONTACT" || "$ACME_CONTACT" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] \
+    || { echo "--acme-contact must be an email address" >&2; exit 1; }
+if [[ -n "$FCM_PROJECT$FCM_SERVICE_ACCOUNT" ]]; then
+    [[ -n "$FCM_PROJECT" && -n "$FCM_SERVICE_ACCOUNT" ]] \
+        || { echo "--fcm-project and --fcm-service-account go together" >&2; exit 1; }
+    [[ "$FCM_PROJECT" =~ ^[a-z0-9-]+$ ]] || { echo "--fcm-project must be a Firebase project id" >&2; exit 1; }
+    FCM_SERVICE_ACCOUNT="$(readlink -f "$FCM_SERVICE_ACCOUNT")" && [[ -f "$FCM_SERVICE_ACCOUNT" ]] \
+        || { echo "no such service account file" >&2; exit 1; }
+    # A Nix path literal: no spaces or quotes to break out of the expression.
+    [[ "$FCM_SERVICE_ACCOUNT" =~ ^/[A-Za-z0-9/._-]+$ ]] \
+        || { echo "--fcm-service-account path must be letters, digits and /._-" >&2; exit 1; }
+    jq -e '.type == "service_account" and .project_id != null' "$FCM_SERVICE_ACCOUNT" >/dev/null \
+        || { echo "--fcm-service-account is not a service account key" >&2; exit 1; }
+fi
+[[ "$QEMU_MEMORY" =~ ^[1-9][0-9]*[MG]$ ]] || { echo "--memory must be like 1536M or 3G" >&2; exit 1; }
+[[ -z "$STORE_BIND" || "$STORE_BIND" =~ ^[0-9.]+$ ]] || { echo "--store-bind must be an IPv4 address" >&2; exit 1; }
+[[ -z "$PACK_DIR" || -z "$BUNDLE" ]] || { echo "--pack and --prebuilt are exclusive" >&2; exit 1; }
+if [[ -n "$PACK_DIR" ]]; then
+    mkdir -p "$PACK_DIR" && PACK_DIR="$(readlink -f "$PACK_DIR")"
+fi
+if [[ -n "$BUNDLE" ]]; then
+    # The image is what it was packed as. An image option here would describe an enclave that is
+    # not the one about to boot, and the summary and the passkey client would believe it.
+    [[ -z "$WEBAUTHN_RP_ID$WEBAUTHN_ALLOWED_ORIGINS$GUEST_EGRESS_ORIGINS$BACKGROUND_TIMEOUT_SECS$GUEST_ENV$TLS_DOMAIN$ACME_STAGING$ACME_CONTACT$FCM_PROJECT" ]] \
+        || { echo "--prebuilt fixes the image: pass image options to --pack instead" >&2; exit 1; }
+    BUNDLE="$(readlink -f "$BUNDLE")" && [[ -f "$BUNDLE/image.env" ]] \
+        || { echo "--prebuilt $BUNDLE: not a bundle (no image.env)" >&2; exit 1; }
+    [[ -n "$GUEST_WASM" ]] || { echo "--prebuilt needs --guest: a bundle carries no guest" >&2; exit 1; }
+    # shellcheck source=/dev/null
+    source "$BUNDLE/image.env"
+fi
+
 if [[ -n "${FRESH_STORE:-}" && -z "${KEEP_STORE:-}" ]]; then
     echo "--fresh only means something with --keep-store: without it every start is fresh" >&2
     exit 1
 fi
 
 export GUEST_WASM PREFIX HTTPS_PORT WEBAUTHN_RP_ID WEBAUTHN_ALLOWED_ORIGINS KEEP_STORE FRESH_STORE \
-    GUEST_EGRESS_ORIGINS BACKGROUND_TIMEOUT_SECS GUEST_ENV
+    GUEST_EGRESS_ORIGINS BACKGROUND_TIMEOUT_SECS GUEST_ENV TLS_DOMAIN ACME_STAGING ACME_CONTACT \
+    FCM_PROJECT FCM_SERVICE_ACCOUNT QEMU_MEMORY STORE_BIND PACK_DIR BUNDLE
 # shellcheck source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+
+if [[ -n "$PACK_DIR" ]]; then
+    enclave_pack
+    exit 0
+fi
 
 enclave_bring_up
 
@@ -183,6 +279,12 @@ enclave_bring_up
 say "enrolling a passkey, so there is something to try"
 signed enrol >/dev/null || fail "the enclave refused to enrol a passkey"
 
+if [[ -n "$PUBLISH_HOOK" ]]; then
+    say "publishing this boot's pins"
+    # Not fatal: the enclave is up and serving either way, and a hook that failed says so itself.
+    $PUBLISH_HOOK "$RUNDIR" || echo "the publish hook failed; clients still hold the previous pins" >&2
+fi
+
 if [[ -n "${KEEP_STORE:-}" ]]; then
     store_note="The store in $STORE_DIR is kept: it resumes, with its tenants and
 their data, and the new guest is an upgrade of it. --fresh discards it."
@@ -191,12 +293,28 @@ else
 enclave boots into genesis rather than resuming. --keep-store keeps it."
 fi
 
+if [[ -n "$FCM_PROJECT" ]]; then
+    wakes="Firebase project $FCM_PROJECT"
+else
+    wakes="$FCM_RECORD  (every notification the guest raised, as JSON)"
+fi
+if [[ -n "$TLS_DOMAIN" ]]; then
+    certificate_note="The certificate is from Let's Encrypt."
+    [[ -z "$ACME_STAGING" ]] || certificate_note="The certificate is from Let's Encrypt's staging CA, which nothing trusts."
+else
+    certificate_note="The certificate is issued by Pebble, which no public root signs, so a client
+also needs Pebble's root — or has to pin the certificate out of the attestation
+document, which is what a real client should do anyway:
+
+  --ca          $RUNDIR/pebble-root.pem"
+fi
+
 cat <<EOF
 
 == the enclave is up ==
 
-  url      https://127.0.0.1:$HTTPS_PORT
-  host     enclave.test   (the name on the certificate)
+  url      https://${TLS_DOMAIN:-127.0.0.1}:$HTTPS_PORT
+  host     ${TLS_DOMAIN:-enclave.test}   (the name on the certificate)
   rp id    ${WEBAUTHN_RP_ID:-enclave.test}${WEBAUTHN_ALLOWED_ORIGINS:+   allowing $WEBAUTHN_ALLOWED_ORIGINS}
   egress   ${GUEST_EGRESS_ORIGINS:-none — the guest has no outbound network}
 
@@ -209,11 +327,7 @@ root is what the documents chain to.
   --pcr16       $EXPECTED_PCR16
   --trust-root  $TRUST_ROOT
 
-The certificate is issued by Pebble, which no public root signs, so a client
-also needs Pebble's root — or has to pin the certificate out of the attestation
-document, which is what a real client should do anyway:
-
-  --ca          $RUNDIR/pebble-root.pem
+$certificate_note
 
 Try it with the client this repo builds. It signs a WebAuthn assertion for each
 request, which is the only way anything reaches the guest:
@@ -236,7 +350,7 @@ Or verify the attestation on its own, without touching the guest:
 
 Console:  $CONSOLE
 Store:    http://127.0.0.1:9000  (minioadmin/minioadmin, buckets $DATA_BUCKET and $ROOTS_BUCKET)
-Wakes:    $FCM_RECORD  (every notification the guest raised, as JSON)
+Wakes:    $wakes
 
 To run a new build of your guest, stop this and start it again with the new
 component. $store_note PCR16 changes either way, and the trust root is new every

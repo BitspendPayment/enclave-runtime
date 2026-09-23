@@ -30,6 +30,16 @@
 #   WITH_SUBSTITUTE  also stage a second, altered guest, for a caller that
 #                 wants to show what happens when the object is replaced.
 #   TIMEOUT       seconds for each wait. Default 240.
+#   QEMU_MEMORY   the enclave's memory, as QEMU's -m. Default 3G.
+#   STORE_BIND    the address MinIO is published on. Default all of them.
+#   TLS_DOMAIN    serve this name with a certificate from Let's Encrypt instead
+#                 of enclave.test from Pebble — for an emulator on a public host.
+#                 ACME_STAGING picks the staging CA, ACME_CONTACT its contact.
+#   FCM_PROJECT / FCM_SERVICE_ACCOUNT
+#                 real Firebase notifications instead of the stub.
+#   PACK_DIR      build everything a run needs into this directory and stop.
+#   BUNDLE        run from a directory PACK_DIR made: no Nix, no cargo, no git
+#                 on this machine — see `enclave_pack`.
 #
 # What it gets back, after `enclave_bring_up`:
 #
@@ -55,6 +65,18 @@ KEEP_STORE="${KEEP_STORE:-}"
 FRESH_STORE="${FRESH_STORE:-}"
 IMAGE="${QEMU_IMAGE:-s3fs-qemu-nitro:latest}"
 TIMEOUT="${TIMEOUT:-240}"
+QEMU_MEMORY="${QEMU_MEMORY:-3G}"
+STORE_BIND="${STORE_BIND:-}"
+TLS_DOMAIN="${TLS_DOMAIN:-}"
+ACME_STAGING="${ACME_STAGING:-}"
+ACME_CONTACT="${ACME_CONTACT:-}"
+FCM_PROJECT="${FCM_PROJECT:-}"
+FCM_SERVICE_ACCOUNT="${FCM_SERVICE_ACCOUNT:-}"
+PACK_DIR="${PACK_DIR:-}"
+BUNDLE="${BUNDLE:-}"
+
+LETS_ENCRYPT_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory
+LETS_ENCRYPT_STAGING_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory
 CONSOLE="$RUNDIR/console.log"
 
 # Host-side port that gvproxy forwards into the enclave's :443. Pebble also
@@ -85,6 +107,10 @@ say() { printf '\n== %s ==\n' "$*"; }
 # Preconditions, each with the fix rather than just the symptom.
 # ---------------------------------------------------------------------------
 enclave_preflight() {
+    if [[ -n "$BUNDLE" ]]; then
+        enclave_preflight_host
+        return
+    fi
     command -v nix >/dev/null || {
         echo "nix is not on PATH; see deploy/nix/README.md" >&2; exit 1; }
 
@@ -123,22 +149,35 @@ enclave_preflight() {
         echo "  git add <them>, or remove them" >&2
         exit 1
     fi
-    [[ -e /dev/kvm ]] || { echo "no /dev/kvm — the nitro-enclave machine needs KVM" >&2; exit 1; }
-    [[ -e /dev/vsock ]] || {
-        echo "no /dev/vsock — the host needs: sudo modprobe vsock_loopback" >&2
-        exit 1
-    }
-    docker image inspect "$IMAGE" >/dev/null 2>&1 || {
-        echo "missing QEMU image $IMAGE — build it:" >&2
-        echo "  docker build -t $IMAGE deploy/qemu-nitro" >&2
-        exit 1
-    }
-
     VSOCK_BIN="$WORK/tools/bin/vhost-device-vsock"
     [[ -x "$VSOCK_BIN" ]] || {
         echo "missing $VSOCK_BIN (cargo install vhost-device-vsock --root $WORK/tools)" >&2
         exit 1
     }
+    enclave_preflight_host
+}
+
+# What running needs, as opposed to building. A bundle is run on a machine that has none of the
+# build's tools, so this is all it checks.
+enclave_preflight_host() {
+    if [[ -n "$BUNDLE" ]]; then
+        [[ -f "$BUNDLE/eif/s3fs-qemu.eif" && -x "$BUNDLE/bin/gvproxy" ]] \
+            || { echo "$BUNDLE is not a bundle: pack one with dev-enclave.sh --pack" >&2; exit 1; }
+        VSOCK_BIN="$BUNDLE/bin/vhost-device-vsock"
+    fi
+    # Packing only builds, so nothing it produces needs this machine to be able to run it.
+    if [[ -z "$PACK_DIR" ]]; then
+        [[ -e /dev/kvm ]] || { echo "no /dev/kvm — the nitro-enclave machine needs KVM" >&2; exit 1; }
+        [[ -e /dev/vsock ]] || {
+            echo "no /dev/vsock — the host needs: sudo modprobe vsock_loopback" >&2
+            exit 1
+        }
+        docker image inspect "$IMAGE" >/dev/null 2>&1 || {
+            echo "missing QEMU image $IMAGE — build it:" >&2
+            echo "  docker build -t $IMAGE deploy/qemu-nitro" >&2
+            exit 1
+        }
+    fi
 
     # Checked immediately before the `rm -rf`, because RUNDIR is overridable and
     # this is the one line here that destroys something. `$WORK/` with an empty
@@ -231,8 +270,16 @@ nix_expr() {
 }
 
 enclave_build_image() {
+    if [[ -n "$BUNDLE" ]]; then
+        EIF_DIR="$BUNDLE/eif"
+        EIF="$EIF_DIR/s3fs-qemu.eif"
+        EXPECTED_PCR0="$(jq -r .PCR0 "$EIF_DIR/pcr.json")"
+        echo "EIF   $EIF (prebuilt)"
+        echo "PCR0  $EXPECTED_PCR0"
+        return
+    fi
     say "building the enclave image"
-    if [[ -n "${WEBAUTHN_RP_ID:-}${GUEST_EGRESS_ORIGINS:-}${BACKGROUND_TIMEOUT_SECS:-}${GUEST_ENV:-}" ]]; then
+    if [[ -n "${WEBAUTHN_RP_ID:-}${GUEST_EGRESS_ORIGINS:-}${BACKGROUND_TIMEOUT_SECS:-}${GUEST_ENV:-}${TLS_DOMAIN}${FCM_PROJECT}" ]]; then
         # The same image configured differently. Not a package — flake outputs take no arguments —
         # so the flake's `lib.eifQemu` is called directly, which reading the flake by path needs
         # --impure for. dev-enclave.sh has already held every value to a shape that cannot break
@@ -256,6 +303,16 @@ enclave_build_image() {
             IFS=, read -ra kvs <<<"$GUEST_ENV"
             for kv in "${kvs[@]}"; do env_attrs+=" ${kv%%=*} = \"${kv#*=}\";"; done
             args+=" guestEnv = {$env_attrs };"
+        fi
+        if [[ -n "$TLS_DOMAIN" ]]; then
+            local directory="$LETS_ENCRYPT_DIRECTORY"
+            [[ -n "$ACME_STAGING" ]] && directory="$LETS_ENCRYPT_STAGING_DIRECTORY"
+            args+=" tlsDomains = [ \"$TLS_DOMAIN\" ]; acmeDirectory = \"$directory\"; acmeCa = null;"
+            # A bare address: the runtime adds the mailto: scheme itself.
+            [[ -n "$ACME_CONTACT" ]] && args+=" acmeContacts = [ \"$ACME_CONTACT\" ];"
+        fi
+        if [[ -n "$FCM_PROJECT" ]]; then
+            args+=" fcm = { projectId = \"$FCM_PROJECT\"; serviceAccountFile = $FCM_SERVICE_ACCOUNT; };"
         fi
         nix_expr "eif-qemu (${args# })" "$RUNDIR/eif" \
             "((builtins.getFlake \"git+file://$REPO\").lib.\${builtins.currentSystem}.eifQemu {$args })"
@@ -305,12 +362,21 @@ enclave_build_guest() {
 # not run on a machine that has no such store path. Only what goes *inside* the
 # enclave has to come from Nix.
 enclave_build_clients() {
+    if [[ -n "$BUNDLE" ]]; then
+        ATTEST="$BUNDLE/bin/nitro-attest"
+        PASSKEY="$BUNDLE/bin/passkey-client"
+        EXPECTED_PCR16="$("$ATTEST" --measure "$RUNDIR/guests/guest.wasm" | jq -r .PCR16)"
+        echo "PCR16 $EXPECTED_PCR16"
+        return
+    fi
     say "building the verifier"
     ( cd "$REPO" && cargo build --release -p nitro-attestation --features cli ) 2>&1 | tail -2
     ATTEST="$REPO/target/release/nitro-attest"
     [[ -x "$ATTEST" ]] || { echo "nitro-attest did not build" >&2; exit 1; }
 
-    if [[ -n "${EXPECTED_PCR16:-}" ]]; then
+    if [[ -n "$PACK_DIR" ]]; then
+        :   # No guest in a bundle: the run names its own, and measures it then.
+    elif [[ -n "${EXPECTED_PCR16:-}" ]]; then
         # The release build measured the guest with a Nix-built nitro-attest;
         # this one was built here. They must agree, or a key policy and a client
         # would pin different numbers for the same guest.
@@ -371,7 +437,7 @@ enclave_start_store() {
     fi
     # The same recipe the SQLite CI job used. It lived in run-e2e.sh in full
     # until both copies had to agree with nothing making them agree.
-    MINIO_LABEL="$LABEL" "$REPO/scripts/minio-up.sh" \
+    MINIO_LABEL="$LABEL" MINIO_BIND="$STORE_BIND" "$REPO/scripts/minio-up.sh" \
         "$PREFIX-minio" 9000 "$DATA_BUCKET" "$ROOTS_BUCKET" $data_dir
     upload_guest guest.wasm
     echo "MinIO ready with $DATA_BUCKET and $ROOTS_BUCKET, and the guest at $ROOTS_BUCKET/guest/guest.wasm"
@@ -401,15 +467,19 @@ enclave_start_parent() {
     # registration token if it were. The stub answers the two endpoints the
     # runtime calls and records every message, so a caller can assert on what
     # the runtime *sent*.
+    #
+    # Not with real notifications: the image then talks to Google, and has no stub to dial.
     FCM_RECORD="$RUNDIR/fcm-messages.jsonl"
-    python3 "$REPO/deploy/qemu-nitro/fcm-stub.py" "$FCM_RECORD" > "$RUNDIR/fcm-stub.log" 2>&1 &
-    pids+=($!)
-    for _ in $(seq 50); do
-        curl -sf -o /dev/null -X POST --data '{}' http://127.0.0.1:9101/token && break
-        sleep 0.1
-    done
-    curl -sf -o /dev/null -X POST --data '{}' http://127.0.0.1:9101/token \
-        || { echo "the FCM stub never answered:" >&2; cat "$RUNDIR/fcm-stub.log" >&2; exit 1; }
+    if [[ -z "$FCM_PROJECT" ]]; then
+        python3 "$REPO/deploy/qemu-nitro/fcm-stub.py" "$FCM_RECORD" > "$RUNDIR/fcm-stub.log" 2>&1 &
+        pids+=($!)
+        for _ in $(seq 50); do
+            curl -sf -o /dev/null -X POST --data '{}' http://127.0.0.1:9101/token && break
+            sleep 0.1
+        done
+        curl -sf -o /dev/null -X POST --data '{}' http://127.0.0.1:9101/token \
+            || { echo "the FCM stub never answered:" >&2; cat "$RUNDIR/fcm-stub.log" >&2; exit 1; }
+    fi
 
     # forward-cid 1 turns the guest's vsock connections into host vsock loopback
     # connections, which is the only arrangement that reaches a listener for the
@@ -431,8 +501,12 @@ enclave_start_parent() {
     # The same pin as the gvforwarder inside the image, and built static for the
     # same reason: it has to run here, and later on Amazon Linux, neither of
     # which has a Nix store.
-    nix_build gvproxy "$RUNDIR/gvproxy" >/dev/null
-    GV_DIR="$(resolve_out_link "$RUNDIR/gvproxy")"
+    if [[ -n "$BUNDLE" ]]; then
+        GV_DIR="$BUNDLE"
+    else
+        nix_build gvproxy "$RUNDIR/gvproxy" >/dev/null
+        GV_DIR="$(resolve_out_link "$RUNDIR/gvproxy")"
+    fi
 
     "$GV_DIR/bin/gvproxy" \
         --listen "vsock://:1024" \
@@ -529,7 +603,7 @@ boot_enclave() {
             -accel kvm -cpu host \
             -kernel /eif/s3fs-qemu.eif \
             -chardev socket,id=chr0,path=/run/vsock/vhost.socket \
-            -m 3G -smp 2 -nographic -no-reboot >/dev/null
+            -m "$QEMU_MEMORY" -smp 2 -nographic -no-reboot >/dev/null
     docker logs -f "$1" > "$2" 2>&1 &
 }
 
@@ -641,6 +715,10 @@ wait_for_https() {
 # the served chain against that root the way any PKI client would — which is the
 # part a self-signed image could never test.
 enclave_check_certificate() {
+    if [[ -n "$TLS_DOMAIN" ]]; then
+        enclave_check_public_certificate
+        return
+    fi
     curl -sk --max-time 5 "https://127.0.0.1:15000/roots/0" > "$RUNDIR/pebble-root.pem" \
         || { echo "could not fetch Pebble's root" >&2; exit 1; }
     curl -sk --max-time 5 "https://127.0.0.1:15000/intermediates/0" > "$RUNDIR/pebble-int.pem" \
@@ -678,6 +756,31 @@ enclave_check_certificate() {
         || { echo "the certificate was not issued by Pebble: $issuer" >&2; exit 1; }
 }
 
+# A public name, from a public CA. Checked as any client on the internet checks it — the system's
+# roots and the name — except against staging, whose roots nothing trusts by design; there the
+# issuer is what says the order went where it should.
+enclave_check_public_certificate() {
+    local out names issuer
+    out="$(echo | openssl s_client -connect "127.0.0.1:$HTTPS_PORT" -servername "$TLS_DOMAIN" \
+        -verify_hostname "$TLS_DOMAIN" -showcerts 2>&1 || true)"
+    sed -n '/BEGIN CERT/,/END CERT/p' <<<"$out" > "$RUNDIR/served-chain.pem"
+    [[ -s "$RUNDIR/served-chain.pem" ]] || { echo "the enclave presented no certificate" >&2; exit 1; }
+    names="$(openssl x509 -in "$RUNDIR/served-chain.pem" -noout -ext subjectAltName | tail -n +2 | tr -d ' ')"
+    issuer="$(openssl x509 -in "$RUNDIR/served-chain.pem" -noout -issuer)"
+    echo "served for $names"
+    echo "issued by $issuer"
+    [[ "$names" == *"DNS:$TLS_DOMAIN"* ]] \
+        || { echo "the certificate is not for $TLS_DOMAIN: $names" >&2; exit 1; }
+    if [[ -n "$ACME_STAGING" ]]; then
+        [[ "$issuer" == *STAGING* ]] \
+            || { echo "expected a Let's Encrypt staging certificate: $issuer" >&2; exit 1; }
+    else
+        grep -q "Verify return code: 0 (ok)" <<<"$out" \
+            || { echo "the served certificate does not verify against the system roots:" >&2
+                 grep "Verify return code" <<<"$out" >&2; exit 1; }
+    fi
+}
+
 # Append the certificate in $1 to the bundle $2 unless it is already there.
 keep_pem() {
     touch "$2"
@@ -696,7 +799,8 @@ enclave_bring_up() {
 
     enclave_start_store
     enclave_start_parent
-    enclave_start_ca
+    # A public name is validated by the public CA, over the internet, on this host's :443.
+    [[ -n "$TLS_DOMAIN" ]] || enclave_start_ca
     enclave_expose_https
 
     say "booting the enclave"
@@ -713,7 +817,9 @@ enclave_bring_up() {
 
     enclave_trust_root
 
-    say "waiting for Pebble to issue the serving certificate"
+    local ca=Pebble
+    [[ -z "$TLS_DOMAIN" ]] || ca="Let's Encrypt"
+    say "waiting for $ca to issue the serving certificate"
     wait_for_https || {
         echo "no certificate was ever issued; the ACME path did not complete" >&2
         echo "--- pebble ---" >&2;  docker logs "$PREFIX-pebble" 2>&1 | tail -30 >&2
@@ -722,4 +828,35 @@ enclave_bring_up() {
     }
     echo "the enclave is serving a certificate it obtained over ACME"
     enclave_check_certificate
+}
+
+# Everything a run builds, in one directory, for a machine that should not build.
+#
+# The image is a file and its measurement is beside it; gvproxy is static; the verifier, the passkey
+# client and vhost-device-vsock link only against the C library. So a host with Docker, KVM and
+# vsock runs the whole stack from this with `--prebuilt` — no Nix store, no toolchain, no checkout
+# that has to match — which is what makes a small VM enough. The image configuration is recorded
+# beside it, because it is fixed by the image: a run cannot change it, only read it.
+enclave_pack() {
+    enclave_preflight
+    enclave_build_image
+    enclave_build_clients
+    nix_build gvproxy "$RUNDIR/gvproxy" >/dev/null
+    GV_DIR="$(resolve_out_link "$RUNDIR/gvproxy")"
+
+    say "packing into $PACK_DIR"
+    rm -rf "$PACK_DIR"; mkdir -p "$PACK_DIR/eif" "$PACK_DIR/bin"
+    cp -L "$EIF_DIR/s3fs-qemu.eif" "$EIF_DIR/pcr.json" "$PACK_DIR/eif/"
+    cp -L "$GV_DIR/bin/gvproxy" "$ATTEST" "$PASSKEY" "$VSOCK_BIN" "$PACK_DIR/bin/"
+    chmod -R u+w "$PACK_DIR"
+    {
+        printf 'WEBAUTHN_RP_ID=%q\n' "${WEBAUTHN_RP_ID:-}"
+        printf 'WEBAUTHN_ALLOWED_ORIGINS=%q\n' "${WEBAUTHN_ALLOWED_ORIGINS:-}"
+        printf 'GUEST_EGRESS_ORIGINS=%q\n' "${GUEST_EGRESS_ORIGINS:-}"
+        printf 'TLS_DOMAIN=%q\n' "$TLS_DOMAIN"
+        printf 'ACME_STAGING=%q\n' "$ACME_STAGING"
+        printf 'FCM_PROJECT=%q\n' "$FCM_PROJECT"
+    } > "$PACK_DIR/image.env"
+    echo "PCR0  $EXPECTED_PCR0"
+    du -sh "$PACK_DIR" | cut -f1 | sed 's/^/size  /'
 }
