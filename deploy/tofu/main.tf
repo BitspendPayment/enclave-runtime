@@ -146,6 +146,11 @@ data "aws_iam_policy_document" "buckets" {
       "s3:DeleteObject",
       "s3:ListBucket",
       "s3:GetBucketLocation",
+      # Root records are read by version, underneath any delete marker.
+      "s3:ListBucketVersions",
+      "s3:GetObjectVersion",
+      # A PutObject that carries retention headers needs this too.
+      "s3:PutObjectRetention",
     ]
     resources = concat(
       [for b in var.buckets : "arn:aws:s3:::${b}"],
@@ -156,12 +161,14 @@ data "aws_iam_policy_document" "buckets" {
   # The anchor chain is what makes rollback detectable, and Object Lock is what
   # makes it immutable. Nothing on the parent has any business relaxing that,
   # so the permission to do it is withheld rather than merely unused.
+  # PutObjectRetention is not in this list because the runtime needs it to
+  # write roots at all, and in COMPLIANCE mode it can only extend a retention,
+  # never shorten one.
   statement {
     sid    = "NeverWeakenRetention"
     effect = "Deny"
     actions = [
       "s3:PutBucketObjectLockConfiguration",
-      "s3:PutObjectRetention",
       "s3:PutObjectLegalHold",
       "s3:BypassGovernanceRetention",
     ]

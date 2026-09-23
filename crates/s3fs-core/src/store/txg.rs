@@ -4,6 +4,7 @@
 //! point: the conditional PUT of the root record.
 //!
 //! ```text
+//!   0. first commit of a session only: claim a transaction group (below)
 //!   1. consume a transaction group number        (never reused, see below)
 //!   2. rebuild the dnode array copy-on-write     (staged in memory)
 //!   3. PUT every slab, and wait for all of them  ← durability barrier
@@ -24,12 +25,24 @@
 //!
 //! ## Transaction group numbers are never reused
 //!
-//! This is the invariant the whole encryption scheme rests on, and the
-//! non-obvious threat to it is a crash *between* steps 3 and 4. The tip root
-//! still names transaction group `T`, so a naive remount would resume at
-//! `T + 1` — the very number whose nonces were already burned writing the
-//! orphaned slabs. [`next_safe_txg`] closes that by probing forward past any
-//! orphan before the first commit of a session.
+//! This is the invariant the whole encryption scheme rests on: a block nonce
+//! is `(txg, seq)` under one key, so sealing two different blocks under the
+//! same transaction group is the GCM nonce-reuse break. Two things threaten
+//! it, and both come from a number being burned without a root recording it:
+//! a crash *between* steps 3 and 4, and a second mount opened at the same tip.
+//! A naive remount, or the second mount, would resume at `tip + 1` — the very
+//! number whose nonces the orphaned slabs already spent.
+//!
+//! The rule that closes both: **every burned transaction group is at most one
+//! past the highest published root.** A session earns the right to seal
+//! blocks by first publishing a *claim* — a root that names `tip + 1` and no
+//! new blocks — and after any transaction that did not end in a published
+//! root, whether it failed or was simply dropped, it must claim again before
+//! sealing under the next number. The claim goes through
+//! the same conditional PUT as a commit, so of two mounts at one tip exactly
+//! one claims and the other is poisoned before it has encrypted a byte. And
+//! because the rule is enforced in the locked root chain, nothing the host can
+//! delete from the data bucket weakens it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -48,14 +61,6 @@ use super::objset::ObjectSet;
 use super::root::{RootRecord, RootStore};
 use super::slab::SlabWriter;
 
-/// Ceiling on how far [`next_safe_txg`] will probe.
-///
-/// Each orphan is one crash between writing slabs and publishing a root.
-/// Hitting this means either something is crashing in a tight loop or the
-/// store is fabricating slabs, and both deserve a loud failure rather than an
-/// unbounded scan.
-const MAX_ORPHAN_PROBE: u64 = 1024;
-
 /// Default permissions for the root directory.
 const ROOT_DIR_MODE: u32 = 0o040755;
 
@@ -66,27 +71,16 @@ fn now_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-/// Find the first transaction group number that is safe to use.
-///
-/// Starts just past the tip's transaction group and steps over any that
-/// already have a slab — the remains of a commit that died after writing its
-/// data but before publishing a root.
-pub async fn next_safe_txg(blocks: &BlockStore, tip_txg: u64) -> FsResult<u64> {
-    for txg in (tip_txg + 1..).take(MAX_ORPHAN_PROBE as usize) {
-        if !blocks.slab_exists(txg, 0).await? {
-            return Ok(txg);
-        }
-    }
-    Err(FsError::Integrity(
-        "txg: too many orphaned transaction groups to skip",
-    ))
-}
-
 #[derive(Debug)]
 struct State {
     objset: ObjectSet,
     root: RootRecord,
     next_txg: u64,
+    /// Whether the root chain already records `next_txg - 1`, so sealing
+    /// under `next_txg` cannot collide with anything an earlier session or a
+    /// rival mount burned. True only when the last number handed out ended
+    /// in a published root: false at mount, and from `begin` until `commit`.
+    claimed: bool,
     /// Once set, every operation fails with this. A poisoned mount has either
     /// lost a race for its sequence number or seen the store misbehave; in
     /// both cases continuing would risk silently diverging from what is
@@ -162,7 +156,10 @@ impl Store {
         root: RootRecord,
     ) -> FsResult<Store> {
         let objset = ObjectSet::from_root(root.meta_dnode.clone(), root.next_objid)?;
-        let next_txg = next_safe_txg(&blocks, root.txg).await?;
+        let next_txg = root
+            .txg
+            .checked_add(1)
+            .ok_or(FsError::Invalid("transaction group space exhausted"))?;
         Ok(Store {
             blocks,
             roots,
@@ -171,6 +168,7 @@ impl Store {
                 objset,
                 root,
                 next_txg,
+                claimed: false,
                 poison: None,
             }),
         })
@@ -220,6 +218,7 @@ impl Store {
                 objset,
                 root,
                 next_txg: txg + 1,
+                claimed: true,
                 poison: None,
             }),
         })
@@ -299,6 +298,37 @@ impl Store {
         }
     }
 
+    /// Publish a root naming `next_txg` and no new blocks, so that number is
+    /// on record before anything is sealed under the one after it.
+    ///
+    /// Losing the race for the sequence number means another mount is live at
+    /// this tip; that is fatal for the same reason losing a commit is, except
+    /// that here nothing has been encrypted yet, which is the point.
+    async fn claim(&self, state: &mut State) -> FsResult<()> {
+        let txg = state.next_txg;
+        let root = RootRecord::seal(
+            &self.keys,
+            state.root.seq + 1,
+            Some(&state.root),
+            txg,
+            now_nanos(),
+            state.objset.meta().clone(),
+            state.objset.next_objid(),
+        )?;
+        if let Err(e) = self.roots.publish(&root).await {
+            if !e.is_transient() {
+                state.poison = Some(e.clone());
+            }
+            return Err(e);
+        }
+        state.root = root;
+        state.next_txg = txg
+            .checked_add(1)
+            .ok_or(FsError::Invalid("transaction group space exhausted"))?;
+        state.claimed = true;
+        Ok(())
+    }
+
     /// Begin a transaction.
     ///
     /// The returned handle holds the store's lock, so transactions serialise.
@@ -309,6 +339,9 @@ impl Store {
     pub async fn begin(&self) -> FsResult<Transaction<'_>> {
         let mut state = self.state.lock().await;
         state.check()?;
+        if !state.claimed {
+            self.claim(&mut state).await?;
+        }
 
         // Consume the transaction group up front and never give it back. An
         // abandoned transaction burns its number, which is exactly right:
@@ -317,6 +350,9 @@ impl Store {
         state.next_txg = txg
             .checked_add(1)
             .ok_or(FsError::Invalid("transaction group space exhausted"))?;
+        // Handed out, not yet on record. Stays false if this transaction is
+        // dropped or fails, and the next `begin` claims before sealing.
+        state.claimed = false;
 
         Ok(Transaction {
             store: self,
@@ -421,14 +457,16 @@ impl Transaction<'_> {
             Ok((objset, root)) => {
                 self.state.objset = objset;
                 self.state.root = root.clone();
+                self.state.claimed = true;
                 Ok(root)
             }
             Err(e) => {
                 // A transient failure before the root PUT leaves the store
                 // exactly as it was — the slabs are orphans — so the mount
                 // stays usable and the caller may retry with a fresh
-                // transaction group. Anything else means we no longer know
-                // what is committed.
+                // transaction group, once the next `begin` has claimed it:
+                // this one was burned with no root to say so. Anything else
+                // means we no longer know what is committed.
                 if !e.is_transient() {
                     self.state.poison = Some(e.clone());
                 }
@@ -685,24 +723,28 @@ mod tests {
     async fn a_crash_between_slabs_and_root_does_not_reuse_a_transaction_group() {
         let h = Harness::new();
         let store = h.open().await.unwrap();
-        let tip_txg = store.root().await.unwrap().txg;
-
-        // Simulate the crash directly: write a slab for the next transaction
-        // group, and never publish its root.
-        let orphan_txg = tip_txg + 1;
-        h.data
-            .put_blob(PutBlobInput::new(
-                h.config.slab_key(orphan_txg, 0),
-                Bytes::from_static(b"orphaned commit"),
-            ))
+        let objid = store.reserve_objid().await.unwrap();
+        store
+            .commit(BTreeMap::from([(objid, file(objid, 1))]))
             .await
             .unwrap();
+
+        // The real thing: slabs land, the root PUT dies, the process dies.
+        h.roots.fail_next_put(FsError::IoTimeout);
+        let objid = store.reserve_objid().await.unwrap();
+        assert!(store
+            .commit(BTreeMap::from([(objid, file(objid, 2))]))
+            .await
+            .is_err());
+        let orphan_txg = store.state.lock().await.next_txg - 1;
+        let orphan_key = h.config.slab_key(orphan_txg, 0);
+        let orphan = h.data.get_blob(&orphan_key, None).await.unwrap().body;
         drop(store);
 
         let store = h.open().await.unwrap();
         let objid = store.reserve_objid().await.unwrap();
         let root = store
-            .commit(BTreeMap::from([(objid, file(objid, 1))]))
+            .commit(BTreeMap::from([(objid, file(objid, 3))]))
             .await
             .unwrap();
 
@@ -713,31 +755,93 @@ mod tests {
         );
         // And the orphan is untouched, not overwritten.
         assert_eq!(
-            h.data
-                .get_blob(&h.config.slab_key(orphan_txg, 0), None)
-                .await
-                .unwrap()
-                .body,
-            Bytes::from_static(b"orphaned commit")
+            h.data.get_blob(&orphan_key, None).await.unwrap().body,
+            orphan
         );
     }
 
+    /// A transaction dropped without committing consumed a number that no
+    /// root records. The next commit has to claim before it seals, or a
+    /// crash after its slabs would leave that number two past the tip —
+    /// exactly where the next session would start.
     #[tokio::test]
-    async fn consecutive_orphans_are_all_stepped_over() {
+    async fn an_abandoned_transaction_forces_a_claim() {
         let h = Harness::new();
         let store = h.open().await.unwrap();
-        let tip_txg = store.root().await.unwrap().txg;
-        drop(store);
+        let before = store.root().await.unwrap();
 
-        for i in 1..=5 {
-            h.data
-                .put_blob(PutBlobInput::new(
-                    h.config.slab_key(tip_txg + i, 0),
-                    Bytes::from_static(b"orphan"),
-                ))
-                .await
-                .unwrap();
-        }
+        let txn = store.begin().await.unwrap();
+        let abandoned = txn.txg();
+        drop(txn);
+
+        let objid = store.reserve_objid().await.unwrap();
+        let root = store
+            .commit(BTreeMap::from([(objid, file(objid, 1))]))
+            .await
+            .unwrap();
+
+        // One claim root in between, naming a number past the abandoned one.
+        assert_eq!(root.seq, before.seq + 2);
+        let claim = store.roots.load_snapshot(before.seq + 1).await.unwrap();
+        assert!(claim.txg > abandoned);
+        assert_eq!(root.txg, claim.txg + 1);
+    }
+
+    /// A commit that dies short of its root has already sealed blocks under
+    /// its transaction group. The retry must not only skip that number but
+    /// put it on record first, so a crash before the retry lands does not
+    /// hand it to the next session.
+    #[tokio::test]
+    async fn a_transaction_group_is_burned_even_when_the_commit_fails() {
+        let h = Harness::new();
+        let store = h.open().await.unwrap();
+        let before = store.root().await.unwrap();
+
+        h.data.fail_next_put(FsError::IoTimeout);
+        let objid = store.reserve_objid().await.unwrap();
+        assert!(matches!(
+            store
+                .commit(BTreeMap::from([(objid, file(objid, 1))]))
+                .await,
+            Err(FsError::IoTimeout)
+        ));
+        let failed_txg = store.state.lock().await.next_txg - 1;
+        assert!(store.poison().await.is_none(), "a timeout is retryable");
+
+        let root = store
+            .commit(BTreeMap::from([(objid, file(objid, 1))]))
+            .await
+            .unwrap();
+        assert!(root.txg > failed_txg, "reused {}", root.txg);
+
+        // The retry re-claimed first: the chain now holds a root past the
+        // burned number, so no later session can start on it.
+        let claim = store.roots.load_snapshot(root.seq - 1).await.unwrap();
+        assert_eq!(claim.seq, before.seq + 1);
+        assert!(claim.txg > failed_txg);
+        assert_eq!(root.txg, claim.txg + 1);
+    }
+
+    /// The number a session seals under comes from the locked root chain,
+    /// never from what happens to be in the data bucket. A host that deletes
+    /// an orphan gains nothing.
+    #[tokio::test]
+    async fn a_new_session_starts_past_what_the_last_one_could_have_sealed() {
+        let h = Harness::new();
+        let store = h.open().await.unwrap();
+        let tip = store.root().await.unwrap().txg;
+
+        // Claim, then die before writing anything: the data bucket has no
+        // trace of the number this session was about to use.
+        let txn = store.begin().await.unwrap();
+        let burned = txn.txg();
+        drop(txn);
+        drop(store);
+        assert!(h
+            .data
+            .keys()
+            .iter()
+            .all(|k| !k.contains(&format!("{burned:016x}"))));
 
         let store = h.open().await.unwrap();
         let objid = store.reserve_objid().await.unwrap();
@@ -745,67 +849,43 @@ mod tests {
             .commit(BTreeMap::from([(objid, file(objid, 1))]))
             .await
             .unwrap();
-        assert!(root.txg > tip_txg + 5, "landed on {}", root.txg);
+        assert!(
+            root.txg > burned,
+            "{} <= {burned} (tip was {tip})",
+            root.txg
+        );
     }
 
+    /// Two mounts at one tip would allocate the same slab names and the same
+    /// nonces. The claim decides between them before either has ciphertext.
     #[tokio::test]
-    async fn transaction_groups_never_repeat_across_many_commits() {
+    async fn a_mount_that_loses_the_claim_never_seals_a_block() {
         let h = Harness::new();
-        let store = h.open().await.unwrap();
-        let mut seen = std::collections::HashSet::new();
-        seen.insert(store.root().await.unwrap().txg);
+        let a = h.open().await.unwrap();
+        let b = h.open().await.unwrap();
 
-        for i in 0..20u64 {
-            let objid = store.reserve_objid().await.unwrap();
-            let root = store
-                .commit(BTreeMap::from([(objid, file(objid, i))]))
-                .await
-                .unwrap();
-            assert!(
-                seen.insert(root.txg),
-                "transaction group {} reused",
-                root.txg
-            );
-        }
-    }
+        let objid = a.reserve_objid().await.unwrap();
+        a.commit(BTreeMap::from([(objid, file(objid, 1))]))
+            .await
+            .unwrap();
 
-    #[tokio::test]
-    async fn a_transaction_group_is_burned_even_when_the_commit_fails() {
-        let h = Harness::new();
-        let store = h.open().await.unwrap();
-
-        // Steal the sequence number this commit will try to take.
-        let genesis = store.root().await.unwrap();
-        let stolen = RootRecord::seal(
-            &h.keys,
-            1,
-            Some(&genesis),
-            12345,
-            0,
-            genesis.meta_dnode.clone(),
-            2,
-        )
-        .unwrap();
-        let rs = RootStore::new(h.roots.clone(), h.keys.clone(), h.config.clone());
-        rs.publish(&stolen).await.unwrap();
-
-        let objid = store.reserve_objid().await.unwrap();
-        let failed_txg = {
-            let st = store.state.lock().await;
-            st.next_txg
-        };
+        let slabs_before = h.data.object_count();
+        let objid = b.reserve_objid().await.unwrap();
         assert!(matches!(
-            store
-                .commit(BTreeMap::from([(objid, file(objid, 1))]))
-                .await,
+            b.commit(BTreeMap::from([(objid, file(objid, 2))])).await,
             Err(FsError::Conflict)
         ));
-
-        let after = store.state.lock().await.next_txg;
-        assert!(
-            after > failed_txg,
-            "a failed commit must still consume its transaction group"
+        assert!(matches!(b.poison().await, Some(FsError::Conflict)));
+        assert_eq!(
+            h.data.object_count(),
+            slabs_before,
+            "the loser wrote a slab"
         );
+
+        // And the winner's data is intact for the next session.
+        let c = h.open().await.unwrap();
+        let root = c.root().await.unwrap();
+        assert_eq!(root.seq, a.root().await.unwrap().seq);
     }
 
     // ---- poisoning ---------------------------------------------------------

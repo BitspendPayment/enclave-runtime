@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::wasi::descriptors::Descriptor;
 use crate::wasi::{S3FsCtxView, S3WasiView};
 use s3fs_core::{Fs, Inode};
 use wasmtime::component::ResourceTable;
@@ -68,15 +69,54 @@ impl State {
 
     /// Whether the guest left anything behind in the resource table.
     ///
-    /// Meaningless for a `State` that lives one request — the whole table goes
-    /// with it. It matters for a *pooled* instance: the host pushes an
-    /// `incoming-request` and a `response-outparam` per call and never removes
-    /// them, so everything here is reclaimed by the guest dropping its handles.
-    /// A guest that does not is not leaking unboundedly — the table is a slab
-    /// with a free list — but it is leaving entries a later request from the
-    /// same client could still address.
+    /// For a `State` that lives one request the table goes with it, and the
+    /// `Drop` below closes whatever files it still held. It matters for a
+    /// *pooled* instance: the host pushes an `incoming-request` and a
+    /// `response-outparam` per call and never removes them, so everything
+    /// here is reclaimed by the guest dropping its handles. A guest that does
+    /// not is not leaking unboundedly — the table is a slab with a free list
+    /// — but it is leaving entries a later request from the same client could
+    /// still address.
     pub fn resources_settled(&self) -> bool {
         self.table.is_empty()
+    }
+}
+
+/// A file the guest opened and never dropped is held open by the filesystem's
+/// own handle table, not only by this one: dropping the resource table on a
+/// trap, an abort or an eviction releases the guest's reference and nothing
+/// else. Every discard path ends here, so this is the one place to close them.
+/// Closing is async — a writable handle flushes — and `Drop` is not, hence
+/// the spawn; without a runtime there is nothing to spawn on, and the handles
+/// stay open until the process does, which is what would have happened anyway.
+impl Drop for State {
+    fn drop(&mut self) {
+        let handles: Vec<_> = self
+            .table
+            .iter_mut()
+            .filter_map(|entry| match entry.downcast_ref::<Descriptor>() {
+                Some(Descriptor::File { handle, .. }) => Some(handle.clone()),
+                _ => None,
+            })
+            .collect();
+        if handles.is_empty() {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                open = handles.len(),
+                "guest files left open with no runtime to close them"
+            );
+            return;
+        };
+        let fs = self.fs.clone();
+        rt.spawn(async move {
+            for h in handles {
+                if let Err(e) = fs.close(&h).await {
+                    tracing::warn!(error = %e, "closing a file a discarded guest left open");
+                }
+            }
+        });
     }
 }
 
@@ -122,4 +162,61 @@ impl wasmtime_wasi_http::p2::WasiHttpView for State {
 /// internals.
 pub fn new_store(engine: &wasmtime::Engine, state: State) -> Result<Store<State>> {
     Ok(Store::new(engine, state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use s3fs_core::backend::memory::MemoryBackend;
+    use s3fs_core::{Config, MasterSecret, OpenFlags};
+
+    /// A trapped guest's files are closed by the runtime, not kept open
+    /// forever by the filesystem's handle table — dirty buffer and all.
+    #[tokio::test]
+    async fn dropping_a_state_closes_the_files_its_guest_left_open() {
+        let backend = Arc::new(MemoryBackend::new());
+        let fs = Fs::create(
+            backend.clone(),
+            backend,
+            &MasterSecret::from_bytes([3; 32]),
+            [4; 16],
+            Arc::new(Config::default()),
+        )
+        .await
+        .unwrap();
+        let clock = Arc::new(
+            crate::clock::WallClockAdapter::new(Box::new(crate::clock::HostClock)).unwrap(),
+        );
+        let mut state = State::new(
+            wasmtime_wasi::WasiCtxBuilder::new().build(),
+            fs.clone(),
+            clock,
+        );
+
+        let handle = fs
+            .open("/left-open", OpenFlags::create_new())
+            .await
+            .unwrap();
+        fs.pwrite(&handle, 0, b"unsynced").await.unwrap();
+        let id = handle.id;
+        state
+            .table
+            .push(Descriptor::File {
+                parent: fs.root(),
+                handle,
+            })
+            .unwrap();
+        drop(state);
+
+        for _ in 0..100 {
+            if fs.get_handle(id).is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(fs.get_handle(id).is_none(), "the handle is still open");
+        // Closed with a flush, as a guest dropping the descriptor would get.
+        let h = fs.open("/left-open", OpenFlags::read_only()).await.unwrap();
+        assert_eq!(fs.pread(&h, 0, 16).await.unwrap().as_ref(), b"unsynced");
+    }
 }

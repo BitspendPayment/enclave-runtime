@@ -139,19 +139,6 @@ impl BlockStore {
             .map(|_| ())
     }
 
-    /// Whether a transaction group left any slab behind.
-    ///
-    /// Used at mount to step past the wreckage of a commit that wrote its
-    /// slabs and then died before publishing a root. Reusing that transaction
-    /// group number would repeat every AEAD nonce in it.
-    pub async fn slab_exists(&self, txg: u64, slab: u16) -> FsResult<bool> {
-        match self.data.head_blob(&self.config.slab_key(txg, slab)).await {
-            Ok(_) => Ok(true),
-            Err(FsError::NotFound) => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Retention to stamp on a root record, resolved against wall-clock now.
     pub fn root_retention(&self) -> Option<ObjectLock> {
         self.config.root_retention.map(|d| ObjectLock {

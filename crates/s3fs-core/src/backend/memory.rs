@@ -145,6 +145,9 @@ pub struct MemoryBackend {
     state: Arc<RwLock<State>>,
     next_mpu_id: Arc<AtomicU64>,
     next_etag: Arc<AtomicU64>,
+    /// Test-helper: an error the next PUT, conditional or not, returns
+    /// instead of storing.
+    fail_next_put: Arc<RwLock<Option<FsError>>>,
 }
 
 impl Default for MemoryBackend {
@@ -159,7 +162,13 @@ impl MemoryBackend {
             state: Arc::new(RwLock::new(State::default())),
             next_mpu_id: Arc::new(AtomicU64::new(1)),
             next_etag: Arc::new(AtomicU64::new(1)),
+            fail_next_put: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Test-helper: make the next PUT fail with `e`, storing nothing.
+    pub fn fail_next_put(&self, e: FsError) {
+        *self.fail_next_put.write() = Some(e);
     }
 
     /// Test-helper: count of committed objects.
@@ -249,6 +258,9 @@ impl Backend for MemoryBackend {
     }
 
     async fn put_blob(&self, input: PutBlobInput) -> FsResult<BlobMeta> {
+        if let Some(e) = self.fail_next_put.write().take() {
+            return Err(e);
+        }
         let e_tag = self.make_etag(&input.body);
         let now = SystemTime::now();
         let stored = StoredBlob {
@@ -271,6 +283,9 @@ impl Backend for MemoryBackend {
     }
 
     async fn put_blob_if_not_exists(&self, input: PutBlobInput) -> FsResult<BlobMeta> {
+        if let Some(e) = self.fail_next_put.write().take() {
+            return Err(e);
+        }
         let mut g = self.state.write();
         // `If-None-Match: *` tests the *current* version, and a delete marker
         // is a current version that is not an object — so a hidden key accepts

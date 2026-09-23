@@ -70,4 +70,4 @@ pub use indirect::{commit_object, read_data_block, read_raw_block, resolve_ptr};
 pub use objset::ObjectSet;
 pub use root::{RootRecord, RootStore, FORMAT_VERSION};
 pub use slab::{verify_and_open, FinishedSlab, SlabWriter};
-pub use txg::{next_safe_txg, Snapshot, Store, Transaction};
+pub use txg::{Snapshot, Store, Transaction};

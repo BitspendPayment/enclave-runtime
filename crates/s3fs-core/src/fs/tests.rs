@@ -342,6 +342,27 @@ async fn committed_state_survives_a_remount() {
 
 /// Dropping a handle without syncing loses the writes — but the filesystem is
 /// still a consistent, verified state, never a torn one.
+/// A sync that fails on a timeout keeps the buffered data, so the retry
+/// (or the close) actually writes it.
+#[tokio::test]
+async fn a_failed_sync_keeps_the_writes_for_the_retry() {
+    let h = Harness::new();
+    let fs = h.mount().await;
+    let handle = fs.open("/f", OpenFlags::create_new()).await.unwrap();
+    fs.pwrite(&handle, 0, b"survives").await.unwrap();
+
+    h.data.fail_next_put(crate::FsError::IoTimeout);
+    assert!(matches!(
+        fs.sync(&handle).await,
+        Err(crate::FsError::IoTimeout)
+    ));
+    fs.sync(&handle).await.unwrap();
+    fs.close(&handle).await.unwrap();
+
+    let fs = h.mount().await;
+    assert_eq!(read_file(&fs, "/f").await, b"survives");
+}
+
 #[tokio::test]
 async fn unsynced_writes_are_lost_but_leave_a_consistent_state() {
     let h = Harness::new();
@@ -428,6 +449,32 @@ async fn renaming_a_directory_moves_its_whole_subtree() {
     assert_eq!(fs.store().root().await.unwrap().seq, before + 1);
 
     assert_eq!(read_file(&fs, "/z/sub/deep").await, b"deep");
+}
+
+/// The subtree would keep its parent link into a directory now inside it,
+/// and nothing from the root could reach any of it again.
+#[tokio::test]
+async fn a_directory_cannot_be_renamed_into_its_own_subtree() {
+    let fs = fs().await;
+    let root = fs.root();
+    let a = fs.mkdir(&root, "a").await.unwrap();
+    let b = fs.mkdir(&a, "b").await.unwrap();
+    write_file(&fs, "/a/b/data", b"data").await;
+
+    assert!(matches!(
+        fs.rename(&root, "a", &b, "moved").await,
+        Err(FsError::Invalid(_))
+    ));
+    assert!(matches!(
+        fs.rename(&root, "a", &a, "moved").await,
+        Err(FsError::Invalid(_))
+    ));
+    assert_eq!(read_file(&fs, "/a/b/data").await, b"data");
+
+    // A file may go anywhere, and a directory may still go sideways.
+    fs.rename(&b, "data", &b, "data2").await.unwrap();
+    fs.rename(&a, "b", &root, "b").await.unwrap();
+    assert_eq!(read_file(&fs, "/b/data2").await, b"data");
 }
 
 #[tokio::test]

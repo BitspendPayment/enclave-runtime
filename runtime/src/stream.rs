@@ -292,7 +292,10 @@ impl StreamRegistry {
     /// only the caller knows whether a message is still worth sending when the
     /// far side has not been there.
     pub async fn send(&self, tenant: [u8; 16], id: &str, payload: Vec<u8>) -> Result<()> {
-        ensure!(payload.len() <= MAX_MESSAGE, "message exceeds {MAX_MESSAGE} bytes");
+        ensure!(
+            payload.len() <= MAX_MESSAGE,
+            "message exceeds {MAX_MESSAGE} bytes"
+        );
         let record = {
             let records = self.records.lock().await;
             records
@@ -318,7 +321,11 @@ impl StreamRegistry {
                 origin,
                 hyper::Request::builder()
                     .method(hyper::Method::POST)
-                    .uri(format!("{}/escrow/send?id={}", record.origin, record.wire_id()))
+                    .uri(format!(
+                        "{}/escrow/send?id={}",
+                        record.origin,
+                        record.wire_id()
+                    ))
                     .header("content-type", "application/octet-stream")
                     .body(body_from(payload))?,
                 Duration::from_secs(30),
@@ -387,29 +394,34 @@ impl StreamRegistry {
     /// drops it waits out the backoff and dials again, whether or not anybody is
     /// using the wallet, and it starts at boot from the records on disk.
     pub async fn run(self: Arc<Self>, guest: Arc<crate::serve::ServeHandle>) -> Result<()> {
-        let mut live: BTreeMap<([u8; 16], String), tokio::task::JoinHandle<()>> = BTreeMap::new();
+        let mut live: BTreeMap<([u8; 16], String), (StreamRecord, tokio::task::JoinHandle<()>)> =
+            BTreeMap::new();
         loop {
-            let wanted: Vec<StreamRecord> =
-                self.records.lock().await.values().cloned().collect();
+            let wanted: Vec<StreamRecord> = self.records.lock().await.values().cloned().collect();
 
-            // Start what is new.
+            // Start what is new, and restart what changed: a close and reopen
+            // that land between two passes here leave the same key naming a
+            // different origin, and the old supervisor knows nothing of it.
             for record in &wanted {
                 let key = (record.tenant, record.id.clone());
-                if live.get(&key).is_some_and(|h| !h.is_finished()) {
-                    continue;
+                match live.get(&key) {
+                    Some((r, h)) if r == record && !h.is_finished() => continue,
+                    Some((_, h)) => h.abort(),
+                    None => {}
                 }
                 let registry = self.clone();
                 let guest = guest.clone();
                 let record = record.clone();
-                live.insert(
-                    key,
-                    tokio::task::spawn(async move { registry.supervise(guest, record).await }),
-                );
+                let task = {
+                    let record = record.clone();
+                    tokio::task::spawn(async move { registry.supervise(guest, record).await })
+                };
+                live.insert(key, (record, task));
             }
 
             // Stop what is no longer asked for. Aborting drops the connection,
             // which is the whole of "close".
-            live.retain(|key, handle| {
+            live.retain(|key, (_, handle)| {
                 let keep = wanted.iter().any(|r| (r.tenant, r.id.clone()) == *key);
                 if !keep {
                     handle.abort();
@@ -427,7 +439,11 @@ impl StreamRegistry {
     }
 
     /// One connection, held and re-held.
-    async fn supervise(self: &Arc<Self>, guest: Arc<crate::serve::ServeHandle>, record: StreamRecord) {
+    async fn supervise(
+        self: &Arc<Self>,
+        guest: Arc<crate::serve::ServeHandle>,
+        record: StreamRecord,
+    ) {
         let key = (record.tenant, record.id.clone());
         let mut failures = 0usize;
         loop {
@@ -513,13 +529,7 @@ impl StreamRegistry {
                 // NOT sent: a guest that failed has said nothing it wants the
                 // far side to act on, and the message will arrive again.
                 match guest
-                    .run_message(
-                        self,
-                        record.tenant,
-                        &record.id,
-                        &event.id,
-                        event.data,
-                    )
+                    .run_message(self, record.tenant, &record.id, &event.id, event.data)
                     .await
                 {
                     Ok(reply) if !reply.is_empty() => {
@@ -563,6 +573,18 @@ impl SseFramer {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>> {
         self.buffer
             .push_str(std::str::from_utf8(chunk).context("a stream frame was not UTF-8")?);
+        // The spec admits CRLF, CR and LF as line endings. Fold them to LF
+        // here, holding back a trailing CR that may be half of a CRLF the
+        // next read completes.
+        if self.buffer.contains('\r') {
+            let hold = self.buffer.ends_with('\r');
+            let mut norm = self.buffer.replace("\r\n", "\n").replace('\r', "\n");
+            if hold {
+                norm.pop();
+                norm.push('\r');
+            }
+            self.buffer = norm;
+        }
         ensure!(
             self.buffer.len() <= MAX_MESSAGE * 2,
             "an unterminated event exceeded the message ceiling"
@@ -583,7 +605,10 @@ impl SseFramer {
                 continue; // a heartbeat, or a comment
             }
             let bytes = base64_decode(&data).context("event data was not base64")?;
-            ensure!(bytes.len() <= MAX_MESSAGE, "event exceeds the message ceiling");
+            ensure!(
+                bytes.len() <= MAX_MESSAGE,
+                "event exceeds the message ceiling"
+            );
             // An event with no id of its own gets one from its content, so a
             // guest deduplicating by id still can.
             if id.is_empty() {
@@ -637,7 +662,9 @@ mod hex_tenant {
 }
 
 /// The ABI is defined in wit/stream/stream.wit. No tenant id is accepted.
-pub fn add_to_linker(linker: &mut wasmtime::component::Linker<crate::state::State>) -> wasmtime::Result<()> {
+pub fn add_to_linker(
+    linker: &mut wasmtime::component::Linker<crate::state::State>,
+) -> wasmtime::Result<()> {
     use crate::state::State;
 
     fn context(state: &State, mutation: bool) -> Result<StreamContext> {
@@ -717,7 +744,9 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::tenant::tenant_root_by_id(&fs, [1; 16]).await.unwrap();
+        crate::tenant::tenant_root_by_id(&fs, [1; 16])
+            .await
+            .unwrap();
         let r = StreamRegistry::open_registry(fs.clone()).await.unwrap();
         r.set_egress(crate::serve::EgressPolicy::Allowlist(Arc::new(
             crate::serve::egress::EgressAllowlist::parse(&["https://svc.example"]).unwrap(),
@@ -829,7 +858,9 @@ mod tests {
             .await
             .unwrap();
         r.close([1; 16], "esc").await.unwrap();
-        r.close([1; 16], "esc").await.expect("closing twice is fine");
+        r.close([1; 16], "esc")
+            .await
+            .expect("closing twice is fine");
 
         let reopened = StreamRegistry::open_registry(fs).await.unwrap();
         assert!(reopened.records.lock().await.is_empty());
@@ -850,7 +881,9 @@ mod tests {
         assert!(format!("{err:#}").contains("at most"), "{err:#}");
 
         // Another tenant is unaffected: the cap is per tenant, not global.
-        crate::tenant::tenant_root_by_id(&r.fs, [2; 16]).await.unwrap();
+        crate::tenant::tenant_root_by_id(&r.fs, [2; 16])
+            .await
+            .unwrap();
         r.open([2; 16], "esc".into(), "https://svc.example".into())
             .await
             .expect("one tenant's quota is not another's");
@@ -881,11 +914,35 @@ mod tests {
         let mut f = SseFramer::default();
         let whole = format!("id: m1\ndata: {}\n\n", b64(b"hello"));
         let (a, b) = whole.split_at(9);
-        assert!(f.push(a.as_bytes()).unwrap().is_empty(), "half an event is no event");
+        assert!(
+            f.push(a.as_bytes()).unwrap().is_empty(),
+            "half an event is no event"
+        );
         let out = f.push(b.as_bytes()).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "m1");
         assert_eq!(out[0].data, b"hello");
+    }
+
+    /// The spec admits CRLF and CR as line endings, and a real server sends
+    /// them — including a CRLF cut between two reads.
+    #[test]
+    fn crlf_and_cr_terminated_events_are_delivered() {
+        let mut f = SseFramer::default();
+        let crlf = format!("id: m1\r\ndata: {}\r\n\r\n", b64(b"one"));
+        let (a, b) = crlf.split_at(crlf.len() - 3); // split inside the final CRLF
+        assert!(f.push(a.as_bytes()).unwrap().is_empty());
+        let out = f.push(b.as_bytes()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "m1");
+        assert_eq!(out[0].data, b"one");
+
+        // A chunk-final CR is held back — it may be half a CRLF — so the
+        // CR-terminated event is followed by the start of the next line.
+        let cr = format!("data: {}\r\r: hb\r", b64(b"two"));
+        let out = f.push(cr.as_bytes()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data, b"two");
     }
 
     #[test]
@@ -915,9 +972,15 @@ mod tests {
     #[test]
     fn an_event_with_no_id_gets_a_stable_one_from_its_content() {
         let mut f = SseFramer::default();
-        let first = f.push(format!("data: {}\n\n", b64(b"x")).as_bytes()).unwrap();
-        let second = f.push(format!("data: {}\n\n", b64(b"x")).as_bytes()).unwrap();
-        let third = f.push(format!("data: {}\n\n", b64(b"y")).as_bytes()).unwrap();
+        let first = f
+            .push(format!("data: {}\n\n", b64(b"x")).as_bytes())
+            .unwrap();
+        let second = f
+            .push(format!("data: {}\n\n", b64(b"x")).as_bytes())
+            .unwrap();
+        let third = f
+            .push(format!("data: {}\n\n", b64(b"y")).as_bytes())
+            .unwrap();
         assert_eq!(first[0].id, second[0].id, "the same message is the same id");
         assert_ne!(first[0].id, third[0].id);
     }
@@ -929,7 +992,10 @@ mod tests {
         // plus its field names — so the ceiling is above MAX_MESSAGE and a test
         // for it has to actually exceed it.
         let big = "d".repeat(MAX_MESSAGE);
-        assert!(f.push(big.as_bytes()).is_ok(), "one max-size event must fit");
+        assert!(
+            f.push(big.as_bytes()).is_ok(),
+            "one max-size event must fit"
+        );
         let err = loop {
             match f.push(big.as_bytes()) {
                 Ok(_) => continue,

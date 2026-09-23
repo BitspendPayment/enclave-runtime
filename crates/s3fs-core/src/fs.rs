@@ -680,6 +680,24 @@ impl Fs {
         let mut src_dir = DirTxn::load(&blocks, &src_dnode).await?;
         let entry = src_dir.lookup(from_name).await?.ok_or(FsError::NotFound)?;
 
+        // A directory may not move into itself: the subtree would keep its
+        // parent link into a directory that now lives inside it, and nothing
+        // from the root could reach any of it again. Walk up from the
+        // destination; the root is its own parent, which ends the walk.
+        if entry.kind == DnodeKind::Dir {
+            let mut cursor = dst_id;
+            loop {
+                if cursor == entry.objid {
+                    return Err(FsError::Invalid("cannot rename a directory into itself"));
+                }
+                let parent = objset.get_allocated(&blocks, cursor).await?.parent_objid;
+                if parent == cursor {
+                    break;
+                }
+                cursor = parent;
+            }
+        }
+
         // Same directory: one transaction over one structure, or the two would
         // each rebuild from the same base and the second would erase the first.
         let mut dst_dir = if src_id == dst_id {
@@ -1020,7 +1038,9 @@ impl Fs {
         let base = objset.get_allocated(&blocks, objid).await?;
         let record = base.record_size();
 
-        let mut dirty = std::mem::take(&mut st.dirty);
+        // A copy, not a take: if the commit fails the buffers must still be
+        // here for the retry, or a sync that timed out once loses the file.
+        let mut dirty = st.dirty.clone();
         let nblocks = blocks_for_size(st.size, record);
         dirty.retain(|index, _| *index < nblocks);
         for (index, buf) in dirty.iter_mut() {
@@ -1051,6 +1071,7 @@ impl Fs {
 
         txn.stage(updated);
         txn.commit().await?;
+        st.dirty.clear();
         st.meta_dirty = false;
         Ok(())
     }

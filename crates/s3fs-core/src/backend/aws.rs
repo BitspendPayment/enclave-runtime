@@ -269,23 +269,46 @@ impl Backend for AwsS3Backend {
         // `ListObjectVersions` still reports a version that a delete marker is
         // hiding, so this is what tells "never written" from "hidden". The
         // prefix is not an exact match, hence the `Key == key` filter.
-        let listed = self
-            .client
-            .list_object_versions()
-            .bucket(&self.bucket)
-            .prefix(key)
-            .send()
-            .await
-            .map_err(|e| map_sdk_error("ListObjectVersions", e))?;
+        //
+        // Every page, not the first: delete markers count against the page
+        // size and anyone with DeleteObject can stack a thousand of them on a
+        // key, pushing the retained version onto a later page. Stopping early
+        // would report it absent.
+        let mut versions = Vec::new();
+        let mut key_marker = None;
+        let mut version_id_marker = None;
+        loop {
+            let listed = self
+                .client
+                .list_object_versions()
+                .bucket(&self.bucket)
+                .prefix(key)
+                .set_key_marker(key_marker.take())
+                .set_version_id_marker(version_id_marker.take())
+                .send()
+                .await
+                .map_err(|e| map_sdk_error("ListObjectVersions", e))?;
+            versions.extend(
+                listed
+                    .versions
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|v| v.key.as_deref() == Some(key)),
+            );
+            if !listed.is_truncated.unwrap_or(false) {
+                break;
+            }
+            key_marker = listed.next_key_marker;
+            version_id_marker = listed.next_version_id_marker;
+            if key_marker.is_none() {
+                return Err(FsError::Io(
+                    "ListObjectVersions: truncated without a continuation marker".into(),
+                ));
+            }
+        }
 
         // Oldest first: `last_modified` ascending, so the version the
         // conditional PUT created wins over anything layered on later.
-        let mut versions: Vec<_> = listed
-            .versions
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|v| v.key.as_deref() == Some(key))
-            .collect();
         versions.sort_by_key(|v| v.last_modified.map(|d| d.as_nanos()).unwrap_or(i128::MIN));
 
         let version_id = versions

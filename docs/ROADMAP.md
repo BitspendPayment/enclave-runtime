@@ -175,8 +175,9 @@ Two things fold in naturally:
 - **Orphaned dnodes.** A crash while a file is unlinked-but-open leaves an
   allocated, nameless, unreachable dnode. The mark phase already knows what is
   reachable from the root directory, so these fall out for free.
-- **Orphaned slabs.** `next_safe_txg` steps over slabs from commits that died
-  before publishing a root. They are unreferenced by construction.
+- **Orphaned slabs.** Slabs from commits that died before publishing a root.
+  They are unreferenced by construction, and their transaction group is
+  recorded by the next session's claim root, so nothing ever writes there.
 
 ### Cheaper stopgaps
 
