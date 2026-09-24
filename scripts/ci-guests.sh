@@ -35,6 +35,9 @@ cargo test --release -p enclave-runtime --features testing --bin passkey-client
 say "background tasks"
 cargo test -p enclave-runtime --lib tasks::tests -- --include-ignored
 
+say "held connections"
+cargo test -p enclave-runtime --lib stream::tests -- --include-ignored
+
 say "serving a guest"
 cargo test -p enclave-runtime --test serve_guest -- --include-ignored
 

@@ -89,8 +89,9 @@ const BACKOFF: [Duration; 6] = [
     Duration::from_secs(300),
 ];
 
-/// What is written down, and all of it. A connection is a standing instruction,
-/// not a session: there is no state worth keeping about one that is currently up.
+/// What is written down, and all of it but `generation`. A connection is a
+/// standing instruction, not a session: there is no state worth keeping about
+/// one that is currently up.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StreamRecord {
     pub version: u8,
@@ -100,6 +101,13 @@ pub struct StreamRecord {
     /// Scheme, host and port. Admitted by the image's allowlist when opened and
     /// again on every reconnect — a list narrowed between them takes effect.
     pub origin: String,
+    /// Which `open` made this record; zero for one read back at boot. A close
+    /// and a reopen that land between two supervisor passes leave a record
+    /// equal in every field that is written down, and the pass must still see
+    /// a new instruction: the old connection belongs to the old one, and the
+    /// close took its status with it.
+    #[serde(skip)]
+    generation: u64,
 }
 
 impl StreamRecord {
@@ -156,6 +164,9 @@ pub struct StreamRegistry {
     changed: Notify,
     egress: Mutex<Option<crate::serve::EgressPolicy>>,
     messages: AtomicU64,
+    /// The next [`StreamRecord`] generation. Starts at 1, above every record
+    /// read back at boot.
+    generations: AtomicU64,
 }
 
 /// What a guest's `enclave:streams/connection` calls are bound to. As with
@@ -182,6 +193,7 @@ impl StreamRegistry {
             changed: Notify::new(),
             egress: Mutex::new(None),
             messages: AtomicU64::new(0),
+            generations: AtomicU64::new(1),
         });
 
         // Everything standing, read back before anything is served. A record on
@@ -247,6 +259,7 @@ impl StreamRegistry {
             tenant,
             id,
             origin,
+            generation: self.generations.fetch_add(1, Ordering::Relaxed),
         };
         self.publish(&record).await?;
         records.insert((record.tenant, record.id.clone()), record);
@@ -401,7 +414,8 @@ impl StreamRegistry {
 
             // Start what is new, and restart what changed: a close and reopen
             // that land between two passes here leave the same key naming a
-            // different origin, and the old supervisor knows nothing of it.
+            // different record — another origin, or the same one from a later
+            // `open` — and the old supervisor knows nothing of it.
             for record in &wanted {
                 let key = (record.tenant, record.id.clone());
                 match live.get(&key) {
@@ -774,6 +788,7 @@ mod tests {
             tenant: [1; 16],
             id: "svc-abc".into(),
             origin: "https://svc.example".into(),
+            generation: 0,
         };
         let b = StreamRecord {
             tenant: [2; 16],
@@ -1025,5 +1040,81 @@ mod tests {
                 "{bad:?} should not be a stream id"
             );
         }
+    }
+
+    async fn guest(fs: Arc<Fs>) -> Arc<crate::serve::ServeHandle> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm");
+        let bytes = std::fs::read(path).expect("build examples/guest-http for wasm32-wasip2");
+        let (logs, _collector) = crate::guest_io::start(Arc::new(crate::TracingLogSink));
+        let env = crate::GuestEnvironment::new(
+            fs,
+            Box::new(crate::clock::HostClock),
+            Arc::new(nitro_nsm::fake::FakeNsm::new()),
+            &[],
+            &[],
+            logs,
+        )
+        .unwrap();
+        let engine = crate::ServeHandle::engine_with_watchdog().unwrap();
+        Arc::new(crate::ServeHandle::new(&engine, &bytes, env).unwrap())
+    }
+
+    /// Accept one connection and hold it open as an event stream.
+    async fn serve_one(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 8192];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n: hello\n\n")
+            .await
+            .unwrap();
+        socket
+    }
+
+    /// A reopen gets a connection of its own, whether to a new origin or to
+    /// the same one.
+    ///
+    /// The same-origin half is the one that broke. A close and a reopen
+    /// between two supervisor passes left a record equal to the old one, so
+    /// the old connection stayed up — with its status gone, which made `send`
+    /// refuse on it, and with it every reply to a message that arrived.
+    #[tokio::test]
+    #[ignore = "requires built guest-http component"]
+    async fn a_reopened_stream_gets_a_new_connection() {
+        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_a = format!("http://{}", a.local_addr().unwrap());
+        let origin_b = format!("http://{}", b.local_addr().unwrap());
+        let (r, fs) = registry().await;
+        r.set_egress(crate::serve::EgressPolicy::Allowlist(Arc::new(
+            crate::serve::egress::EgressAllowlist::parse(&[origin_a.as_str(), origin_b.as_str()])
+                .unwrap(),
+        )))
+        .await;
+        let supervisor = tokio::spawn(r.clone().run(guest(fs).await));
+        let wait = Duration::from_secs(5);
+
+        r.open([1; 16], "esc".into(), origin_a.clone())
+            .await
+            .unwrap();
+        let _first = tokio::time::timeout(wait, serve_one(&a))
+            .await
+            .expect("never connected");
+
+        r.close([1; 16], "esc").await.unwrap();
+        r.open([1; 16], "esc".into(), origin_a).await.unwrap();
+        let _second = tokio::time::timeout(wait, serve_one(&a))
+            .await
+            .expect("reopened to the same origin, and the old connection was kept");
+
+        r.close([1; 16], "esc").await.unwrap();
+        r.open([1; 16], "esc".into(), origin_b).await.unwrap();
+        let _third = tokio::time::timeout(wait, serve_one(&b))
+            .await
+            .expect("reopened to a new origin, and it was never dialled");
+
+        supervisor.abort();
     }
 }

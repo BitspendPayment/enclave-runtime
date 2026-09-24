@@ -38,11 +38,12 @@
 //! blocks by first publishing a *claim* — a root that names `tip + 1` and no
 //! new blocks — and after any transaction that did not end in a published
 //! root, whether it failed or was simply dropped, it must claim again before
-//! sealing under the next number. The claim goes through
-//! the same conditional PUT as a commit, so of two mounts at one tip exactly
-//! one claims and the other is poisoned before it has encrypted a byte. And
-//! because the rule is enforced in the locked root chain, nothing the host can
-//! delete from the data bucket weakens it.
+//! sealing under the next number. The claim goes through the same
+//! [`RootStore::publish`] as a commit, so of two mounts at one tip exactly one
+//! claims — a delete marker over the winner's claim included — and the other
+//! is poisoned before it has encrypted a byte. And because the rule is
+//! enforced in the locked root chain, nothing the host can delete from the
+//! data bucket weakens it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -886,6 +887,25 @@ mod tests {
         let c = h.open().await.unwrap();
         let root = c.root().await.unwrap();
         assert_eq!(root.seq, a.root().await.unwrap().seq);
+    }
+
+    /// The same race with a delete marker laid over the winner's claim. The
+    /// marker lets the loser's conditional create through, because
+    /// `If-None-Match: *` sees only the current version — and if that were
+    /// the end of it, both mounts would seal under one transaction group: the
+    /// same nonces under the same key, into the same slab names.
+    #[tokio::test]
+    async fn a_delete_marker_does_not_hand_the_claim_to_a_second_mount() {
+        let h = Harness::new();
+        drop(h.open().await.unwrap());
+        let a = h.open().await.unwrap();
+        let b = h.open().await.unwrap();
+
+        let _sealing = a.begin().await.unwrap();
+        h.roots.delete_blob(&h.config.root_key(1)).await.unwrap();
+
+        assert!(matches!(b.begin().await, Err(FsError::Conflict)));
+        assert!(matches!(b.poison().await, Some(FsError::Conflict)));
     }
 
     // ---- poisoning ---------------------------------------------------------

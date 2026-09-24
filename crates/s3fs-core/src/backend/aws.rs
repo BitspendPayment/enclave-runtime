@@ -307,12 +307,14 @@ impl Backend for AwsS3Backend {
             }
         }
 
-        // Oldest first: `last_modified` ascending, so the version the
-        // conditional PUT created wins over anything layered on later.
-        versions.sort_by_key(|v| v.last_modified.map(|d| d.as_nanos()).unwrap_or(i128::MIN));
-
+        // The oldest, so the version the conditional PUT created wins over
+        // anything layered on later. By position, not `last_modified`: S3
+        // lists a key's versions newest first, page after page, while two
+        // versions written close together can share a timestamp — and sorting
+        // on a tie would leave the newer one in front.
         let version_id = versions
             .into_iter()
+            .rev()
             .find_map(|v| v.version_id)
             .ok_or(FsError::NotFound)?;
 
@@ -786,5 +788,68 @@ mod timeout_tests {
             Some(Duration::from_secs(21)),
             "the operation as a whole is unbounded"
         );
+    }
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Two versions of one key stamped in the same second, listed as S3 lists
+    /// them: newest first. Sorting on the timestamp left that order alone, so
+    /// the "retained" record was the one a second writer layered on after
+    /// hiding the first — and root publication reads it back to decide who
+    /// won a sequence.
+    #[tokio::test]
+    async fn the_retained_version_is_the_first_written_even_on_a_timestamp_tie() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let n = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).into_owned();
+                let line = request.lines().next().unwrap_or_default();
+                let body = if line.contains("versionId=v-first") {
+                    "first".to_string()
+                } else if line.contains("versionId=") {
+                    "later".to_string()
+                } else {
+                    let version = |id: &str, latest: bool| {
+                        format!(
+                            "<Version><Key>roots/1</Key><VersionId>{id}</VersionId>\
+                             <IsLatest>{latest}</IsLatest>\
+                             <LastModified>2026-01-01T00:00:00.000Z</LastModified></Version>"
+                        )
+                    };
+                    format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                         <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                         <Name>roots</Name><Prefix>roots/1</Prefix><IsTruncated>false</IsTruncated>\
+                         {}{}</ListVersionsResult>",
+                        version("v-later", true),
+                        version("v-first", false),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AwsS3BackendConfig::new("roots", "us-east-1");
+        config.endpoint = Some(format!("http://{addr}"));
+        config.force_path_style = true;
+        config.access_key_id = Some("test".into());
+        config.secret_access_key = Some("test".into());
+        let backend = AwsS3Backend::connect_unchecked(config).await.unwrap();
+
+        let got = backend.get_retained_blob("roots/1").await.unwrap();
+        assert_eq!(got.body.as_ref(), b"first");
     }
 }

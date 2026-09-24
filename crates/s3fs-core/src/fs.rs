@@ -903,12 +903,24 @@ impl Fs {
     }
 
     pub async fn close(&self, handle: &Arc<FileHandle>) -> FsResult<()> {
-        let objid = handle.inode.objid();
         let result = if handle.flags.write {
             self.sync(handle).await
         } else {
             Ok(())
         };
+        self.abandon(handle).await?;
+        result
+    }
+
+    /// Close without flushing: whatever the handle has not synced is thrown
+    /// away, exactly as on a crash.
+    ///
+    /// For a handle whose owner went away without closing it. Its buffer is a
+    /// write nobody is waiting on, and flushing it whenever the release gets
+    /// round to it would land it on top of anything committed in the
+    /// meantime — an update undone by one that came before it.
+    pub async fn abandon(&self, handle: &Arc<FileHandle>) -> FsResult<()> {
+        let objid = handle.inode.objid();
         self.handles.lock().remove(&handle.id.get());
 
         // If this was the last handle on an object whose last name is already
@@ -917,7 +929,7 @@ impl Fs {
         if reap {
             self.free_orphan(objid).await?;
         }
-        result
+        Ok(())
     }
 
     /// Free an object that lost its last name while it was open.

@@ -70,7 +70,7 @@ impl State {
     /// Whether the guest left anything behind in the resource table.
     ///
     /// For a `State` that lives one request the table goes with it, and the
-    /// `Drop` below closes whatever files it still held. It matters for a
+    /// `Drop` below releases whatever files it still held. It matters for a
     /// *pooled* instance: the host pushes an `incoming-request` and a
     /// `response-outparam` per call and never removes them, so everything
     /// here is reclaimed by the guest dropping its handles. A guest that does
@@ -85,10 +85,16 @@ impl State {
 /// A file the guest opened and never dropped is held open by the filesystem's
 /// own handle table, not only by this one: dropping the resource table on a
 /// trap, an abort or an eviction releases the guest's reference and nothing
-/// else. Every discard path ends here, so this is the one place to close them.
-/// Closing is async — a writable handle flushes — and `Drop` is not, hence
-/// the spawn; without a runtime there is nothing to spawn on, and the handles
-/// stay open until the process does, which is what would have happened anyway.
+/// else. Every discard path ends here, so this is the one place to let go.
+///
+/// Abandoned, not closed: a close flushes, and `Drop` cannot wait for one. A
+/// flush started here would land whenever it was scheduled — after the
+/// tenant's lock had passed to its next request, and possibly on top of what
+/// that request committed to the same file. So a guest that did not finish
+/// loses what it had not synced, as it would on a crash. Abandoning can still
+/// free an unlinked file, which is async, hence the spawn; without a runtime
+/// there is nothing to spawn on, and the handles stay open until the process
+/// does, which is what would have happened anyway.
 impl Drop for State {
     fn drop(&mut self) {
         let handles: Vec<_> = self
@@ -112,8 +118,8 @@ impl Drop for State {
         let fs = self.fs.clone();
         rt.spawn(async move {
             for h in handles {
-                if let Err(e) = fs.close(&h).await {
-                    tracing::warn!(error = %e, "closing a file a discarded guest left open");
+                if let Err(e) = fs.abandon(&h).await {
+                    tracing::warn!(error = %e, "releasing a file a discarded guest left open");
                 }
             }
         });
@@ -170,10 +176,12 @@ mod tests {
     use s3fs_core::backend::memory::MemoryBackend;
     use s3fs_core::{Config, MasterSecret, OpenFlags};
 
-    /// A trapped guest's files are closed by the runtime, not kept open
-    /// forever by the filesystem's handle table — dirty buffer and all.
+    /// A trapped guest's files are released by the runtime, not kept open
+    /// forever by the filesystem's handle table — and released *unflushed*.
+    /// The release runs after the tenant's next request may already have
+    /// committed, so a flush would land on top of that commit and undo it.
     #[tokio::test]
-    async fn dropping_a_state_closes_the_files_its_guest_left_open() {
+    async fn dropping_a_state_releases_its_files_without_flushing_them() {
         let backend = Arc::new(MemoryBackend::new());
         let fs = Fs::create(
             backend.clone(),
@@ -197,7 +205,7 @@ mod tests {
             .open("/left-open", OpenFlags::create_new())
             .await
             .unwrap();
-        fs.pwrite(&handle, 0, b"unsynced").await.unwrap();
+        fs.pwrite(&handle, 0, b"OLD").await.unwrap();
         let id = handle.id;
         state
             .table
@@ -208,6 +216,15 @@ mod tests {
             .unwrap();
         drop(state);
 
+        // The tenant's next request, which the lock lets in as soon as the
+        // dropped guest's call is over.
+        let next = fs
+            .open("/left-open", OpenFlags::read_write())
+            .await
+            .unwrap();
+        fs.pwrite(&next, 0, b"NEW").await.unwrap();
+        fs.close(&next).await.unwrap();
+
         for _ in 0..100 {
             if fs.get_handle(id).is_none() {
                 break;
@@ -215,8 +232,11 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(fs.get_handle(id).is_none(), "the handle is still open");
-        // Closed with a flush, as a guest dropping the descriptor would get.
         let h = fs.open("/left-open", OpenFlags::read_only()).await.unwrap();
-        assert_eq!(fs.pread(&h, 0, 16).await.unwrap().as_ref(), b"unsynced");
+        assert_eq!(
+            fs.pread(&h, 0, 16).await.unwrap().as_ref(),
+            b"NEW",
+            "the dead guest's buffer landed on the next request's commit"
+        );
     }
 }

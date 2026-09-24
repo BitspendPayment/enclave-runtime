@@ -16,7 +16,7 @@
 //! | Destroy a root to erase history | Object Lock COMPLIANCE: the version is undeletable by every principal, including the account root |
 //! | Hide a root behind a delete marker | Tip discovery and loading read the *retained* version, so a marker changes nothing |
 //! | Splice two histories together | `prev_root_hash`, which the signature covers |
-//! | Two writers racing | `If-None-Match: *`, so exactly one wins `seq + 1` |
+//! | Two writers racing | `If-None-Match: *`, then a read-back of the retained version, so exactly one wins `seq + 1` even past a delete marker |
 //!
 //! ## The residual risk
 //!
@@ -439,22 +439,34 @@ impl RootStore {
 
     /// Publish a record, winning or losing the race for its sequence number.
     ///
-    /// `If-None-Match: *` means exactly one writer can ever take a given
-    /// sequence. Losing is [`FsError::Conflict`], and the caller must treat
-    /// that as fatal for the mount rather than retrying: a retry would reuse
-    /// the transaction group number, and with it every AEAD nonce in the
-    /// commit.
+    /// `If-None-Match: *` alone does not decide that race. It tests the
+    /// *current* version, and a delete marker is a current version that is not
+    /// an object — so a host that hides the winner's record lets a second
+    /// conditional create through, and two writers would each believe they
+    /// own the sequence. What decides it is the *retained* version: the first
+    /// ever written, and the one every reader loads. Versions only stack on
+    /// top of it, so once ours exists, whether it is that one can no longer
+    /// change — reading it back after the PUT is exact, where a check before
+    /// the PUT would race another marker.
+    ///
+    /// Losing is [`FsError::Conflict`], and the caller must treat that as
+    /// fatal for the mount rather than retrying: a retry would reuse the
+    /// transaction group number, and with it every AEAD nonce in the commit.
     pub async fn publish(&self, record: &RootRecord) -> FsResult<()> {
-        let mut input = PutBlobInput::new(
-            self.config.root_key(record.seq),
-            Bytes::from(record.encode()?),
-        );
+        let key = self.config.root_key(record.seq);
+        let body = Bytes::from(record.encode()?);
+        let mut input = PutBlobInput::new(key.clone(), body.clone());
         input.object_lock = self.root_retention();
 
         match self.backend.put_blob_if_not_exists(input).await {
             Ok(_) => {}
             Err(FsError::AlreadyExists) => return Err(FsError::Conflict),
             Err(e) => return Err(e),
+        }
+        // ponytail: a LIST and a GET per publish. Comparing the PUT's version
+        // id with the oldest listed one drops the GET, if commits need it.
+        if self.backend.get_retained_blob(&key).await?.body != body {
+            return Err(FsError::Conflict);
         }
         self.raise_floor(record.seq);
         self.write_hint(record.seq).await;
@@ -691,6 +703,24 @@ mod tests {
         assert!(matches!(rs.publish(&second).await, Err(FsError::Conflict)));
 
         // The winner's record is what remains.
+        assert_eq!(rs.load(0).await.unwrap(), first);
+    }
+
+    /// A delete marker makes a taken sequence look free — `If-None-Match: *`
+    /// tests the current version, and the marker is it — so the second PUT
+    /// goes through. Publishing must lose anyway. This is the one place every
+    /// root goes through, so it covers a commit as much as a claim: a commit
+    /// that "won" over a hidden claim would go on sealing under the number
+    /// that claim's mount is about to use.
+    #[tokio::test]
+    async fn a_hidden_record_still_holds_its_sequence() {
+        let (backend, keys, rs) = setup();
+        let first = seal(&keys, 0, None);
+        rs.publish(&first).await.unwrap();
+        backend.delete_blob(&rs.config.root_key(0)).await.unwrap();
+
+        let second = RootRecord::seal(&keys, 0, None, 1, 9999, meta(), 2).unwrap();
+        assert!(matches!(rs.publish(&second).await, Err(FsError::Conflict)));
         assert_eq!(rs.load(0).await.unwrap(), first);
     }
 
