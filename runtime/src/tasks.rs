@@ -1061,6 +1061,23 @@ mod tests {
         .await
         .expect("a recurring task never fired a second time");
 
+        // A success resets the attempt count; a recurrence that had been
+        // quietly retrying would never get back to zero. But the guest writes
+        // its file before it returns, and the queue records the success after,
+        // so the second file is not yet that success: wait for the record to
+        // say so rather than stopping the worker between the two.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let task = q.status([1; 16], "beat").await.unwrap();
+                if task.occurrence >= 2 && task.attempts == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the second occurrence never recorded a success");
+
         worker.abort();
         let _ = worker.await;
 
@@ -1070,9 +1087,6 @@ mod tests {
             names.len(),
             "two occurrences shared one run id: {names:?}"
         );
-        // A success resets the attempt count. A recurrence that had been
-        // quietly retrying would say otherwise.
-        assert_eq!(q.status([1; 16], "beat").await.unwrap().attempts, 0);
     }
     #[tokio::test]
     #[ignore = "requires built guest-http component"]

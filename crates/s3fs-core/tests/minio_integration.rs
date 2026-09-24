@@ -493,6 +493,53 @@ async fn a_mount_floor_above_the_tip_is_refused() {
     assert!(matches!(result, Err(FsError::Rollback { .. })));
 }
 
+/// Two mounts at one tip, and a delete marker laid over the first one's claim
+/// before the second makes its own. Real S3 accepts the second conditional PUT
+/// — the marker is the current version — and without the read-back of the
+/// retained version the second mount seals under the first one's transaction
+/// group: the same nonces, and the same slab names, so its upload overwrites
+/// what the first had committed. It still loses the *next* sequence, so its
+/// refusal alone proves little. The first mount's data surviving is the proof.
+///
+/// Versioning is what keeps that claim beneath the marker; retention, tested
+/// above, is what stops anyone deleting the version itself.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker; run with --features aws -- --ignored"]
+async fn a_delete_marker_does_not_let_a_second_mount_claim_a_sequence() {
+    let (_c, data) = fresh_minio_with_bucket("data-claim").await;
+    let roots = extra_bucket(&data, "roots-claim", true).await;
+    drop(mount(&data, &roots).await);
+    let a = mount(&data, &roots).await;
+    let b = mount(&data, &roots).await;
+
+    a.mkdir(&a.root(), "from-a").await.unwrap();
+    roots
+        .delete_blob(&engine_config().store.root_key(1))
+        .await
+        .expect("a delete marker is a legal write");
+
+    assert!(matches!(
+        b.mkdir(&b.root(), "from-b").await,
+        Err(FsError::Conflict)
+    ));
+    // Reads back the blocks it committed, which the loser would have
+    // overwritten.
+    a.mkdir(&a.root(), "still-a").await.unwrap();
+
+    // The loser's claim sits above the marker, but it is not the one a mount
+    // reads: the winner's history is the filesystem.
+    let c = mount(&data, &roots).await;
+    let mut names: Vec<_> = c
+        .read_dir(&c.root())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["from-a", "still-a"]);
+}
+
 async fn list_keys(backend: &AwsS3Backend, prefix: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut token: Option<String> = None;
