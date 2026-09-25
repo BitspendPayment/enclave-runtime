@@ -1,9 +1,10 @@
 //! Integration tests for `AwsS3Backend` against a MinIO container.
 //!
 //! Every test is `#[ignore]`d so default `cargo test` skips them. Run with
-//! Docker present:
+//! Docker present, after building the image they run on:
 //!
 //! ```bash
+//! scripts/minio-image.sh
 //! cargo test -p s3fs-core --features aws --test minio_integration -- --ignored
 //! ```
 //!
@@ -19,7 +20,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::ContainerAsync;
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::minio::MinIO;
 
 use s3fs_core::backend::{
@@ -33,11 +34,15 @@ use s3fs_core::{Config, Fs, MasterSecret};
 /// Start a MinIO container, build an `AwsS3Backend` pointed at it, and create
 /// the bucket. The returned `ContainerAsync` MUST stay in scope for the
 /// lifetime of the test — when it drops, the container is killed.
+///
+/// The module's own release, under the name `scripts/minio-image.sh` builds it
+/// as: MinIO's published images can no longer be pulled.
 async fn fresh_minio_with_bucket(bucket: &str) -> (ContainerAsync<MinIO>, AwsS3Backend) {
     let container = MinIO::default()
+        .with_name("enclave-runtime/minio")
         .start()
         .await
-        .expect("MinIO container start");
+        .expect("MinIO container start; is the image built? scripts/minio-image.sh");
     let port = container
         .get_host_port_ipv4(9000)
         .await

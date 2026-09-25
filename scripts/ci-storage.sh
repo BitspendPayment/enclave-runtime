@@ -8,5 +8,7 @@
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 cd "$REPO"
 
+"$REPO/scripts/minio-image.sh" >/dev/null
+
 say "MinIO integration"
 cargo test -p s3fs-core --features aws --test minio_integration -- --ignored --test-threads=1

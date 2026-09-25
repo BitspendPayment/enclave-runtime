@@ -445,8 +445,10 @@ enclave_start_store() {
 
 # Where the emulator image looks: `deployment.guestObject` in the roots bucket.
 upload_guest() {
+    local image
+    image="$("$REPO/scripts/minio-image.sh")"
     docker run --rm --network host --label "$LABEL" -v "$RUNDIR/guests:/guests:ro" \
-        --entrypoint sh minio/mc -c "
+        --entrypoint sh "$image" -c "
         mc alias set m http://127.0.0.1:9000 minioadmin minioadmin >/dev/null
         mc cp /guests/$1 m/$ROOTS_BUCKET/guest/guest.wasm >/dev/null" >/dev/null \
         || { echo "could not upload $1 to the store" >&2; exit 1; }

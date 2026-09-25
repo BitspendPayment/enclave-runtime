@@ -23,6 +23,9 @@ data="${3:?data bucket}"
 roots="${4:?roots bucket}"
 data_dir="${5:-}"
 
+# Built from source the first time; minio-image.sh says why.
+image="$("$(dirname "${BASH_SOURCE[0]}")/minio-image.sh")"
+
 # Optional, and applied to every container this starts. A caller that cleans up
 # by label — deploy/qemu-nitro/lib.sh does, so that the list of containers to
 # remove cannot fall out of step with the list it starts — otherwise leaves this
@@ -42,7 +45,7 @@ docker rm -f "$container" >/dev/null 2>&1 || true
 # still reaches it: gvproxy delivers its host address, 192.168.127.254, to the host's loopback.
 docker run -d --rm --name "$container" -p "${MINIO_BIND:+$MINIO_BIND:}$port:9000" "${label[@]}" "${volume[@]}" \
     -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-    minio/minio server /data >/dev/null
+    "$image" server /data >/dev/null
 
 # Ready, not merely started. `mc` against a half-open MinIO fails in ways that
 # read as a bucket problem rather than a timing one, which is a bad half hour
@@ -63,7 +66,7 @@ fi
 
 # Tolerant of buckets that already exist: this script is also how a developer
 # restarts a store between runs, and "already there" is success.
-docker run --rm --network host "${label[@]}" --entrypoint sh minio/mc -c "
+docker run --rm --network host "${label[@]}" --entrypoint sh "$image" -c "
     mc alias set m http://127.0.0.1:$port minioadmin minioadmin >/dev/null
     mc mb m/$data >/dev/null 2>&1 || true
     mc mb --with-lock m/$roots >/dev/null 2>&1 || true" >/dev/null \

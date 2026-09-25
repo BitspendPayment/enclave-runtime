@@ -517,7 +517,7 @@ cargo build --release -p enclave-runtime --features testing --bin passkey-client
 |---|---|
 | `scripts/ci-check.sh` | Formatting, Clippy with warnings denied, workspace library tests, and boot-origin tests. No Docker or built guest required. |
 | `scripts/ci-guests.sh` | Builds HTTP/gRPC guests and the test client; tests tasks, held connections, guest dispatch, TLS binding, HTTP/2, gRPC, authentication, and logging. |
-| `scripts/ci-storage.sh` | Real MinIO/S3 protocol, retention, remount, corruption, rollback, and competing-claim tests through testcontainers. Requires Docker; runs ignored tests serially. |
+| `scripts/ci-storage.sh` | Real MinIO/S3 protocol, retention, remount, corruption, rollback, and competing-claim tests through testcontainers. Requires Docker; runs ignored tests serially. MinIO no longer publishes pullable images, so `scripts/minio-image.sh` builds the pinned release from source on first use (a few minutes), for these tests and the QEMU harness alike. |
 | `scripts/ci-e2e.sh` | Guest and storage suites, required local tools, then the QEMU stack. Requires Linux virtualization, Docker, and Nix. |
 | `deploy/qemu-nitro/run-e2e.sh` | Direct emulator harness once prerequisites are installed: ACME, authenticated requests, persistence, state origins, and measurement checks. |
 | `scripts/ci-bench.sh` | Criterion storage and instance-cost benchmarks; writes `bench.txt`. |
