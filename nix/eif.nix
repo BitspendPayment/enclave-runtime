@@ -25,7 +25,11 @@
 }:
 
 { name
-  # Attribute set of destination path (relative to rootfs/) → store path.
+  # Attribute set of destination path (relative to rootfs/) → store path, or a
+  # path in this repository. Each is interpolated, never `toString`ed: a path
+  # made a string that way carries no context, so the derivation does not
+  # depend on it — and a Nix that evaluates flakes lazily, as the one CI
+  # installs does, never puts the file in the store at all.
 , payload
   # Packages whose runtime closures must be inside the image. These are the
   # derivations themselves, not the files copied out of them: `closureInfo`
@@ -55,7 +59,7 @@ let
   copyPayload = lib.concatStringsSep "\n" (lib.mapAttrsToList
     (dest: src: ''
       mkdir -p "rootfs/$(dirname ${lib.escapeShellArg dest})"
-      cp -L ${lib.escapeShellArg src} "rootfs/${dest}"
+      cp -L ${lib.escapeShellArg "${src}"} "rootfs/${dest}"
       chmod +x "rootfs/${dest}" || true
     '')
     payload);
