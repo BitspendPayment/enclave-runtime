@@ -64,7 +64,8 @@ impl HttpsTransport {
     /// runtime at a local stub. It is the same downgrade `--guest-log-endpoint`
     /// already is, and PCR0 records which image was built.
     pub fn new(allow_plaintext: bool) -> Result<Self> {
-        let builder = hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(web_pki_client_config()?);
+        let builder =
+            hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(web_pki_client_config()?);
         let connector = if allow_plaintext {
             builder
                 .https_or_http()

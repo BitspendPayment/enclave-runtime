@@ -337,12 +337,6 @@ impl ServeHandle {
         Ok(self)
     }
 
-    /// The registry, for the interactive path: a guest serving its owner's
-    /// request must be able to open and close connections.
-    pub(crate) fn streams(&self) -> Option<&Arc<crate::stream::StreamRegistry>> {
-        self.streams.as_ref()
-    }
-
     /// Let the guest wake its tenant's devices.
     ///
     /// Tenant isolation is required for the same reason tasks require it: a
@@ -421,7 +415,10 @@ impl ServeHandle {
                 .map_err(|e| anyhow::anyhow!(e.to_string()))
                 .context("held connections require the on-message export")?;
             let (result,) = run
-                .call_async(&mut store, (id.to_string(), message_id.to_string(), payload))
+                .call_async(
+                    &mut store,
+                    (id.to_string(), message_id.to_string(), payload),
+                )
                 .await?;
             let bytes = result.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(
@@ -1629,7 +1626,10 @@ pub async fn serve_component(
                 // device, so an NSM that will not answer is found now.
                 match attestor.verify_fits().await {
                     Ok(bytes) => {
-                        tracing::info!(document_header_bytes = bytes, "attesting every /auth response")
+                        tracing::info!(
+                            document_header_bytes = bytes,
+                            "attesting every /auth response"
+                        )
                     }
                     Err(e) => anyhow::bail!(
                         "this runtime cannot attest its responses: {e}. Every request would \

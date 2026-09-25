@@ -154,8 +154,8 @@ struct Live {
 pub struct StreamRegistry {
     fs: Arc<Fs>,
     dir: Arc<Inode>,
-    records: Mutex<BTreeMap<(([u8; 16]), String), StreamRecord>>,
-    live: Mutex<BTreeMap<(([u8; 16]), String), Live>>,
+    records: Mutex<BTreeMap<([u8; 16], String), StreamRecord>>,
+    live: Mutex<BTreeMap<([u8; 16], String), Live>>,
     /// Woken when a record appears or goes. `notify_one`, never `notify_waiters`: there is exactly
     /// one consumer — the supervisor loop — and it is not registered as a waiter while it is
     /// collecting records and spawning. `notify_waiters` would drop a wakeup that landed in that

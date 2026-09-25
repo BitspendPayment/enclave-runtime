@@ -200,9 +200,10 @@ impl EgressAllowlist {
         config: OutgoingRequestConfig,
     ) -> HostFutureIncomingResponse {
         let tls = self.tls.clone();
-        let handle = wasmtime_wasi::runtime::spawn(async move {
-            Ok(send(origin, tls, request, config).await)
-        });
+        let handle =
+            wasmtime_wasi::runtime::spawn(
+                async move { Ok(send(origin, tls, request, config).await) },
+            );
         HostFutureIncomingResponse::pending(handle)
     }
 }
@@ -309,7 +310,9 @@ async fn send(
         };
         request.headers_mut().insert(
             hyper::header::HOST,
-            value.parse().map_err(|_| ErrorCode::HttpRequestUriInvalid)?,
+            value
+                .parse()
+                .map_err(|_| ErrorCode::HttpRequestUriInvalid)?,
         );
     }
 
@@ -356,11 +359,19 @@ mod tests {
     fn an_origin_is_scheme_host_and_port_and_nothing_else() {
         assert_eq!(
             Origin::parse("https://ASP.example.com").unwrap(),
-            Origin { tls: true, host: "asp.example.com".into(), port: 443 }
+            Origin {
+                tls: true,
+                host: "asp.example.com".into(),
+                port: 443
+            }
         );
         assert_eq!(
             Origin::parse("http://192.168.127.254:7070/").unwrap(),
-            Origin { tls: false, host: "192.168.127.254".into(), port: 7070 }
+            Origin {
+                tls: false,
+                host: "192.168.127.254".into(),
+                port: 7070
+            }
         );
         for bad in [
             "asp.example.com",
@@ -379,8 +390,8 @@ mod tests {
 
     #[test]
     fn only_the_exact_origin_is_admitted() {
-        let list = EgressAllowlist::parse(&["https://asp.example.com", "http://127.0.0.1:7070"])
-            .unwrap();
+        let list =
+            EgressAllowlist::parse(&["https://asp.example.com", "http://127.0.0.1:7070"]).unwrap();
         let admits = |uri: &str, tls: bool| list.admits(&request(uri), &config(tls)).is_some();
 
         assert!(admits("https://asp.example.com/v1/info", true));
@@ -389,9 +400,18 @@ mod tests {
 
         assert!(!admits("https://evil.example.com/", true), "another host");
         assert!(!admits("https://sub.asp.example.com/", true), "a subdomain");
-        assert!(!admits("https://asp.example.com:8443/", true), "another port");
-        assert!(!admits("http://asp.example.com/", false), "plaintext to a TLS origin");
-        assert!(!admits("http://127.0.0.1:7071/", false), "the admin port beside it");
+        assert!(
+            !admits("https://asp.example.com:8443/", true),
+            "another port"
+        );
+        assert!(
+            !admits("http://asp.example.com/", false),
+            "plaintext to a TLS origin"
+        );
+        assert!(
+            !admits("http://127.0.0.1:7071/", false),
+            "the admin port beside it"
+        );
         assert!(
             !admits("https://asp.example.com/", false),
             "the scheme and the guest's TLS flag must agree"
@@ -402,7 +422,9 @@ mod tests {
     fn an_empty_list_admits_nothing() {
         let list = EgressAllowlist::parse(&["", "  "]).unwrap();
         assert!(list.is_empty());
-        assert!(list.admits(&request("https://example.com/"), &config(true)).is_none());
+        assert!(list
+            .admits(&request("https://example.com/"), &config(true))
+            .is_none());
     }
 
     /// An admitted request really goes out, and the answer really comes back.
@@ -428,13 +450,23 @@ mod tests {
         let origin = list.admits(&req, &config(false)).expect("admitted");
         let response = send(origin, None, req, config(false)).await.expect("sent");
         assert_eq!(response.resp.status(), 200);
-        let body = response.resp.into_body().collect().await.unwrap().to_bytes();
+        let body = response
+            .resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
         assert_eq!(&body[..], b"hello");
 
         let head = server.await.unwrap();
-        assert!(head.starts_with("GET /v1/info?x=1 HTTP/1.1"), "origin-form: {head}");
         assert!(
-            head.to_ascii_lowercase().contains(&format!("host: 127.0.0.1:{port}")),
+            head.starts_with("GET /v1/info?x=1 HTTP/1.1"),
+            "origin-form: {head}"
+        );
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("host: 127.0.0.1:{port}")),
             "{head}"
         );
     }
