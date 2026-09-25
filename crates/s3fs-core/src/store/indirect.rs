@@ -54,7 +54,8 @@ fn decode_entries(block: &[u8]) -> FsResult<Vec<BlkPtr>> {
             "indirect block length is not a multiple of the pointer size",
         ));
     }
-    block.chunks_exact(BLKPTR_LEN).map(BlkPtr::decode).collect()
+    let (entries, _) = block.as_chunks::<BLKPTR_LEN>();
+    entries.iter().map(|e| BlkPtr::decode(e)).collect()
 }
 
 fn encode_entries(entries: &[BlkPtr]) -> Vec<u8> {
