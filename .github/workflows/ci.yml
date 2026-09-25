@@ -85,7 +85,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # No Magic Nix Cache. It relays every store lookup through the Actions
+      # cache API, which rate-limits it, and Nix treats the refusals as fatal:
+      # the image build failed on "rate limit exceeded" with nothing wrong in
+      # it. nixpkgs comes from cache.nixos.org regardless; what is lost is only
+      # this repository's own derivations, rebuilt each run.
       - uses: ./.github/actions/rust
         with:
           shared-key: guests
