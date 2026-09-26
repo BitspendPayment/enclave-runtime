@@ -1,4 +1,8 @@
+# An exact release, not `stable`. CI denies every clippy warning, and each
+# stable release adds lints: a floating channel turned a green branch red with
+# no change to it. Moving to a newer release is a commit of its own, made with
+# whatever its clippy asks for.
 [toolchain]
-channel = "stable"
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-wasip2"]

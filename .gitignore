@@ -1,4 +1,6 @@
-/target
+# Any crate's build directory, not only the workspace root: the example
+# guests are separate workspaces with their own target/.
+target/
 **/*.rs.bk
 Cargo.lock.bak
 .env
@@ -9,3 +11,16 @@ Cargo.lock.bak
 *.iml
 .DS_Store
 /wasm-cache/
+
+# OpenTofu/Terraform working directory: vendored provider binaries, hundreds of
+# MB, re-fetched by `tofu init`. The lock file IS committed — it pins provider
+# versions and belongs under review.
+deploy/tofu/.terraform/
+
+# Run artifacts that scripts/ci-bench.sh and scripts/ci-sqlite.sh drop in the
+# repository root. `bench.txt` exists only long enough for the benchmark tracker
+# to read it, and `runtime.log` is the SQLite job's server output; both are
+# rewritten by every run. Rooted with a leading slash so this covers the files
+# those scripts write and not a log someone keeps deliberately elsewhere.
+/bench.txt
+/runtime.log

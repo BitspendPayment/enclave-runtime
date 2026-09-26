@@ -1,0 +1,13 @@
+package guest:http@0.1.0;
+
+/// What this example needs from the runtime.
+///
+/// Its own world, rather than an edited copy of `enclave:tasks`'s: the vendored
+/// `tasks.wit` and `notify.wit` beside it are byte-for-byte copies of the
+/// canonical ones under `wit/`, and `scripts/wit-drift.sh` checks that they stay
+/// that way. A guest that wants two capabilities composes them here instead of
+/// editing either.
+world app {
+    include enclave:tasks/background@0.1.0;
+    import enclave:notify/notify@0.1.0;
+}

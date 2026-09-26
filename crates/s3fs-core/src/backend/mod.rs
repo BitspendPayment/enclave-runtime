@@ -58,6 +58,48 @@ pub struct Capabilities {
     /// Standard S3: `false`. Yandex S3: `true`. When false, symlink detection
     /// via metadata flag costs an extra HEAD on cache miss.
     pub metadata_in_listings: bool,
+    /// Backend honours per-object Object Lock retention headers on PUT.
+    /// Real S3 and MinIO do (on a bucket created with Object Lock enabled);
+    /// the in-memory fake emulates it. When false, [`PutBlobInput::object_lock`]
+    /// is rejected rather than silently ignored — an unenforced retention is
+    /// worse than no retention, because it looks like a guarantee.
+    pub object_lock: bool,
+}
+
+/// Object Lock retention mode.
+///
+/// The distinction matters: `Governance` can be bypassed by a principal
+/// holding `s3:BypassGovernanceRetention`, so it protects against accident,
+/// not against an adversary. Only `Compliance` is undeletable by every
+/// principal including the account root, which is what makes it usable as a
+/// rollback anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectLockMode {
+    Governance,
+    Compliance,
+}
+
+impl ObjectLockMode {
+    /// Wire value for `x-amz-object-lock-mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ObjectLockMode::Governance => "GOVERNANCE",
+            ObjectLockMode::Compliance => "COMPLIANCE",
+        }
+    }
+}
+
+/// Per-object retention to apply at PUT time.
+///
+/// Bucket-level default retention achieves the same thing and is simpler to
+/// operate; this exists so a caller can lock root records without relying on
+/// bucket configuration it may not control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectLock {
+    pub mode: ObjectLockMode,
+    /// Absolute instant until which the object version cannot be deleted or
+    /// overwritten.
+    pub retain_until: SystemTime,
 }
 
 /// Result of a `HeadObject` (or the equivalent metadata view from a list /
@@ -121,6 +163,28 @@ pub struct PutBlobInput {
     pub body: Bytes,
     pub metadata: HashMap<String, String>,
     pub content_type: Option<String>,
+    /// Retention to stamp on this object version. `None` leaves it to the
+    /// bucket's default retention configuration (if any).
+    pub object_lock: Option<ObjectLock>,
+}
+
+impl PutBlobInput {
+    /// Plain PUT with no metadata, content type, or retention.
+    pub fn new(key: impl Into<String>, body: Bytes) -> Self {
+        Self {
+            key: key.into(),
+            body,
+            metadata: HashMap::new(),
+            content_type: None,
+            object_lock: None,
+        }
+    }
+
+    /// Stamp per-object retention on this PUT.
+    pub fn with_object_lock(mut self, lock: ObjectLock) -> Self {
+        self.object_lock = Some(lock);
+        self
+    }
 }
 
 /// Inputs to `copy_blob`.
@@ -161,6 +225,28 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
     async fn head_blob(&self, key: &str) -> FsResult<BlobMeta>;
 
     async fn get_blob(&self, key: &str, range: Option<Range<u64>>) -> FsResult<GetBlobOutput>;
+
+    /// Read the **retained** version of an object, seeing past a delete marker.
+    ///
+    /// Object Lock protects a *version*. It does not stop a `DeleteObject`
+    /// without a version id, which inserts a delete marker: `GetObject` then
+    /// answers `NoSuchKey` while the retained version sits underneath,
+    /// genuinely undeletable. Confirmed against MinIO — the delete returns
+    /// `{"DeleteMarker": true}` and succeeds, and deleting the version itself
+    /// fails with *"Object is WORM protected"*.
+    ///
+    /// That gap matters wherever **absence carries meaning**. A substituted
+    /// object is caught by a signature; a hidden one has no signature to check,
+    /// so "nobody ever wrote this" and "somebody hid it" become the same
+    /// answer — and for the boot machine the first authorises creating a new
+    /// filesystem. This method is how they stay distinguishable.
+    ///
+    /// Returns the **oldest** non-marker version: the one the conditional PUT
+    /// created and retention pinned. Anything newer was written by someone not
+    /// using a conditional PUT, which is to say not by us.
+    ///
+    /// Needs `s3:ListBucketVersions` in addition to `s3:GetObject`.
+    async fn get_retained_blob(&self, key: &str) -> FsResult<GetBlobOutput>;
 
     async fn put_blob(&self, input: PutBlobInput) -> FsResult<BlobMeta>;
 

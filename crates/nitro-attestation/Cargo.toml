@@ -1,0 +1,50 @@
+[package]
+name = "nitro-attestation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Parse and verify AWS Nitro Enclaves attestation documents"
+
+[[bin]]
+name = "nitro-attest"
+path = "src/bin/nitro-attest.rs"
+required-features = ["cli"]
+
+[features]
+default = []
+# The `nitro-attest` command. Off by default so a client embedding the
+# verifier does not also compile a TLS client and an argument parser.
+cli = ["dep:clap", "dep:rustls", "dep:rustls-pki-types"]
+# Builds genuinely signed attestation documents, for tests elsewhere in the
+# workspace and for the QEMU harness. Not a stub: it mints a real certificate
+# chain and a real ES384 COSE_Sign1, so a verifier cannot pass against it by
+# skipping a check.
+testing = ["dep:rcgen", "dep:time"]
+
+[dependencies]
+# Deliberately no dependency on `nitro-nsm`. Verification happens on the
+# *client*, which has no `/dev/nsm`, is usually not Linux, and must not need a
+# device layer to check a signature.
+anyhow      = { workspace = true }
+aws-lc-rs   = { workspace = true }
+ciborium    = "0.2"
+coset       = "0.4"
+x509-parser = "0.18"
+base64      = "0.22"
+hex         = "0.4"
+
+clap            = { version = "4", features = ["derive"], optional = true }
+rustls          = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs", "tls12"], optional = true }
+rustls-pki-types = { version = "1", optional = true }
+rcgen           = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"], optional = true }
+# rcgen takes certificate validity as `time::OffsetDateTime` and does not
+# re-export the crate, so building a chain needs it directly.
+time            = { version = "0.3", default-features = false, optional = true }
+
+[dev-dependencies]
+# So plain `cargo test` exercises the document builder without needing
+# `--features testing` on the command line.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+time  = { version = "0.3", default-features = false }

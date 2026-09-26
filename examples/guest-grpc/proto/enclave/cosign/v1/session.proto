@@ -1,0 +1,55 @@
+// The wire format this guest speaks. Checked in as the specification a client
+// generates stubs from — nothing in this workspace compiles it, because four
+// fields of `#[derive(prost::Message)]` is less machinery than a protoc
+// toolchain in every build.
+//
+// The messages are deliberately about a *signing session* without being about
+// signing: this prototype settles the transport and the authorization, and
+// carries no cryptography at all.
+syntax = "proto3";
+
+package enclave.cosign.v1;
+
+service SigningSession {
+  // One long-lived channel. Both directions are open at once: the guest
+  // answers each message as it arrives rather than waiting for the client to
+  // finish, which is the property the runtime exists to support here.
+  rpc Sign(stream ClientMsg) returns (stream ServerMsg);
+}
+
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  KIND_HELLO = 1;
+  KIND_ROUND = 2;
+  KIND_FINISH = 3;
+}
+
+message ClientMsg {
+  // The client's, never the runtime's. A stream that dies takes its in-memory
+  // session with it; only what the guest committed to storage survives.
+  string session_id = 1;
+  uint64 seq = 2;
+  Kind kind = 3;
+  bytes payload = 4;
+
+  // There is deliberately **no per-message approval field here.**
+  //
+  // An earlier draft carried `challenge_id` and `assertion`, which promised a
+  // check nothing performed: verifying a passkey assertion needs the stored
+  // credential, the issued challenge and the relying-party configuration, all
+  // of which live in the runtime and none of which a guest can reach. Fields
+  // that look like a credential and are never checked are worse than no fields
+  // — they read as a guarantee.
+  //
+  // A cosigner that needs "the person approved *these bytes*" must obtain it
+  // per message, and that needs a host function letting a guest ask the runtime
+  // to verify one. No such import exists. It should be designed before a real
+  // key depends on it. See docs/STREAMING.md.
+}
+
+message ServerMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  Kind kind = 3;
+  bytes payload = 4;
+}

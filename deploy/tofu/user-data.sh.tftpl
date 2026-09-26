@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Deployment configuration the image cannot know: which buckets, which region,
+# which domain. Written where the enclave.service unit picks it up.
+#
+# Not a place for secrets. This file is readable from the instance metadata
+# service by anything on the box, and the parent is the party the enclave
+# excludes. The master key is deliberately absent — until M8 it is supplied
+# out of band, and after M8 it comes from KMS gated on PCR0, which is a
+# statement about the enclave's code rather than about this machine.
+set -euxo pipefail
+
+mkdir -p /etc/systemd/system/enclave.service.d
+cat > /etc/systemd/system/enclave.service.d/deployment.conf <<CONF
+[Service]
+Environment=S3FS_BUCKET=${data_bucket}
+Environment=S3FS_ROOTS_BUCKET=${roots_bucket}
+Environment=AWS_REGION=${region}
+Environment=S3FS_TLS_DOMAINS=${tls_domains}
+CONF
+
+systemctl daemon-reload
+systemctl restart enclave.service || true

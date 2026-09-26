@@ -1,7 +1,7 @@
 //! `FsError` — the engine's internal error type.
 //!
 //! Translation to WASI Preview 2 `wasi:filesystem/types::error-code` happens in
-//! the `s3fs-wasmtime` crate. Inside the engine we keep error variants close to
+//! the `enclave-runtime` crate. Inside the engine we keep error variants close to
 //! POSIX-flavored categories so call sites are obvious.
 
 use thiserror::Error;
@@ -68,6 +68,34 @@ pub enum FsError {
     #[error("precondition / CAS conflict")]
     Conflict,
 
+    /// A block, dnode, or root record failed verification: checksum mismatch
+    /// against the parent block pointer, AEAD authentication failure, a bad
+    /// root signature, or a broken `prev_root_hash` chain link.
+    ///
+    /// This is never transient and must never be retried or degraded around.
+    /// Producing it poisons the mount: the store is either lying or corrupt,
+    /// and in both cases the only safe response is to stop serving bytes.
+    /// The store holds no filesystem.
+    ///
+    /// Distinct from `NotFound`, which is about a path inside a mounted
+    /// filesystem. This says the *store* is empty, and it is returned rather
+    /// than quietly formatting one: an enclave pointed at an empty store must
+    /// be able to tell "this filesystem is new" from "everything has been
+    /// hidden", and only the caller knows which it is entitled to assume.
+    #[error("the store holds no filesystem")]
+    NoFilesystem,
+
+    #[error("integrity check failed: {0}")]
+    Integrity(&'static str),
+
+    /// The store offered a root record older than one we have already
+    /// accepted, or older than the configured floor. Distinct from
+    /// [`FsError::Integrity`] because the data is *valid* — correctly signed
+    /// and internally consistent — just stale. That is the signature of a
+    /// rollback attempt rather than corruption.
+    #[error("rollback detected: root seq {found} is not newer than {expected}")]
+    Rollback { expected: u64, found: u64 },
+
     #[error("i/o timeout")]
     IoTimeout,
 
@@ -108,6 +136,30 @@ mod tests {
             FsError::Invalid("bad part number").to_string(),
             "invalid argument: bad part number"
         );
+        assert_eq!(
+            FsError::Integrity("blkptr checksum").to_string(),
+            "integrity check failed: blkptr checksum"
+        );
+        assert_eq!(
+            FsError::Rollback {
+                expected: 42,
+                found: 41
+            }
+            .to_string(),
+            "rollback detected: root seq 41 is not newer than 42"
+        );
+    }
+
+    /// Integrity and rollback failures are adversarial signals, not blips.
+    /// Retrying them would turn a detected attack into a spin loop.
+    #[test]
+    fn verification_failures_are_never_transient() {
+        assert!(!FsError::Integrity("root signature").is_transient());
+        assert!(!FsError::Rollback {
+            expected: 2,
+            found: 1
+        }
+        .is_transient());
     }
 
     #[test]

@@ -1,119 +1,95 @@
-//! Benchmarks for the Fs hot paths against `MemoryBackend`. The numbers
-//! are useful for relative comparison (regressions, the impact of design
-//! changes); they're not representative of real S3 latency since
-//! MemoryBackend is in-process.
+//! Hot-path benchmarks against the in-memory backend.
 //!
-//! Run with `cargo bench -p s3fs-core`. Add `--bench fs_hot_paths` to
-//! filter. To compare two revisions, use `criterion`'s baselines:
-//! `cargo bench -p s3fs-core -- --save-baseline before`,
-//! then `cargo bench -p s3fs-core -- --baseline before`.
+//! Numbers here are relative only — there is no network, so what they measure
+//! is the engine's own cost: encryption, hashing, the copy-on-write rebuild,
+//! and the commit protocol. That is exactly the part worth watching, because
+//! against real S3 the round trips dominate everything else.
+//!
+//! ```bash
+//! cargo bench -p s3fs-core
+//! ```
 
 use std::sync::Arc;
 
-use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use tokio::runtime::Runtime;
 
 use s3fs_core::backend::memory::MemoryBackend;
-use s3fs_core::backend::{Backend, PutBlobInput};
-use s3fs_core::config::PartSchedule;
-use s3fs_core::{Config, Fs, OpenFlags};
+use s3fs_core::backend::Backend;
+use s3fs_core::{Config, Fs, MasterSecret, OpenFlags};
 
-fn build_fs(part_size: u64) -> (Arc<MemoryBackend>, Arc<Fs>) {
-    let backend = Arc::new(MemoryBackend::new());
-    let cfg = Config::builder()
-        .part_schedule(PartSchedule {
-            tiers: vec![(part_size, 1000)],
-        })
-        .single_part_threshold(part_size)
-        .max_parallel_parts(8)
-        .max_parallel_copy(8)
-        .max_merge_copy_bytes(128 * 1024 * 1024)
-        .memory_limit_bytes(64 * 1024 * 1024)
-        .build();
-    let fs = Fs::new(backend.clone() as Arc<dyn Backend>, Arc::new(cfg));
-    (backend, fs)
+fn runtime() -> Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
 }
 
-/// Open a file, write `payload`, sync, close. End-to-end small-file path.
-fn bench_small_file_write_sync(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    let mut group = c.benchmark_group("small_file_write_sync");
+async fn fresh_fs(record_size: usize) -> Arc<Fs> {
+    let config = Config::builder()
+        .record_size(record_size)
+        .root_retention(None)
+        .build();
+    Fs::create(
+        Arc::new(MemoryBackend::new()) as Arc<dyn Backend>,
+        Arc::new(MemoryBackend::new()) as Arc<dyn Backend>,
+        &MasterSecret::from_bytes([1u8; 32]),
+        [0u8; 16],
+        Arc::new(config),
+    )
+    .await
+    .expect("creating the filesystem")
+}
+
+/// Write and commit a whole file: the full path through encryption, the
+/// indirect-tree rebuild, slab packing, and a signed root record.
+fn write_and_commit(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("write_and_commit");
+
     for size in [1024usize, 64 * 1024, 1024 * 1024] {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
-            let payload = vec![0xAB_u8; size];
-            b.to_async(&rt).iter(|| {
-                let payload = payload.clone();
-                async move {
-                    let (_backend, fs) = build_fs(5 * 1024 * 1024);
-                    let h = fs
-                        .open(
-                            "k",
-                            OpenFlags {
-                                read: true,
-                                write: true,
-                                create: true,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .unwrap();
-                    fs.pwrite(&h, 0, &payload).await.unwrap();
-                    fs.sync(&h).await.unwrap();
+            let data = vec![0xabu8; size];
+            b.to_async(&rt).iter_batched(
+                || data.clone(),
+                |data| async move {
+                    let fs = fresh_fs(128 * 1024).await;
+                    let h = fs.open("/bench", OpenFlags::create_new()).await.unwrap();
+                    fs.pwrite(&h, 0, &data).await.unwrap();
                     fs.close(&h).await.unwrap();
-                    black_box(())
-                }
-            });
+                },
+                BatchSize::SmallInput,
+            );
         });
     }
     group.finish();
 }
 
-/// Pre-populate a 30 MiB file and `pread` random offsets via the buffer
-/// pool. Measures cache-miss + cache-hit read paths.
-fn bench_pread_buffered(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    let mut group = c.benchmark_group("pread_buffered");
-    for read_size in [4 * 1024usize, 64 * 1024, 1024 * 1024] {
-        group.throughput(Throughput::Bytes(read_size as u64));
+/// Commit cost as a function of how many records the transaction group dirties.
+///
+/// The interesting shape: slab packing means the number of PUTs stays flat, so
+/// this should scale with bytes rather than with block count.
+fn commit_by_dirty_blocks(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("commit_by_dirty_blocks");
+    let record = 4096usize;
+
+    for blocks in [1usize, 16, 256] {
+        group.throughput(Throughput::Elements(blocks as u64));
         group.bench_with_input(
-            BenchmarkId::from_parameter(read_size),
-            &read_size,
-            |b, &read_size| {
-                let setup = || {
-                    let part_size = 5 * 1024 * 1024u64;
-                    let (backend, fs) = build_fs(part_size);
-                    let body = Bytes::from(vec![0u8; 30 * 1024 * 1024]);
-                    let backend = backend.clone();
-                    let fs = fs.clone();
-                    rt.block_on(async move {
-                        backend
-                            .put_blob(PutBlobInput {
-                                key: "big".into(),
-                                body,
-                                metadata: Default::default(),
-                                content_type: None,
-                            })
-                            .await
-                            .unwrap();
-                        let h = fs.open("big", OpenFlags::read_only()).await.unwrap();
-                        (fs, h)
-                    })
-                };
-                let (fs, h) = setup();
-                b.to_async(&rt).iter(|| {
-                    let fs = fs.clone();
-                    let h = h.clone();
-                    async move {
-                        // Read at a moving offset to vary pool hits/misses.
-                        let off = (fastrand::u64(..) % (29 * 1024 * 1024)) as u64;
-                        let r = fs.pread(&h, off, read_size).await.unwrap();
-                        black_box(r);
+            BenchmarkId::from_parameter(blocks),
+            &blocks,
+            |b, &blocks| {
+                b.to_async(&rt).iter(|| async move {
+                    let fs = fresh_fs(record).await;
+                    let h = fs.open("/bench", OpenFlags::create_new()).await.unwrap();
+                    // One byte per record, so every record is dirtied but the
+                    // volume of data stays small.
+                    for i in 0..blocks {
+                        fs.pwrite(&h, (i * record) as u64, b"x").await.unwrap();
                     }
+                    fs.close(&h).await.unwrap();
                 });
             },
         );
@@ -121,50 +97,70 @@ fn bench_pread_buffered(c: &mut Criterion) {
     group.finish();
 }
 
-/// In-place edit of a multi-part file: 30 MiB existing object, modify
-/// `dirty_kb` at part 1, sync. Exercises the GeeseFS-parity MPU +
-/// UploadPartCopy materialisation path and the parallel-upload flusher.
-fn bench_inplace_subpart_edit(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    let mut group = c.benchmark_group("inplace_subpart_edit");
-    for dirty_kb in [4_usize, 64, 1024] {
-        group.throughput(Throughput::Bytes((dirty_kb * 1024) as u64));
+/// Random reads over a committed file, warm cache. Measures verification cost:
+/// a BLAKE3 pass plus an AEAD open per block, plus the indirect-tree walk.
+fn random_reads(c: &mut Criterion) {
+    let rt = runtime();
+    let file_size = 8 * 1024 * 1024usize;
+
+    let fs = rt.block_on(async {
+        let fs = fresh_fs(128 * 1024).await;
+        let h = fs.open("/bench", OpenFlags::create_new()).await.unwrap();
+        fs.pwrite(&h, 0, &vec![0x5au8; file_size]).await.unwrap();
+        fs.close(&h).await.unwrap();
+        fs
+    });
+
+    let mut group = c.benchmark_group("random_read");
+    for len in [4096usize, 64 * 1024] {
+        group.throughput(Throughput::Bytes(len as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, &len| {
+            let fs = fs.clone();
+            b.to_async(&rt).iter(|| {
+                let fs = fs.clone();
+                async move {
+                    let h = fs.open("/bench", OpenFlags::read_only()).await.unwrap();
+                    let offset = fastrand::u64(0..(file_size - len) as u64);
+                    fs.pread(&h, offset, len).await.unwrap();
+                    fs.close(&h).await.unwrap();
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Directory lookup as the directory grows. The separator index means this
+/// should stay roughly flat rather than degrading with entry count.
+fn directory_lookup(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("directory_lookup");
+
+    for entries in [10usize, 1_000, 10_000] {
+        let fs = rt.block_on(async {
+            let fs = fresh_fs(4096).await;
+            let root = fs.root();
+            for i in 0..entries {
+                let h = fs
+                    .open(&format!("/entry-{i:06}"), OpenFlags::create_new())
+                    .await
+                    .unwrap();
+                fs.close(&h).await.unwrap();
+            }
+            let _ = root;
+            fs
+        });
+
         group.bench_with_input(
-            BenchmarkId::from_parameter(dirty_kb),
-            &dirty_kb,
-            |b, &dirty_kb| {
+            BenchmarkId::from_parameter(entries),
+            &entries,
+            |b, &entries| {
+                let fs = fs.clone();
                 b.to_async(&rt).iter(|| {
-                    let dirty = vec![0xAB_u8; dirty_kb * 1024];
+                    let fs = fs.clone();
                     async move {
-                        let part_size = 5 * 1024 * 1024u64;
-                        let (backend, fs) = build_fs(part_size);
-                        let body = Bytes::from(vec![0u8; 30 * 1024 * 1024]);
-                        backend
-                            .put_blob(PutBlobInput {
-                                key: "k".into(),
-                                body,
-                                metadata: Default::default(),
-                                content_type: None,
-                            })
-                            .await
-                            .unwrap();
-                        let h = fs
-                            .open(
-                                "k",
-                                OpenFlags {
-                                    read: true,
-                                    write: true,
-                                    ..Default::default()
-                                },
-                            )
-                            .await
-                            .unwrap();
-                        fs.pwrite(&h, part_size, &dirty).await.unwrap();
-                        fs.sync(&h).await.unwrap();
-                        fs.close(&h).await.unwrap();
-                        black_box(())
+                        let name = format!("entry-{:06}", fastrand::usize(0..entries));
+                        fs.lookup_at(&fs.root(), &name).await.unwrap();
                     }
                 });
             },
@@ -175,8 +171,9 @@ fn bench_inplace_subpart_edit(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_small_file_write_sync,
-    bench_pread_buffered,
-    bench_inplace_subpart_edit,
+    write_and_commit,
+    commit_by_dirty_blocks,
+    random_reads,
+    directory_lookup
 );
 criterion_main!(benches);

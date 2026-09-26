@@ -1,0 +1,35 @@
+# The enclave's only route to anything.
+#
+# An enclave has no NIC. Every packet it sends leaves over vsock and arrives
+# here, so nothing inside works until this is running — not S3, not DNS, not an
+# inbound request. An enclave that boots and then answers nothing is almost
+# always this unit having failed.
+[Unit]
+Description=gvproxy, the enclave's network
+Before=enclave.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/gvproxy \
+    --listen vsock://:1024 \
+    --listen unix:///run/gvproxy/network.sock
+RuntimeDirectory=gvproxy
+Restart=always
+RestartSec=2
+
+# It terminates ethernet frames from an untrusted enclave and speaks to the
+# network on its behalf, so it gets no more of the host than that needs.
+DynamicUser=no
+User=root
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

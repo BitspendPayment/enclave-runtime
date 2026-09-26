@@ -1,0 +1,240 @@
+[package]
+name = "enclave-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runs a Wasm guest inside an AWS Nitro Enclave against a Merkle-anchored S3 filesystem"
+
+# Library plus binary. The library half was `s3fs-host` until it had exactly
+# one consumer; the binary half is argument parsing over it. They are one crate
+# because the split had stopped describing anything — `s3fs-host` had grown the
+# NSM, the vsock tap device and the attestation endpoints, none of which mean
+# anything outside an enclave.
+#
+# It stays a library rather than collapsing into `main.rs` because integration
+# tests cannot import a binary-only crate, and `tests/serve_tls.rs` is where
+# the certificate-binding property is actually checked.
+[lib]
+name = "enclave_runtime"
+path = "src/lib.rs"
+
+[[bin]]
+name = "enclave-runtime"
+path = "src/main.rs"
+
+# The client half of the gate, for the QEMU harness. A shell script cannot sign
+# a WebAuthn assertion, and the harness's self-signed certificate means no real
+# platform authenticator would ever attest against it — so the e2e drives the
+# gate with this. Behind `testing`, because it can mint assertions.
+[[bin]]
+name = "passkey-client"
+path = "src/bin/passkey-client.rs"
+required-features = ["testing"]
+
+# One feature, and it is not about size. `testing` compiles
+# `auth::SoftwareAuthenticator`, which mints WebAuthn assertions — a forgery
+# tool. It is off by default so it cannot reach a production image, and on for
+# the QEMU harness, whose self-signed certificate means no real platform
+# authenticator will ever attest against it.
+#
+# There used to be `aws` and `serve` features too, so a host embedding only the
+# `wasi:filesystem` bindings could skip the AWS SDK and hyper. With one consumer
+# that always wants both, they bought nothing and cost
+# `--features aws,s3fs-host/serve` on every command.
+[features]
+default = []
+# `nitro-attestation/testing` costs nothing new: it is `dep:rcgen` plus
+# `dep:time`, and rcgen is already enabled here by this very feature. It is
+# what lets `testing::Enclave` mint documents a client can actually verify.
+testing = ["dep:rcgen", "nitro-attestation/testing"]
+
+[dependencies]
+s3fs-core = { path = "../crates/s3fs-core", features = ["aws"] }
+nitro-nsm = { path = "../crates/nitro-nsm" }
+nitro-attestation = { path = "../crates/nitro-attestation" }
+
+# The host compiles components, so it needs cranelift on top of the runtime.
+wasmtime         = { version = "=44.0.0", features = ["component-model", "async", "runtime", "cranelift", "std"] }
+wasmtime-wasi    = { workspace = true }
+wasmtime-wasi-io = "=44.0.0"
+
+# `default-send-request` is deliberately OFF. With it on, `wasi:http`'s
+# outgoing-handler quietly gains a working implementation — a guest could make
+# arbitrary outbound requests, through a second rustls and its own root store,
+# neither of which anything here configures. With it off, `send_request`
+# becomes a trait method we are *required* to write, so refusing egress is a
+# visible decision rather than a feature flag nobody looked at. See
+# `serve::EgressPolicy`.
+wasmtime-wasi-http = { version = "=44.0.0", default-features = false, features = ["p2"] }
+hyper          = { version = "1", features = ["http1", "http2", "server", "client"] }
+# Protocol chosen per connection rather than per deployment. `auto::Builder`
+# reads the HTTP/2 connection preface before deciding, so one listener serves
+# both and a client that never heard of h2 is unaffected. h2 is what gRPC
+# requires and nothing else here needs; it is pure Rust and brings no crypto of
+# its own, so what it adds to the measured image is a framing layer.
+hyper-util     = { version = "0.1", default-features = false, features = ["server", "server-auto", "client", "client-legacy", "http1", "http2", "tokio"] }
+http           = "1"
+http-body-util = "0.1"
+
+# aws-lc-rs, not ring: it is already the crypto stack for the block store's
+# AEAD, signatures and key derivation, and a second one would mean two
+# implementations of the same primitives inside one attested image.
+#
+# That argument has one accepted exception, below: `webauthn-rs` brings
+# `openssl` and `openssl-sys`, which is a second stack *with C bindings*, inside
+# the boundary PCR0 measures. It was taken knowingly, in exchange for not
+# writing assertion verification by hand on the authentication path. Left
+# unqualified this comment would contradict the manifest it is in.
+rustls         = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs", "tls12"] }
+# Already in the image via rustls, which parses every certificate it verifies.
+# Naming it here adds no code to the build — only the ability to ask for the
+# public key rather than re-deriving a parser we would have to trust.
+webpki         = { package = "rustls-webpki", version = "0.103" }
+tokio-rustls   = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
+# The client half, for `notify`: the runtime calls Firebase itself because the
+# guest may not (see `serve::EgressPolicy`). Neither `aws-lc-rs` nor
+# `webpki-roots` is enabled here on purpose — `notify::transport` builds its
+# own `ClientConfig`, so the trust decision is in code a reviewer reads rather
+# than behind a feature name nobody looked at.
+hyper-rustls   = { version = "0.27", default-features = false, features = ["http1", "http2"] }
+# The roots that client validates against, compiled into the measured image
+# rather than read from a file. Already in the tree via rustls-acme.
+webpki-roots   = "1"
+# Self-signed certificates, for the test harnesses and the QEMU emulator only.
+# Optional, and off in a production build: the runtime serves ACME-issued
+# certificates, so a certificate generator has no business inside the boundary
+# PCR0 measures.
+rcgen          = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"], optional = true }
+# TLS-ALPN-01, so the challenge arrives on the port the parent already
+# forwards. `webpki-roots` is not optional in practice: reaching the ACME
+# directory means validating the CA's own TLS certificate, and the enclave
+# cannot borrow the parent's trust store — the parent is the party being
+# excluded.
+# PEM, not a hand-rolled split: the certificate half of rustls-acme's blob is
+# the ACME directory's HTTP response verbatim, so its line endings are the CA's
+# choice and CRLF is as valid as LF. Already in the tree via rcgen/rustls-acme.
+pem            = "3"
+rustls-acme    = { version = "0.15", default-features = false, features = ["tokio", "aws-lc-rs", "tls12", "webpki-roots"] }
+# Sealing the ACME cache uses the same AES-256-GCM as the block store.
+aws-lc-rs      = { workspace = true }
+blake3         = { workspace = true }
+# rustls-acme drives issuance through a Stream.
+futures        = { workspace = true }
+# The state_root pre-image and the receipt payloads. CBOR because the
+# receipt travels in an attestation document, which is CBOR already.
+ciborium       = "0.2"
+base64         = "0.22"
+# Scrubs the FCM service-account key on drop. Already in the tree via
+# aws-credential-types; naming it here is what lets `notify::oauth` hold
+# the key in a `Zeroizing` rather than a bare String.
+zeroize        = { workspace = true }
+hex            = "0.4"
+
+# The PTP clock is read through the POSIX dynamic-clock mechanism. rustix is
+# already compiled into the tree via wasmtime, so this adds no build cost and
+# avoids a direct libc dependency.
+rustix      = { version = "1", features = ["time", "fs"] }
+# Pinned to whatever `wasmtime-wasi` accepts for `secure_random`, which is
+# cap-rand's re-export of rand 0.8 — not a version to guess at.
+cap-rand    = "3"
+getrandom   = "0.3"
+
+clap        = { version = "4", features = ["derive", "env"] }
+anyhow      = { workspace = true }
+async-trait = { workspace = true }
+bytes       = { workspace = true }
+tokio       = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "signal", "net", "io-util", "time"] }
+tracing     = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# CiphertextForRecipient — what KMS returns when the response is encrypted to
+# the enclave rather than sent as plaintext — is a CMS EnvelopedData (RFC 5652).
+# The crate parses the structure; `keys::recipient` decides what shape is
+# acceptable, which is deliberately one shape and no other.
+cms = { version = "0.2.3", default-features = false, features = ["alloc"] }
+# Already pulled in by `cms`; named here for the OIDs and the OCTET STRING the
+# unwrap has to read out of the algorithm parameters.
+der = { version = "0.7", default-features = false, features = ["alloc", "oid", "std"] }
+# The master secret is minted and released by KMS, never by configuration.
+# `Recipient` is the parameter that matters: it makes KMS encrypt its answer to
+# a key inside the enclave and omit `Plaintext` entirely, so the parent can
+# proxy the call without being able to read it. SSM holds the resulting
+# ciphertext, and nothing else.
+aws-sdk-kms = { version = "1.51.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-sdk-ssm = { version = "1.56.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+# Guest stdout and stderr, out to CloudWatch Logs from inside the enclave.
+#
+# Yes, this puts an AWS SDK inside the boundary PCR0 measures — but KMS, SSM and
+# S3 are already here, for the same reason: an enclave with no network of its
+# own still calls AWS over gvproxy. It brings no new crypto stack; kms and ssm
+# already pull `rustls`, which is what the ban above is actually about.
+aws-sdk-cloudwatchlogs = { version = "1.131.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+# The default credential chain, which resolves through gvproxy to the parent
+# instance's IMDS. Named explicitly rather than relied on as a fallback, so it
+# is obvious *which* identity guest logs are written with.
+aws-config = { workspace = true, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
+# The feature adds no code beyond one registration constructor — see
+# `auth::routes`. Without it, options ask for a non-discoverable credential,
+# which Android below 14 creates outside Password Manager where nothing finds it.
+webauthn-rs = { version = "0.5.5", features = ["workaround-google-passkey-specific-issues"] }
+serde_json = "1.0.151"
+serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+# `StaticReplayClient`: canned HTTP responses for the CloudWatch client, so the
+# tests assert the request that is actually serialised rather than a mock of
+# one. A dev-dependency, so none of it reaches the image. It is already in the
+# tree as a transitive dependency of the SDK — naming it here adds no code to
+# the build, only the ability to ask for its test utilities.
+aws-smithy-http-client = { version = "1", features = ["test-util"] }
+# `start_paused`: a timeout test should not spend the timeout.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+aws-smithy-types = { workspace = true }
+# Building canned HTTP requests/responses for the replay client.
+http = "1"
+# The HTTP/2 client half, for the streaming suites. Driving h2 from a real
+# client is the only way to prove the server negotiates it and frames it
+# correctly.
+#
+# This used to say the runtime never calls out over HTTP and that `client` was
+# dev-only. Neither was true: `aws-config`'s `rustls` feature has pulled a hyper
+# client into the production graph for as long as the AWS SDKs have been here,
+# and `notify` now uses one deliberately.
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "server", "server-auto", "http1", "http2", "tokio"] }
+# Turning a channel into a request body, so a test can hold the request open
+# and feed it one gRPC frame at a time — which is the only way to observe the
+# guest answering before the client has finished asking.
+tokio-stream = "0.1"
+# A real gRPC client, so the guest's framing is checked against an
+# implementation that did not come from this repository. Hand-rolled framing on
+# both ends would only prove the two halves agree with each other.
+#
+# Dev-only, and it has to be: `tonic` does not build for wasm32-wasip2, which
+# is why the *guest* frames gRPC by hand in the first place.
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tower = { version = "0.5", features = ["util"] }
+# The integration suites drive the gate with a software passkey, which only
+# exists under `testing`. A dev-dependency on the crate itself is how a crate
+# turns a feature on for its own tests without turning it on for consumers.
+enclave-runtime = { path = ".", features = ["testing"] }
+# Checking that a generated certificate really parses as X.509.
+x509-parser = "0.18"
+nitro-nsm = { path = "../crates/nitro-nsm", features = ["testing"] }
+# Builds genuinely signed attestation documents for the TLS binding tests.
+nitro-attestation = { path = "../crates/nitro-attestation", features = ["testing"] }
+# The fresh-versus-warm instance question: how much of a request is
+# instantiation, and is it enough to justify pooling instances per client.
+criterion = { version = "0.5", features = ["async_tokio"] }
+# Building the CMS envelope a test has to unwrap. Both arrive with `cms`
+# anyway; naming them here keeps the test encoder honest rather than reaching
+# through a re-export.
+spki = "0.7"
+x509-cert = "0.2"
+
+[[bench]]
+name = "instance_cost"
+harness = false

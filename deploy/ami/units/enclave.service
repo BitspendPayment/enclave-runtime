@@ -1,0 +1,31 @@
+[Unit]
+Description=s3fs Nitro Enclave
+# Ordered after both, because the enclave needs memory the allocator reserves
+# and a network gvproxy provides. Started before either, it fails in ways that
+# name neither.
+After=nitro-enclaves-allocator.service gvproxy.service
+Requires=nitro-enclaves-allocator.service gvproxy.service
+
+[Service]
+# `run-enclave` returns once the enclave is running rather than staying in the
+# foreground, so this is oneshot with RemainAfterExit — the unit's state then
+# tracks "an enclave was started", which is what it can honestly claim. The
+# enclave's own liveness is a question for its attestation endpoint, not
+# systemd.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/enclave-start
+ExecStop=/usr/bin/nitro-cli terminate-enclave --all
+
+Environment=EIF=/opt/enclave/s3fs.eif
+Environment=CPU_COUNT=2
+Environment=MEMORY_MIB=3072
+Environment=FORWARD_PORTS=443
+
+# The enclave takes a while to load a ~140 MiB image and mount its filesystem.
+TimeoutStartSec=300
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

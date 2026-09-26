@@ -6,99 +6,116 @@ on:
   pull_request:
     branches: [main]
 
+# Two pushes to one pull request used to run two complete fans to completion,
+# and only the second was ever read.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Four stages, each a checkout, a toolchain, and one script. The scripts are the
+# recipes: they live in scripts/ so a job can be run locally with the same
+# command CI uses, and so deploy/qemu-nitro/run-e2e.sh can share them instead of
+# keeping a second copy that has to agree.
+#
+# There are deliberately no `needs:` edges. Gating the long jobs behind the
+# short one would put its minutes on the front of the critical path to save
+# runner time only on runs that were failing anyway; cancel-in-progress above
+# removes the waste that actually dominates, which is superseded runs.
 jobs:
-  build:
-    name: build + test (default features)
+  unit:
+    name: fmt, clippy, unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo build
-        run: cargo build --workspace --all-targets
-      - name: cargo test (lib)
-        run: cargo test --workspace --lib
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+          shared-key: host
+      - run: scripts/ci-check.sh
 
-  build-aws:
-    name: build + test (aws feature)
+  bench:
+    name: benchmarks
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Writing the tracked history back to gh-pages on main.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo build --features aws
-        run: cargo build --workspace --features aws --all-targets
-      - name: cargo test --features aws (lib)
-        run: cargo test --workspace --features aws --lib
-      - name: cargo clippy --features aws
-        run: cargo clippy --workspace --features aws --all-targets -- -D warnings
+          shared-key: guests
+          workspaces: |
+            . -> target
+            examples/guest-http -> target
+      - run: scripts/ci-bench.sh
 
-  minio-integration:
-    name: MinIO integration tests
+      - uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: cargo
+          output-file-path: bench.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # History is written only from main. A pull request compares against
+          # it and says so in the log, but must not rewrite the baseline.
+          auto-push: ${{ github.ref == 'refs/heads/main' }}
+          save-data-file: ${{ github.ref == 'refs/heads/main' }}
+          # A shared runner's neighbours move these numbers more than most
+          # commits do, so a regression is reported and never fails the build.
+          # Tightening this is worth doing once there is enough history to know
+          # what the noise floor actually is.
+          alert-threshold: "200%"
+          comment-on-alert: true
+          fail-on-alert: false
+
+  # There is deliberately no SQLite job. The runtime measures its guest into
+  # PCR16 before it will serve, and that reads the NSM — which a hosted runner
+  # does not have, so the binary refuses to start there at all. The workload
+  # lives on in scripts/ci-sqlite.sh for a machine with an enclave.
+  e2e:
+    name: the whole stack, in an emulated enclave
     runs-on: ubuntu-latest
-    services:
-      minio:
-        image: minio/minio:RELEASE.2025-02-28T09-55-16Z
-        ports:
-          - 9000:9000
+    # The integration suites, then a cold Nix build of the image, then the
+    # emulated boot. This is the only integration signal, so it carries the
+    # suites that used to have their own job.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      # No Magic Nix Cache. It relays every store lookup through the Actions
+      # cache API, which rate-limits it, and Nix treats the refusals as fatal:
+      # the image build failed on "rate limit exceeded" with nothing wrong in
+      # it. nixpkgs comes from cache.nixos.org regardless; what is lost is only
+      # this repository's own derivations, rebuilt each run.
+      - uses: ./.github/actions/rust
+        with:
+          shared-key: guests
+          workspaces: |
+            . -> target
+            examples/guest-http -> target
+            examples/guest-grpc -> target
+      - uses: actions/cache@v4
+        with:
+          path: target/qemu-nitro/tools
+          # The pinned version lives in the script, so the key follows the
+          # script rather than being a second place to update.
+          key: vhost-device-vsock-${{ hashFiles('scripts/ci-e2e.sh') }}
+      - run: scripts/ci-e2e.sh
         env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/ready"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 12
-          ENTRYPOINT /usr/bin/docker-entrypoint.sh server /data
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo test (minio integration)
-        run: cargo test -p s3fs-core --features aws --test minio_integration -- --ignored --test-threads=1
-
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+          # A runner boots the emulated enclave more slowly than a workstation,
+          # and the default is tuned for the latter.
+          TIMEOUT: 480
+      # Nested virtualisation on hosted runners works but is not something
+      # GitHub supports, so this is the job most likely to fail for reasons
+      # outside this repository. Its logs are the only way to tell that apart
+      # from a real regression.
+      - uses: actions/upload-artifact@v4
+        if: failure()
         with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  guest-build:
-    name: example guest builds for wasm32-wasip2
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
-      - name: Install wasi-sdk
-        run: |
-          curl -sLO https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
-          mkdir -p $HOME/wasi-sdk
-          tar xf wasi-sdk-25.0-x86_64-linux.tar.gz -C $HOME/wasi-sdk --strip-components=1
-      - name: build guest-fsdemo (with bundled SQLite)
-        env:
-          CC_wasm32_wasip2: ${{ github.workspace }}/../wasi-sdk/bin/clang
-          AR_wasm32_wasip2: ${{ github.workspace }}/../wasi-sdk/bin/ar
-        run: |
-          export CC_wasm32_wasip2=$HOME/wasi-sdk/bin/clang
-          export AR_wasm32_wasip2=$HOME/wasi-sdk/bin/ar
-          export CFLAGS_wasm32_wasip2="--sysroot=$HOME/wasi-sdk/share/wasi-sysroot -DSQLITE_THREADSAFE=0 -DHAVE_USLEEP=1"
-          cd examples/guest-fsdemo
-          cargo build --release --target wasm32-wasip2
+          name: e2e-logs
+          path: |
+            target/qemu-nitro/e2e/*.log
+          if-no-files-found: ignore

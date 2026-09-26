@@ -26,6 +26,9 @@ siphasher   = { workspace = true }
 hashlink    = { workspace = true }
 bitvec      = { workspace = true }
 percent-encoding = { workspace = true }
+blake3      = { workspace = true }
+zeroize     = { workspace = true }
+aws-lc-rs   = { workspace = true }
 
 aws-config             = { workspace = true, optional = true, features = ["behavior-version-latest", "rt-tokio"] }
 aws-sdk-s3             = { workspace = true, optional = true, features = ["rt-tokio", "rustls", "behavior-version-latest"] }

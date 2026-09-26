@@ -19,7 +19,7 @@ use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart as SdkCompletedPart, Delete, MetadataDirective,
-    ObjectIdentifier,
+    ObjectIdentifier, ObjectLockMode as SdkObjectLockMode,
 };
 use aws_sdk_s3::Client;
 use aws_smithy_runtime_api::client::result::SdkError;
@@ -28,9 +28,29 @@ use bytes::Bytes;
 
 use super::{
     Backend, BlobItem, BlobMeta, Capabilities, CompletedPart, CopyBlobInput, GetBlobOutput,
-    ListBlobsInput, ListBlobsOutput, MultipartId, PartUploadOutput, PutBlobInput,
+    ListBlobsInput, ListBlobsOutput, MultipartId, ObjectLock, ObjectLockMode, PartUploadOutput,
+    PutBlobInput,
 };
 use crate::errors::{FsError, FsResult};
+
+/// Apply Object Lock retention headers to a `PutObject` request.
+///
+/// Note the bucket must have been created with Object Lock enabled
+/// (`ObjectLockEnabledForBucket`); S3 rejects these headers otherwise. That
+/// failure surfaces as `InvalidRequest` from `send()` rather than being
+/// swallowed here, which is the behaviour we want — a retention we asked for
+/// and didn't get must be loud.
+fn apply_object_lock(
+    req: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    lock: &ObjectLock,
+) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
+    let mode = match lock.mode {
+        ObjectLockMode::Governance => SdkObjectLockMode::Governance,
+        ObjectLockMode::Compliance => SdkObjectLockMode::Compliance,
+    };
+    req.object_lock_mode(mode)
+        .object_lock_retain_until_date(aws_smithy_types::DateTime::from(lock.retain_until))
+}
 
 /// Construction parameters for [`AwsS3Backend`].
 #[derive(Debug, Clone)]
@@ -73,6 +93,7 @@ impl AwsS3BackendConfig {
 pub struct AwsS3Backend {
     bucket: String,
     client: Client,
+    config: AwsS3BackendConfig,
 }
 
 impl AwsS3Backend {
@@ -98,7 +119,26 @@ impl AwsS3Backend {
         let mut conf_builder = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(Region::new(config.region.clone()))
-            .force_path_style(config.force_path_style);
+            .force_path_style(config.force_path_style)
+            // `request_timeout` was stored on this config and never applied.
+            // The SDK's defaults give a connect timeout and **no operation
+            // timeout**, so a read that stalls after the connection is
+            // established hangs forever — and inside an enclave that hangs
+            // whatever called it: a mount, a commit, or a guest holding its
+            // tenant's lock open across a response body. Nothing above can
+            // rescue it either, because a task parked in a host future
+            // executes no wasm and so is invisible to the epoch watchdog.
+            //
+            // Per attempt, with the SDK's retries on top, which is what this
+            // field's own documentation describes. The overall ceiling is three
+            // times that — the standard retry policy's attempt count — so a
+            // pathological endpoint cannot stretch one operation without limit.
+            .timeout_config(
+                aws_smithy_types::timeout::TimeoutConfig::builder()
+                    .operation_attempt_timeout(config.request_timeout)
+                    .operation_timeout(config.request_timeout * 3)
+                    .build(),
+            );
         if let Some(ep) = &config.endpoint {
             conf_builder = conf_builder.endpoint_url(ep);
         }
@@ -117,13 +157,20 @@ impl AwsS3Backend {
         }
         let client = Client::from_conf(conf_builder.build());
         Ok(Self {
-            bucket: config.bucket,
+            bucket: config.bucket.clone(),
             client,
+            config,
         })
     }
 
     pub fn bucket(&self) -> &str {
         &self.bucket
+    }
+
+    /// The configuration this backend was built from, so a caller can derive
+    /// a second backend against another bucket on the same endpoint.
+    pub fn config(&self) -> &AwsS3BackendConfig {
+        &self.config
     }
 
     pub fn client(&self) -> &Client {
@@ -139,6 +186,7 @@ impl Backend for AwsS3Backend {
             upload_part_copy: true,
             batch_delete: true,
             metadata_in_listings: false,
+            object_lock: true,
         }
     }
 
@@ -217,6 +265,99 @@ impl Backend for AwsS3Backend {
         })
     }
 
+    async fn get_retained_blob(&self, key: &str) -> FsResult<GetBlobOutput> {
+        // `ListObjectVersions` still reports a version that a delete marker is
+        // hiding, so this is what tells "never written" from "hidden". The
+        // prefix is not an exact match, hence the `Key == key` filter.
+        //
+        // Every page, not the first: delete markers count against the page
+        // size and anyone with DeleteObject can stack a thousand of them on a
+        // key, pushing the retained version onto a later page. Stopping early
+        // would report it absent.
+        let mut versions = Vec::new();
+        let mut key_marker = None;
+        let mut version_id_marker = None;
+        loop {
+            let listed = self
+                .client
+                .list_object_versions()
+                .bucket(&self.bucket)
+                .prefix(key)
+                .set_key_marker(key_marker.take())
+                .set_version_id_marker(version_id_marker.take())
+                .send()
+                .await
+                .map_err(|e| map_sdk_error("ListObjectVersions", e))?;
+            versions.extend(
+                listed
+                    .versions
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|v| v.key.as_deref() == Some(key)),
+            );
+            if !listed.is_truncated.unwrap_or(false) {
+                break;
+            }
+            key_marker = listed.next_key_marker;
+            version_id_marker = listed.next_version_id_marker;
+            if key_marker.is_none() {
+                return Err(FsError::Io(
+                    "ListObjectVersions: truncated without a continuation marker".into(),
+                ));
+            }
+        }
+
+        // The oldest, so the version the conditional PUT created wins over
+        // anything layered on later. By position, not `last_modified`: S3
+        // lists a key's versions newest first, page after page, while two
+        // versions written close together can share a timestamp — and sorting
+        // on a tie would leave the newer one in front.
+        let version_id = versions
+            .into_iter()
+            .rev()
+            .find_map(|v| v.version_id)
+            .ok_or(FsError::NotFound)?;
+
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .map_err(|e| map_sdk_error("GetObject(versionId)", e))?;
+
+        let e_tag = resp.e_tag.clone().unwrap_or_default();
+        let last_modified = resp
+            .last_modified
+            .as_ref()
+            .map(dt_to_systemtime)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let content_type = resp.content_type.clone();
+        let metadata = resp.metadata.clone().unwrap_or_default();
+        let body = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| FsError::Io(format!("GetObject(versionId) body: {e}")))?
+            .into_bytes();
+        let size = body.len() as u64;
+
+        Ok(GetBlobOutput {
+            meta: BlobMeta {
+                key: key.to_string(),
+                e_tag,
+                size,
+                last_modified,
+                content_type,
+                metadata,
+                is_dir_marker: key.ends_with('/'),
+            },
+            body,
+        })
+    }
+
     async fn put_blob(&self, input: PutBlobInput) -> FsResult<BlobMeta> {
         let key = input.key.clone();
         let body = ByteStream::from(input.body.to_vec());
@@ -233,6 +374,9 @@ impl Backend for AwsS3Backend {
         }
         if let Some(ct) = &input.content_type {
             req = req.content_type(ct);
+        }
+        if let Some(lock) = &input.object_lock {
+            req = apply_object_lock(req, lock);
         }
         let resp = req
             .send()
@@ -266,6 +410,9 @@ impl Backend for AwsS3Backend {
         }
         if let Some(ct) = &input.content_type {
             req = req.content_type(ct);
+        }
+        if let Some(lock) = &input.object_lock {
+            req = apply_object_lock(req, lock);
         }
         let resp = req.send().await.map_err(|e| {
             // S3 returns 412 PreconditionFailed when If-None-Match: * fires.
@@ -434,6 +581,15 @@ impl Backend for AwsS3Backend {
         if let Some(ct) = &input.content_type {
             req = req.content_type(ct);
         }
+        if let Some(lock) = &input.object_lock {
+            let mode = match lock.mode {
+                ObjectLockMode::Governance => SdkObjectLockMode::Governance,
+                ObjectLockMode::Compliance => SdkObjectLockMode::Compliance,
+            };
+            req = req
+                .object_lock_mode(mode)
+                .object_lock_retain_until_date(aws_smithy_types::DateTime::from(lock.retain_until));
+        }
         let resp = req
             .send()
             .await
@@ -596,5 +752,104 @@ where
         SdkError::DispatchFailure(_) => FsError::Network(format!("{e:?}")),
         SdkError::ResponseError(_) => FsError::Io(format!("{e:?}")),
         _ => FsError::Io(format!("{e:?}")),
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    /// The bug this guards: the field existed, was defaulted, was threaded
+    /// through two layers of config — and was never handed to the SDK. Asserted
+    /// on the built client rather than on our own struct, because our struct
+    /// held the right value the whole time it was being ignored.
+    #[tokio::test]
+    async fn the_request_timeout_reaches_the_client() {
+        let mut config = AwsS3BackendConfig::new("bucket", "us-east-1");
+        config.request_timeout = Duration::from_secs(7);
+        config.endpoint = Some("http://127.0.0.1:1".into());
+
+        let backend = AwsS3Backend::connect_unchecked(config)
+            .await
+            .expect("building a client does no I/O");
+        let timeouts = backend
+            .client()
+            .config()
+            .timeout_config()
+            .expect("the SDK was given no timeout configuration at all");
+
+        assert_eq!(
+            timeouts.operation_attempt_timeout(),
+            Some(Duration::from_secs(7)),
+            "one attempt is unbounded"
+        );
+        assert_eq!(
+            timeouts.operation_timeout(),
+            Some(Duration::from_secs(21)),
+            "the operation as a whole is unbounded"
+        );
+    }
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Two versions of one key stamped in the same second, listed as S3 lists
+    /// them: newest first. Sorting on the timestamp left that order alone, so
+    /// the "retained" record was the one a second writer layered on after
+    /// hiding the first — and root publication reads it back to decide who
+    /// won a sequence.
+    #[tokio::test]
+    async fn the_retained_version_is_the_first_written_even_on_a_timestamp_tie() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let n = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).into_owned();
+                let line = request.lines().next().unwrap_or_default();
+                let body = if line.contains("versionId=v-first") {
+                    "first".to_string()
+                } else if line.contains("versionId=") {
+                    "later".to_string()
+                } else {
+                    let version = |id: &str, latest: bool| {
+                        format!(
+                            "<Version><Key>roots/1</Key><VersionId>{id}</VersionId>\
+                             <IsLatest>{latest}</IsLatest>\
+                             <LastModified>2026-01-01T00:00:00.000Z</LastModified></Version>"
+                        )
+                    };
+                    format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                         <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                         <Name>roots</Name><Prefix>roots/1</Prefix><IsTruncated>false</IsTruncated>\
+                         {}{}</ListVersionsResult>",
+                        version("v-later", true),
+                        version("v-first", false),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AwsS3BackendConfig::new("roots", "us-east-1");
+        config.endpoint = Some(format!("http://{addr}"));
+        config.force_path_style = true;
+        config.access_key_id = Some("test".into());
+        config.secret_access_key = Some("test".into());
+        let backend = AwsS3Backend::connect_unchecked(config).await.unwrap();
+
+        let got = backend.get_retained_blob("roots/1").await.unwrap();
+        assert_eq!(got.body.as_ref(), b"first");
     }
 }
