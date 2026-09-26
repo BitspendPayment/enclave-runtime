@@ -1,0 +1,79 @@
+# A dev enclave anyone can download: the bundle `dev-enclave.sh --pack` makes,
+# with the harness, the WIT and the container images inside it, published as a
+# release asset. Manual, because image options fix PCR0 and a consumer names
+# the options its harness expects — see docs/DEV_ENCLAVE.md, "Build here, run
+# there". One dispatch is one profile: a name, and the image options as one
+# string, which dev-enclave.sh validates value by value.
+#
+# ubuntu-22.04 rather than latest, on purpose: the host binaries in the bundle
+# link glibc, and what was built against 22.04's runs on 22.04 and 24.04 hosts
+# where the reverse does not hold.
+name: Publish a dev enclave
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: A name for this configuration, e.g. merlin-e2e
+        required: true
+        type: string
+      image_args:
+        description: dev-enclave.sh image options, as one line (--guest-egress ..., --guest-env ..., --background-timeout ...)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: pack, prove, release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The image is built through `builtins.getFlake "git+file://..."`, which wants the
+          # repository's revision count; a shallow clone has none and Nix refuses it.
+          fetch-depth: 0
+      # Also configures KVM on a hosted runner, which the smoke boot needs.
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: ./.github/actions/rust
+        with:
+          shared-key: guests
+          workspaces: |
+            . -> target
+            examples/guest-http -> target
+            examples/guest-grpc -> target
+      - uses: actions/cache@v4
+        with:
+          path: target/qemu-nitro/tools
+          key: vhost-device-vsock-${{ hashFiles('scripts/lib.sh') }}
+      - name: Pack, then run the whole stack from the tarball
+        env:
+          # A runner boots the emulated enclave more slowly than a workstation.
+          TIMEOUT: 480
+        run: scripts/ci-pack.sh out "${{ inputs.profile }}" ${{ inputs.image_args }}
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="dev-enclave-${{ inputs.profile }}-$(git rev-parse --short HEAD)"
+          pcr0="$(jq -r .PCR0 "out/${{ inputs.profile }}/eif/pcr.json")"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" --prerelease --title "$tag" \
+              --notes "Dev enclave bundle, profile ${{ inputs.profile }}.
+          PCR0 \`$pcr0\`
+          Image options: \`${{ inputs.image_args }}\`
+          Run it: \`<bundle>/deploy/qemu-nitro/dev-enclave.sh --prebuilt <bundle> --guest your.wasm\`"
+          fi
+          gh release upload --clobber "$tag" "out/$tag.tar.gz" "out/$tag.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: pack-smoke-logs
+          path: out/smoke/target/qemu-nitro/e2e/*.log
