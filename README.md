@@ -72,7 +72,7 @@ The harness targets Linux with working KVM and vsock, Docker, Nix with flakes, R
 rustup target add wasm32-wasip2
 sudo modprobe vsock_loopback
 
-docker build -t s3fs-qemu-nitro:latest deploy/qemu-nitro
+docker build -t s3fs-qemu-nitro:latest deploy/qemu-nitro   # built from source; ~680 MB
 cargo install vhost-device-vsock --version 0.3.0 --locked \
   --root target/qemu-nitro/tools
 

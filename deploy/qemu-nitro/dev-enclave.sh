@@ -245,8 +245,7 @@ if [[ -n "$BUNDLE" ]]; then
     BUNDLE="$(readlink -f "$BUNDLE")" && [[ -f "$BUNDLE/image.env" ]] \
         || { echo "--prebuilt $BUNDLE: not a bundle (no image.env)" >&2; exit 1; }
     [[ -n "$GUEST_WASM" ]] || { echo "--prebuilt needs --guest: a bundle carries no guest" >&2; exit 1; }
-    # shellcheck source=/dev/null
-    source "$BUNDLE/image.env"
+    # lib.sh reads image.env itself, for run-e2e.sh's sake as much as this script's.
 fi
 
 if [[ -n "${FRESH_STORE:-}" && -z "${KEEP_STORE:-}" ]]; then
