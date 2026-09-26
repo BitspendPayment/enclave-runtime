@@ -18,7 +18,8 @@ set -euo pipefail
 MINIO_RELEASE=RELEASE.2025-02-28T09-55-16Z
 # The last mc release before that server.
 MC_RELEASE=RELEASE.2025-02-21T16-00-46Z
-IMAGE="enclave-runtime/minio:$MINIO_RELEASE"
+# `MINIO_IMAGE` names one already present — what a bundle loaded — and skips the build.
+IMAGE="${MINIO_IMAGE:-enclave-runtime/minio:$MINIO_RELEASE}"
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     # ponytail: rebuilt on every CI run, a few minutes; `docker save` it into

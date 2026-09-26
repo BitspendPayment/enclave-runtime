@@ -4,7 +4,7 @@ A real enclave on your own machine, to develop a client against.
 
 ```bash
 sudo modprobe vsock_loopback                       # once per boot
-docker build -t s3fs-qemu-nitro:latest deploy/qemu-nitro
+docker build -t s3fs-qemu-nitro:latest deploy/qemu-nitro   # QEMU with the nitro-enclave machine; ~680 MB
 cargo install vhost-device-vsock --root target/qemu-nitro/tools
 
 deploy/qemu-nitro/dev-enclave.sh --guest path/to/your-component.wasm
@@ -176,18 +176,41 @@ user on :443, `sysctl net.ipv4.ip_unprivileged_port_start=443`.
 ### Build here, run there
 
 Building needs Nix, cargo and this checkout; running needs none of them. `--pack DIR` builds the
-image with the image options given, plus every host binary — gvproxy (static), `nitro-attest`,
-`passkey-client` and `vhost-device-vsock` (libc only) — into `DIR`, records the image options in
-`DIR/image.env`, and stops. On the host:
+image with the image options given and puts into `DIR` everything a run needs:
 
 ```
-dev-enclave.sh --prebuilt DIR --guest component.wasm --port 443 --keep-store ...
+DIR/
+├── image.env          every image option, the runtime revision, and the image tags below
+├── eif/               s3fs-qemu.eif, pcr.json
+├── bin/               gvproxy (static); nitro-attest, passkey-client, vhost-device-vsock (libc only)
+├── images/            qemu.tar.gz, minio.tar.gz — the container images, loaded on first run
+├── deploy/qemu-nitro/ this harness, as it was when the image was built
+├── scripts/           lib.sh, minio-up.sh, minio-image.sh, wasi-sdk.sh
+└── wit/               what guests are built against, for a consumer's drift check
 ```
 
-needs only `deploy/qemu-nitro/` and `scripts/minio-up.sh` from this repository beside it, and the
-QEMU image loaded (`QEMU_IMAGE` names it). Image options are refused with `--prebuilt`: the image is
-what was packed. The build image carries QEMU's compilers; copying `/usr/local` into a slim Debian
-image is about 100 MB compressed, against 3.7 GB.
+A bundle runs from its own copy of the harness, so nothing from this repository has to be beside
+it — not a checkout, not the QEMU image, not Nix, cargo or git:
+
+```
+DIR/deploy/qemu-nitro/dev-enclave.sh --prebuilt DIR --guest component.wasm --port 443 --keep-store ...
+```
+
+The host needs KVM the user can open, `vsock_loopback` (`sudo modprobe vsock_loopback`), Docker,
+`python3`, `jq`, `curl` and `openssl`; on a GitHub-hosted runner `/dev/kvm` is root-owned and needs
+the udev rule `scripts/lib.sh`'s `prepare_enclave_host` applies. Image options are refused with
+`--prebuilt`: the image is what was packed, and `image.env` says what that was. `QEMU_IMAGE` and
+`MINIO_IMAGE` in the environment override the tags the bundle recorded. Extract a bundle at a
+short path: its sockets live under `DIR/target/qemu-nitro/<name>/`, and a Unix socket path is at
+most 107 bytes — past that `vhost-device-vsock` fails with "path must be shorter than SUN_LEN".
+
+`scripts/ci-pack.sh OUT PROFILE [image options...]` is the whole release step: it packs, tars the
+bundle as `dev-enclave-PROFILE-<rev>.tar.gz` with a `.sha256`, and then runs `run-e2e.sh` — all
+eight legs — from an extracted copy with nothing pointing at the checkout. The "Publish a dev
+enclave" workflow runs it on a hosted runner and attaches the result to a release named after the
+profile and the revision. One bundle is one configuration: image options are measured into PCR0,
+so a consumer publishes the options its harness expects, pins the bundle built from them, and
+checks `image.env` against them before booting.
 
 The attestation chain the emulator mints is valid for 30 days, so a long-running host has to be
 restarted within that — with `--keep-store`, a restart costs nothing but new pins.

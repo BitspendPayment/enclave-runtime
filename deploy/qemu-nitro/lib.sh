@@ -63,6 +63,15 @@ RUNDIR="${RUNDIR:-$WORK/$PREFIX}"
 STORE_DIR="$WORK/$PREFIX-store"
 KEEP_STORE="${KEEP_STORE:-}"
 FRESH_STORE="${FRESH_STORE:-}"
+# A bundle records what its image was built with and which container images it runs on. Read
+# before the defaults below so those names reach them, and read here rather than only in
+# dev-enclave.sh so that run-e2e.sh can drive a bundle too. Every line of it is written so a
+# caller's environment still wins.
+BUNDLE="${BUNDLE:-}"
+if [[ -n "$BUNDLE" && -f "$BUNDLE/image.env" ]]; then
+    # shellcheck source=/dev/null
+    source "$BUNDLE/image.env"
+fi
 IMAGE="${QEMU_IMAGE:-s3fs-qemu-nitro:latest}"
 TIMEOUT="${TIMEOUT:-240}"
 QEMU_MEMORY="${QEMU_MEMORY:-3G}"
@@ -73,7 +82,6 @@ ACME_CONTACT="${ACME_CONTACT:-}"
 FCM_PROJECT="${FCM_PROJECT:-}"
 FCM_SERVICE_ACCOUNT="${FCM_SERVICE_ACCOUNT:-}"
 PACK_DIR="${PACK_DIR:-}"
-BUNDLE="${BUNDLE:-}"
 
 LETS_ENCRYPT_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory
 LETS_ENCRYPT_STAGING_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory
@@ -164,6 +172,17 @@ enclave_preflight_host() {
         [[ -f "$BUNDLE/eif/s3fs-qemu.eif" && -x "$BUNDLE/bin/gvproxy" ]] \
             || { echo "$BUNDLE is not a bundle: pack one with dev-enclave.sh --pack" >&2; exit 1; }
         VSOCK_BIN="$BUNDLE/bin/vhost-device-vsock"
+        # The container images travel in the bundle, tagged as image.env names them. Loaded only
+        # when missing: a host that ran this bundle before already has them.
+        if [[ -f "$BUNDLE/images/qemu.tar.gz" ]] && ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "loading the QEMU image from the bundle"
+            docker load -i "$BUNDLE/images/qemu.tar.gz" >/dev/null
+        fi
+        if [[ -n "${MINIO_IMAGE:-}" && -f "$BUNDLE/images/minio.tar.gz" ]] \
+            && ! docker image inspect "$MINIO_IMAGE" >/dev/null 2>&1; then
+            echo "loading the MinIO image from the bundle"
+            docker load -i "$BUNDLE/images/minio.tar.gz" >/dev/null
+        fi
     fi
     # Packing only builds, so nothing it produces needs this machine to be able to run it.
     if [[ -z "$PACK_DIR" ]]; then
@@ -367,6 +386,7 @@ enclave_build_clients() {
         PASSKEY="$BUNDLE/bin/passkey-client"
         EXPECTED_PCR16="$("$ATTEST" --measure "$RUNDIR/guests/guest.wasm" | jq -r .PCR16)"
         echo "PCR16 $EXPECTED_PCR16"
+        enclave_measure_substitute
         return
     fi
     say "building the verifier"
@@ -387,11 +407,7 @@ enclave_build_clients() {
         echo "PCR16 $EXPECTED_PCR16"
     fi
 
-    if [[ -n "${WITH_SUBSTITUTE:-}" ]]; then
-        SUBSTITUTE_PCR16="$("$ATTEST" --measure "$RUNDIR/guests/substitute.wasm" | jq -r .PCR16)"
-        [[ "$SUBSTITUTE_PCR16" != "$EXPECTED_PCR16" ]] \
-            || { echo "the substitute guest measures the same as the real one" >&2; exit 1; }
-    fi
+    enclave_measure_substitute
 
     # The client half of the WebAuthn gate. Nothing reaches the guest without a
     # fresh assertion bound to that exact request, and a shell script cannot
@@ -400,6 +416,17 @@ enclave_build_clients() {
         --bin passkey-client ) 2>&1 | tail -2
     PASSKEY="$REPO/target/release/passkey-client"
     [[ -x "$PASSKEY" ]] || { echo "passkey-client did not build" >&2; exit 1; }
+}
+
+# The altered guest run-e2e.sh's leg 8 boots, measured with whichever verifier the run has — the
+# one just built, or the bundle's. It used to be measured only on the build path, so the
+# runtime's own e2e could not run against a pack: leg 8 read a variable nothing had set.
+enclave_measure_substitute() {
+    if [[ -n "${WITH_SUBSTITUTE:-}" ]]; then
+        SUBSTITUTE_PCR16="$("$ATTEST" --measure "$RUNDIR/guests/substitute.wasm" | jq -r .PCR16)"
+        [[ "$SUBSTITUTE_PCR16" != "$EXPECTED_PCR16" ]] \
+            || { echo "the substitute guest measures the same as the real one" >&2; exit 1; }
+    fi
 }
 
 # Two identities, each with its own passkey file, so a caller can show that one
@@ -481,6 +508,12 @@ enclave_start_parent() {
         done
         curl -sf -o /dev/null -X POST --data '{}' http://127.0.0.1:9101/token \
             || { echo "the FCM stub never answered:" >&2; cat "$RUNDIR/fcm-stub.log" >&2; exit 1; }
+        # Answered by *this* stub? Another listener on :9101 answers too (Dart DevTools likes that
+        # port), and then the wake lands there instead — which run-e2e.sh's leg 6b reads as "never
+        # woke anybody", $TIMEOUT seconds later. A warning, not a failure: a run that never looks
+        # at a wake is unaffected.
+        kill -0 "${pids[-1]}" 2>/dev/null \
+            || echo "warning: the FCM stub died — :9101 is taken, so wake signals will go astray ($(tail -1 "$RUNDIR/fcm-stub.log"))" >&2
     fi
 
     # forward-cid 1 turns the guest's vsock connections into host vsock loopback
@@ -841,23 +874,59 @@ enclave_bring_up() {
 # beside it, because it is fixed by the image: a run cannot change it, only read it.
 enclave_pack() {
     enclave_preflight
+    # Packing does not run the image, but it does ship it.
+    docker image inspect "$IMAGE" >/dev/null 2>&1 || {
+        echo "missing QEMU image $IMAGE — build it:" >&2
+        echo "  docker build -t $IMAGE deploy/qemu-nitro" >&2
+        exit 1
+    }
     enclave_build_image
     enclave_build_clients
     nix_build gvproxy "$RUNDIR/gvproxy" >/dev/null
     GV_DIR="$(resolve_out_link "$RUNDIR/gvproxy")"
 
     say "packing into $PACK_DIR"
-    rm -rf "$PACK_DIR"; mkdir -p "$PACK_DIR/eif" "$PACK_DIR/bin"
+    rm -rf "$PACK_DIR"; mkdir -p "$PACK_DIR/eif" "$PACK_DIR/bin" "$PACK_DIR/images"
     cp -L "$EIF_DIR/s3fs-qemu.eif" "$EIF_DIR/pcr.json" "$PACK_DIR/eif/"
     cp -L "$GV_DIR/bin/gvproxy" "$ATTEST" "$PASSKEY" "$VSOCK_BIN" "$PACK_DIR/bin/"
     chmod -R u+w "$PACK_DIR"
+
+    # The harness itself, the MinIO scripts it calls, the wasi-sdk pin a guest build needs, and
+    # the WIT guests are built against — tracked files only, as the image build saw them. A
+    # bundle then runs from its own copy of deploy/qemu-nitro: lib.sh's REPO is the bundle, and
+    # nothing has to be checked out beside it.
+    git -C "$REPO" ls-files -z deploy/qemu-nitro scripts/lib.sh scripts/minio-up.sh \
+        scripts/minio-image.sh scripts/wasi-sdk.sh wit \
+        | (cd "$REPO" && xargs -0 cp --parents -t "$PACK_DIR")
+
+    # The container images, so a host needs to build none. The QEMU image is retagged by content
+    # so two bundles from two builds never claim one tag; MinIO keeps the release tag its script
+    # looks for.
+    local qemu_id qemu_tag minio_image
+    qemu_id="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
+    qemu_tag="s3fs-qemu-nitro:${qemu_id:7:12}"
+    docker tag "$IMAGE" "$qemu_tag"
+    say "saving $qemu_tag"
+    docker save "$qemu_tag" | gzip -1 > "$PACK_DIR/images/qemu.tar.gz"
+    minio_image="$("$REPO/scripts/minio-image.sh")"
+    say "saving $minio_image"
+    docker save "$minio_image" | gzip -1 > "$PACK_DIR/images/minio.tar.gz"
+
     {
         printf 'WEBAUTHN_RP_ID=%q\n' "${WEBAUTHN_RP_ID:-}"
         printf 'WEBAUTHN_ALLOWED_ORIGINS=%q\n' "${WEBAUTHN_ALLOWED_ORIGINS:-}"
         printf 'GUEST_EGRESS_ORIGINS=%q\n' "${GUEST_EGRESS_ORIGINS:-}"
+        printf 'GUEST_ENV=%q\n' "${GUEST_ENV:-}"
+        printf 'BACKGROUND_TIMEOUT_SECS=%q\n' "${BACKGROUND_TIMEOUT_SECS:-}"
         printf 'TLS_DOMAIN=%q\n' "$TLS_DOMAIN"
         printf 'ACME_STAGING=%q\n' "$ACME_STAGING"
+        printf 'ACME_CONTACT=%q\n' "$ACME_CONTACT"
         printf 'FCM_PROJECT=%q\n' "$FCM_PROJECT"
+        printf 'ENCLAVE_RUNTIME_REV=%q\n' "$(git -C "$REPO" describe --always --dirty)"
+        # The images this bundle runs on, unless the caller names others: read before lib.sh
+        # sets its defaults, and exported for the MinIO scripts, which are child processes.
+        printf ': "${QEMU_IMAGE:=%q}"\n' "$qemu_tag"
+        printf 'export MINIO_IMAGE="${MINIO_IMAGE:-%q}"\n' "$minio_image"
     } > "$PACK_DIR/image.env"
     echo "PCR0  $EXPECTED_PCR0"
     du -sh "$PACK_DIR" | cut -f1 | sed 's/^/size  /'

@@ -8,7 +8,13 @@
 #
 # Built in a container rather than on the host so it needs no root there, and
 # so the toolchain is pinned rather than whatever the developer happens to have.
-FROM debian:trixie
+#
+# Two stages. The first has the compilers and is 3.7 GB; the second copies the
+# installed QEMU onto a slim base with its shared libraries and is what
+# `docker build` produces — about 680 MB, 100 MB compressed, which is what
+# makes a bundle that carries the image worth downloading. Nothing runs from
+# the first stage but the build.
+FROM debian:trixie AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git ca-certificates curl xz-utils cpio \
@@ -42,5 +48,17 @@ RUN qemu-system-x86_64 -device help 2>&1 | grep -q virtio-nsm \
 RUN qemu-system-x86_64 --version | head -1 > /qemu-version \
  && qemu-system-x86_64 -M help | grep -i nitro >> /qemu-version \
  && qemu-system-x86_64 -device help 2>&1 | grep -i nsm >> /qemu-version
+
+# The image the harness runs: QEMU and what it links against, and no toolchain.
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libglib2.0-0t64 libpixman-1-0 libslirp0 libcbor0.10 libgnutls30t64 \
+        libfdt1 libzstd1 zlib1g libaio1t64 liburing2 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local /usr/local
+COPY --from=build /qemu-version /qemu-version
+# Fails the build, not the boot, if a library is missing.
+RUN ! ldd /usr/local/bin/qemu-system-x86_64 | grep -q "not found" \
+ && qemu-system-x86_64 -M help | grep -qi nitro
 
 WORKDIR /work
