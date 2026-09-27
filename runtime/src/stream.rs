@@ -39,6 +39,11 @@
 //!      └── per event: invoke the guest's `on-message`, send back what it returns
 //! ```
 //!
+//! Both carry `x-enclave-attestation`: a document binding which of the two it
+//! is, the connection's wire id and the exact body — see [`stream_user_data`].
+//! Without it a service could not tell this enclave from anyone who had learned
+//! an id.
+//!
 //! # What it does not promise
 //!
 //! Delivery is **at least once** in both directions: a reconnect may redeliver,
@@ -64,6 +69,7 @@ use s3fs_core::{Fs, Inode, OpenFlags};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 
+use crate::serve::attest::{ResponseAttestor, ATTESTATION_HEADER};
 use crate::serve::egress::Origin;
 use crate::tenant::ensure_dir;
 
@@ -76,6 +82,42 @@ pub const MAX_MESSAGE: usize = 256 * 1024;
 /// socket and a supervisor; a tenant that could ask for unboundedly many could
 /// exhaust the process on everyone else's behalf.
 const PER_TENANT: usize = 8;
+
+/// Prefixes what a request's attestation binds, so that digest cannot be
+/// mistaken for one made for any other purpose. The NUL is part of it.
+pub const STREAM_DOMAIN: &[u8] = b"enclave-runtime/stream/v1\0";
+/// The held `GET /escrow/stream`. Its body is empty.
+pub const OPEN: &str = "open";
+/// A `POST /escrow/send`. Its body is the message.
+pub const SEND: &str = "send";
+
+/// What an outbound request's attestation document binds as `user_data`:
+///
+/// ```text
+/// SHA-256(STREAM_DOMAIN ‖ kind ‖ 0x00 ‖ wire_id ‖ 0x00 ‖ SHA-256(body))
+/// ```
+///
+/// Which request, whose connection, and exactly the bytes carried — so a
+/// document cannot be moved from an open to a send, onto another connection, or
+/// onto another body. The tenant half of the wire id is the runtime's, never the
+/// guest's, so it also says which customer a message is for. Neither a kind nor
+/// a wire id can hold a NUL, so the layout parses one way; the body goes in as a
+/// digest so the preimage stays small whatever the message.
+pub fn stream_user_data(kind: &str, wire_id: &str, body: &[u8]) -> [u8; 32] {
+    use nitro_attestation::sha256;
+    let body = sha256(body);
+    sha256(
+        &[
+            STREAM_DOMAIN,
+            kind.as_bytes(),
+            b"\0",
+            wire_id.as_bytes(),
+            b"\0",
+            &body,
+        ]
+        .concat(),
+    )
+}
 
 /// Reconnection backoff. Starts quick, because the common failure is a service
 /// restarting, and settles long, because the uncommon one is a service that is
@@ -163,6 +205,9 @@ pub struct StreamRegistry {
     /// `notify_one` leaves a permit, so the next `notified()` returns at once.
     changed: Notify,
     egress: Mutex<Option<crate::serve::EgressPolicy>>,
+    /// What signs each request to the far side. `None` sends them unsigned, and
+    /// a service that checks — every one that should — refuses them.
+    attestor: Mutex<Option<Arc<ResponseAttestor>>>,
     messages: AtomicU64,
     /// The next [`StreamRecord`] generation. Starts at 1, above every record
     /// read back at boot.
@@ -192,6 +237,7 @@ impl StreamRegistry {
             live: Mutex::new(BTreeMap::new()),
             changed: Notify::new(),
             egress: Mutex::new(None),
+            attestor: Mutex::new(None),
             messages: AtomicU64::new(0),
             generations: AtomicU64::new(1),
         });
@@ -230,6 +276,13 @@ impl StreamRegistry {
     /// known, and consulted on every connect rather than only at `open`.
     pub async fn set_egress(&self, egress: crate::serve::EgressPolicy) {
         *self.egress.lock().await = Some(egress);
+    }
+
+    /// What proves each request to the far side comes from this enclave. Set
+    /// once serving starts, to the attestor `/auth/*` responses use — one
+    /// device, one limit on it.
+    pub async fn set_attestor(&self, attestor: Arc<ResponseAttestor>) {
+        *self.attestor.lock().await = Some(attestor);
     }
 
     pub async fn open(&self, tenant: [u8; 16], id: String, origin: String) -> Result<()> {
@@ -332,15 +385,7 @@ impl StreamRegistry {
         let held = egress
             .send_direct(
                 origin,
-                hyper::Request::builder()
-                    .method(hyper::Method::POST)
-                    .uri(format!(
-                        "{}/escrow/send?id={}",
-                        record.origin,
-                        record.wire_id()
-                    ))
-                    .header("content-type", "application/octet-stream")
-                    .body(body_from(payload))?,
+                self.request(SEND, &record, payload).await?,
                 Duration::from_secs(30),
             )
             .await
@@ -365,6 +410,52 @@ impl StreamRegistry {
             }
             _ => bail!("{origin:?} is not an origin this image allows"),
         }
+    }
+
+    /// The request for one exchange with the far side, attested if this runtime
+    /// attests.
+    ///
+    /// Both shapes are built here so what is signed cannot drift from what is
+    /// sent: `kind` picks the method and path as well as going into the proof,
+    /// the wire id is the one the URL names, and the body is hashed from the very
+    /// bytes that become it. With no attestor there is no header and a service
+    /// refuses — see "What proves the enclave to the service" in
+    /// `docs/STREAMING.md`.
+    async fn request(
+        &self,
+        kind: &str,
+        record: &StreamRecord,
+        body: Vec<u8>,
+    ) -> Result<hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>> {
+        let wire_id = record.wire_id();
+        let (method, path, (name, value)) = if kind == OPEN {
+            (
+                hyper::Method::GET,
+                "stream",
+                ("accept", "text/event-stream"),
+            )
+        } else {
+            (
+                hyper::Method::POST,
+                "send",
+                ("content-type", "application/octet-stream"),
+            )
+        };
+        let mut request = hyper::Request::builder()
+            .method(method)
+            .uri(format!("{}/escrow/{path}?id={wire_id}", record.origin))
+            .header(name, value);
+        // Out of the lock before signing: held across the device call, it would
+        // queue every connection's requests behind one signature at a time.
+        let attestor = self.attestor.lock().await.clone();
+        if let Some(attestor) = attestor {
+            let document = attestor
+                .stream_document(stream_user_data(kind, &wire_id, &body))
+                .await
+                .map_err(|e| anyhow::anyhow!("attesting a stream {kind}: {e}"))?;
+            request = request.header(ATTESTATION_HEADER, document);
+        }
+        Ok(request.body(body_from(body))?)
     }
 
     async fn publish(&self, record: &StreamRecord) -> Result<()> {
@@ -497,15 +588,7 @@ impl StreamRegistry {
 
         let origin = Origin::parse(&record.origin)?;
         let egress = self.admit(&origin).await?;
-        let request = hyper::Request::builder()
-            .method(hyper::Method::GET)
-            .uri(format!(
-                "{}/escrow/stream?id={}",
-                record.origin,
-                record.wire_id()
-            ))
-            .header("accept", "text/event-stream")
-            .body(empty_body())?;
+        let request = self.request(OPEN, record, Vec::new()).await?;
 
         // A long first-byte timeout: a service with nothing to say yet is the
         // normal case, not a broken one.
@@ -639,13 +722,8 @@ fn base64_decode(s: &str) -> Result<Vec<u8>> {
     Ok(base64::engine::general_purpose::STANDARD.decode(s)?)
 }
 
-fn empty_body() -> wasmtime_wasi_http::p2::body::HyperOutgoingBody {
-    use http_body_util::{BodyExt, Empty};
-    Empty::<bytes::Bytes>::new()
-        .map_err(|e: std::convert::Infallible| match e {})
-        .boxed_unsync()
-}
-
+/// Empty bytes make an empty body — `Full` of nothing is end-of-stream at once,
+/// exactly as `Empty` is — so the held `GET` uses this too.
 fn body_from(bytes: Vec<u8>) -> wasmtime_wasi_http::p2::body::HyperOutgoingBody {
     use http_body_util::{BodyExt, Full};
     Full::new(bytes::Bytes::from(bytes))
@@ -912,6 +990,69 @@ mod tests {
             .unwrap();
         let err = r.send([1; 16], "esc", vec![1, 2, 3]).await.unwrap_err();
         assert!(format!("{err:#}").contains("not connected"), "{err:#}");
+    }
+
+    // --- Attestation ---------------------------------------------------------
+
+    /// Pinned, so a service can pin the same values. Computed outside this crate —
+    /// `{ printf 'enclave-runtime/stream/v1\0send\0%s\0' "$WIRE_ID"; printf hello |
+    /// sha256sum | cut -d' ' -f1 | xxd -r -p; } | sha256sum`, and likewise for `open` over
+    /// no bytes — because this implementation checked against itself would prove nothing.
+    #[test]
+    fn what_a_request_binds_is_pinned() {
+        let wire_id = "01010101010101010101010101010101-esc";
+        assert_eq!(
+            hex::encode(stream_user_data(OPEN, wire_id, b"")),
+            "f9a46679b41ae322117cb08515fefa42b1c53a7d24aa472eedde9650a6d7fb82"
+        );
+        assert_eq!(
+            hex::encode(stream_user_data(SEND, wire_id, b"hello")),
+            "c828be10c689f688431ce5ecb5ca9870a03f8ac375956733fa755150bdd6fa7c"
+        );
+    }
+
+    /// Once the runtime has an attestor, each request carries a document binding
+    /// which of the two it is, whose connection, and the bytes it actually sends —
+    /// and before, none: nothing goes in its place, so a service that checks refuses.
+    ///
+    /// Read back out of the header a service reads, from a device that signs what
+    /// it is asked to bind, rather than from the runtime's own intermediate values.
+    #[tokio::test]
+    async fn every_request_is_signed_over_exactly_what_it_sends() {
+        use base64::Engine;
+        use http_body_util::BodyExt;
+
+        let (r, _fs) = registry().await;
+        let record = StreamRecord {
+            version: 1,
+            tenant: [1; 16],
+            id: "esc".into(),
+            origin: "https://svc.example".into(),
+            generation: 0,
+        };
+        let unsigned = r.request(SEND, &record, b"x".to_vec()).await.unwrap();
+        assert!(unsigned.headers().get(ATTESTATION_HEADER).is_none());
+
+        let nsm = crate::testing::SigningNsm::new().unwrap();
+        r.set_attestor(Arc::new(ResponseAttestor::new(Arc::new(nsm), b"g")))
+            .await;
+        for (kind, method, body) in [(OPEN, "GET", &b""[..]), (SEND, "POST", &b"a message"[..])] {
+            let request = r.request(kind, &record, body.to_vec()).await.unwrap();
+            assert_eq!(request.method(), method);
+            // What a service recomputes from: the `id` it was sent, and the body it got.
+            let query = format!("id={}", record.wire_id());
+            assert_eq!(request.uri().query(), Some(query.as_str()));
+            let header = request.headers().get(ATTESTATION_HEADER).expect("unsigned");
+            let cose = base64::engine::general_purpose::STANDARD
+                .decode(header)
+                .unwrap();
+            let document = nitro_attestation::parse(&cose).unwrap();
+            let bound = stream_user_data(kind, &record.wire_id(), body);
+            assert_eq!(document.user_data.as_deref(), Some(&bound[..]), "{kind}");
+            assert_eq!(document.nonce, None);
+            let sent = request.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(sent, body, "the bytes bound are the bytes sent");
+        }
     }
 
     // --- Framing -------------------------------------------------------------

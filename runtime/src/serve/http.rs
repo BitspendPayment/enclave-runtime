@@ -1361,6 +1361,12 @@ impl Server {
                 "held connections require authentication"
             );
             streams.set_egress(self.guest.egress.clone()).await;
+            // The attestor `/auth/*` uses, not a second one: one device, and one
+            // limit on it for both directions. Set before the supervisor starts,
+            // so not even the first dial after a restart goes out unsigned.
+            if let Some(attestor) = &self.attestor {
+                streams.set_attestor(attestor.clone()).await;
+            }
             scheduler.spawn(streams.clone().run(self.guest.clone()));
         }
         let listener = TcpListener::bind(self.addr)

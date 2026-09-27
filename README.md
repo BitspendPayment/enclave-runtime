@@ -360,7 +360,7 @@ GET  <origin>/escrow/stream?id=<tenant-hex>-<stream-id>
 POST <origin>/escrow/send?id=<tenant-hex>-<stream-id>
 ```
 
-SSE `data` contains base64 bytes; an `id` supplies message identity, with a content-derived fallback when absent. The tenant prefix prevents the same guest-local name from colliding across users. The runtime limits a tenant to eight connections and each message to 256 KiB, with reconnect delays from one second up to five minutes. The origin policy is checked again on reconnect.
+SSE `data` contains base64 bytes; an `id` supplies message identity, with a content-derived fallback when absent. The tenant prefix prevents the same guest-local name from colliding across users. Both requests carry `x-enclave-attestation`, a document binding the wire id and the exact body, so a peer can tell the enclave from anyone who can reach its URL — see [streaming](docs/STREAMING.md). The runtime limits a tenant to eight connections and each message to 256 KiB, with reconnect delays from one second up to five minutes. The origin policy is checked again on reconnect.
 
 Connection instructions are durable; messages are not a durable inbox/outbox. Deduplicate replayed IDs in the application and arrange replay/acknowledgment with the peer. Do not infer exactly-once delivery or lossless recovery from an SSE reconnect. Closing and reopening a stream, to the same origin or another, drops the old connection and dials a new one.
 

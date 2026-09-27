@@ -51,6 +51,14 @@
 //! sent, and treat a *missing* header as a failure. Without the last of those,
 //! an attacker who strips the header downgrades every client that does not
 //! check.
+//!
+//! # And the other way
+//!
+//! The same device also signs every request of a connection the runtime holds
+//! for a guest ([`crate::stream`]), under the same header and the same limit —
+//! bound to that request's bytes rather than to a connection, because there the
+//! enclave is the client. [`ResponseAttestor::stream_document`] makes those;
+//! `docs/STREAMING.md` says what a service checks.
 
 use std::sync::Arc;
 
@@ -87,7 +95,8 @@ pub const MAX_DOCUMENT_HEADER_BYTES: usize = 16 * 1024;
 /// Each document is an ECDSA P-384 signature on the device, and the device is
 /// one device. This is what stops attestation exhausting the NSM or the
 /// blocking pool — and, because it is now on the path of *every* request, it is
-/// also the runtime's throughput ceiling.
+/// also the runtime's throughput ceiling. Every dial and every message of a held
+/// connection spends one too, under the same limit.
 const CONCURRENT_DOCUMENTS: usize = 4;
 
 /// Why a nonce was not acceptable.
@@ -191,7 +200,7 @@ impl std::fmt::Display for AttestError {
     }
 }
 
-/// Produces one document per response.
+/// Produces one document per response, and one per outbound stream request.
 pub struct ResponseAttestor {
     nsm: Arc<dyn Nsm>,
     guest: [u8; 32],
@@ -217,21 +226,6 @@ impl ResponseAttestor {
     }
 
     /// A document binding `nonce` and the leaf this connection was served.
-    ///
-    /// The permit is taken **before** the blocking call, not inside it: tokio's
-    /// blocking pool queues without bound, so acquiring inside would convert a
-    /// burst into thread growth rather than backpressure.
-    ///
-    /// It is then *moved into* the closure, and this is load-bearing. A
-    /// `spawn_blocking` task cannot be cancelled — dropping its `JoinHandle`
-    /// only detaches it, and the ioctl runs to completion regardless. A permit
-    /// merely borrowed by this future would therefore be released the moment a
-    /// caller went away while the device was still working, letting the next
-    /// request start a call the limit was supposed to hold back. Since this
-    /// runs before the request is routed, and so before any auth gate, a peer
-    /// that connects and disconnects in a loop could drive the device past
-    /// `CONCURRENT_DOCUMENTS` without ever authenticating. Owning the permit
-    /// ties its lifetime to the work rather than to the waiter.
     pub async fn document(
         &self,
         certificate: Option<&[u8]>,
@@ -247,8 +241,41 @@ impl ResponseAttestor {
             guest: self.guest,
         }
         .serialize();
-        let request = AttestationRequest::with_user_data(user_data).nonce(nonce.0.clone());
+        self.sign(AttestationRequest::with_user_data(user_data).nonce(nonce.0.clone()))
+            .await
+    }
 
+    /// A document for one outbound stream request, binding `user_data` alone —
+    /// [`crate::stream::stream_user_data`] says what that is.
+    ///
+    /// No nonce, because nobody is there to choose one: the service first hears
+    /// of the request when it arrives, and asking it for a nonce would be a
+    /// round trip per message. Its freshness is the document's own timestamp,
+    /// which the service bounds. No certificate either — the enclave is the
+    /// client here, and the guest is PCR16's to name. Smaller than what
+    /// [`Self::verify_fits`] sized at boot, so that check covers this too.
+    pub async fn stream_document(&self, user_data: [u8; 32]) -> Result<HeaderValue, AttestError> {
+        self.sign(AttestationRequest::with_user_data(user_data.to_vec()))
+            .await
+    }
+
+    /// One signature from the device, under the limit both callers share.
+    ///
+    /// The permit is taken **before** the blocking call, not inside it: tokio's
+    /// blocking pool queues without bound, so acquiring inside would convert a
+    /// burst into thread growth rather than backpressure.
+    ///
+    /// It is then *moved into* the closure, and this is load-bearing. A
+    /// `spawn_blocking` task cannot be cancelled — dropping its `JoinHandle`
+    /// only detaches it, and the ioctl runs to completion regardless. A permit
+    /// merely borrowed by this future would therefore be released the moment a
+    /// caller went away while the device was still working, letting the next
+    /// request start a call the limit was supposed to hold back. Since this
+    /// runs before the request is routed, and so before any auth gate, a peer
+    /// that connects and disconnects in a loop could drive the device past
+    /// `CONCURRENT_DOCUMENTS` without ever authenticating. Owning the permit
+    /// ties its lifetime to the work rather than to the waiter.
+    async fn sign(&self, request: AttestationRequest) -> Result<HeaderValue, AttestError> {
         let permit = self
             .limit
             .clone()

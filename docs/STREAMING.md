@@ -143,6 +143,82 @@ enclave terminates it and is alive now. It says nothing about individual
 messages and nothing about signing results, because it is generated before the
 guest runs.
 
+## What proves the enclave to the service
+
+Everything above is a client calling in. The held connections of
+[`enclave:streams/connection`](../wit/stream/stream.wit) run the other way: the
+runtime dials the service and holds `GET <origin>/escrow/stream?id=<wire id>`
+open for server-sent events, and sends each message as
+`POST <origin>/escrow/send?id=<wire id>`. There the enclave is the client, and
+the service has to tell this image from anyone who has learned a wire id — a
+customer running a cosigner of their own, say.
+
+So the runtime signs both. Each carries `x-enclave-attestation`: an NSM
+attestation document (COSE_Sign1), standard base64 with padding — the header
+and encoding of an `/auth/*` response. Its `user_data` is 32 bytes:
+
+```text
+SHA-256( "enclave-runtime/stream/v1" 0x00  kind 0x00  wire_id 0x00  SHA-256(body) )
+```
+
+| request | `kind` | `wire_id` | `body` |
+|---|---|---|---|
+| `GET /escrow/stream` | `open` | the `id` query parameter | empty |
+| `POST /escrow/send` | `send` | the `id` query parameter | the request body, byte for byte |
+
+The wire id is `<tenant hex>-<stream id>`, URL-safe as sent. Its tenant half
+comes from the authenticated invocation, never from the guest, so a document
+also says whose connection a message belongs to. There is no nonce — the
+service first hears of a request when it arrives, and asking it for one would
+cost a round trip per message — and no public key. A pinned vector, from
+`stream_user_data` in `runtime/src/stream.rs`: with wire id
+`01010101010101010101010101010101-esc`, `open` over no bytes is
+`f9a46679b41ae322117cb08515fefa42b1c53a7d24aa472eedde9650a6d7fb82` and `send`
+over `hello` is
+`c828be10c689f688431ce5ecb5ca9870a03f8ac375956733fa755150bdd6fa7c`.
+
+### What a service checks, before acting on the body
+
+1. **Signature and chain** to the root it pins: AWS's Nitro root in
+   production. In development, the root the dev enclave mints and prints at
+   each boot ([DEV_ENCLAVE.md](DEV_ENCLAVE.md)) — which proves only that the
+   image produced the document, not who ran it.
+2. **PCR0 and PCR16, both pinned.** PCR0 is the runtime image, PCR16 the guest
+   it measured. Neither alone is an identity: any runtime can write a
+   convincing PCR16, and PCR0 does not contain the guest.
+3. **Freshness**: the document's `timestamp` within five minutes of the
+   service's clock. With no nonce, this is the only bound on replay.
+4. **`user_data`**, recomputed from the `id` it was sent and the exact body it
+   received, compared byte for byte.
+5. **For `open`, only a newer document replaces a held stream.** A `GET` whose
+   document is no newer than the one the live stream for that wire id was
+   opened with is refused, or a `GET` replayed inside the window could take a
+   live connection over.
+6. **A missing header is a refusal**, never a downgrade. A runtime with no
+   attestor configured sends none, and is meant to be refused.
+
+### What it costs
+
+**One NSM signature per message, and one per dial**, under the same
+four-at-a-time limit as `/auth/*` responses: the device is one device.
+
+**The header is a few KB**: about 3.3 KB of base64 from the dev enclave, and
+6–8 KB expected on hardware, whose certificate bundle is larger. The runtime
+refuses to start if a document would exceed 16 KiB. Anything in front of the
+service must accept a request header of **~16 KB** — nginx's default
+`large_client_header_buffers 4 8k` leaves no room for a document from hardware.
+
+### What it does not prove
+
+- **Which service it was for.** Nothing names the origin: a document one
+  service received is good, for five minutes, at any other that accepts the
+  same wire id.
+- **That a `send` is new.** One replayed inside the window is a duplicate, not
+  a forgery, and delivery is at least once anyway — handlers deduplicate as
+  they already must.
+- **Anything about the service.** What arrives down the held stream is
+  authenticated by TLS and the egress allowlist, not by this.
+
 ## Known limits
 
 - **One task, alternating.** The guest reads and writes in turn rather than
