@@ -310,12 +310,16 @@
           S3FS_GUEST_OBJECT = deployment.guestObject;
           S3FS_BACKGROUND_TASKS = lib.boolToString deployment.backgroundTasks;
           S3FS_BACKGROUND_CONCURRENCY = toString deployment.backgroundConcurrency;
-          # Push notifications. Empty means off. The credential is named, never
-          # carried: baking a service-account key into the image would put it in
-          # every copy of the image and pin it to a PCR0 it has no reason to
-          # move with.
-          S3FS_FCM_PROJECT_ID = deployment.fcmProjectId;
-          S3FS_FCM_SERVICE_ACCOUNT_PARAMETER = deployment.fcmServiceAccountParameter;
+          # Push notifications, through an AWS End User Messaging Push
+          # application. Empty means off. Only the application is named: its FCM
+          # channel holds the Firebase credential, and the runtime signs as the
+          # instance's role, so no image carries a secret.
+          S3FS_PUSH_APP_ID = deployment.pushAppId;
+          # The instance's role, for the runtime alone: gvproxy maps this one
+          # address to the metadata service, which a guest cannot reach at any
+          # address (`serve::egress` refuses the whole proxy network). `AWS_*`
+          # never reaches a guest either.
+          AWS_EC2_METADATA_SERVICE_ENDPOINT = "http://192.168.127.253";
           S3FS_HTTP_LISTEN = "0.0.0.0:443";
           # ACME, not self-signed: a platform authenticator will not attest
           # against a certificate a browser does not trust, so a self-signed one
@@ -374,16 +378,7 @@
           # Registration is open: anyone who can reach the port may create a
           # tenant of their own. There is nothing to provision, and nothing an
           # image could leak by carrying it.
-        }
-        # Set only when used, so an image that names no origins and keeps the
-        # default timeout is the image it was before these settings existed.
-        // lib.optionalAttrs (deployment.guestEgressOrigins != [ ]) {
-          S3FS_GUEST_EGRESS_ORIGINS = lib.concatStringsSep "," deployment.guestEgressOrigins;
-        }
-        // lib.optionalAttrs (deployment.backgroundTimeoutSecs != null) {
-          S3FS_BACKGROUND_TIMEOUT_SECS = toString deployment.backgroundTimeoutSecs;
-        }
-        // deployment.guestEnv;
+        };
       };
 
       # The runtime configured for the emulator, as a function of the relying
@@ -397,13 +392,6 @@
       eifQemu = {
         rpId ? "enclave.test",
         allowedOrigins ? [ ],
-        # Origins the guest may reach — see `guestEgressOrigins` in
-        # deploy/nix/deployment.nix. The dev stack's host is 192.168.127.254.
-        guestEgressOrigins ? [ ],
-        backgroundTimeoutSecs ? null,
-        # Variables for the guest, e.g. the address of the service it may reach. The guest inherits
-        # the image environment minus `AWS_*` and `S3FS_*`, so a plain name reaches it.
-        guestEnv ? { },
         # The certificate. The defaults are Pebble on the harness host, for `enclave.test`. An emulator
         # on a public host passes its real name and a real CA instead — `dev-enclave.sh --domain` —
         # with `acmeCa = null`, since a public CA's API needs no trust root shipped in the image.
@@ -411,10 +399,10 @@
         acmeDirectory ? "https://192.168.127.254:14000/dir",
         acmeCa ? "/pebble-ca.pem",
         acmeContacts ? [ ],
-        # Real notifications: `{ projectId; serviceAccountFile; }`, the file a Firebase service
-        # account's JSON key. Null keeps the stub. The credential is baked into the image like every
-        # other setting here, so it lands in the Nix store and the EIF of whoever builds this.
-        fcm ? null,
+        # Real notifications: the AWS End User Messaging Push application to send through, signed as
+        # the host's instance role (gvproxy maps `.253` to its metadata service). Null keeps the
+        # stub on the host. Not a secret: the application's FCM channel holds the credential.
+        pushAppId ? null,
       }: callEif (runtimeImage // {
         payload = runtimeImage.payload // {
           "enclave-runtime" = "${enclave-runtime-testing}/bin/enclave-runtime";
@@ -490,17 +478,13 @@
           # downstream moves. The guest is guest-http, which exports the
           # `run-task` the runtime refuses to start without when this is set.
           S3FS_BACKGROUND_TASKS = "true";
-          # Notifications, against a stub on the host rather than Google —
-          # which is unreachable from here and would refuse an invented
-          # registration token anyway. What the e2e checks is what the
-          # *runtime* sends, and the stub records exactly that.
-          #
-          # A literal credential, not an SSM parameter: there is no SSM here.
-          # It is a throwaway key in a test image, and the `http://` endpoint
-          # is the same downgrade `--guest-log-endpoint` already is. PCR0
-          # records that this image was built with both.
-          S3FS_FCM_PROJECT_ID = "e2e";
-          S3FS_FCM_SERVICE_ACCOUNT = builtins.readFile ./deploy/qemu-nitro/fcm/service-account.json;
+          # Notifications, against a stub on the host rather than AWS — which
+          # would refuse an invented registration token anyway. What the e2e
+          # checks is what the *runtime* sends, and the stub records exactly
+          # that. The `http://` endpoint is the same downgrade
+          # `--guest-log-endpoint` already is, and PCR0 records it. A real
+          # application replaces both below.
+          S3FS_PUSH_APP_ID = "e2e";
           # Off. Inherited from the production image, and there is no AWS
           # here to send to: the harness's credentials are MinIO's, which
           # CloudWatch would reject. Empty means off — the same shape as the
@@ -532,19 +516,13 @@
           S3FS_ACME_CA = acmeCa;
         } // nixpkgs.lib.optionalAttrs (acmeContacts != [ ]) {
           S3FS_ACME_CONTACTS = nixpkgs.lib.concatStringsSep "," acmeContacts;
-        } // nixpkgs.lib.optionalAttrs (fcm == null) {
-          S3FS_FCM_ENDPOINT = "http://192.168.127.254:9101";
-        } // nixpkgs.lib.optionalAttrs (fcm != null) {
-          S3FS_FCM_PROJECT_ID = fcm.projectId;
-          # One line: the image's environment file is `KEY=value` per line.
-          S3FS_FCM_SERVICE_ACCOUNT = builtins.toJSON (builtins.fromJSON (builtins.readFile fcm.serviceAccountFile));
+        } // nixpkgs.lib.optionalAttrs (pushAppId == null) {
+          S3FS_PUSH_ENDPOINT = "http://192.168.127.254:9101";
+        } // nixpkgs.lib.optionalAttrs (pushAppId != null) {
+          S3FS_PUSH_APP_ID = pushAppId;
         } // nixpkgs.lib.optionalAttrs (allowedOrigins != [ ]) {
           S3FS_WEBAUTHN_ALLOWED_ORIGINS = nixpkgs.lib.concatStringsSep "," allowedOrigins;
-        } // nixpkgs.lib.optionalAttrs (guestEgressOrigins != [ ]) {
-          S3FS_GUEST_EGRESS_ORIGINS = nixpkgs.lib.concatStringsSep "," guestEgressOrigins;
-        } // nixpkgs.lib.optionalAttrs (backgroundTimeoutSecs != null) {
-          S3FS_BACKGROUND_TIMEOUT_SECS = toString backgroundTimeoutSecs;
-        } // guestEnv;
+        };
       });
 
     in

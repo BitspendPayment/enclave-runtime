@@ -330,8 +330,8 @@ say "6/8  work approved once runs later, without a second assertion"
 # Enrolled first, or there is nobody to wake when the task finishes. This is an
 # ordinary signed interaction: enrolling is interactive-only, so it could not
 # have been done by the background work itself.
-FCM_TOKEN="e2e-device:APA91bEnclaveRuntimeHarnessToken0123456789"
-signed post --path /devices --body "$FCM_TOKEN" >/dev/null \
+DEVICE_TOKEN="e2e-device:APA91bEnclaveRuntimeHarnessToken0123456789"
+signed post --path /devices --body "$DEVICE_TOKEN" >/dev/null \
     || fail "enrolling a device was refused"
 [[ "$(signed get --path /devices)" == "1" ]] \
     || fail "the device did not enrol"
@@ -367,29 +367,39 @@ result="$(jq -r '.result | implode' <<<"$record")"
     || fail "the task completed but produced \"$result\""
 echo "scheduled work ran for its owner alone, with no second assertion signed"
 
-say "6b/8 the finished task woke its owner, and told Google nothing"
+say "6b/8 the finished task woke its owner, and told AWS and Google nothing"
 # The wake was raised inside `run-task`, by background work, with nobody signing
 # anything at that moment — and it left the enclave as a *data-only* message.
 #
-# That absence is the property: an FCM payload crosses the parent instance and
-# then Google, so a title or a body would disclose to both exactly what this
+# That absence is the property: a wake crosses the parent instance, AWS and then
+# Google, so a title or a body would disclose to all three exactly what this
 # enclave exists to keep from them. The app wakes and fetches the detail over
 # its own attested connection.
 recorded=""
 for _ in $(seq "$TIMEOUT"); do
-    [[ -s "$FCM_RECORD" ]] && { recorded=1; break; }
+    [[ -s "$PUSH_RECORD" ]] && { recorded=1; break; }
     sleep 1
 done
 [[ -n "$recorded" ]] || fail "the finished task never woke anybody"
 
-wake="$(head -1 "$FCM_RECORD")"
+wake="$(head -1 "$PUSH_RECORD")"
+# Sent as the push service's own call, signed for it, and as `RawContent` alone: a structured GCM
+# field would wrap the data where an app never looks.
+echo "$wake" | jq -e '.request_keys == ["Addresses", "MessageConfiguration"]' >/dev/null \
+    || fail "the wake was not a plain SendMessages request: $wake"
+echo "$wake" | jq -e '.configuration == ["RawContent"]' >/dev/null \
+    || fail "the wake carried more than RawContent: $wake"
+[[ "$(echo "$wake" | jq -r '.channel')" == "GCM" ]] \
+    || fail "the wake was not addressed to an FCM token: $wake"
+[[ "$(echo "$wake" | jq -r '.authorization')" == AWS4-HMAC-SHA256\ Credential=*/mobiletargeting/aws4_request,* ]] \
+    || fail "the wake was not signed for the push service: $wake"
 echo "$wake" | jq -e '.message.notification == null' >/dev/null \
     || fail "the wake carried a notification block: $wake"
 [[ "$(echo "$wake" | jq -r '.message.data.category')" == "task-done" ]] \
     || fail "unexpected category: $wake"
 [[ "$(echo "$wake" | jq -r '.message.data.ref')" == "e2e-job" ]] \
     || fail "the wake did not name the task: $wake"
-[[ "$(echo "$wake" | jq -r '.message.token')" == "$FCM_TOKEN" ]] \
+[[ "$(echo "$wake" | jq -r '.token')" == "$DEVICE_TOKEN" ]] \
     || fail "the wake went to a device nobody enrolled: $wake"
 [[ "$(echo "$wake" | jq -r '.message.apns.payload.aps."content-available"')" == "1" ]] \
     || fail "the wake would not have woken an iOS app: $wake"

@@ -1,7 +1,7 @@
 //! Which devices a tenant can be woken on.
 //!
 //! A registration token is a capability: whoever holds one can wake that device
-//! from anywhere, as this Firebase project. So tokens live at
+//! from anywhere, through the Firebase project it was issued for. So tokens live at
 //! `/runtime/devices/<tenant>/`, above every tenant scope and unreachable from
 //! any guest — the same placement, and the same reason, as
 //! [`crate::auth::credential`]. A guest enrols one and asks for a count; it

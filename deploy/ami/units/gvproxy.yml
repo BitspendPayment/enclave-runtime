@@ -1,0 +1,16 @@
+# gvproxy's network for the enclave, written down rather than left to its defaults.
+#
+# - The enclave's address: gvforwarder's fixed MAC gets 192.168.127.2 from gvproxy's DHCP, which
+#   is where inbound :443 is forwarded.
+# - The instance metadata service, for the runtime's instance role, at 192.168.127.253 and
+#   nowhere else. `-ec2-metadata-access` would open all of 169.254/16 to everything in the
+#   enclave; this opens one address, which the runtime refuses to any guest along with the rest of
+#   the proxy's network (runtime/src/serve/egress.rs). gvproxy dials from this host, so the
+#   metadata service's hop limit of 1 still holds.
+#
+# A configuration file also leaves out defaults nothing here uses: the parent's loopback on
+# 192.168.127.254, an ssh forward into the enclave, and DNS names for the host.
+stack:
+  nat: { "192.168.127.253": "169.254.169.254" }
+  gatewayVirtualIPs: [ "192.168.127.253" ]
+  dhcpStaticLeases: { "192.168.127.2": "5a:94:ef:e4:0c:ee" }

@@ -25,9 +25,11 @@ build rather than a published number — and leaves the production default alone
 | Setting | Default | Purpose |
 |---|---:|---|
 | `S3FS_BACKGROUND_CONCURRENCY` | 1 | Maximum active background workers |
-| `S3FS_BACKGROUND_TIMEOUT_SECS` | 30 | Maximum duration of one guest attempt |
 | `S3FS_BACKGROUND_MAX_RECORDS` | 1024 | Total durable records, including terminal tasks |
 | `S3FS_BACKGROUND_PER_TENANT` | 64 | Records allowed per tenant |
+
+One guest attempt may run 600 seconds, and that is not a setting: work that drives a round with
+an outside service waits on its schedule, which is minutes.
 
 All limits must be positive. Background workers have separate admission from
 interactive requests and yield on epoch ticks. They use the same tenant lock,

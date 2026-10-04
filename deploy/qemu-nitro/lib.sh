@@ -21,7 +21,7 @@
 #   PREFIX        names the run: $WORK/$PREFIX, and every container and docker
 #                 label. Default `e2e`. It keeps two runs' files and containers
 #                 apart; it does not let them run at the same time, because
-#                 MinIO's :9000, the FCM stub's :9101 and the enclave's vsock CID
+#                 MinIO's :9000, the push stub's :9101 and the enclave's vsock CID
 #                 are fixed — the last two by the image, which dials them.
 #   HTTPS_PORT    host port gvproxy forwards to the enclave's :443, and the
 #                 port Pebble validates against. Default 8443.
@@ -35,8 +35,9 @@
 #   TLS_DOMAIN    serve this name with a certificate from Let's Encrypt instead
 #                 of enclave.test from Pebble — for an emulator on a public host.
 #                 ACME_STAGING picks the staging CA, ACME_CONTACT its contact.
-#   FCM_PROJECT / FCM_SERVICE_ACCOUNT
-#                 real Firebase notifications instead of the stub.
+#   PUSH_APP_ID   real notifications through that AWS End User Messaging Push
+#                 application, signed as this host's instance role, instead of
+#                 the stub.
 #   PACK_DIR      build everything a run needs into this directory and stop.
 #   BUNDLE        run from a directory PACK_DIR made: no Nix, no cargo, no git
 #                 on this machine — see `enclave_pack`.
@@ -79,8 +80,7 @@ STORE_BIND="${STORE_BIND:-}"
 TLS_DOMAIN="${TLS_DOMAIN:-}"
 ACME_STAGING="${ACME_STAGING:-}"
 ACME_CONTACT="${ACME_CONTACT:-}"
-FCM_PROJECT="${FCM_PROJECT:-}"
-FCM_SERVICE_ACCOUNT="${FCM_SERVICE_ACCOUNT:-}"
+PUSH_APP_ID="${PUSH_APP_ID:-}"
 PACK_DIR="${PACK_DIR:-}"
 
 LETS_ENCRYPT_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory
@@ -127,7 +127,7 @@ enclave_preflight() {
     # inside the EIF derivation as a bare "cp: cannot stat", naming a store path
     # that does not contain it — true, and useless. Checked here instead.
     local f
-    for f in pebble/ca.pem pebble/cert.pem pebble/key.pem fcm/service-account.json; do
+    for f in pebble/ca.pem pebble/cert.pem pebble/key.pem; do
         git -C "$REPO" ls-files --error-unmatch "deploy/qemu-nitro/$f" >/dev/null 2>&1 || {
             echo "deploy/qemu-nitro/$f is not tracked by git, so nix cannot see it." >&2
             echo "  git add deploy/qemu-nitro/" >&2
@@ -298,7 +298,7 @@ enclave_build_image() {
         return
     fi
     say "building the enclave image"
-    if [[ -n "${WEBAUTHN_RP_ID:-}${GUEST_EGRESS_ORIGINS:-}${BACKGROUND_TIMEOUT_SECS:-}${GUEST_ENV:-}${TLS_DOMAIN}${FCM_PROJECT}" ]]; then
+    if [[ -n "${WEBAUTHN_RP_ID:-}${TLS_DOMAIN}${PUSH_APP_ID}" ]]; then
         # The same image configured differently. Not a package — flake outputs take no arguments —
         # so the flake's `lib.eifQemu` is called directly, which reading the flake by path needs
         # --impure for. dev-enclave.sh has already held every value to a shape that cannot break
@@ -313,16 +313,6 @@ enclave_build_image() {
         [[ -n "${WEBAUTHN_RP_ID:-}" ]] && args+=" rpId = \"$WEBAUTHN_RP_ID\";"
         [[ -n "${WEBAUTHN_ALLOWED_ORIGINS:-}" ]] \
             && args+=" allowedOrigins = $(nix_list "$WEBAUTHN_ALLOWED_ORIGINS");"
-        [[ -n "${GUEST_EGRESS_ORIGINS:-}" ]] \
-            && args+=" guestEgressOrigins = $(nix_list "$GUEST_EGRESS_ORIGINS");"
-        [[ -n "${BACKGROUND_TIMEOUT_SECS:-}" ]] \
-            && args+=" backgroundTimeoutSecs = $BACKGROUND_TIMEOUT_SECS;"
-        if [[ -n "${GUEST_ENV:-}" ]]; then
-            local env_attrs="" kv
-            IFS=, read -ra kvs <<<"$GUEST_ENV"
-            for kv in "${kvs[@]}"; do env_attrs+=" ${kv%%=*} = \"${kv#*=}\";"; done
-            args+=" guestEnv = {$env_attrs };"
-        fi
         if [[ -n "$TLS_DOMAIN" ]]; then
             local directory="$LETS_ENCRYPT_DIRECTORY"
             [[ -n "$ACME_STAGING" ]] && directory="$LETS_ENCRYPT_STAGING_DIRECTORY"
@@ -330,9 +320,7 @@ enclave_build_image() {
             # A bare address: the runtime adds the mailto: scheme itself.
             [[ -n "$ACME_CONTACT" ]] && args+=" acmeContacts = [ \"$ACME_CONTACT\" ];"
         fi
-        if [[ -n "$FCM_PROJECT" ]]; then
-            args+=" fcm = { projectId = \"$FCM_PROJECT\"; serviceAccountFile = $FCM_SERVICE_ACCOUNT; };"
-        fi
+        [[ -n "$PUSH_APP_ID" ]] && args+=" pushAppId = \"$PUSH_APP_ID\";"
         nix_expr "eif-qemu (${args# })" "$RUNDIR/eif" \
             "((builtins.getFlake \"git+file://$REPO\").lib.\${builtins.currentSystem}.eifQemu {$args })"
     else
@@ -364,6 +352,17 @@ enclave_build_guest() {
         EXPECTED_PCR16="$(jq -r .PCR16 "$GUEST_DIR/guest-pcr16.json")"
         install -m 0644 "$GUEST_DIR/guest.wasm" "$RUNDIR/guests/guest.wasm"
         echo "PCR16 $EXPECTED_PCR16"
+    fi
+
+    if [[ -n "${GUEST_ENV:-}" ]]; then
+        # The guest's settings go into its file, where the runtime reads them once it has hashed
+        # the file into PCR16 — so they are measured with the guest's code, and the image carries
+        # none. What PCR16 should be is then this configured file's, measured below.
+        local settings
+        IFS=, read -ra settings <<<"$GUEST_ENV"
+        python3 "$REPO/deploy/qemu-nitro/guest-env.py" "$RUNDIR/guests/guest.wasm" "${settings[@]}"
+        EXPECTED_PCR16=""
+        echo "guest settings: ${settings[*]%%=*}"
     fi
 
     if [[ -n "${WITH_SUBSTITUTE:-}" ]]; then
@@ -492,28 +491,29 @@ enclave_start_parent() {
     python3 "$REPO/deploy/qemu-nitro/heartbeat.py" 9000 > "$RUNDIR/heartbeat.log" 2>&1 &
     pids+=($!)
 
-    # Firebase is not reachable from here and would refuse an invented
-    # registration token if it were. The stub answers the two endpoints the
-    # runtime calls and records every message, so a caller can assert on what
-    # the runtime *sent*.
+    # AWS would refuse an invented registration token, and a laptop has no
+    # instance role to sign with. The stub answers the two calls the runtime
+    # makes and records every message, so a caller can assert on what the
+    # runtime *sent*.
     #
-    # Not with real notifications: the image then talks to Google, and has no stub to dial.
-    FCM_RECORD="$RUNDIR/fcm-messages.jsonl"
-    if [[ -z "$FCM_PROJECT" ]]; then
-        python3 "$REPO/deploy/qemu-nitro/fcm-stub.py" "$FCM_RECORD" > "$RUNDIR/fcm-stub.log" 2>&1 &
+    # Not with real notifications: the image then talks to AWS, and has no stub to dial.
+    PUSH_RECORD="$RUNDIR/push-messages.jsonl"
+    if [[ -z "$PUSH_APP_ID" ]]; then
+        python3 "$REPO/deploy/qemu-nitro/push-stub.py" "$PUSH_RECORD" > "$RUNDIR/push-stub.log" 2>&1 &
         pids+=($!)
+        local channel=http://127.0.0.1:9101/v1/apps/e2e/channels/gcm
         for _ in $(seq 50); do
-            curl -sf -o /dev/null -X POST --data '{}' http://127.0.0.1:9101/token && break
+            curl -sf -o /dev/null "$channel" && break
             sleep 0.1
         done
-        curl -sf -o /dev/null -X POST --data '{}' http://127.0.0.1:9101/token \
-            || { echo "the FCM stub never answered:" >&2; cat "$RUNDIR/fcm-stub.log" >&2; exit 1; }
+        curl -sf -o /dev/null "$channel" \
+            || { echo "the push stub never answered:" >&2; cat "$RUNDIR/push-stub.log" >&2; exit 1; }
         # Answered by *this* stub? Another listener on :9101 answers too (Dart DevTools likes that
         # port), and then the wake lands there instead — which run-e2e.sh's leg 6b reads as "never
         # woke anybody", $TIMEOUT seconds later. A warning, not a failure: a run that never looks
         # at a wake is unaffected.
         kill -0 "${pids[-1]}" 2>/dev/null \
-            || echo "warning: the FCM stub died — :9101 is taken, so wake signals will go astray ($(tail -1 "$RUNDIR/fcm-stub.log"))" >&2
+            || echo "warning: the push stub died — :9101 is taken, so wake signals will go astray ($(tail -1 "$RUNDIR/push-stub.log"))" >&2
     fi
 
     # forward-cid 1 turns the guest's vsock connections into host vsock loopback
@@ -543,7 +543,25 @@ enclave_start_parent() {
         GV_DIR="$(resolve_out_link "$RUNDIR/gvproxy")"
     fi
 
+    # A configuration file rather than gvproxy's defaults, so what the enclave can reach is
+    # written down: the address its DHCP hands gvforwarder's fixed MAC, and this host on `.254`.
+    # A file also leaves out the defaults nothing here uses — an ssh forward into the enclave, and
+    # DNS names for the host. With real notifications, `.253` is the host's metadata service, for
+    # the runtime's instance role; guests are refused that address like every private one, and
+    # `-ec2-metadata-access` would have opened all of 169.254/16 instead.
+    local imds_nat="" imds_ip=""
+    if [[ -n "$PUSH_APP_ID" ]]; then
+        imds_nat='"192.168.127.253": "169.254.169.254"'
+        imds_ip=', "192.168.127.253"'
+    fi
+    cat > "$RUNDIR/gvproxy.yml" <<EOF
+stack:
+  nat: { "192.168.127.254": "127.0.0.1"${imds_nat:+, $imds_nat} }
+  gatewayVirtualIPs: [ "192.168.127.254"$imds_ip ]
+  dhcpStaticLeases: { "192.168.127.2": "5a:94:ef:e4:0c:ee" }
+EOF
     "$GV_DIR/bin/gvproxy" \
+        --config "$RUNDIR/gvproxy.yml" \
         --listen "vsock://:1024" \
         --listen "unix://$RUNDIR/network.sock" \
         > "$RUNDIR/gvproxy.log" 2>&1 &
@@ -575,7 +593,7 @@ enclave_start_ca() {
 {
   "pebble": {
     "listenAddress": "0.0.0.0:14000",
-    "managementListenAddress": "0.0.0.0:15000",
+    "managementListenAddress": "127.0.0.2:15000",
     "certificate": "/pebble/cert.pem",
     "privateKey": "/pebble/key.pem",
     "httpPort": 80,
@@ -754,9 +772,9 @@ enclave_check_certificate() {
         enclave_check_public_certificate
         return
     fi
-    curl -sk --max-time 5 "https://127.0.0.1:15000/roots/0" > "$RUNDIR/pebble-root.pem" \
+    curl -sk --max-time 5 "https://127.0.0.2:15000/roots/0" > "$RUNDIR/pebble-root.pem" \
         || { echo "could not fetch Pebble's root" >&2; exit 1; }
-    curl -sk --max-time 5 "https://127.0.0.1:15000/intermediates/0" > "$RUNDIR/pebble-int.pem" \
+    curl -sk --max-time 5 "https://127.0.0.2:15000/intermediates/0" > "$RUNDIR/pebble-int.pem" \
         || { echo "could not fetch Pebble's intermediate" >&2; exit 1; }
     if [[ -n "$KEEP_STORE" ]]; then
         # Pebble mints a new CA every start, but a kept store holds the
@@ -915,13 +933,10 @@ enclave_pack() {
     {
         printf 'WEBAUTHN_RP_ID=%q\n' "${WEBAUTHN_RP_ID:-}"
         printf 'WEBAUTHN_ALLOWED_ORIGINS=%q\n' "${WEBAUTHN_ALLOWED_ORIGINS:-}"
-        printf 'GUEST_EGRESS_ORIGINS=%q\n' "${GUEST_EGRESS_ORIGINS:-}"
-        printf 'GUEST_ENV=%q\n' "${GUEST_ENV:-}"
-        printf 'BACKGROUND_TIMEOUT_SECS=%q\n' "${BACKGROUND_TIMEOUT_SECS:-}"
         printf 'TLS_DOMAIN=%q\n' "$TLS_DOMAIN"
         printf 'ACME_STAGING=%q\n' "$ACME_STAGING"
         printf 'ACME_CONTACT=%q\n' "$ACME_CONTACT"
-        printf 'FCM_PROJECT=%q\n' "$FCM_PROJECT"
+        printf 'PUSH_APP_ID=%q\n' "$PUSH_APP_ID"
         printf 'ENCLAVE_RUNTIME_REV=%q\n' "$(git -C "$REPO" describe --always --dirty)"
         # The images this bundle runs on, unless the caller names others: read before lib.sh
         # sets its defaults, and exported for the MinIO scripts, which are child processes.

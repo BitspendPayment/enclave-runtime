@@ -139,13 +139,16 @@ identifies the enclave before it approves anything.
 | `--allowed-origin ORIGIN` | an origin assertions may claim besides `https://<rp id>`, repeatable — `android:apk-key-hash:<hash>` for an Android app |
 | `--keep-store` | keep the store in `target/qemu-nitro/<name>-store` and resume it on the next start with that name — see [Restarting](#restarting) |
 | `--fresh` | with `--keep-store`, discard the kept store first |
-| `--guest-egress ORIGIN` | an origin the guest may send requests to, `http(s)://host[:port]`, repeatable. None by default. The machine running the script is `192.168.127.254` from inside the enclave |
-| `--background-timeout SECS` | how long one background task may run; the runtime's default is 30 |
-| `--guest-env NAME=VALUE` | a variable for the guest, repeatable — e.g. the address of the origin it may reach |
+| `--guest-env NAME=VALUE` | a setting for the guest, repeatable — e.g. the address of a service it talks to. Written into the guest file before it is uploaded, so it is measured into PCR16 with the guest and can be given with `--prebuilt` |
+
+A guest reaches the public internet and nothing else, by address; there is no
+option for it. In the emulator it also reaches the machine running the script,
+`192.168.127.254` from inside the enclave, on every port but the runtime's own
+there (its store, its CA, its push stub).
 
 Everything the run produced lives under `target/qemu-nitro/<name>/`: the console
-log, the trust root, the passkey state files, and `fcm-messages.jsonl` — every
-notification the guest raised, since Firebase is stubbed locally.
+log, the trust root, the passkey state files, and `push-messages.jsonl` — every
+notification the guest raised, since the push service is stubbed locally.
 
 ## On a public host
 
@@ -163,7 +166,7 @@ What changes:
 | `--domain NAME` | serve `NAME` with a certificate from Let's Encrypt, validated over TLS-ALPN-01. `NAME` must resolve to the host and `--port` must be 443, reachable from the internet. Pebble is not started |
 | `--acme-staging` | Let's Encrypt's staging CA. Prove issuance with it first: production allows five duplicate certificates a week, and nothing trusts a staging one |
 | `--acme-contact EMAIL` | the contact registered with the CA |
-| `--fcm-project ID --fcm-service-account FILE` | real Firebase notifications instead of the stub. The key is baked into the image, so it lands in the builder's Nix store and the EIF |
+| `--push-app-id ID` | real notifications through that AWS End User Messaging Push application instead of the stub, signed as the host's instance role — so the host must be on EC2, with a role allowed to send through it. Not a secret: the application's FCM channel holds the Firebase credential |
 | `--memory SIZE` | the enclave's memory (QEMU `-m`). Default `3G`; the runtime with a small guest runs in `1536M` |
 | `--store-bind ADDR` | publish MinIO on one address, e.g. `127.0.0.1`. Its credentials are the defaults; the enclave still reaches it through gvproxy |
 | `--publish-hook CMD` | run `CMD <run dir>` once the enclave is up. The trust root is new every boot, so whatever clients read their pins from needs the new one |

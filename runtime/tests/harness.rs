@@ -109,6 +109,34 @@ async fn a_task_that_finishes_wakes_its_owner() {
     assert_eq!(wake.token, DEVICE);
 }
 
+/// A guest deployed with settings sees them, and they are part of what a client pins: the
+/// settings travel in the guest file, so a changed setting is a changed PCR16.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn a_guest_sees_the_settings_it_was_deployed_with_and_they_are_measured() {
+    let plain = guest();
+    let configured = enclave_runtime::env::with_settings_section(
+        &plain,
+        &[("SERVICE_URL", "https://service.example"), ("LANG", "C")],
+    );
+    assert_ne!(
+        nitro_attestation::guest_pcr(&plain),
+        nitro_attestation::guest_pcr(&configured),
+        "a setting that does not move PCR16 is one the host could change unseen"
+    );
+
+    let enclave = Enclave::builder(configured.clone()).start().await.unwrap();
+    assert_eq!(enclave.pcr16(), nitro_attestation::guest_pcr(&configured));
+    let alice = enclave.enrol().await.unwrap();
+    let (status, body) = enclave.signed(&alice, "GET", "/env", "").await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("SERVICE_URL=https://service.example"),
+        "{body}"
+    );
+    assert!(body.contains("LANG=C"), "{body}");
+}
+
 /// The measurements a client would pin, available before it connects.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]

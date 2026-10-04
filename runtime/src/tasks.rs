@@ -23,6 +23,11 @@ const MAX_RECORD: usize = 1024 * 1024;
 const MAX_ATTEMPTS: u32 = 5;
 const DIR: &str = "/runtime/tasks";
 
+/// How long one attempt at a background task may run. Fixed, not a setting: a task that drives a
+/// round with an outside service waits on that service's schedule, which is minutes, and a limit
+/// a deployment can lower is one more way for that work to fail somewhere other than here.
+pub const TASK_TIMEOUT: Duration = Duration::from_secs(600);
+
 #[derive(Debug, Clone)]
 pub struct TaskLimits {
     pub concurrency: usize,
@@ -36,7 +41,7 @@ impl Default for TaskLimits {
             concurrency: 1,
             max_records: 1024,
             per_tenant: 64,
-            timeout: Duration::from_secs(30),
+            timeout: TASK_TIMEOUT,
         }
     }
 }

@@ -8,7 +8,7 @@ WASI has no way to reach a person or a service between requests, so the runtime 
 
 Every party that relies on the enclave checks the same two measurements: PCR0 for the runtime image and its configuration, PCR16 for the guest. KMS checks them before releasing the storage key, a native app before sending a passkey-approved request, and a service on every message the runtime sends it.
 
-> **Pre-1.0, under active correctness review.** The runtime, its capabilities, the KMS recipient flow and the deployment tooling are implemented and tested, including end to end in an emulated enclave. Validation on real Nitro hardware and against live KMS and FCM is outstanding, as is storage garbage collection. This is not a production-readiness claim.
+> **Pre-1.0, under active correctness review.** The runtime, its capabilities, the KMS recipient flow and the deployment tooling are implemented and tested, including end to end in an emulated enclave. Validation on real Nitro hardware and against live KMS and AWS End User Messaging Push is outstanding, as is storage garbage collection. This is not a production-readiness claim.
 
 ## Contents
 
@@ -60,7 +60,7 @@ An enclave has no NTP. The hypervisor sets its system clock, and the parent inst
 | Guest `wasi:clocks/wall-clock` | Every `SystemTime::now()`, including expiry checks in guest code |
 | Filesystem `set-times` with "now" | File timestamps agree with the guest's clock |
 | Task scheduler | `run-at` deadlines and recurring intervals |
-| FCM OAuth | The service-account JWT's `iat` and `exp`. Google checks these, which makes this the one place an outside party checks the enclave's clock; skew shows up as `invalid_grant` |
+| Push signing | The SigV4 date on every call to the push service. AWS checks it, which makes this the one place an outside party checks the enclave's clock; skew shows up as a refused signature, retried |
 | Notification queue | Device enrollment times and retry backoff |
 
 A read that fails mid-run returns the last good reading and logs a warning. A few milliseconds stale is harmless; a zero timestamp means 1970 dates, expired certificates and rejected tokens. The production image sets `S3FS_CLOCK_SOURCE=ptp`, so a missing device stops the boot, while `auto` falls back to the host clock with a warning. The QEMU image uses the host clock because QEMU has no PTP device.
@@ -92,7 +92,7 @@ flowchart TB
     M --> S["Counterparty service<br/>checks every request the runtime<br/>sends on a held connection"]
 ```
 
-PCR0 covers configuration as well as code: the egress allowlist, the guest environment, the FCM project, the WebAuthn origins and the bucket identities. An app that pins PCR0 has therefore also pinned where the guest can send data and which push project can wake its devices.
+PCR0 covers configuration as well as code: the push application, the WebAuthn origins and the bucket identities. An app that pins PCR0 has therefore also pinned which push application can wake its devices. A guest's own settings are not image configuration: they travel in the guest file ([`guest-env.py`](deploy/qemu-nitro/guest-env.py) writes them before it is uploaded), so PCR16 measures them with the guest's code and one image serves any deployment. Where a guest can send data is not configuration: a guest reaches the public internet and nothing else, by address, so what it sends is its own code's decision — and that code is PCR16.
 
 ## Capabilities beyond WASI
 
@@ -118,26 +118,25 @@ devices:         func() -> result<u32, string>;               // a count, never 
 wake:            func(category: string, reference: option<string>) -> result<_, string>;
 ```
 
-A guest cannot reach the network on its own, so the runtime holds the Firebase Cloud Messaging credential and sends on its behalf. **A wake is data-only.** The payload crosses the parent instance and then Google, so it has no title, no body and no `notification` object, and no setting can add one:
+A guest holds no push credential, so the runtime sends on its behalf through AWS End User Messaging Push, signing as the instance's role; the Firebase credential lives on the push application's FCM channel, inside AWS, and no image carries it. **A wake is data-only.** The payload crosses the parent instance, AWS and then Google, so it has no title, no body and no `notification` object, and no setting can add one. It goes as `RawContent`, which reaches the phone as written:
 
 ```json
-{"message": {"token": "…",
-             "data": {"v": "1", "category": "task-done", "ref": "invoice-42"},
-             "android": {"priority": "high", "ttl": "3600s"},
-             "apns": {"headers": {"apns-push-type": "background", "apns-priority": "5"},
-                      "payload": {"aps": {"content-available": 1}}}}}
+{"data": {"v": "1", "category": "task-done", "ref": "invoice-42"},
+ "android": {"priority": "high", "ttl": "3600s"},
+ "apns": {"headers": {"apns-push-type": "background", "apns-priority": "5"},
+          "payload": {"aps": {"content-available": 1}}}}
 ```
 
 On waking, the app attests the enclave and fetches the details over its pinned connection, which the parent cannot read.
 
 How notify draws on the rest of the runtime:
 
-- **Credentials.** The runtime signs the service-account JWT itself, with `iat` and `exp` from the PTP clock. It sends over an HTTPS client that trusts only the web PKI roots compiled into the image, because the parent answers the enclave's DNS.
+- **Credentials.** The runtime signs each call itself (SigV4, dated by the PTP clock) with the instance role's credentials, fetched from the metadata service at an address gvproxy maps for the runtime alone. It sends over an HTTPS client that trusts only the web PKI roots compiled into the image, because the parent answers the enclave's DNS.
 - **Authority.** Enrolling or forgetting a device is a standing ability to reach a person, so it takes an interactive, passkey-approved call. Raising a wake from background work is the main use: a task finishes and tells its owner to come and look. A wake grants nothing; it uses an enrollment the owner already made.
 - **Storage.** Device tokens live in `/runtime/devices` in the encrypted store, outside every tenant's scope. A guest enrolls a token and can only ever get a count back.
-- **Delivery** is best effort and bounded. Repeat wakes for one `(tenant, category)` coalesce, and a full queue drops and counts instead of blocking the guest. Transient failures back off, and tokens FCM reports as `UNREGISTERED` are pruned. Each tenant can enroll 8 devices; enrolling a ninth evicts the oldest.
+- **Delivery** is best effort and bounded. Repeat wakes for one `(tenant, category)` coalesce, and a full queue drops and counts instead of blocking the guest. Transient failures back off, and tokens the service reports gone are pruned. Each tenant can enroll 8 devices; enrolling a ninth evicts the oldest.
 
-A stolen FCM credential lets someone send wake signals and nothing more. A wake carries no data, and the app's response to any wake is to fetch over the attested channel. Set `S3FS_FCM_PROJECT_ID` (measured) and, in production, `S3FS_FCM_SERVICE_ACCOUNT_PARAMETER` (an SSM parameter). See [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md).
+A parent that borrows the role can send wake signals through that one application and nothing more. A wake carries no data, and the app's response to any wake is to fetch over the attested channel. Set `S3FS_PUSH_APP_ID` (measured, not secret). See [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md).
 
 ### `enclave:streams` — let a service talk first
 
@@ -166,7 +165,7 @@ user_data = SHA-256("enclave-runtime/stream/v1" 0x00 ‖ kind ‖ 0x00 ‖ wire_
 
 The service verifies the chain, pins PCR0 and PCR16, rejects documents more than five minutes old, and recomputes `user_data` from the URL's `id` and the body it received. Knowing a wire ID is not enough to pass as this enclave, whether by forging a message or by standing up a cosigner of one's own.
 
-The origin must be in the image's egress allowlist, which the runtime re-checks on every reconnect, so holding a connection reaches nothing the guest could not reach itself. Limits: 8 connections per tenant, 256 KiB per message. Delivery is at least once in both directions, so deduplicate by `message-id`. See [docs/STREAMING.md](docs/STREAMING.md).
+The origin is checked like a guest's own request on every reconnect and send — the public internet only — so holding a connection reaches nothing the guest could not reach itself. Limits: 8 connections per tenant, 256 KiB per message. Delivery is at least once in both directions, so deduplicate by `message-id`. See [docs/STREAMING.md](docs/STREAMING.md).
 
 ### `enclave:tasks` — work while nobody is connected
 
@@ -193,7 +192,7 @@ The runtime marks each invocation as either interactive (a passkey-approved requ
 | `notify.wake`, `devices` | ✓ | ✓ | ✓ |
 | `streams.stream-open`, `stream-close` | ✓ | | |
 | `streams.stream-send`, `stream-status` | ✓ | | ✓ |
-| `wasi:http` to allowlisted origins | ✓ | ✓ | ✓ |
+| `wasi:http` to the public internet | ✓ | ✓ | ✓ |
 
 Background work cannot grant itself more work, connections or devices. It can only use what an approved request already set up.
 
@@ -209,7 +208,7 @@ sequenceDiagram
     participant App as Phone app
     participant RT as Runtime (enclave)
     participant G as Guest
-    participant FCM
+    participant Push as Push service
     App->>RT: /auth/* with a fresh nonce
     RT-->>App: attestation binding PCR0, PCR16 and the TLS certificate
     App->>RT: passkey assertion
@@ -219,12 +218,12 @@ sequenceDiagram
     Note over RT: later, when the PTP clock reaches run-at
     RT->>G: run-task in a fresh instance
     G->>RT: write the result, then notify.wake(task-done, report)
-    RT->>FCM: data-only message, OAuth JWT signed on PTP time
-    FCM-->>App: silent wake
+    RT->>Push: data-only message, SigV4 signed on PTP time
+    Push-->>App: silent wake, through FCM
     App->>RT: attest, approve, fetch the result
 ```
 
-The [QEMU harness](deploy/qemu-nitro/run-e2e.sh) runs this flow in an emulated enclave, with a stub in place of FCM that checks the wake carried no content.
+The [QEMU harness](deploy/qemu-nitro/run-e2e.sh) runs this flow in an emulated enclave, with a stub in place of the push service that checks the wake carried no content.
 
 ## Try it locally
 
@@ -250,7 +249,7 @@ docker build -t s3fs-qemu-nitro:latest deploy/qemu-nitro   # built from source; 
 cargo install vhost-device-vsock --version 0.3.0 --locked \
   --root target/qemu-nitro/tools
 
-# Builds the example guest and starts MinIO, a local ACME CA and an FCM stub.
+# Builds the example guest and starts MinIO, a local ACME CA and a push stub.
 deploy/qemu-nitro/dev-enclave.sh --keep-store
 ```
 
@@ -283,11 +282,10 @@ With `--keep-store`, restarting the harness preserves the store and registered c
 deploy/qemu-nitro/dev-enclave.sh \
   --guest path/to/component.wasm \
   --keep-store \
-  --guest-egress http://192.168.127.254:7070 \
   --guest-env SERVICE_URL=http://192.168.127.254:7070
 ```
 
-The guest must export `wasi:http/incoming-handler`, and may use the [WIT capabilities](wit/). The emulator image enables background tasks by default, which requires the guest to export `run-task`. For an HTTP-only guest, add `--guest-env S3FS_BACKGROUND_TASKS=false`. `192.168.127.254` reaches the development host through gvproxy.
+The guest must export `wasi:http/incoming-handler`, and may use the [WIT capabilities](wit/). The emulator image enables background tasks by default, which requires the guest to export `run-task`. For an HTTP-only guest, add `--guest-env S3FS_BACKGROUND_TASKS=false`. `192.168.127.254` reaches the development host through gvproxy, on every port but the runtime's own; otherwise a guest reaches the public internet and nothing else.
 
 There is no bare laptop mode: the runtime measures its guest into PCR16 before it boots, and that needs an NSM. Host integration tests use a fake NSM; QEMU provides an emulated one.
 
@@ -308,8 +306,8 @@ flowchart TB
     end
     FS -->|opaque slabs, signed roots| S3[("S3")]
     Dev -.->|recipient attestation| KMS["KMS + SSM"]
-    Held <-->|attested SSE + POST| Svc["Allowed services"]
-    Notify -->|data-only wake| FCM["FCM"]
+    Held <-->|attested SSE + POST| Svc["Public services"]
+    Notify -->|data-only wake| Push["AWS push → FCM"]
 ```
 
 The parent provides transport and decides whether the enclave runs. With production key release and client verification configured correctly, it cannot read stored data or the enclave's TLS traffic. It can still stop the service, drop or delay traffic, observe metadata and answer DNS, which is why every outbound connection validates certificates against roots that are part of the measured image.
@@ -317,7 +315,7 @@ The parent provides transport and decides whether the enclave runs. With product
 AWS Nitro attestation, KMS, S3's authenticated responses, Object Lock and the approved runtime and guest are part of the trust model. Attestation identifies code; it does not show the code is safe, so an approved guest is trusted with its tenant's data. Two channels out of the enclave are deliberate:
 
 - **Guest output** is untrusted text. A bounded queue drops rather than blocks, and guest records are separated from runtime events by tracing target, never by message content. Console and CloudWatch logs are operational, not audit evidence: their readers see whatever the guest printed, and the parent can write to the same CloudWatch stream.
-- **Egress** carries whatever the guest sends to an allowed origin. Allow only the services the guest needs.
+- **Egress** carries whatever the guest sends, to any public address. The metadata service, the proxy, this machine and the operator's network are refused by address, after resolution — see [`serve/egress.rs`](runtime/src/serve/egress.rs) — and what the guest sends is its own code's decision, measured by PCR16.
 
 ## Measured boot and key release
 
@@ -366,7 +364,7 @@ The store is single-writer, has no garbage collection yet, and commits through S
 
 ## Configuration
 
-`cargo run -p enclave-runtime --bin enclave-runtime -- --help` is the definitive reference. Configuration that Nix bakes into the image is measured: changing a bucket, relying party, allowed origin, FCM project, logging destination or guest environment changes PCR0. The `S3FS_` prefix is left over from the filesystem's original name.
+`cargo run -p enclave-runtime --bin enclave-runtime -- --help` is the definitive reference. Configuration that Nix bakes into the image is measured: changing a bucket, relying party, allowed origin, push application or logging destination changes PCR0, and changing a guest's settings changes PCR16. The `S3FS_` prefix is left over from the filesystem's original name.
 
 | Area | Main flags / environment |
 |---|---|
@@ -375,10 +373,9 @@ The store is single-writer, has no garbage collection yet, and commits through S
 | Key source | Required `--master-key-source kms\|static`; `--kms-key-id`, `--master-key-parameter`, `--environment` |
 | Listener and TLS | `--http-listen`, `--tls`, repeatable `--tls-domain`, `--acme-contact`, `--acme-directory` |
 | WebAuthn | `--webauthn-rp-id`, `--webauthn-origin`, repeatable `--webauthn-allowed-origin` (including `android:apk-key-hash:…`) |
-| Egress | Repeatable `--guest-egress-origin` / `S3FS_GUEST_EGRESS_ORIGINS` |
-| Guest environment | `--no-inherit-env`, repeatable `--guest-env NAME=VALUE` or `--guest-env NAME` |
-| Background tasks | `--background-tasks true`, concurrency, timeout, total-record and per-tenant limits |
-| Notifications | `S3FS_FCM_PROJECT_ID` plus `S3FS_FCM_SERVICE_ACCOUNT` (development) or `S3FS_FCM_SERVICE_ACCOUNT_PARAMETER` (SSM) |
+| Guest environment | The settings the guest file carries, over `--no-inherit-env` and repeatable `--guest-env NAME=VALUE` or `--guest-env NAME` |
+| Background tasks | `--background-tasks true`, concurrency, total-record and per-tenant limits. One attempt may run 600 s, which is not a setting |
+| Notifications | `S3FS_PUSH_APP_ID`, an AWS End User Messaging Push application |
 | Logging | `S3FS_GUEST_LOG_GROUP`, `S3FS_GUEST_LOG_STREAM`; `RUST_LOG` (`guest=warn` filters guest output) |
 | Store | `--bucket`, `--roots-bucket`, `--bucket-prefix`, `--fs-id`, `--region`, `--endpoint`, `--min-root-seq` |
 
@@ -424,7 +421,7 @@ nix build .#guest-release --out-link guest-release  # guest.wasm, guest-pcr16.js
 nix build .#eif --rebuild                           # rebuild and compare
 ```
 
-1. Set the bucket identities, filesystem ID, region, guest object key, TLS domains, relying party, egress and FCM settings in [`deployment.nix`](deploy/nix/deployment.nix).
+1. Set the bucket identities, filesystem ID, region, guest object key, TLS domains, relying party and push application in [`deployment.nix`](deploy/nix/deployment.nix).
 2. Build the EIF and the guest, and keep PCR0 and PCR16 as release outputs.
 3. Provision from `deploy/tofu`. The KMS key, its policy and SSM access are provisioned separately for now; wire `S3FS_KMS_KEY_ID` and `S3FS_MASTER_KEY_PARAMETER` into the measured `runtimeImage.env` in `flake.nix`.
 4. Upload the approved component and bind KMS release to the approved measurements.
@@ -438,7 +435,7 @@ Reproducibility, and which inputs remain pinned AWS prebuilt artifacts, are cove
 | Area | Current boundary |
 |---|---|
 | Nitro validation | Real recipient key release, refusal of substituted measurements, AWS-root attestation, PTP and NSM availability, IMDSv2 networking and CloudWatch delivery need hardware evidence |
-| Notifications | The FCM path is exercised against a stub, not yet against the real service |
+| Notifications | The push path is exercised against a stub, not yet against the real service |
 | Delivery | Tasks, held connections, notifications and logs each have their own retry and durability contract; none gives exactly-once side effects |
 | Authorization scope | A passkey approves one interaction on one route, not every payload byte or stream message. Per-message approval needs a host import that is not built yet |
 | Single active writer | No distributed writer coordination, scheduler fencing or multi-enclave failover |

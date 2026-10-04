@@ -13,6 +13,7 @@ Wants=network-online.target
 [Service]
 Type=exec
 ExecStart=/usr/local/bin/gvproxy \
+    --config /etc/gvproxy/config.yml \
     --listen vsock://:1024 \
     --listen unix:///run/gvproxy/network.sock
 RuntimeDirectory=gvproxy

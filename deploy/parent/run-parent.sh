@@ -52,7 +52,9 @@ EOF
 rm -f "$API_SOCKET"
 
 echo "== starting gvproxy on vsock port $VSOCK_PORT =="
+# The same network the AMI's unit gives it — see deploy/ami/units/gvproxy.yml.
 gvproxy \
+    --config "$(dirname "${BASH_SOURCE[0]}")/../ami/units/gvproxy.yml" \
     --listen "vsock://:${VSOCK_PORT}" \
     --listen "unix://${API_SOCKET}" \
     &

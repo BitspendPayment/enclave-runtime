@@ -80,35 +80,21 @@
   # work survives restarts; only this active enclave may own its scheduler.
   backgroundTasks = false;
   backgroundConcurrency = 1;
-  # How long one background task may run. A task that drives a round with an
-  # outside service waits on that service's schedule, which is minutes. `null`
-  # keeps the runtime's default (30 seconds) and leaves PCR0 as it was.
-  backgroundTimeoutSecs = null;
 
-  # Origins guests may send requests to, as "https://host[:port]". None by
-  # default, and then a guest has no outbound network at all.
+  # The guest's own settings are not here. They travel in the guest file, written
+  # into it by `deploy/qemu-nitro/guest-env.py` before it is uploaded as
+  # `guestObject`, so they are measured into PCR16 with its code and the image
+  # serves any deployment of any guest. A guest reaches the public internet and
+  # nothing else, by address — see `runtime/src/serve/egress.rs` — so there is no
+  # list of where it may send.
+
+  # Push notifications: the AWS End User Messaging Push application wake signals go
+  # through, or "" for none. Its FCM channel holds the Firebase credential, so the
+  # image carries no secret: the runtime signs as the instance's role, which
+  # `deploy/tofu` allows to send through this one application and nothing else.
   #
-  # Compared exactly — scheme, host, port — over TLS verified against the web
-  # PKI. It is a channel out of the enclave carrying whatever the guest puts in
-  # it, so name only services the guest has to reach: for a wallet cosigner,
-  # its ASP. Measured by PCR0 like everything here: a client learns where the
-  # guest can send traffic from the attestation, and adding one is a new image.
-  guestEgressOrigins = [ ];
-
-  # Variables for the guest, as { NAME = "value"; }. The guest inherits the image
-  # environment minus anything under `AWS_` or `S3FS_`, so these reach it — and,
-  # being image environment, are measured by PCR0 like the rest. For a cosigner
-  # whose egress names its ASP, this is where it learns the address: { ASP_URL =
-  # "https://asp.example.com"; }.
-  guestEnv = { };
-
-  # Push notifications, off unless both are set. `fcmProjectId` is the Firebase
-  # project; the service account itself is read at boot from this SSM parameter
-  # rather than baked in, so it rotates without moving PCR0.
-  #
-  # What a parent that steals that credential gets is the ability to ring
-  # doorbells: a wake signal carries no content, and reading anything still
-  # needs a key KMS releases only against a matching PCR0 and PCR16.
-  fcmProjectId = "";
-  fcmServiceAccountParameter = "";
+  # What a parent that borrows that role gets is the ability to ring doorbells: a
+  # wake signal carries no content, and reading anything still needs a key KMS
+  # releases only against a matching PCR0 and PCR16.
+  pushAppId = "";
 }

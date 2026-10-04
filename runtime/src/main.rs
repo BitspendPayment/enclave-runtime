@@ -41,83 +41,20 @@ use enclave_runtime::{
     DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
-/// Where the FCM credential comes from, once the settings have been checked.
-enum FcmCredential {
-    /// Already parsed, because it was supplied literally and parsing it needed
-    /// nothing but the bytes.
-    Account(Box<enclave_runtime::ServiceAccount>),
-    /// A name to resolve against SSM, once there is a network.
-    Parameter(String),
-}
-
 /// Notification settings, as far as they can be decided without I/O.
 struct NotifySettings {
-    project_id: String,
-    credential: FcmCredential,
+    app_id: String,
     endpoint: Option<String>,
 }
 
-/// Read a parameter, decrypting a SecureString if that is what it is.
-///
-/// Its own small client rather than the one `keys` builds: that one is
-/// configured from a `MasterKeyConfig` and exists to fetch a KMS ciphertext,
-/// and threading an unrelated credential through it would tie two things
-/// together that have no reason to change at the same time.
-async fn read_ssm_parameter(cli: &Cli, name: &str) -> Result<String> {
-    use aws_sdk_ssm::config::{BehaviorVersion, Credentials, Region};
-
-    let region = Region::new(cli.region.clone());
-    let mut builder = aws_sdk_ssm::Config::builder()
-        .behavior_version(BehaviorVersion::latest())
-        .region(region.clone())
-        // Bounded, because this runs before the listener binds. A parameter
-        // store that accepts a connection and then says nothing would mean an
-        // enclave that never serves at all.
-        .timeout_config(
-            aws_sdk_ssm::config::timeout::TimeoutConfig::builder()
-                .operation_timeout(Duration::from_secs(5))
-                .connect_timeout(Duration::from_secs(3))
-                .build(),
-        );
-    if let Some(endpoint) = &cli.ssm_endpoint {
-        builder = builder.endpoint_url(endpoint);
-    }
-    // Static credentials when they were configured, and the default chain
-    // otherwise — which inside an enclave reaches the parent's instance role
-    // through gvproxy. Naming one is not optional: `Config::builder()` starts
-    // empty and resolves neither on its own, so leaving this out is not a
-    // default, it is no credentials at all.
-    builder = match (
-        cli.access_key_id.as_deref(),
-        cli.secret_access_key.as_deref(),
-    ) {
-        (Some(akid), Some(sak)) => builder.credentials_provider(Credentials::new(
-            akid,
-            sak,
-            cli.session_token.clone(),
-            None,
-            "s3fs-static",
-        )),
-        _ => builder.credentials_provider(
-            aws_config::default_provider::credentials::DefaultCredentialsChain::builder()
-                .region(region)
-                .build()
-                .await,
-        ),
-    };
-    let client = aws_sdk_ssm::Client::from_conf(builder.build());
-    let response = client
-        .get_parameter()
-        .name(name)
-        .with_decryption(true)
-        .send()
-        .await
-        .with_context(|| format!("reading SSM parameter {name}"))?;
-    response
-        .parameter()
-        .and_then(|p| p.value())
+/// A setting's value, with empty meaning unset: the image environment is layered, and setting a
+/// variable to "" is how a layer says "not this one".
+fn nonempty(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
         .map(str::to_string)
-        .with_context(|| format!("SSM parameter {name} has no value"))
 }
 
 #[derive(Parser, Debug)]
@@ -133,8 +70,6 @@ struct Cli {
     background_tasks: bool,
     #[arg(long, env = "S3FS_BACKGROUND_CONCURRENCY", default_value_t = 1)]
     background_concurrency: usize,
-    #[arg(long, env = "S3FS_BACKGROUND_TIMEOUT_SECS", default_value_t = 30)]
-    background_timeout_secs: u64,
     #[arg(long, env = "S3FS_BACKGROUND_MAX_RECORDS", default_value_t = 1024)]
     background_max_records: usize,
     #[arg(long, env = "S3FS_BACKGROUND_PER_TENANT", default_value_t = 64)]
@@ -384,37 +319,22 @@ struct Cli {
     #[arg(long, env = "S3FS_GUEST_LOG_ENDPOINT")]
     guest_log_endpoint: Option<String>,
 
-    /// The Firebase project wake signals are sent for.
+    /// The push application wake signals go through: an AWS End User Messaging Push
+    /// application, whose FCM channel holds the Firebase credential.
     ///
-    /// Empty means notifications are off — the same layering rule the guest
-    /// log settings follow, so an image can carry the setting and a deployment
-    /// can blank it.
-    #[arg(long, env = "S3FS_FCM_PROJECT_ID")]
-    fcm_project_id: Option<String>,
+    /// Empty means notifications are off — the same layering rule the guest log settings
+    /// follow, so an image can carry the setting and a deployment can blank it. The image names
+    /// the application and nothing else: requests are signed as the instance's own role, so
+    /// there is no credential here to set, or to leak from a published image.
+    #[arg(long, env = "S3FS_PUSH_APP_ID")]
+    push_app_id: Option<String>,
 
-    /// The service-account JSON itself. Development and local runs.
-    ///
-    /// Inside an enclave this arrives through the parent instance, which is the
-    /// party the enclave excludes. What a stolen credential buys is the ability
-    /// to ring doorbells: wake signals carry no data, and reading any of it
-    /// still needs a key KMS releases only to a matching PCR0/PCR16.
-    #[arg(long, env = "S3FS_FCM_SERVICE_ACCOUNT")]
-    fcm_service_account: Option<String>,
-
-    /// An SSM parameter holding that JSON. The production source.
-    ///
-    /// Keeps the secret out of the measured image and out of the launch
-    /// invocation, and lets it rotate without moving PCR0.
-    #[arg(long, env = "S3FS_FCM_SERVICE_ACCOUNT_PARAMETER")]
-    fcm_service_account_parameter: Option<String>,
-
-    /// Point the FCM client somewhere else. For tests and the emulator.
-    ///
-    /// A downgrade path: an `http://` endpoint hands wake signals to whatever
-    /// is listening. PCR0 records which image was built, which is the only
-    /// reason this is acceptable.
-    #[arg(long, env = "S3FS_FCM_ENDPOINT")]
-    fcm_endpoint: Option<String>,
+    /// Point the push client at a stub. **Only in a `testing` build**, for tests and the
+    /// emulator: an `http://` endpoint hands wake signals to whatever is listening, and
+    /// requests to it are signed with a placeholder rather than the instance's role.
+    #[cfg(any(test, feature = "testing"))]
+    #[arg(long, env = "S3FS_PUSH_ENDPOINT")]
+    push_endpoint: Option<String>,
 
     /// Clients kept warm at once.
     ///
@@ -475,21 +395,6 @@ struct Cli {
         value_delimiter = ','
     )]
     webauthn_allowed_origins: Vec<String>,
-
-    /// An origin guests may send `wasi:http` requests to, as
-    /// `https://host[:port]` — or `http://host:port`, for a local stack.
-    /// Repeatable. None by default, and then a guest has no outbound network at
-    /// all.
-    ///
-    /// Compared exactly: scheme, host and port. It is a channel out of the
-    /// enclave carrying whatever the guest puts in it, so name only services
-    /// the guest has to reach. Image environment, so PCR0 covers the list.
-    #[arg(
-        long = "guest-egress-origin",
-        env = "S3FS_GUEST_EGRESS_ORIGINS",
-        value_delimiter = ','
-    )]
-    guest_egress_origins: Vec<String>,
 
     /// Seconds a challenge is good for.
     ///
@@ -632,51 +537,34 @@ impl Cli {
     /// told apart from a mistake.
     /// Everything about notifications that can be decided without a network.
     ///
-    /// The literal credential is parsed here, key and all: a malformed service
-    /// account must fail at boot rather than the first time somebody is waiting
-    /// to be woken, and proving it parses needs nothing but the bytes.
+    /// A malformed application id fails at boot rather than the first time somebody is waiting
+    /// to be woken; whether the application can deliver is the probe's to find out, once there
+    /// is a network.
     fn notify_settings(&self) -> Result<Option<NotifySettings>> {
-        let set = |value: &Option<String>| {
-            value
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
-        };
-        let project = set(&self.fcm_project_id);
-        let literal = set(&self.fcm_service_account);
-        let parameter = set(&self.fcm_service_account_parameter);
-
-        // Empty means off, not malformed.
-        if project.is_none() && literal.is_none() && parameter.is_none() {
-            return Ok(None);
-        }
-        anyhow::ensure!(
-            !(literal.is_some() && parameter.is_some()),
-            "--fcm-service-account and --fcm-service-account-parameter are alternatives. \
-             Refused rather than resolved by precedence: a deployment that set both has \
-             one of them wrong, and guessing which would be the wrong help."
-        );
-        let Some(project_id) = project else {
-            anyhow::bail!(
-                "an FCM credential was given without --fcm-project-id, so there is no \
-                 project to send for"
-            );
-        };
-        let credential = match (literal, parameter) {
-            (Some(json), _) => FcmCredential::Account(Box::new(
-                enclave_runtime::ServiceAccount::parse(&json).context("--fcm-service-account")?,
-            )),
-            (_, Some(name)) => FcmCredential::Parameter(name),
-            (None, None) => anyhow::bail!(
-                "--fcm-project-id was set without a service account, so nothing can be sent"
+        match (nonempty(&self.push_app_id), self.push_endpoint()) {
+            (None, None) => Ok(None),
+            (None, Some(_)) => anyhow::bail!(
+                "--push-endpoint was given without --push-app-id, so there is no application to \
+                 send through"
             ),
-        };
-        Ok(Some(NotifySettings {
-            project_id,
-            credential,
-            endpoint: set(&self.fcm_endpoint),
-        }))
+            (Some(app_id), endpoint) => {
+                anyhow::ensure!(
+                    enclave_runtime::notify::valid_app_id(&app_id),
+                    "--push-app-id must be the application's id, 1-64 letters and digits"
+                );
+                Ok(Some(NotifySettings { app_id, endpoint }))
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    fn push_endpoint(&self) -> Option<String> {
+        nonempty(&self.push_endpoint)
+    }
+
+    #[cfg(not(any(test, feature = "testing")))]
+    fn push_endpoint(&self) -> Option<String> {
+        None
     }
 
     fn guest_log_config(&self) -> Result<Option<enclave_runtime::CloudWatchConfig>> {
@@ -922,7 +810,9 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     let mounted = booted.mounted;
     let fs = mounted.fs.clone();
 
-    let env = cli.env_policy().build()?;
+    // What the image says, then what the guest file says on top: the settings a guest was
+    // deployed with travel inside it, measured into PCR16 with its code — see `env::from_guest`.
+    let env = enclave_runtime::env::with_guest_settings(cli.env_policy().build()?, &component)?;
 
     /// The ACME directory's trust root, if this build can have one.
     ///
@@ -943,6 +833,49 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     #[cfg(not(any(test, feature = "testing")))]
     fn acme_directory_ca(_cli: &Cli) -> anyhow::Result<Option<Vec<u8>>> {
         Ok(None)
+    }
+
+    /// Open the emulator's host to guests, but not the runtime's own services on it.
+    ///
+    /// The host is where an emulator's services live — an ASP, a payout platform — and where
+    /// the runtime's own are too: its store, its CA, its push stub. A guest may reach the first
+    /// and never the second, so the second are named by the runtime's own settings, which cannot
+    /// drift from where those services are. Two definitions, as above: a production binary has
+    /// no host to open.
+    #[cfg(any(test, feature = "testing"))]
+    fn open_dev_host(cli: &Cli) -> anyhow::Result<()> {
+        let mut own = Vec::new();
+        for url in [
+            &cli.endpoint,
+            &cli.kms_endpoint,
+            &cli.ssm_endpoint,
+            &cli.acme_directory,
+            &cli.guest_log_endpoint,
+            &cli.push_endpoint,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let uri: http::Uri = url.parse().with_context(|| format!("{url} is not a URL"))?;
+            own.push(uri.port_u16().unwrap_or(match uri.scheme_str() {
+                Some("https") => 443,
+                _ => 80,
+            }));
+        }
+        own.sort_unstable();
+        own.dedup();
+        tracing::warn!(
+            ?own,
+            "guests may reach the public internet, and the emulator's host on every port but these"
+        );
+        enclave_runtime::serve::egress::admit_dev_host(own);
+        Ok(())
+    }
+
+    #[cfg(not(any(test, feature = "testing")))]
+    fn open_dev_host(_cli: &Cli) -> anyhow::Result<()> {
+        tracing::info!("guests may reach the public internet, and nothing else");
+        Ok(())
     }
 
     // One certificate source, or none. There is no third: a certificate the
@@ -1009,16 +942,9 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         .filter(|o| !o.is_empty())
         .map(str::to_string)
         .collect();
-    // Parsed before anything serves: a malformed origin refuses the boot rather
-    // than quietly admitting less, or more, than the image says.
-    let egress = enclave_runtime::serve::EgressPolicy::from_allowlist(
-        enclave_runtime::serve::EgressAllowlist::parse(&cli.guest_egress_origins)
-            .context("parsing --guest-egress-origin")?,
-    );
-    if let enclave_runtime::serve::EgressPolicy::Allowlist(list) = &egress {
-        let origins: Vec<String> = list.origins().map(|o| o.to_string()).collect();
-        tracing::warn!(?origins, "guests may send requests to these origins");
-    }
+    // Where guests may send is no setting: the public internet, checked on every connect — see
+    // `serve::egress`. Only the emulator widens it, to its host.
+    open_dev_host(&cli)?;
 
     let authentication = match (&cli.webauthn_rp_id, &cli.webauthn_origin) {
         (Some(rp_id), Some(origin)) => {
@@ -1168,28 +1094,35 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         }
     }
 
-    // Resolved before the listener binds, so a credential that cannot be
-    // fetched is a boot failure rather than a surprise on the first wake.
+    // Decided before the listener binds, so a setting that cannot work is a boot failure rather
+    // than a surprise on the first wake. Whether the application can deliver is the probe's to
+    // find out once serving starts.
     let notify = match cli.notify_settings()? {
         None => None,
         Some(settings) => {
-            let service_account = match settings.credential {
-                FcmCredential::Account(account) => *account,
-                FcmCredential::Parameter(name) => {
-                    let json = read_ssm_parameter(&cli, &name).await?;
-                    enclave_runtime::ServiceAccount::parse(&json).with_context(|| {
-                        format!("the FCM service account in SSM parameter {name}")
-                    })?
-                }
-            };
             tracing::info!(
-                project = %settings.project_id,
+                app = %settings.app_id,
                 "notifications are enabled; wake signals carry no content"
             );
+            let credentials = match &settings.endpoint {
+                // The emulator's stub checks no signature, and the static keys in an emulator's
+                // image are its object store's: neither is the instance's role.
+                Some(_) => aws_credential_types::provider::SharedCredentialsProvider::new(
+                    aws_credential_types::Credentials::new(
+                        "push-stub",
+                        "push-stub",
+                        None,
+                        None,
+                        "push-stub",
+                    ),
+                ),
+                None => enclave_runtime::notify::instance_role(),
+            };
             Some(enclave_runtime::NotifyConfig {
-                project_id: settings.project_id,
-                service_account,
+                app_id: settings.app_id,
+                region: cli.region.clone(),
                 endpoint: settings.endpoint,
+                credentials,
             })
         }
     };
@@ -1209,9 +1142,9 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             notify,
             background_tasks: cli
                 .background_tasks
-                .then(|| enclave_runtime::tasks::TaskLimits {
+                .then_some(enclave_runtime::tasks::TaskLimits {
                     concurrency: cli.background_concurrency,
-                    timeout: Duration::from_secs(cli.background_timeout_secs),
+                    timeout: enclave_runtime::tasks::TASK_TIMEOUT,
                     max_records: cli.background_max_records,
                     per_tenant: cli.background_per_tenant,
                 }),
@@ -1223,7 +1156,6 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             max_interaction: Duration::from_secs(cli.max_interaction_secs),
             tenancy,
             authentication,
-            egress,
         },
     )
     .await;
@@ -1434,17 +1366,6 @@ mod tests {
         assert!(cli.notify_settings().expect("valid").is_none());
     }
 
-    fn account_json() -> String {
-        serde_json::json!({
-            "type": "service_account",
-            "project_id": "enclave-test",
-            "private_key_id": "kid-1",
-            "private_key": include_str!("notify/testdata/service-account-key.pem"),
-            "client_email": "wake@enclave-test.iam.gserviceaccount.com",
-        })
-        .to_string()
-    }
-
     /// An image carries the setting; a deployment blanks it. Empty is off, not
     /// malformed — the same rule the guest log settings follow.
     #[test]
@@ -1454,84 +1375,53 @@ mod tests {
             "b",
             "--master-key",
             &"aa".repeat(32),
-            "--fcm-project-id",
-            "",
-            "--fcm-service-account",
+            "--push-app-id",
             "",
         ]);
         assert!(cli.notify_settings().expect("valid").is_none());
     }
 
+    /// An application id is all production names: no credential, no endpoint.
     #[test]
-    fn a_literal_service_account_is_parsed_at_startup_rather_than_on_first_use() {
+    fn an_application_id_is_all_a_deployment_sets() {
         let cli = cli_from(&[
             "--bucket",
             "b",
             "--master-key",
             &"aa".repeat(32),
-            "--fcm-project-id",
-            "enclave-test",
-            "--fcm-service-account",
-            &account_json(),
+            "--push-app-id",
+            "0123456789abcdef0123456789abcdef",
         ]);
         let settings = cli.notify_settings().expect("valid").expect("configured");
-        assert_eq!(settings.project_id, "enclave-test");
-        assert!(matches!(settings.credential, FcmCredential::Account(_)));
+        assert_eq!(settings.app_id, "0123456789abcdef0123456789abcdef");
+        assert!(settings.endpoint.is_none());
+    }
 
-        // And a broken one fails here, not later.
+    /// It goes into a URL path, so a malformed one fails at boot.
+    #[test]
+    fn a_malformed_application_id_is_refused() {
         let cli = cli_from(&[
             "--bucket",
             "b",
             "--master-key",
             &"aa".repeat(32),
-            "--fcm-project-id",
-            "enclave-test",
-            "--fcm-service-account",
-            "{\"type\":\"service_account\"}",
+            "--push-app-id",
+            "../channels",
         ]);
         assert!(cli.notify_settings().is_err());
     }
 
-    /// Refused rather than resolved by precedence: a deployment that set both
-    /// has one of them wrong, and guessing which is the wrong kind of help.
     #[test]
-    fn two_credential_sources_are_refused_rather_than_ranked() {
+    fn a_stub_without_an_application_is_refused() {
         let cli = cli_from(&[
             "--bucket",
             "b",
             "--master-key",
             &"aa".repeat(32),
-            "--fcm-project-id",
-            "p",
-            "--fcm-service-account",
-            &account_json(),
-            "--fcm-service-account-parameter",
-            "/prod/fcm",
+            "--push-endpoint",
+            "http://127.0.0.1:9101",
         ]);
         assert!(cli.notify_settings().is_err());
-    }
-
-    #[test]
-    fn a_half_configured_notifier_is_refused_without_touching_the_network() {
-        let project_only = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--fcm-project-id",
-            "p",
-        ]);
-        assert!(project_only.notify_settings().is_err());
-
-        let credential_only = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--fcm-service-account-parameter",
-            "/prod/fcm",
-        ]);
-        assert!(credential_only.notify_settings().is_err());
     }
 
     #[test]

@@ -110,10 +110,10 @@ impl EnclaveBuilder {
 
     /// Let the guest enrol devices and raise wake signals.
     ///
-    /// The harness stands up a stub in place of Firebase and records what the
-    /// runtime sent — see [`Enclave::wakes`]. The transport, the signed OAuth
-    /// assertion and the error handling are the real ones; only the far end is
-    /// not Google.
+    /// The harness stands up a stub in place of the push service and records
+    /// what the runtime sent — see [`Enclave::wakes`]. The transport, the SigV4
+    /// signature, the probe and the result handling are the real ones; only the
+    /// far end is not AWS.
     pub fn notify(mut self) -> Self {
         self.notify = true;
         self
@@ -129,7 +129,7 @@ pub struct Enclave {
     addr: SocketAddr,
     nsm: Arc<SigningNsm>,
     guest: Vec<u8>,
-    fcm: Option<Arc<stub::Fcm>>,
+    push: Option<Arc<stub::Push>>,
 }
 
 impl Enclave {
@@ -186,15 +186,17 @@ impl Enclave {
         // Detached: the collector runs as long as this environment can send,
         // which is what a harness wants. Production drains it explicitly.
         let (logs, _collector) = crate::guest_io::start(Arc::new(crate::TracingLogSink));
-        let guest_env = GuestEnvironment::new(fs, Box::new(HostClock), entropy, &[], &[], logs)
+        // As the binary does it: what the guest file carries is the guest's environment.
+        let env = crate::env::with_guest_settings(Vec::new(), &builder.guest)?;
+        let guest_env = GuestEnvironment::new(fs, Box::new(HostClock), entropy, &env, &[], logs)
             .context("building the guest environment")?;
 
-        let fcm = if builder.notify {
-            Some(stub::Fcm::start().await?)
+        let push = if builder.notify {
+            Some(stub::Push::start().await?)
         } else {
             None
         };
-        let notify = match &fcm {
+        let notify = match &push {
             Some(stub) => Some(stub.config()?),
             None => None,
         };
@@ -221,7 +223,6 @@ impl Enclave {
                     max_interaction: std::time::Duration::from_secs(300),
                     tenancy: Some(Arc::new(Tenancy::new(PoolLimits::default()))),
                     authentication: Some((auth, gate)),
-                    egress: Default::default(),
                 },
             )
             .await;
@@ -233,7 +234,7 @@ impl Enclave {
                     addr,
                     nsm,
                     guest: builder.guest,
-                    fcm,
+                    push,
                 });
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -271,7 +272,7 @@ impl Enclave {
     ///
     /// Empty unless the builder asked for [`EnclaveBuilder::notify`].
     pub fn wakes(&self) -> Vec<Wake> {
-        self.fcm.as_ref().map(|f| f.wakes()).unwrap_or_default()
+        self.push.as_ref().map(|p| p.wakes()).unwrap_or_default()
     }
 
     /// Register a passkey, and with it a new tenant.

@@ -18,7 +18,7 @@ on:
         required: true
         type: string
       image_args:
-        description: dev-enclave.sh image options, as one line (--guest-egress ..., --guest-env ..., --background-timeout ...)
+        description: dev-enclave.sh image options, as one line (--rp-id ..., --allowed-origin ..., --push-app-id ...). A guest's settings are not image options; they are given when a bundle boots.
         required: false
         default: ""
         type: string

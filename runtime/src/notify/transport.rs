@@ -1,14 +1,16 @@
-//! The one place this runtime opens an outbound connection of its own.
+//! The push client's connection, made by this runtime itself.
 //!
-//! Everything else that leaves the enclave goes through an AWS SDK. This does
-//! not, because Firebase is not AWS — so the trust decision is made here, in
-//! code, rather than inherited from a feature name.
+//! Everything else that talks to AWS goes through an SDK. The push service does
+//! not: it is two small JSON calls, signed here, and a generated SDK for them
+//! would put far more code inside the measured image than the calls need. So the
+//! trust decision is made here, in code, rather than inherited from a feature
+//! name.
 //!
 //! # Why the roots are compiled in
 //!
 //! [`crate::net`] notes that the **parent instance answers DNS**. Certificate
-//! validation is therefore the only thing standing between
-//! `fcm.googleapis.com` and whatever the parent would prefer to point it at.
+//! validation is therefore the only thing standing between the push service's
+//! name and whatever the parent would prefer to point it at.
 //! The anchor set is `webpki-roots`, compiled into the image and covered by
 //! PCR0, rather than a file the image happens to ship — so what this enclave
 //! trusts outbound is part of what a client attests to.
@@ -23,12 +25,19 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
-use super::fcm::FcmTransport;
-
 /// Refuse a response larger than this rather than buffering whatever arrives.
-/// FCM's answers are small; anything this size is a sign the far end is not
-/// FCM.
+/// The push service's answers are small; anything this size is a sign the far
+/// end is not it.
 const MAX_RESPONSE: usize = 64 * 1024;
+
+/// One HTTP exchange. The seam that keeps the network out of the tests.
+#[async_trait::async_trait]
+pub trait PushTransport: Send + Sync + std::fmt::Debug {
+    async fn send(
+        &self,
+        request: http::Request<Vec<u8>>,
+    ) -> std::result::Result<http::Response<Vec<u8>>, String>;
+}
 
 /// A hyper client pinned to the public roots.
 pub struct HttpsTransport {
@@ -54,7 +63,7 @@ pub fn web_pki_client_config() -> Result<rustls::ClientConfig> {
         rustls::crypto::aws_lc_rs::default_provider().into(),
     )
     .with_safe_default_protocol_versions()
-    .context("selecting TLS protocol versions for the FCM client")?
+    .context("selecting TLS protocol versions")?
     .with_root_certificates(roots)
     .with_no_client_auth())
 }
@@ -82,7 +91,7 @@ impl HttpsTransport {
 }
 
 #[async_trait::async_trait]
-impl FcmTransport for HttpsTransport {
+impl PushTransport for HttpsTransport {
     async fn send(
         &self,
         request: http::Request<Vec<u8>>,

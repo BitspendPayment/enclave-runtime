@@ -1,30 +1,40 @@
 # Notifications
 
-A guest can ask the runtime to wake its tenant's devices through Firebase Cloud
-Messaging. It is for the moments that matter — work that finished, an approval
-somebody is waiting on — and it exists because a guest has no other way to reach
-a person between requests.
+A guest can ask the runtime to wake its tenant's devices through AWS End User
+Messaging Push — the service that was Amazon Pinpoint — which delivers to
+Android through Firebase Cloud Messaging. It is for the moments that matter —
+work that finished, an approval somebody is waiting on — and it exists because a
+guest has no other way to reach a person between requests.
 
-The guest does not send anything. It cannot: [`serve::EgressPolicy`] refuses
-every outgoing request a guest makes, deliberately. The runtime holds the
-credential and owns the connection.
+The guest does not send anything, and holds no credential that could. The runtime
+signs as the instance's own role and owns the connection. The Firebase
+credential lives on the push application's FCM channel, inside AWS, so no image
+carries it.
 
 ## A wake signal carries nothing
 
 **There is no title, no body, and no `notification` object. Not behind a flag.**
 
-An FCM payload travels through the parent instance — the party an enclave exists
-to exclude — and then through Google. Anything put in it is disclosed to both. So
-a wake carries an opaque `category`, an optional tenant-local `reference`, and a
-schema version:
+A wake travels through the parent instance — the party an enclave exists to
+exclude — then through AWS, then through Google. Anything put in it is disclosed
+to all three. So a wake carries an opaque `category`, an optional tenant-local
+`reference`, and a schema version. It is sent as one `SendMessages` call per
+device, with the FCM v1 message as `RawContent` and nothing beside it:
 
 ```json
-{"message": {"token": "…",
-             "data": {"v": "1", "category": "approval-needed", "ref": "txn-9f2"},
-             "android": {"priority": "high", "ttl": "3600s"},
-             "apns": {"headers": {"apns-push-type": "background", "apns-priority": "5"},
-                      "payload": {"aps": {"content-available": 1}}}}}
+{"Addresses": {"<token>": {"ChannelType": "GCM"}},
+ "MessageConfiguration": {"GCMMessage": {"RawContent":
+   "{\"fcmV1Message\": {\"message\": {
+       \"data\": {\"v\": \"1\", \"category\": \"approval-needed\", \"ref\": \"txn-9f2\"},
+       \"android\": {\"priority\": \"high\", \"ttl\": \"3600s\"},
+       \"apns\": {\"headers\": {\"apns-push-type\": \"background\", \"apns-priority\": \"5\"},
+                \"payload\": {\"aps\": {\"content-available\": 1}}}}}}"}}}
 ```
+
+`RawContent` and only that: the service's structured fields wrap what they carry —
+`Data` reaches the phone as one string under `pinpoint.jsonBody` — so an app
+reading `data.category` would never find it, and the wake would be reported
+delivered and dropped.
 
 The app wakes and fetches the detail over its own attested connection, where the
 parent is excluded again. That costs a round trip and is the entire point.
@@ -34,31 +44,44 @@ the OS *without* the app running, so a wake carrying one would show text and fai
 to wake anything.
 
 Labels are identifiers, not prose — 1–64 characters of `[A-Za-z0-9_-]`. If a
-category name would itself be sensitive, choose an opaque one; Google sees the
-label, the timing and the destination regardless.
+category name would itself be sensitive, choose an opaque one; AWS and Google
+see the label, the timing and the destination regardless.
 
 ## Enable
 
-Set a project and exactly one credential source. Empty means off.
+One setting. Empty means off.
 
 | Setting | Purpose |
 |---|---|
-| `S3FS_FCM_PROJECT_ID` | The Firebase project. Baked into the image, so PCR0 covers it |
-| `S3FS_FCM_SERVICE_ACCOUNT` | The service-account JSON itself. Development |
-| `S3FS_FCM_SERVICE_ACCOUNT_PARAMETER` | An SSM parameter holding that JSON. Production |
-| `S3FS_FCM_ENDPOINT` | Send somewhere else. Tests and the emulator only |
+| `S3FS_PUSH_APP_ID` | The push application. Baked into the image, so PCR0 covers it. Not a secret |
+| `S3FS_PUSH_ENDPOINT` | Send to a stub instead, signed with a placeholder. Only a `testing` build has it |
 
-Both credential sources at once is refused rather than ranked: a deployment that
-set both has one of them wrong, and guessing which is the wrong kind of help. A
-literal credential is parsed — key included — at startup, so a malformed one
-fails at boot rather than the first time somebody is waiting to be woken.
+Requests go to `pinpoint.<region>.amazonaws.com` in the runtime's region, signed
+(SigV4, service `mobiletargeting`) at the trusted clock's time as the instance's
+role. The role comes from the metadata service and nowhere else: the image names
+`http://192.168.127.253` as its address, which gvproxy maps for the runtime alone
+(`deploy/ami/units/gvproxy.yml`), and no guest can reach it.
+
+At boot the runtime reads the application's FCM channel. One that is disabled,
+holds no Firebase service account, or would authenticate with the legacy server
+key — `KEY`, the channel's default, which Google has turned off — refuses the
+boot; a channel that cannot be reached only warns.
 
 Notifications require authentication and tenant isolation, for the same reason
 background tasks do: the tenant a wake belongs to comes from a verified
 assertion, and without a gate there is none.
 
-In the Nix deployment set `fcmProjectId` and `fcmServiceAccountParameter` in
-`deploy/nix/deployment.nix`. Both change PCR0.
+In the Nix deployment set `pushAppId` in `deploy/nix/deployment.nix`, and
+`push_app_id` in `deploy/tofu`, which lets the parent's role send through that
+one application. Set the channel up once, from the CLI — it keeps the service
+account out of tofu state:
+
+```sh
+aws pinpoint create-app --create-application-request Name=wakes
+aws pinpoint update-gcm-channel --application-id <id> --gcm-channel-request \
+  "$(jq -n --rawfile s service-account.json \
+        '{ServiceJson: $s, DefaultAuthenticationMethod: "TOKEN", Enabled: true}')"
+```
 
 ## Guest contract
 
@@ -97,12 +120,17 @@ tenant's only instance slot.
   the guest can act on, so it is not reported to it; exceeding the per-tenant cap
   of distinct in-flight categories *is* returned as an error, because that one is
   actionable.
-- Transient failures retry with backoff. Credential failures count as transient:
-  an expired token heals on the next refresh, and treating it as fatal would turn
-  routine rotation into an outage.
-- A token FCM reports as `UNREGISTERED` is **pruned, never retried**. It is
-  terminal by definition, it would spend the tenant's backoff budget while their
-  other devices queue behind it, and it would occupy one of eight slots for ever.
+- Transient failures retry with backoff. A refused signature counts as
+  transient and fetches the role's credentials again: a credential that expired
+  in flight heals, and treating it as fatal would turn routine rotation into an
+  outage.
+- A token the service reports gone — a `PERMANENT_FAILURE` for that address with
+  status 404 or 410, or an `UNREGISTERED` message, inside a 200 — is **pruned,
+  never retried**. It is terminal by definition, it would spend the tenant's
+  backoff budget while their other devices queue behind it, and it would occupy
+  one of eight slots for ever. Other permanent failures are dropped and counted,
+  not pruned: pruning is not undone, and a wallet that thinks its token enrolled
+  never offers it again until FCM rotates it.
 - Queued wakes are **not durable**. A restart loses them, on purpose: in `tasks`
   the record *is* the work, whereas here it would be a stale pointer to work that
   already happened, and the next wake or the next poll supersedes it.
@@ -112,24 +140,25 @@ the newest refused — this is a cache of places a person can be reached, not a
 credential list, and somebody on their ninth phone must still be able to enrol
 it.
 
-## What a stolen credential buys
+## What a borrowed role buys
 
-The service account reaches the runtime through the parent instance, which is the
-party the enclave excludes. State it plainly.
+The runtime signs as the parent instance's role, so the parent can sign as it too.
+State it plainly.
 
-A parent that steals it **can** send wake signals to registration tokens it
-obtains elsewhere, as this project; and it can delay, drop or reorder the
-enclave's own sends, which it could already do because it carries every packet.
+A parent **can** send wake signals through this one application, to registration
+tokens it obtains elsewhere; and it can delay, drop or reorder the enclave's own
+sends, which it could already do because it carries every packet.
 
 It **cannot** read any tenant's data, or the device tokens themselves — those
 live in `/runtime/devices` inside the encrypted filesystem, under a key KMS
-releases only against a matching PCR0 and PCR16. It cannot impersonate the
+releases only against a matching PCR0 and PCR16. It cannot read the Firebase
+credential either: the channel never returns it. It cannot impersonate the
 enclave to a client, which needs an attestation document it cannot produce. And a
 forged wake means nothing, because a wake carries no state: the app's response to
 one is to fetch over the attested channel, where the parent is shut out again.
 
-The credential protects a doorbell. Keeping it in SSM rather than the image means
-it can rotate without moving PCR0, which is proportionate to that.
+The role protects a doorbell, and IAM scopes it to one application and revokes it
+without a new image.
 
 ## The example guest
 
@@ -152,10 +181,13 @@ cargo test -p enclave-runtime --lib notify::
 cargo test -p enclave-runtime --lib tasks::tests -- --include-ignored
 ```
 
-Nothing in the suite reaches Google: the wire is covered by a transport double
-that records exactly what would have been sent. **The FCM path is unverified
-against the real service** — the same honesty `guest_io::cloudwatch` applies to
-its own credential path. What is exercised end to end is leg `6b/8` of
+Nothing in the suite reaches AWS: the wire is covered by a transport double that
+records exactly what would have been sent, and pins its signature. **The push
+path is unverified against the real service** — its response shapes are from
+the API model, not from a live answer, and the dead-token status under token
+authentication is undocumented — the same honesty `guest_io::cloudwatch` applies
+to its own credential path. What is exercised end to end is leg `6b/8` of
 [`deploy/qemu-nitro/run-e2e.sh`](../deploy/qemu-nitro/run-e2e.sh), where a
 finished background task wakes an enrolled device inside an emulated enclave and
-a stub records that the message carried no content.
+a stub records that the request was signed for the service, carried only
+`RawContent`, and that the message carried no content.

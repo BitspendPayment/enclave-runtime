@@ -84,14 +84,13 @@ pub use mount::{connect, create, mount_existing, parse_fs_id, Backends, MountCon
 pub use net::{bring_up, Network, NetworkConfig, NetworkMode, DEFAULT_GVFORWARDER};
 pub use nitro_nsm::{Nsm, NsmDevice, DEFAULT_NSM_DEVICE};
 pub use notify::{
-    start as start_notify_forwarder, DeviceRegistry, FcmClient, FcmTransport, Notifier,
-    NotifyConfig, NotifyContext, NotifyForwarder, SendError, ServiceAccount,
-    NOTIFY_STARTUP_PROBE_TIMEOUT,
+    start as start_notify_forwarder, DeviceRegistry, Notifier, NotifyConfig, NotifyContext,
+    NotifyForwarder, PinpointClient, PushTransport, SendError, NOTIFY_STARTUP_PROBE_TIMEOUT,
 };
 pub use random::{open_entropy, GuestRandom, HostEntropy, RandomSource};
 pub use run::{read_component, GuestEnvironment, GuestOutcome, EXIT_RUNTIME_FAILURE};
 pub use serve::{
-    apply_tenant, serve_component, AcmeConfig, CertificateSlot, EgressPolicy, GuestInstance,
+    apply_tenant, serve_component, AcmeConfig, CertificateSlot, GuestEgress, GuestInstance,
     PoolLimits, SealedAcmeCache, ServeConfig, ServeHandle, Server, Tenancy, TenantPool,
     TlsIdentity, TlsMode, X_ENCLAVE_TENANT,
 };

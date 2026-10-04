@@ -126,6 +126,20 @@ impl GuestEnvironment {
         // builder's default, because "the guest cannot read stdin" is a
         // decision and not an accident.
         wasi.stdin(tokio::io::empty());
+        // No sockets of its own, stated rather than left to the builder's defaults: a guest's way
+        // out is `wasi:http`, where the runtime makes the connection and checks where it goes —
+        // see `serve::egress`. A socket would be a way around that check.
+        wasi.allow_tcp(false)
+            .allow_udp(false)
+            .allow_ip_name_lookup(false)
+            .socket_addr_check(|_, _| Box::pin(async { false }));
+        // No sockets of its own, stated rather than inherited from the builder's defaults, which
+        // allow creating TCP and UDP sockets. A guest's one way out is `wasi:http`, where the
+        // runtime makes the connection and decides where it may go — see `serve::egress`.
+        wasi.allow_tcp(false)
+            .allow_udp(false)
+            .allow_ip_name_lookup(false)
+            .socket_addr_check(|_, _| Box::pin(async { false }));
         // Never `inherit_stdio`. Guest output is untrusted, attacker-chosen
         // text; on the enclave's own stdout it would be indistinguishable from
         // the runtime's log lines. These carry it into `crate::guest_io`

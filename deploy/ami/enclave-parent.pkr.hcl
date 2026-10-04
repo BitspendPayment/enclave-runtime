@@ -185,6 +185,7 @@ build {
     inline = [
       "set -euxo pipefail",
       "sudo install -m 0644 /tmp/units/gvproxy.service /etc/systemd/system/",
+      "sudo install -D -m 0644 /tmp/units/gvproxy.yml /etc/gvproxy/config.yml",
       "sudo install -m 0644 /tmp/units/enclave.service /etc/systemd/system/",
       "sudo install -m 0755 /tmp/units/enclave-start.sh /usr/local/bin/enclave-start",
       "sudo systemctl enable gvproxy.service enclave.service",

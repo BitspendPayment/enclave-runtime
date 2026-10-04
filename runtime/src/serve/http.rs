@@ -87,9 +87,6 @@ pub struct ServeConfig {
     /// development and QEMU arrangement, and [`serve_component`] says so
     /// loudly at startup rather than leaving it to be noticed.
     pub authentication: Option<(Arc<AuthEndpoints>, Arc<Gate>)>,
-    /// What guests may reach over `wasi:http`. [`EgressPolicy::Denied`] unless
-    /// the deployment names origins.
-    pub egress: crate::serve::EgressPolicy,
 }
 
 impl Default for ServeConfig {
@@ -121,7 +118,6 @@ impl Default for ServeConfig {
             // for, never inherited.
             tenancy: None,
             authentication: None,
-            egress: crate::serve::EgressPolicy::Denied,
         }
     }
 }
@@ -183,7 +179,6 @@ pub struct ServeHandle {
     /// Connections this runtime holds for guests — see [`crate::stream`].
     streams: Option<Arc<crate::stream::StreamRegistry>>,
     notify: Option<Arc<crate::notify::Notifier>>,
-    egress: crate::serve::EgressPolicy,
     guest: Arc<GuestEnvironment>,
     /// One request at a time for callers with no resolved tenant.
     ///
@@ -291,7 +286,6 @@ impl ServeHandle {
             tasks: None,
             streams: None,
             notify: None,
-            egress: crate::serve::EgressPolicy::Denied,
             pre,
             guest: Arc::new(guest),
             anonymous: Arc::new(tokio::sync::Mutex::new(())),
@@ -351,14 +345,6 @@ impl ServeHandle {
         Ok(self)
     }
 
-    /// Let guests reach the origins [`crate::serve::EgressPolicy`] names — for
-    /// requests and background tasks alike, since renewing something on a
-    /// schedule is exactly the work that happens with nobody connected.
-    pub fn with_egress(mut self, egress: crate::serve::EgressPolicy) -> Self {
-        self.egress = egress;
-        self
-    }
-
     /// An internal component export, never an HTTP route or a fabricated token.
     /// One message from a held connection, as one guest invocation.
     ///
@@ -398,7 +384,6 @@ impl ServeHandle {
                 tenant,
                 interactive: false,
             });
-            store.data_mut().set_egress(self.egress.clone());
             store.data_mut().notify =
                 self.notify
                     .as_ref()
@@ -469,7 +454,6 @@ impl ServeHandle {
                 tenant: task.tenant,
                 interactive: false,
             });
-            store.data_mut().set_egress(self.egress.clone());
             store.data_mut().notify =
                 self.notify
                     .as_ref()
@@ -658,7 +642,6 @@ impl ServeHandle {
                 tenant: tenant_id,
                 interactive: true,
             });
-        instance.store.data_mut().set_egress(self.egress.clone());
         instance.store.data_mut().notify =
             self.notify
                 .as_ref()
@@ -1360,7 +1343,6 @@ impl Server {
                 self.gate.is_some(),
                 "held connections require authentication"
             );
-            streams.set_egress(self.guest.egress.clone()).await;
             // The attestor `/auth/*` uses, not a second one: one device, and one
             // limit on it for both directions. Set before the supervisor starts,
             // so not even the first dial after a restart goes out unsigned.
@@ -1516,8 +1498,7 @@ pub async fn serve_component(
     let engine = ServeHandle::engine_with_watchdog()?;
     let mut handle = ServeHandle::new(&engine, component_bytes, guest)?
         .with_timeout(config.request_timeout)
-        .with_max_interaction(config.max_interaction)
-        .with_egress(config.egress.clone());
+        .with_max_interaction(config.max_interaction);
     if let Some(tenancy) = &config.tenancy {
         handle = handle.with_tenancy(tenancy.clone());
     }
@@ -1536,9 +1517,9 @@ pub async fn serve_component(
     }
     // Held connections, whenever there is a tenant to attribute one to and a gate to authenticate
     // that tenant. No flag of its own: the registry is a directory and a supervisor loop over
-    // whatever records exist, and a guest that never asks for a connection has neither. What a
-    // guest may REACH is still the egress allowlist's to say, checked on every dial and every
-    // send — so enabling this widens nothing.
+    // whatever records exist, and a guest that never asks for a connection has neither. A held
+    // connection reaches only what the guest's own request could, checked on every dial and
+    // every send — so enabling this widens nothing.
     if config.tenancy.is_some() && config.authentication.is_some() {
         let registry =
             crate::stream::StreamRegistry::open_registry(handle.environment().fs().clone()).await?;
@@ -1560,7 +1541,7 @@ pub async fn serve_component(
             .as_deref()
             .is_some_and(|e| e.starts_with("http://"));
         let transport = Arc::new(crate::notify::HttpsTransport::new(plaintext)?);
-        let mut client = crate::notify::FcmClient::new(notify, transport);
+        let mut client = crate::notify::pinpoint::client(notify, transport)?;
 
         let clock = handle.environment().clock().clone();
         let now = {
@@ -1569,23 +1550,28 @@ pub async fn serve_component(
         };
         // Bounded, and never fatal for a transient failure. A push service
         // must not be what decides whether the enclave binds its listener —
-        // but a credential that will never work is a deployment mistake, and
-        // finding it now beats finding it the first time somebody needed a
-        // wake signal.
+        // but an application that can never deliver, or a role that may not
+        // send, is a deployment mistake, and finding it now beats finding it
+        // the first time somebody needed a wake signal.
         match tokio::time::timeout(
             crate::notify::NOTIFY_STARTUP_PROBE_TIMEOUT,
             client.probe(now),
         )
         .await
         {
-            Ok(Ok(())) => tracing::info!("notifications are configured and the credential works"),
+            Ok(Ok(())) => {
+                tracing::info!("notifications are configured and the application can deliver")
+            }
             Ok(Err(crate::notify::SendError::Refused(detail))) => {
-                anyhow::bail!("the FCM credential was rejected: {detail}")
+                anyhow::bail!("the push application cannot deliver: {detail}")
             }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "could not reach FCM at startup; wake signals will retry")
-            }
-            Err(_) => tracing::warn!("FCM did not answer at startup; wake signals will retry"),
+            Ok(Err(e)) => tracing::warn!(
+                error = %e,
+                "could not reach the push service at startup; wake signals will retry"
+            ),
+            Err(_) => tracing::warn!(
+                "the push service did not answer at startup; wake signals will retry"
+            ),
         }
 
         let (notifier, forwarder) = crate::notify::start(registry, clock, client);

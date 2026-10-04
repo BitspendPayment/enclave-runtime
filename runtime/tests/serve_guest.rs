@@ -215,31 +215,6 @@ async fn a_traversing_path_is_refused() {
     assert_ne!(status, 200, "traversal must not succeed: {body}");
 }
 
-/// `wasi:http/outgoing-handler` is linked, so a guest can call it. It must
-/// fail. This is the enclave's egress boundary, checked through the same
-/// linker the runtime uses rather than against the policy type in isolation.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_linker_denies_guest_egress() {
-    use enclave_runtime::EgressPolicy;
-    use wasmtime_wasi_http::p2::{types::OutgoingRequestConfig, WasiHttpHooks};
-
-    let mut policy = EgressPolicy::Denied;
-    let req = hyper::Request::builder()
-        .uri("https://example.invalid/")
-        .body(body(b""))
-        .unwrap();
-    let config = OutgoingRequestConfig {
-        use_tls: true,
-        connect_timeout: std::time::Duration::from_secs(1),
-        first_byte_timeout: std::time::Duration::from_secs(1),
-        between_bytes_timeout: std::time::Duration::from_secs(1),
-    };
-    let Err(err) = policy.send_request(req, config) else {
-        panic!("egress must be refused");
-    };
-    assert!(format!("{err:?}").contains("HttpRequestDenied"), "{err:?}");
-}
-
 /// A guest that never returns and never answers.
 ///
 /// Without a watchdog this is not a slow request, it is a permanent one: the

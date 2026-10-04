@@ -184,7 +184,6 @@ async fn start_inner(slot: Option<enclave_runtime::CertificateSlot>) -> Harness 
                 // These tests are about the attestation binding, which is
                 // reached under `/enclave/` and never passes the gate.
                 authentication: None,
-                egress: Default::default(),
             },
         )
         .await;

@@ -217,7 +217,7 @@ service must accept a request header of **~16 KB** — nginx's default
   a forgery, and delivery is at least once anyway — handlers deduplicate as
   they already must.
 - **Anything about the service.** What arrives down the held stream is
-  authenticated by TLS and the egress allowlist, not by this.
+  authenticated by TLS, not by this.
 
 ## Known limits
 

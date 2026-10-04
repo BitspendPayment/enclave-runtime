@@ -26,9 +26,9 @@ pub struct State {
     /// with "now" agrees with it.
     clock: Arc<crate::clock::WallClockAdapter>,
     http: wasmtime_wasi_http::WasiHttpCtx,
-    /// What `wasi:http/outgoing-handler` may reach. `Denied` until the
-    /// serving code says otherwise — see [`State::set_egress`].
-    egress: crate::serve::EgressPolicy,
+    /// What `wasi:http/outgoing-handler` reaches: the public internet, and the
+    /// same for every guest — see [`crate::serve::GuestEgress`].
+    egress: crate::serve::GuestEgress,
 }
 
 impl State {
@@ -54,17 +54,12 @@ impl State {
             fs,
             clock,
             http: wasmtime_wasi_http::WasiHttpCtx::new(),
-            egress: crate::serve::EgressPolicy::Denied,
+            egress: crate::serve::GuestEgress,
         }
     }
 
     pub fn fs(&self) -> &Arc<Fs> {
         &self.fs
-    }
-
-    /// Give the guest the deployment's egress policy.
-    pub fn set_egress(&mut self, egress: crate::serve::EgressPolicy) {
-        self.egress = egress;
     }
 
     /// Whether the guest left anything behind in the resource table.

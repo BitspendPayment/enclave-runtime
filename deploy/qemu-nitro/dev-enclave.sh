@@ -41,14 +41,11 @@ PREFIX="${PREFIX:-dev}"
 HTTPS_PORT="${HTTPS_PORT:-8443}"
 WEBAUTHN_RP_ID=""
 WEBAUTHN_ALLOWED_ORIGINS=""
-GUEST_EGRESS_ORIGINS=""
-BACKGROUND_TIMEOUT_SECS=""
 GUEST_ENV=""
 TLS_DOMAIN=""
 ACME_STAGING=""
 ACME_CONTACT=""
-FCM_PROJECT=""
-FCM_SERVICE_ACCOUNT=""
+PUSH_APP_ID=""
 QEMU_MEMORY="${QEMU_MEMORY:-3G}"
 STORE_BIND=""
 PUBLISH_HOOK=""
@@ -60,10 +57,9 @@ usage() {
 usage: ${0##*/} [--guest COMPONENT.wasm] [--port PORT] [--name NAME]
                      [--rp-id DOMAIN] [--allowed-origin ORIGIN]...
                      [--keep-store [--fresh]]
-                     [--guest-egress ORIGIN]... [--background-timeout SECS]
                      [--guest-env NAME=VALUE]...
                      [--domain NAME [--acme-staging] [--acme-contact EMAIL]]
-                     [--fcm-project ID --fcm-service-account FILE]
+                     [--push-app-id ID]
                      [--memory SIZE] [--store-bind ADDR] [--publish-hook CMD]
                      [--pack DIR | --prebuilt DIR]
 
@@ -89,16 +85,15 @@ usage: ${0##*/} [--guest COMPONENT.wasm] [--port PORT] [--name NAME]
             upgrade of the same store. The trust root and the attestation chain
             are still new every boot, so clients re-read their pins.
   --fresh   with --keep-store, discard the kept store first.
-  --guest-egress ORIGIN
-            an origin the guest may send requests to, as http(s)://host[:port].
-            Repeatable. None by default, and then the guest has no outbound
-            network. The host running this script is 192.168.127.254 from
-            inside the enclave. A different image, so a different PCR0.
-  --background-timeout SECS
-            how long one background task may run (the runtime's default is 30).
   --guest-env NAME=VALUE
-            a variable for the guest, e.g. ASP_URL=http://192.168.127.254:7070.
-            Repeatable. Baked into the image, so measured by PCR0.
+            a setting for the guest, e.g. ASP_URL=http://192.168.127.254:7070.
+            Repeatable. Written into the guest file before it is uploaded, so it
+            is measured into PCR16 with the guest's code, not baked into the
+            image: it can be given with --prebuilt.
+
+  A guest may send requests to the public internet, and from this emulator also to the host
+  running this script — 192.168.127.254 from inside — on every port but the runtime's own. There
+  is no option for it: the rule is by address, in the runtime.
 
   For an emulator on a public host — test infrastructure, not a trust boundary: whoever runs the
   host can read every tenant's data and sign attestation documents. See docs/DEV_ENCLAVE.md.
@@ -112,9 +107,12 @@ usage: ${0##*/} [--guest COMPONENT.wasm] [--port PORT] [--name NAME]
             production CA's rate limit. Its certificates are trusted by nothing.
   --acme-contact EMAIL
             the address Let's Encrypt sends expiry notices to.
-  --fcm-project ID --fcm-service-account FILE
-            real Firebase notifications, with that service account's JSON key,
-            instead of the stub. The key is baked into the image.
+  --push-app-id ID
+            real notifications, through that AWS End User Messaging Push
+            application, instead of the stub. Signed as this host's instance
+            role, so the host must be on EC2, with a role allowed to send
+            through the application. Not a secret: the application's FCM
+            channel holds the Firebase credential, and the image only names it.
   --memory SIZE
             the enclave's memory, as QEMU's -m. Default $QEMU_MEMORY.
   --store-bind ADDR
@@ -147,11 +145,6 @@ while [[ $# -gt 0 ]]; do
         --name)  need "$1" "${2:-}"; PREFIX="$2";     shift 2 ;;
         --rp-id) need "$1" "${2:-}"; WEBAUTHN_RP_ID="$2"; shift 2 ;;
         --keep-store) KEEP_STORE=1; shift ;;
-        --guest-egress)
-                 need "$1" "${2:-}"
-                 GUEST_EGRESS_ORIGINS="${GUEST_EGRESS_ORIGINS:+$GUEST_EGRESS_ORIGINS,}$2"
-                 shift 2 ;;
-        --background-timeout) need "$1" "${2:-}"; BACKGROUND_TIMEOUT_SECS="$2"; shift 2 ;;
         --guest-env) need "$1" "${2:-}"; GUEST_ENV="${GUEST_ENV:+$GUEST_ENV,}$2"; shift 2 ;;
         --fresh) FRESH_STORE=1; shift ;;
         --allowed-origin)
@@ -161,8 +154,7 @@ while [[ $# -gt 0 ]]; do
         --domain) need "$1" "${2:-}"; TLS_DOMAIN="$2"; shift 2 ;;
         --acme-staging) ACME_STAGING=1; shift ;;
         --acme-contact) need "$1" "${2:-}"; ACME_CONTACT="$2"; shift 2 ;;
-        --fcm-project) need "$1" "${2:-}"; FCM_PROJECT="$2"; shift 2 ;;
-        --fcm-service-account) need "$1" "${2:-}"; FCM_SERVICE_ACCOUNT="$2"; shift 2 ;;
+        --push-app-id) need "$1" "${2:-}"; PUSH_APP_ID="$2"; shift 2 ;;
         --memory) need "$1" "${2:-}"; QEMU_MEMORY="$2"; shift 2 ;;
         --store-bind) need "$1" "${2:-}"; STORE_BIND="$2"; shift 2 ;;
         --publish-hook) need "$1" "${2:-}"; PUBLISH_HOOK="$2"; shift 2 ;;
@@ -194,11 +186,6 @@ for o in "${origins[@]}"; do
     [[ "$o" =~ ^(https://[a-z0-9.-]+(:[0-9]+)?|android:apk-key-hash:[A-Za-z0-9_-]{43})$ ]] \
         || { echo "--allowed-origin $o: expected https://<host> or android:apk-key-hash:<43 characters>" >&2; exit 1; }
 done
-IFS=, read -ra egress <<<"$GUEST_EGRESS_ORIGINS"
-for o in "${egress[@]}"; do
-    [[ "$o" =~ ^https?://[a-z0-9.-]+(:[0-9]{1,5})?$ ]] \
-        || { echo "--guest-egress $o: expected http(s)://host[:port]" >&2; exit 1; }
-done
 IFS=, read -ra guest_env <<<"$GUEST_ENV"
 for kv in "${guest_env[@]}"; do
     [[ "$kv" =~ ^[A-Z_][A-Z0-9_]*=[A-Za-z0-9:/._-]*$ ]] \
@@ -206,8 +193,6 @@ for kv in "${guest_env[@]}"; do
     [[ "$kv" != S3FS_* && "$kv" != AWS_* ]] \
         || { echo "--guest-env $kv: S3FS_ and AWS_ variables are withheld from guests" >&2; exit 1; }
 done
-[[ -z "$BACKGROUND_TIMEOUT_SECS" || "$BACKGROUND_TIMEOUT_SECS" =~ ^[1-9][0-9]{0,5}$ ]] \
-    || { echo "--background-timeout must be a number of seconds" >&2; exit 1; }
 if [[ -n "$WEBAUTHN_ALLOWED_ORIGINS" && -z "$WEBAUTHN_RP_ID" ]]; then
     echo "--allowed-origin needs --rp-id: an app's origin is only ever vouched for by its own domain" >&2
     exit 1
@@ -219,28 +204,20 @@ fi
     || { echo "--acme-staging and --acme-contact need --domain: Pebble takes neither" >&2; exit 1; }
 [[ -z "$ACME_CONTACT" || "$ACME_CONTACT" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] \
     || { echo "--acme-contact must be an email address" >&2; exit 1; }
-if [[ -n "$FCM_PROJECT$FCM_SERVICE_ACCOUNT" ]]; then
-    [[ -n "$FCM_PROJECT" && -n "$FCM_SERVICE_ACCOUNT" ]] \
-        || { echo "--fcm-project and --fcm-service-account go together" >&2; exit 1; }
-    [[ "$FCM_PROJECT" =~ ^[a-z0-9-]+$ ]] || { echo "--fcm-project must be a Firebase project id" >&2; exit 1; }
-    FCM_SERVICE_ACCOUNT="$(readlink -f "$FCM_SERVICE_ACCOUNT")" && [[ -f "$FCM_SERVICE_ACCOUNT" ]] \
-        || { echo "no such service account file" >&2; exit 1; }
-    # A Nix path literal: no spaces or quotes to break out of the expression.
-    [[ "$FCM_SERVICE_ACCOUNT" =~ ^/[A-Za-z0-9/._-]+$ ]] \
-        || { echo "--fcm-service-account path must be letters, digits and /._-" >&2; exit 1; }
-    jq -e '.type == "service_account" and .project_id != null' "$FCM_SERVICE_ACCOUNT" >/dev/null \
-        || { echo "--fcm-service-account is not a service account key" >&2; exit 1; }
-fi
+[[ -z "$PUSH_APP_ID" || "$PUSH_APP_ID" =~ ^[0-9a-f]{32}$ ]] \
+    || { echo "--push-app-id must be an application id: 32 hex characters" >&2; exit 1; }
 [[ "$QEMU_MEMORY" =~ ^[1-9][0-9]*[MG]$ ]] || { echo "--memory must be like 1536M or 3G" >&2; exit 1; }
 [[ -z "$STORE_BIND" || "$STORE_BIND" =~ ^[0-9.]+$ ]] || { echo "--store-bind must be an IPv4 address" >&2; exit 1; }
 [[ -z "$PACK_DIR" || -z "$BUNDLE" ]] || { echo "--pack and --prebuilt are exclusive" >&2; exit 1; }
+[[ -z "$PACK_DIR" || -z "$GUEST_ENV" ]] \
+    || { echo "--guest-env configures a guest, and a bundle carries none: give it when the bundle boots" >&2; exit 1; }
 if [[ -n "$PACK_DIR" ]]; then
     mkdir -p "$PACK_DIR" && PACK_DIR="$(readlink -f "$PACK_DIR")"
 fi
 if [[ -n "$BUNDLE" ]]; then
     # The image is what it was packed as. An image option here would describe an enclave that is
     # not the one about to boot, and the summary and the passkey client would believe it.
-    [[ -z "$WEBAUTHN_RP_ID$WEBAUTHN_ALLOWED_ORIGINS$GUEST_EGRESS_ORIGINS$BACKGROUND_TIMEOUT_SECS$GUEST_ENV$TLS_DOMAIN$ACME_STAGING$ACME_CONTACT$FCM_PROJECT" ]] \
+    [[ -z "$WEBAUTHN_RP_ID$WEBAUTHN_ALLOWED_ORIGINS$TLS_DOMAIN$ACME_STAGING$ACME_CONTACT$PUSH_APP_ID" ]] \
         || { echo "--prebuilt fixes the image: pass image options to --pack instead" >&2; exit 1; }
     BUNDLE="$(readlink -f "$BUNDLE")" && [[ -f "$BUNDLE/image.env" ]] \
         || { echo "--prebuilt $BUNDLE: not a bundle (no image.env)" >&2; exit 1; }
@@ -254,8 +231,8 @@ if [[ -n "${FRESH_STORE:-}" && -z "${KEEP_STORE:-}" ]]; then
 fi
 
 export GUEST_WASM PREFIX HTTPS_PORT WEBAUTHN_RP_ID WEBAUTHN_ALLOWED_ORIGINS KEEP_STORE FRESH_STORE \
-    GUEST_EGRESS_ORIGINS BACKGROUND_TIMEOUT_SECS GUEST_ENV TLS_DOMAIN ACME_STAGING ACME_CONTACT \
-    FCM_PROJECT FCM_SERVICE_ACCOUNT QEMU_MEMORY STORE_BIND PACK_DIR BUNDLE
+    GUEST_ENV TLS_DOMAIN ACME_STAGING ACME_CONTACT PUSH_APP_ID \
+    QEMU_MEMORY STORE_BIND PACK_DIR BUNDLE
 # shellcheck source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
@@ -292,10 +269,10 @@ else
 enclave boots into genesis rather than resuming. --keep-store keeps it."
 fi
 
-if [[ -n "$FCM_PROJECT" ]]; then
-    wakes="Firebase project $FCM_PROJECT"
+if [[ -n "$PUSH_APP_ID" ]]; then
+    wakes="push application $PUSH_APP_ID"
 else
-    wakes="$FCM_RECORD  (every notification the guest raised, as JSON)"
+    wakes="$PUSH_RECORD  (every notification the guest raised, as JSON)"
 fi
 if [[ -n "$TLS_DOMAIN" ]]; then
     certificate_note="The certificate is from Let's Encrypt."
@@ -315,7 +292,7 @@ cat <<EOF
   url      https://${TLS_DOMAIN:-127.0.0.1}:$HTTPS_PORT
   host     ${TLS_DOMAIN:-enclave.test}   (the name on the certificate)
   rp id    ${WEBAUTHN_RP_ID:-enclave.test}${WEBAUTHN_ALLOWED_ORIGINS:+   allowing $WEBAUTHN_ALLOWED_ORIGINS}
-  egress   ${GUEST_EGRESS_ORIGINS:-none — the guest has no outbound network}
+  egress   the public internet, and this host on every port but the runtime's own
 
 What a client has to pin. All three, and none of them stands in for another:
 PCR0 is the image, taken by the hypervisor and unforgeable from inside; PCR16 is

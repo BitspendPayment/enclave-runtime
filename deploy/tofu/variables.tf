@@ -82,3 +82,9 @@ variable "guest_log_retention_days" {
   type        = number
   default     = 30
 }
+
+variable "push_app_id" {
+  description = "The AWS End User Messaging Push application wake signals go through, as the image names it (pushAppId), or empty for none. The parent's role may send through this one application."
+  type        = string
+  default     = ""
+}

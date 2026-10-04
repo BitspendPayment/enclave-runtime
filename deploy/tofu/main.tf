@@ -240,6 +240,30 @@ resource "aws_iam_role_policy" "guest_logs" {
   policy = data.aws_iam_policy_document.guest_logs.json
 }
 
+# Wake signals, through the one push application the image names (`pushAppId` in
+# deploy/nix/deployment.nix) and nothing else: sending, and reading its FCM channel, which the
+# runtime does once at boot to refuse an application that could never deliver. The Firebase
+# credential lives on that channel, not here and not in the image. None without an application.
+data "aws_iam_policy_document" "push" {
+  count = var.push_app_id == "" ? 0 : 1
+  statement {
+    sid     = "SendWakes"
+    effect  = "Allow"
+    actions = ["mobiletargeting:SendMessages", "mobiletargeting:GetGcmChannel"]
+    resources = [
+      "arn:aws:mobiletargeting:${var.region}:${data.aws_caller_identity.current.account_id}:apps/${var.push_app_id}",
+      "arn:aws:mobiletargeting:${var.region}:${data.aws_caller_identity.current.account_id}:apps/${var.push_app_id}/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "push" {
+  count  = var.push_app_id == "" ? 0 : 1
+  name   = "${local.name}-push"
+  role   = aws_iam_role.parent.id
+  policy = data.aws_iam_policy_document.push[0].json
+}
+
 # For a shell without opening port 22.
 resource "aws_iam_role_policy_attachment" "ssm" {
   role       = aws_iam_role.parent.name
@@ -289,19 +313,17 @@ resource "aws_instance" "parent" {
     http_tokens   = "required" # IMDSv2
     http_endpoint = "enabled"
 
-    # UNVERIFIED PRODUCTION DEPENDENCY. Nothing in this repository proves that
-    # an enclave can actually reach IMDS: the QEMU harness has no instance
-    # metadata service to reach, so gvproxy's handling of 169.254.169.254 has
-    # never been exercised. Every AWS call the enclave makes — S3, KMS, SSM and
-    # now CloudWatch — rests on it. Validate IMDSv2 credential resolution on
-    # Nitro hardware before production; if gvproxy routes rather than proxies,
-    # this must be 2, and the symptom is calls failing in a way that reads like
-    # missing credentials rather than like a network fault.
+    # UNVERIFIED ON HARDWARE. The enclave reaches IMDS only at 192.168.127.253,
+    # which gvproxy maps to 169.254.169.254 (deploy/ami/units/gvproxy.yml) and
+    # the image names in AWS_EC2_METADATA_SERVICE_ENDPOINT; no guest can reach
+    # it. Every AWS call the enclave makes rests on that path, and the QEMU
+    # harness has no metadata service to prove it with. The push probe at boot
+    # is the first check that it works.
     #
-    # One hop is right *if* gvproxy proxies — it terminates the enclave's
-    # connection here and opens its own, so the request originates on this
-    # instance. Stated rather than defaulted, because the value is a deployment
-    # decision and not an incidental.
+    # One hop is right: gvproxy proxies rather than routes — it terminates the
+    # enclave's connection here and dials its own (pkg/services/forwarder/tcp.go),
+    # so the request originates on this instance. Stated rather than defaulted,
+    # because the value is a deployment decision and not an incidental.
     http_put_response_hop_limit = 1
   }
 

@@ -25,7 +25,7 @@ pub const X_ENCLAVE_TENANT: HeaderName = HeaderName::from_static("x-enclave-tena
 /// `None` arm removes rather than skips, so an unauthenticated request cannot
 /// carry a tenant into the guest by claiming one.
 ///
-/// This cannot live in `EgressPolicy::is_forbidden_header`, which runs *inside*
+/// This cannot live in `GuestEgress::is_forbidden_header`, which runs *inside*
 /// `new_incoming_request` after injection — it could only delete the header,
 /// silently, with no error anywhere.
 pub fn apply_tenant<B>(tenant: Option<&[u8; 16]>, req: &mut hyper::Request<B>) {

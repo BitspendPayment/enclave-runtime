@@ -64,7 +64,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use s3fs_core::{Fs, Inode, OpenFlags};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
@@ -140,8 +140,8 @@ pub struct StreamRecord {
     #[serde(with = "hex_tenant")]
     pub tenant: [u8; 16],
     pub id: String,
-    /// Scheme, host and port. Admitted by the image's allowlist when opened and
-    /// again on every reconnect — a list narrowed between them takes effect.
+    /// Scheme, host and port. Checked on every dial and every send, as a
+    /// guest's own request would be: the public internet only.
     pub origin: String,
     /// Which `open` made this record; zero for one read back at boot. A close
     /// and a reopen that land between two supervisor passes leave a record
@@ -204,7 +204,6 @@ pub struct StreamRegistry {
     /// window, and the connection would then wait out the poll below before it was ever dialled.
     /// `notify_one` leaves a permit, so the next `notified()` returns at once.
     changed: Notify,
-    egress: Mutex<Option<crate::serve::EgressPolicy>>,
     /// What signs each request to the far side. `None` sends them unsigned, and
     /// a service that checks — every one that should — refuses them.
     attestor: Mutex<Option<Arc<ResponseAttestor>>>,
@@ -236,7 +235,6 @@ impl StreamRegistry {
             records: Mutex::new(BTreeMap::new()),
             live: Mutex::new(BTreeMap::new()),
             changed: Notify::new(),
-            egress: Mutex::new(None),
             attestor: Mutex::new(None),
             messages: AtomicU64::new(0),
             generations: AtomicU64::new(1),
@@ -272,12 +270,6 @@ impl StreamRegistry {
         Ok(registry)
     }
 
-    /// The origins a guest may be connected to. Set once the image's policy is
-    /// known, and consulted on every connect rather than only at `open`.
-    pub async fn set_egress(&self, egress: crate::serve::EgressPolicy) {
-        *self.egress.lock().await = Some(egress);
-    }
-
     /// What proves each request to the far side comes from this enclave. Set
     /// once serving starts, to the attestor `/auth/*` responses use — one
     /// device, one limit on it.
@@ -287,10 +279,7 @@ impl StreamRegistry {
 
     pub async fn open(&self, tenant: [u8; 16], id: String, origin: String) -> Result<()> {
         ensure!(valid_id(&id), "a stream id is 1..=64 of [A-Za-z0-9_-]");
-        let parsed = Origin::parse(&origin).context("that is not an origin")?;
-        self.admit(&parsed)
-            .await
-            .context("this image does not allow a connection to that origin")?;
+        Origin::parse(&origin).context("that is not an origin")?;
 
         let mut records = self.records.lock().await;
         if let Some(existing) = records.get(&(tenant, id.clone())) {
@@ -381,35 +370,19 @@ impl StreamRegistry {
         );
 
         let origin = Origin::parse(&record.origin)?;
-        let egress = self.admit(&origin).await?;
-        let held = egress
-            .send_direct(
-                origin,
-                self.request(SEND, &record, payload).await?,
-                Duration::from_secs(30),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("sending on {id}: {e:?}"))?;
+        let held = crate::serve::egress::send_direct(
+            origin,
+            self.request(SEND, &record, payload).await?,
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("sending on {id}: {e:?}"))?;
         ensure!(
             held.response.status().is_success(),
             "the far side refused a message: {}",
             held.response.status()
         );
         Ok(())
-    }
-
-    /// The allowlist, if it admits `origin` — checked on every connect and every
-    /// send, not only at `open`, so a list narrowed by a redeploy takes effect on
-    /// connections that were already standing.
-    async fn admit(&self, origin: &Origin) -> Result<Arc<crate::serve::EgressAllowlist>> {
-        match self.egress.lock().await.clone() {
-            Some(crate::serve::EgressPolicy::Allowlist(list))
-                if list.origins().any(|o| o == origin) =>
-            {
-                Ok(list)
-            }
-            _ => bail!("{origin:?} is not an origin this image allows"),
-        }
     }
 
     /// The request for one exchange with the far side, attested if this runtime
@@ -587,7 +560,6 @@ impl StreamRegistry {
         use http_body_util::BodyExt;
 
         let origin = Origin::parse(&record.origin)?;
-        let egress = self.admit(&origin).await?;
         let request = self.request(OPEN, record, Vec::new()).await?;
 
         // A long first-byte timeout: a service with nothing to say yet is the
@@ -596,8 +568,7 @@ impl StreamRegistry {
         // `held` is kept for the whole of the read loop below, and that is not
         // tidiness: it owns the task driving the connection, and dropping it
         // ends the body. See [`crate::serve::egress::HeldResponse`].
-        let mut held = egress
-            .send_direct(origin, request, Duration::from_secs(60))
+        let mut held = crate::serve::egress::send_direct(origin, request, Duration::from_secs(60))
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         ensure!(
@@ -840,21 +811,18 @@ mod tests {
             .await
             .unwrap();
         let r = StreamRegistry::open_registry(fs.clone()).await.unwrap();
-        r.set_egress(crate::serve::EgressPolicy::Allowlist(Arc::new(
-            crate::serve::egress::EgressAllowlist::parse(&["https://svc.example"]).unwrap(),
-        )))
-        .await;
         (r, fs)
     }
 
+    /// An origin is scheme, host and port: anything more is refused, not ignored.
     #[tokio::test]
-    async fn an_origin_the_image_does_not_allow_is_refused() {
+    async fn an_origin_with_a_path_is_refused() {
         let (r, _fs) = registry().await;
         let err = r
-            .open([1; 16], "esc".into(), "https://elsewhere.example".into())
+            .open([1; 16], "esc".into(), "https://svc.example/v1".into())
             .await
             .unwrap_err();
-        assert!(format!("{err:#}").contains("does not allow"), "{err:#}");
+        assert!(format!("{err:#}").contains("not an origin"), "{err:#}");
     }
 
     /// Two tenants opening a connection under the same local id must be distinguishable by the
@@ -912,14 +880,6 @@ mod tests {
             .await
             .expect("the same instruction again changes nothing");
 
-        r.set_egress(crate::serve::EgressPolicy::Allowlist(Arc::new(
-            crate::serve::egress::EgressAllowlist::parse(&[
-                "https://svc.example",
-                "https://other.example",
-            ])
-            .unwrap(),
-        )))
-        .await;
         let err = r
             .open([1; 16], "esc".into(), "https://other.example".into())
             .await
@@ -1226,14 +1186,14 @@ mod tests {
     async fn a_reopened_stream_gets_a_new_connection() {
         let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin_a = format!("http://{}", a.local_addr().unwrap());
-        let origin_b = format!("http://{}", b.local_addr().unwrap());
+        // Loopback is out of every guest's reach, so the listeners go by names a test may point
+        // there.
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        crate::serve::egress::test_host("reopen-a.test", loopback);
+        crate::serve::egress::test_host("reopen-b.test", loopback);
+        let origin_a = format!("http://reopen-a.test:{}", a.local_addr().unwrap().port());
+        let origin_b = format!("http://reopen-b.test:{}", b.local_addr().unwrap().port());
         let (r, fs) = registry().await;
-        r.set_egress(crate::serve::EgressPolicy::Allowlist(Arc::new(
-            crate::serve::egress::EgressAllowlist::parse(&[origin_a.as_str(), origin_b.as_str()])
-                .unwrap(),
-        )))
-        .await;
         let supervisor = tokio::spawn(r.clone().run(guest(fs).await));
         let wait = Duration::from_secs(5);
 

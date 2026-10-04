@@ -1,16 +1,14 @@
 //! Waking a tenant's devices, without telling anyone what happened.
 //!
-//! A guest cannot reach its user between requests, and by default it cannot
-//! reach the network at all — [`crate::serve::EgressPolicy`] refuses every
-//! outgoing request a guest makes, and a deployment that opens any names only
-//! specific origins, never a push service. So the runtime holds the push
-//! credential and sends on the guest's behalf, and the guest gets a host import
-//! instead of a socket.
+//! A guest cannot reach its user between requests, and it holds no credential
+//! a push service would take. So the runtime sends on the guest's behalf, as
+//! the instance's own role, through the push application the image names — see
+//! [`pinpoint`] — and the guest gets a host import instead of a credential.
 //!
 //! # A wake signal carries nothing
 //!
 //! The payload crosses the parent instance — the party this enclave exists to
-//! exclude — and then Google. So it contains an opaque category, an optional
+//! exclude — then AWS, then Google. So it contains an opaque category, an optional
 //! tenant-local reference, and nothing else: no title, no body, no
 //! `notification` object. The app wakes and fetches the detail over the
 //! attested channel, where the parent is excluded again.
@@ -31,14 +29,12 @@ use crate::clock::WallClockAdapter;
 use crate::state::State;
 
 pub mod device;
-pub mod fcm;
-pub mod oauth;
+pub mod pinpoint;
 pub mod transport;
 
 pub use device::{DeviceRegistry, StoredDevice, MAX_DEVICES, MAX_DEVICES_PER_TENANT};
-pub use fcm::{FcmClient, FcmTransport, NotifyConfig, SendError};
-pub use oauth::{AccessToken, ServiceAccount, TokenResponse};
-pub use transport::{web_pki_client_config, HttpsTransport};
+pub use pinpoint::{instance_role, valid_app_id, NotifyConfig, PinpointClient, SendError};
+pub use transport::{web_pki_client_config, HttpsTransport, PushTransport};
 
 /// Wakes waiting to be sent. Beyond this the oldest are dropped: a wake is a
 /// hint, and a backlog of stale hints is worth less than a fresh one.
@@ -163,7 +159,7 @@ impl Notifier {
     /// because that one is actionable — the guest is raising more distinct
     /// categories than it has reason to.
     pub fn raise(&self, tenant: [u8; 16], category: &str, reference: Option<&str>) -> Result<()> {
-        fcm::check_labels(category, reference)?;
+        pinpoint::check_labels(category, reference)?;
 
         let key = (tenant, category.to_string());
         {
@@ -204,7 +200,7 @@ impl Notifier {
     }
 }
 
-/// The task that actually talks to FCM.
+/// The task that actually talks to the push service.
 pub struct NotifyForwarder {
     task: tokio::task::JoinHandle<()>,
     stop: Arc<Notify>,
@@ -232,7 +228,7 @@ impl NotifyForwarder {
 pub fn start(
     registry: Arc<DeviceRegistry>,
     clock: Arc<WallClockAdapter>,
-    client: FcmClient,
+    client: PinpointClient,
 ) -> (Arc<Notifier>, NotifyForwarder) {
     let (tx, rx) = mpsc::channel::<Wake>(QUEUE_CAPACITY);
     let counters = Arc::new(Counters::default());
@@ -264,7 +260,7 @@ fn backoff_for(attempts: u32) -> Duration {
 
 async fn forward(
     mut rx: mpsc::Receiver<Wake>,
-    mut client: FcmClient,
+    mut client: PinpointClient,
     registry: Arc<DeviceRegistry>,
     notifier: Arc<Notifier>,
     counters: Arc<Counters>,
@@ -350,7 +346,7 @@ fn drain(rx: &mut mpsc::Receiver<Wake>, pending: &mut VecDeque<Wake>) {
 /// Send one wake to every device the tenant has. Returns the wake again if it
 /// is worth another attempt.
 async fn deliver(
-    client: &mut FcmClient,
+    client: &mut PinpointClient,
     registry: &Arc<DeviceRegistry>,
     notifier: &Arc<Notifier>,
     counters: &Arc<Counters>,
@@ -385,7 +381,10 @@ async fn deliver(
             }
             Err(SendError::DeadToken(detail)) => {
                 counters.pruned.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(detail, "pruning a registration token FCM says is gone");
+                tracing::debug!(
+                    detail,
+                    "pruning a registration token the push service says is gone"
+                );
                 if let Err(e) = registry
                     .forget_if_unchanged(wake.tenant, &device.token, device.created_ms)
                     .await
@@ -395,7 +394,7 @@ async fn deliver(
             }
             Err(SendError::Refused(detail)) => {
                 counters.refused.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(detail, "FCM refused a wake signal");
+                tracing::warn!(detail, "the push service refused a wake signal");
             }
             Err(SendError::Transient(detail)) => {
                 tracing::debug!(detail, "a wake signal will be retried");
@@ -506,7 +505,7 @@ pub fn add_to_linker(linker: &mut wasmtime::component::Linker<State>) -> wasmtim
 
 #[cfg(test)]
 mod tests {
-    use super::fcm::testing::Recorder;
+    use super::pinpoint::testing::{Counted, Recorder, SENT};
     use super::*;
     use crate::clock::HostClock;
     use s3fs_core::backend::memory::MemoryBackend;
@@ -517,20 +516,6 @@ mod tests {
 
     fn token(seed: &str) -> String {
         format!("{seed}{}", "y".repeat(40))
-    }
-
-    fn account() -> ServiceAccount {
-        ServiceAccount::parse(
-            &serde_json::json!({
-                "type": "service_account",
-                "project_id": "enclave-test",
-                "private_key_id": "kid-1",
-                "private_key": include_str!("testdata/service-account-key.pem"),
-                "client_email": "wake@enclave-test.iam.gserviceaccount.com",
-            })
-            .to_string(),
-        )
-        .unwrap()
     }
 
     async fn fixture(
@@ -554,11 +539,14 @@ mod tests {
         let registry = DeviceRegistry::open(fs).await.unwrap();
         let clock = Arc::new(WallClockAdapter::new(Box::new(HostClock)).unwrap());
         let recorder = Recorder::with(replies);
-        let client = FcmClient::new(
+        let client = PinpointClient::new(
             NotifyConfig {
-                project_id: "enclave-test".into(),
-                service_account: account(),
+                app_id: "enclavetest".into(),
+                region: "eu-west-2".into(),
                 endpoint: None,
+                credentials: aws_credential_types::provider::SharedCredentialsProvider::new(
+                    Counted::default(),
+                ),
             },
             recorder.clone(),
         );
@@ -608,24 +596,22 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_wake_reaches_every_device_the_tenant_enrolled() {
-        let (notifier, forwarder, _registry, recorder) = fixture(vec![(200, "{}")]).await;
+        let (notifier, forwarder, _registry, recorder) = fixture(vec![(200, SENT)]).await;
         notifier.register_device(ALICE, &token("a")).await.unwrap();
         notifier.register_device(ALICE, &token("b")).await.unwrap();
 
         notifier.raise(ALICE, "task-done", Some("job")).unwrap();
         until(|| recorder.messages().len() == 2).await;
 
-        let sent: Vec<_> = recorder.messages();
-        assert!(sent
-            .iter()
-            .all(|m| m["message"]["data"]["category"] == "task-done"));
+        let sent: Vec<_> = recorder.fcm_messages();
+        assert!(sent.iter().all(|m| m["data"]["category"] == "task-done"));
         forwarder.shutdown().await;
     }
 
     /// The invariant that keeps a push service out of the request path.
     #[tokio::test(flavor = "multi_thread")]
     async fn raising_a_wake_never_delays_the_guest_call_that_raised_it() {
-        let (notifier, forwarder, _registry, recorder) = fixture(vec![(200, "{}")]).await;
+        let (notifier, forwarder, _registry, recorder) = fixture(vec![(200, SENT)]).await;
         recorder
             .stall
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -677,13 +663,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_dead_token_is_pruned_and_the_tenants_other_devices_still_get_woken() {
-        let gone = serde_json::json!({"error": {
-            "status": "NOT_FOUND", "message": "gone",
-            "details": [{"errorCode": "UNREGISTERED"}]}})
+        // One device is gone — which the service says in a 200, about that address — and the
+        // other accepts. One answer covering both, so the order they are sent in is no matter.
+        let answer = serde_json::json!({"Result": {
+            token("dead"): {"DeliveryStatus": "PERMANENT_FAILURE", "StatusCode": 404,
+                            "StatusMessage": "Not found"},
+            token("live"): {"DeliveryStatus": "SUCCESSFUL", "StatusCode": 200}}})
         .to_string();
-        // The first device answers UNREGISTERED, the second accepts.
-        let (notifier, forwarder, registry, recorder) =
-            fixture(vec![(404, &gone), (200, "{}")]).await;
+        let (notifier, forwarder, registry, recorder) = fixture(vec![(200, &answer)]).await;
         notifier
             .register_device(ALICE, &token("dead"))
             .await
@@ -712,7 +699,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_wake_for_a_tenant_with_no_devices_is_dropped_quietly() {
-        let (notifier, forwarder, _registry, recorder) = fixture(vec![(200, "{}")]).await;
+        let (notifier, forwarder, _registry, recorder) = fixture(vec![(200, SENT)]).await;
         notifier.raise(ALICE, "nobody-home", None).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(recorder.messages().is_empty());
@@ -721,7 +708,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_category_that_is_not_a_label_is_refused_before_it_is_queued() {
-        let (notifier, forwarder, _registry, recorder) = fixture(vec![(200, "{}")]).await;
+        let (notifier, forwarder, _registry, recorder) = fixture(vec![(200, SENT)]).await;
         notifier.register_device(ALICE, &token("a")).await.unwrap();
         assert!(notifier
             .raise(ALICE, "Approve $4,000 to Acme", None)
@@ -738,7 +725,7 @@ mod tests {
     /// ticks, not thousands of iterations.
     #[tokio::test(start_paused = true)]
     async fn an_idle_forwarder_does_not_spin() {
-        let (notifier, _forwarder, _registry, _recorder) = fixture(vec![(200, "{}")]).await;
+        let (notifier, _forwarder, _registry, _recorder) = fixture(vec![(200, SENT)]).await;
         let before = notifier.wakeups();
         tokio::time::sleep(Duration::from_secs(300)).await;
         let woke = notifier.wakeups() - before;
@@ -750,7 +737,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_flushes_what_is_queued_and_cannot_hold_the_enclave_open() {
-        let (notifier, forwarder, _registry, recorder) = fixture(vec![(200, "{}")]).await;
+        let (notifier, forwarder, _registry, recorder) = fixture(vec![(200, SENT)]).await;
         notifier.register_device(ALICE, &token("a")).await.unwrap();
         notifier.raise(ALICE, "last-word", None).unwrap();
         forwarder.shutdown().await;
@@ -761,7 +748,7 @@ mod tests {
         );
 
         // And a stalled service cannot hold shutdown open past the deadline.
-        let (notifier, forwarder, _registry, recorder) = fixture(vec![(200, "{}")]).await;
+        let (notifier, forwarder, _registry, recorder) = fixture(vec![(200, SENT)]).await;
         recorder
             .stall
             .store(true, std::sync::atomic::Ordering::Relaxed);

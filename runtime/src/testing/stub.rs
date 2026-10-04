@@ -1,29 +1,27 @@
-//! Firebase, as far as the harness is concerned.
+//! The push service, as far as the harness is concerned.
 //!
-//! The runtime builds its own FCM transport inside `serve_component`, so a
+//! The runtime builds its own push transport inside `serve_component`, so a
 //! harness cannot hand it a recording double without putting a testing-only
 //! field on `ServeConfig`. Standing up a real endpoint instead is both less
-//! invasive and a better test: the transport, the signed OAuth assertion, the
-//! bearer header and the error classification are all the production ones. Only
-//! the far end is not Google.
+//! invasive and a better test: the transport, the SigV4 signature, the probe and
+//! the result classification are all the production ones. Only the far end is
+//! not AWS.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::Wake;
-use crate::notify::{NotifyConfig, ServiceAccount};
+use crate::notify::NotifyConfig;
 
-const KEY: &str = include_str!("fcm-key.pem");
-
-pub(super) struct Fcm {
+pub(super) struct Push {
     addr: SocketAddr,
     wakes: Arc<Mutex<Vec<Wake>>>,
 }
 
-impl Fcm {
+impl Push {
     pub(super) async fn start() -> Result<Arc<Self>> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
@@ -42,27 +40,20 @@ impl Fcm {
             }
         });
 
-        Ok(Arc::new(Fcm { addr, wakes }))
+        Ok(Arc::new(Push { addr, wakes }))
     }
 
     pub(super) fn config(&self) -> Result<NotifyConfig> {
-        let account = serde_json::json!({
-            "type": "service_account",
-            "project_id": "harness",
-            "private_key_id": "harness",
-            "private_key": KEY,
-            "client_email": "wake@harness.iam.gserviceaccount.com",
-            // The assertion's `aud` is this same string, so it has to name
-            // where the exchange actually happens.
-            "token_uri": format!("http://{}/token", self.addr),
-        })
-        .to_string();
         Ok(NotifyConfig {
-            project_id: "harness".into(),
-            service_account: ServiceAccount::parse(&account)
-                .context("the harness service account")?,
+            app_id: "harness".into(),
+            region: "eu-west-2".into(),
             // `http://` is what tells the runtime plaintext is acceptable here.
             endpoint: Some(format!("http://{}", self.addr)),
+            // Signed for real, by a credential nothing checks: verifying SigV4 would mean
+            // reimplementing AWS, and `notify::pinpoint`'s own tests pin the signature.
+            credentials: aws_credential_types::provider::SharedCredentialsProvider::new(
+                aws_credential_types::Credentials::new("harness", "harness", None, None, "harness"),
+            ),
         })
     }
 
@@ -108,25 +99,36 @@ async fn serve_one(socket: &mut tokio::net::TcpStream, wakes: &Mutex<Vec<Wake>>)
         .to_string();
     let body = &raw[head_end..];
 
-    let reply = if path.ends_with("/token") {
-        // The runtime signed a real RS256 assertion to get here. Verifying it
-        // would mean reimplementing Google; that the signing is genuine is
-        // covered by `notify::oauth`'s own tests.
-        serde_json::json!({"access_token": "harness", "expires_in": 3600})
-    } else if path.ends_with("messages:send") {
-        let message: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
-        let data = &message["message"]["data"];
-        wakes.lock().unwrap().push(Wake {
-            category: data["category"].as_str().unwrap_or_default().to_string(),
-            reference: data["ref"].as_str().map(str::to_string),
-            token: message["message"]["token"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-        });
-        serde_json::json!({"name": "projects/harness/messages/stub"})
+    let reply = if path.ends_with("/channels/gcm") {
+        serde_json::json!({"Platform": "GCM", "Enabled": true,
+                           "HasFcmServiceCredentials": true,
+                           "DefaultAuthenticationMethod": "TOKEN"})
+    } else if path.ends_with("/messages") {
+        let request: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+        let raw = request["MessageConfiguration"]["GCMMessage"]["RawContent"]
+            .as_str()
+            .unwrap_or_default();
+        let raw: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
+        let data = &raw["fcmV1Message"]["message"]["data"];
+        let mut result = serde_json::Map::new();
+        for token in request["Addresses"]
+            .as_object()
+            .into_iter()
+            .flat_map(|a| a.keys())
+        {
+            wakes.lock().unwrap().push(Wake {
+                category: data["category"].as_str().unwrap_or_default().to_string(),
+                reference: data["ref"].as_str().map(str::to_string),
+                token: token.clone(),
+            });
+            result.insert(
+                token.clone(),
+                serde_json::json!({"DeliveryStatus": "SUCCESSFUL", "StatusCode": 200}),
+            );
+        }
+        serde_json::json!({"ApplicationId": "harness", "Result": result})
     } else {
-        serde_json::json!({"error": {"status": "NOT_FOUND"}})
+        serde_json::json!({"Message": "not found"})
     };
 
     let encoded = reply.to_string();

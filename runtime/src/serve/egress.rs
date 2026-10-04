@@ -1,32 +1,33 @@
-//! The origins a guest may reach, when a deployment names any.
+//! Where a guest may send: the public internet, and nothing else.
 //!
-//! A guest reaches nothing by default — see [`super::EgressPolicy`]. Some guests
-//! cannot do their job from inside that: a wallet cosigner that holds a pre-signed
-//! renewal has to talk to the service it renews with, and the only alternative is
-//! routing the conversation through a phone that may be off. So a deployment may
-//! name **origins** — scheme, host and port, nothing else — and a guest may send
-//! `wasi:http` requests to exactly those.
+//! A guest reaches outward through `wasi:http`, and the runtime makes the connection for it.
+//! What it may reach is decided here, on the address a name resolves to and never on the name:
+//! the parent answers this enclave's DNS, so a name can be pointed anywhere, and `2852039166` is
+//! as good a spelling of 169.254.169.254 as the dotted one.
 //!
-//! What that does and does not open:
+//! What a public-only rule keeps out of reach, and why each one matters:
 //!
-//! - **Origins, compared exactly.** `https://asp.example.com` admits that host on
-//!   443 and nothing else: not a subdomain, not another port, not plaintext to
-//!   the same name. No wildcards, no paths, no user info.
-//! - **HTTPS is verified against the public web PKI** (webpki roots, the same
-//!   store the runtime's own FCM client uses). A plaintext `http://` origin is
-//!   admitted only when named as one — which is for a local development stack
-//!   and is measured like every other choice.
-//! - **It is part of the image.** The list reaches the runtime as image
-//!   environment, so PCR0 covers it: a client verifying an enclave learns where
-//!   its guest can send traffic, and changing it is a new image.
-//! - **It is a channel out of the enclave.** Whatever the guest puts in a request
-//!   leaves the attested boundary. Name only services the guest has to reach, and
-//!   treat the guest code as the thing deciding what they are sent.
+//! - **The instance metadata service** (link-local): the parent's role credentials, and with them
+//!   every tenant's storage.
+//! - **The proxy's own network** (192.168.127.0/24): gvproxy's control API on `.1`, which asks
+//!   for no credential and can unpublish this enclave; this enclave on `.2`; the runtime's own way
+//!   to the metadata service on `.253`; the parent's loopback on `.254`.
+//! - **This machine** (loopback, `0.0.0.0`): the runtime's own listener.
+//! - **The operator's network** (private and shared ranges): whatever the parent can reach that
+//!   the internet cannot.
 //!
-//! Requests travel over HTTP/1.1, from a fresh connection per request.
+//! Nothing here is configured, so nothing here can be configured wrong: a guest that has to reach
+//! a service reaches it on the public internet. The image no longer says where a guest may send —
+//! the guest's code, measured into PCR16, does. In the emulator (the `testing` build) the host's
+//! services sit on `.254`, and that one address is open on every port but the runtime's own
+//! there; see [`admit_dev_host`].
+//!
+//! HTTPS is verified against the public web PKI, the same roots the runtime's own clients use. A
+//! redirect is never followed here: a 3xx goes back to the guest, and a request it then makes is
+//! checked like any other. Requests travel over HTTP/1.1, from a fresh connection per request.
 
-use std::collections::BTreeSet;
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -35,13 +36,112 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::p2::{
-    bindings::http::types::ErrorCode,
+    bindings::http::types::{DnsErrorPayload, ErrorCode},
     body::{HyperIncomingBody, HyperOutgoingBody},
     hyper_request_error,
     types::{HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig},
 };
 
-/// One origin a guest may reach.
+/// The emulator's host, as gvproxy presents it to the enclave.
+const DEV_HOST: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 254);
+
+/// Whether a guest may connect to `addr`: a public IPv4 address, or — in the emulator only —
+/// [`DEV_HOST`] on a port that is not in `dev_host`, the runtime's own there.
+pub(crate) fn admits(addr: SocketAddr, dev_host: Option<&[u16]>) -> bool {
+    // gvproxy carries IPv4 only, so an IPv6 destination is unreachable or an IPv4 one in
+    // disguise, which `to_canonical` turns back into what it is.
+    let IpAddr::V4(ip) = addr.ip().to_canonical() else {
+        return false;
+    };
+    if let Some(own) = dev_host.filter(|_| ip == DEV_HOST) {
+        return !own.contains(&addr.port());
+    }
+    let [a, b, c, _] = ip.octets();
+    !(a == 0 // 0.0.0.0 is this machine, on Linux
+        || a >= 224 // multicast, 240/4 and broadcast
+        || ip.is_private() // 10/8, 172.16/12, 192.168/16, the proxy's /24 among them
+        || ip.is_loopback()
+        || ip.is_link_local() // 169.254/16: the metadata service, time sync, the VPC resolver
+        || ip.is_documentation()
+        || (a == 100 && b & 0xc0 == 64) // 100.64/10, shared address space
+        || (a == 198 && b & 0xfe == 18) // 198.18/15, benchmarking
+        || (a == 192 && b == 0 && c == 0)) // 192.0.0/24, protocol assignments
+}
+
+/// The emulator's exemption: the ports on [`DEV_HOST`] the runtime uses itself. Set once at boot.
+#[cfg(any(test, feature = "testing"))]
+static DEV_HOST_OWN_PORTS: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+
+/// Open the emulator's host to guests, except `own` — the ports of the runtime's own services
+/// there, its store and its certificate authority among them.
+///
+/// The emulator's services (an ASP, a payout platform) live on the host, which the enclave reaches
+/// only as `.254`, so a guest under test needs it. Only in a `testing` build, and only once: the
+/// image's own boot sets it, and nothing after can widen it.
+#[cfg(any(test, feature = "testing"))]
+pub fn admit_dev_host(own: Vec<u16>) {
+    let _ = DEV_HOST_OWN_PORTS.set(own);
+}
+
+#[cfg(any(test, feature = "testing"))]
+fn dev_host() -> Option<&'static [u16]> {
+    DEV_HOST_OWN_PORTS.get().map(Vec::as_slice)
+}
+
+#[cfg(not(any(test, feature = "testing")))]
+fn dev_host() -> Option<&'static [u16]> {
+    None
+}
+
+/// Names a unit test points at a local listener, which the rule would otherwise refuse.
+#[cfg(test)]
+static TEST_HOSTS: std::sync::Mutex<Vec<(String, IpAddr)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn test_host(name: &str, ip: IpAddr) {
+    TEST_HOSTS
+        .lock()
+        .unwrap()
+        .push((name.to_ascii_lowercase(), ip));
+}
+
+/// Every address `host` resolves to that a guest may connect to.
+///
+/// Resolved once, and the connection goes to exactly these: a name cannot answer one address to
+/// this check and another to the connect.
+async fn public_addrs(host: &str, port: u16) -> std::result::Result<Vec<SocketAddr>, ErrorCode> {
+    #[cfg(test)]
+    if let Some((_, ip)) = TEST_HOSTS.lock().unwrap().iter().find(|(n, _)| n == host) {
+        return Ok(vec![SocketAddr::new(*ip, port)]);
+    }
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| {
+            tracing::warn!(host, error = %e, "guest egress: could not resolve");
+            ErrorCode::DnsError(DnsErrorPayload {
+                rcode: None,
+                info_code: None,
+            })
+        })?
+        .map(|a| SocketAddr::new(a.ip().to_canonical(), a.port()))
+        .collect();
+    let admitted: Vec<SocketAddr> = resolved
+        .iter()
+        .copied()
+        .filter(|a| admits(*a, dev_host()))
+        .collect();
+    if admitted.is_empty() {
+        tracing::warn!(
+            host,
+            ?resolved,
+            "guest egress: not the public internet; refused"
+        );
+        return Err(ErrorCode::DestinationIpProhibited);
+    }
+    Ok(admitted)
+}
+
+/// Where a request is addressed: scheme, host and port.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Origin {
     pub tls: bool,
@@ -52,9 +152,9 @@ pub struct Origin {
 
 impl Origin {
     /// Parse `https://host[:port]` or `http://host[:port]`. Anything more — a
-    /// path, a query, user info, a wildcard — is refused rather than ignored,
-    /// because an entry that reads as narrower than it is would be the worst kind
-    /// of mistake in this list.
+    /// path, a query, user info, a wildcard — is refused rather than ignored:
+    /// a held stream's origin is an instruction, and one that reads as narrower
+    /// than it is would be the worst kind of mistake in it.
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
         let (tls, rest) = if let Some(rest) = s.strip_prefix("https://") {
@@ -93,7 +193,7 @@ impl Origin {
     }
 
     /// The origin a request is addressed to, or `None` if it names none.
-    fn of(request: &hyper::Request<HyperOutgoingBody>, use_tls: bool) -> Option<Self> {
+    pub(crate) fn of(request: &hyper::Request<HyperOutgoingBody>, use_tls: bool) -> Option<Self> {
         let uri = request.uri();
         let tls = match uri.scheme_str() {
             Some("https") => true,
@@ -117,95 +217,40 @@ impl fmt::Display for Origin {
     }
 }
 
-/// The origins a deployment admits.
-#[derive(Debug, Default)]
-pub struct EgressAllowlist {
-    origins: BTreeSet<Origin>,
-    tls: Option<Arc<rustls::ClientConfig>>,
+/// Send a guest's `request` to `origin`, as the `wasi:http` future the guest will poll.
+pub(crate) fn spawn_send(
+    origin: Origin,
+    request: hyper::Request<HyperOutgoingBody>,
+    config: OutgoingRequestConfig,
+) -> HostFutureIncomingResponse {
+    let handle =
+        wasmtime_wasi::runtime::spawn(async move { Ok(send(origin, request, config).await) });
+    HostFutureIncomingResponse::pending(handle)
 }
 
-impl EgressAllowlist {
-    /// Parse every entry, failing on the first that does not parse. Empty
-    /// entries are dropped: an image built with no origins still sets the
-    /// variable, to nothing.
-    pub fn parse<S: AsRef<str>>(entries: &[S]) -> Result<Self> {
-        let origins = entries
-            .iter()
-            .map(|e| e.as_ref().trim())
-            .filter(|e| !e.is_empty())
-            .map(Origin::parse)
-            .collect::<Result<BTreeSet<_>>>()?;
-        let tls = if origins.iter().any(|o| o.tls) {
-            Some(Arc::new(crate::notify::web_pki_client_config()?))
-        } else {
-            None
-        };
-        Ok(EgressAllowlist { origins, tls })
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.origins.is_empty()
-    }
-
-    pub fn origins(&self) -> impl Iterator<Item = &Origin> {
-        self.origins.iter()
-    }
-
-    /// Whether `request` is addressed to an admitted origin.
-    ///
-    /// The scheme the URI names and the TLS flag the guest set must agree: a
-    /// guest cannot name `https://` and have it sent in the clear, or the reverse.
-    pub fn admits(
-        &self,
-        request: &hyper::Request<HyperOutgoingBody>,
-        config: &OutgoingRequestConfig,
-    ) -> Option<Origin> {
-        let origin = Origin::of(request, config.use_tls)?;
-        (origin.tls == config.use_tls && self.origins.contains(&origin)).then_some(origin)
-    }
-
-    /// Send from the RUNTIME's own code rather than on a guest's behalf.
-    ///
-    /// Same connection, same TLS, same allowlist — the caller has already had
-    /// `origin` admitted. What differs is only the shape of the answer: a guest
-    /// gets a `wasi:http` future it will poll, and the runtime gets a response
-    /// it can await. Used by [`crate::stream`], which holds connections that no
-    /// guest could hold for itself.
-    pub async fn send_direct(
-        &self,
-        origin: Origin,
-        request: hyper::Request<HyperOutgoingBody>,
-        first_byte_timeout: std::time::Duration,
-    ) -> std::result::Result<HeldResponse, ErrorCode> {
-        let config = OutgoingRequestConfig {
-            use_tls: origin.tls,
-            connect_timeout: std::time::Duration::from_secs(10),
-            first_byte_timeout,
-            // A held stream is quiet between events; a service that has said
-            // nothing for this long is one worth reconnecting to.
-            between_bytes_timeout: std::time::Duration::from_secs(300),
-        };
-        let incoming = send(origin, self.tls.clone(), request, config).await?;
-        Ok(HeldResponse {
-            response: incoming.resp,
-            _worker: incoming.worker,
-        })
-    }
-
-    /// Send `request` to `origin`, which [`Self::admits`] has already approved.
-    pub fn send(
-        &self,
-        origin: Origin,
-        request: hyper::Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
-    ) -> HostFutureIncomingResponse {
-        let tls = self.tls.clone();
-        let handle =
-            wasmtime_wasi::runtime::spawn(
-                async move { Ok(send(origin, tls, request, config).await) },
-            );
-        HostFutureIncomingResponse::pending(handle)
-    }
+/// Send from the RUNTIME's own code rather than as a guest's future.
+///
+/// Same connection, same TLS, same rule. What differs is only the shape of the answer: a guest
+/// gets a `wasi:http` future it will poll, and the runtime gets a response it can await. Used by
+/// [`crate::stream`], which holds connections that no guest could hold for itself.
+pub async fn send_direct(
+    origin: Origin,
+    request: hyper::Request<HyperOutgoingBody>,
+    first_byte_timeout: std::time::Duration,
+) -> std::result::Result<HeldResponse, ErrorCode> {
+    let config = OutgoingRequestConfig {
+        use_tls: origin.tls,
+        connect_timeout: std::time::Duration::from_secs(10),
+        first_byte_timeout,
+        // A held stream is quiet between events; a service that has said
+        // nothing for this long is one worth reconnecting to.
+        between_bytes_timeout: std::time::Duration::from_secs(300),
+    };
+    let incoming = send(origin, request, config).await?;
+    Ok(HeldResponse {
+        response: incoming.resp,
+        _worker: incoming.worker,
+    })
 }
 
 /// A response, with the connection that is still feeding it.
@@ -225,7 +270,6 @@ pub struct HeldResponse {
 
 async fn send(
     origin: Origin,
-    tls: Option<Arc<rustls::ClientConfig>>,
     mut request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
 ) -> std::result::Result<IncomingResponse, ErrorCode> {
@@ -236,22 +280,25 @@ async fn send(
         ..
     } = config;
 
-    // To the origin as admitted, not to whatever the URI's authority spells: the
+    // To the origin as parsed, not to whatever the URI's authority spells: the
     // two agree by construction, and connecting to the parsed value leaves no
-    // second interpretation to disagree with.
+    // second interpretation to disagree with. To the addresses checked, and to
+    // no other: there is no second lookup for a name to answer differently.
     let host = origin.host.trim_start_matches('[').trim_end_matches(']');
-    let tcp = timeout(connect_timeout, TcpStream::connect((host, origin.port)))
-        .await
-        .map_err(|_| ErrorCode::ConnectionTimeout)?
-        .map_err(|e| {
+    let tcp = timeout(connect_timeout, async {
+        let addrs = public_addrs(host, origin.port).await?;
+        TcpStream::connect(&addrs[..]).await.map_err(|e| {
             tracing::warn!(%origin, error = %e, "guest egress: could not connect");
             ErrorCode::ConnectionRefused
-        })?;
+        })
+    })
+    .await
+    .map_err(|_| ErrorCode::ConnectionTimeout)??;
 
     let (mut sender, worker) = if origin.tls {
-        let config = tls.ok_or(ErrorCode::InternalError(Some(
-            "no TLS configuration for an https origin".into(),
-        )))?;
+        let config = crate::notify::web_pki_client_config()
+            .map(Arc::new)
+            .map_err(|e| ErrorCode::InternalError(Some(format!("{e:#}"))))?;
         let name = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|_| ErrorCode::HttpRequestUriInvalid)?;
         let stream = tokio_rustls::TlsConnector::from(config)
@@ -388,46 +435,153 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_the_exact_origin_is_admitted() {
-        let list =
-            EgressAllowlist::parse(&["https://asp.example.com", "http://127.0.0.1:7070"]).unwrap();
-        let admits = |uri: &str, tls: bool| list.admits(&request(uri), &config(tls)).is_some();
-
-        assert!(admits("https://asp.example.com/v1/info", true));
-        assert!(admits("https://asp.example.com:443/v1/info", true));
-        assert!(admits("http://127.0.0.1:7070/v1/batch/events", false));
-
-        assert!(!admits("https://evil.example.com/", true), "another host");
-        assert!(!admits("https://sub.asp.example.com/", true), "a subdomain");
-        assert!(
-            !admits("https://asp.example.com:8443/", true),
-            "another port"
-        );
-        assert!(
-            !admits("http://asp.example.com/", false),
-            "plaintext to a TLS origin"
-        );
-        assert!(
-            !admits("http://127.0.0.1:7071/", false),
-            "the admin port beside it"
-        );
-        assert!(
-            !admits("https://asp.example.com/", false),
-            "the scheme and the guest's TLS flag must agree"
-        );
+    fn at(addr: &str) -> SocketAddr {
+        addr.parse().unwrap()
     }
 
     #[test]
-    fn an_empty_list_admits_nothing() {
-        let list = EgressAllowlist::parse(&["", "  "]).unwrap();
-        assert!(list.is_empty());
-        assert!(list
-            .admits(&request("https://example.com/"), &config(true))
-            .is_none());
+    fn only_the_public_internet_is_admitted() {
+        for public in [
+            "1.1.1.1:443",
+            "8.8.8.8:53",
+            "100.63.255.255:80",
+            "100.128.0.1:80",
+            "172.15.255.255:80",
+            "172.32.0.1:80",
+            "198.17.255.255:80",
+            "198.20.0.1:80",
+            "223.255.255.255:80",
+            "[::ffff:1.1.1.1]:443",
+        ] {
+            assert!(
+                admits(at(public), None),
+                "{public} is on the public internet"
+            );
+        }
+        for private in [
+            "0.0.0.0:80",
+            "0.1.2.3:80",
+            "10.0.0.1:80",
+            "100.64.0.1:80",
+            "100.127.255.255:80",
+            "127.0.0.1:443",
+            "169.254.169.254:80",
+            "169.254.170.2:80",
+            "172.16.0.1:80",
+            "172.31.255.255:80",
+            "192.0.0.1:80",
+            "192.0.2.1:80",
+            "192.168.127.1:80",
+            "192.168.127.2:443",
+            "192.168.127.253:80",
+            "192.168.127.254:7070",
+            "198.18.0.1:80",
+            "198.19.255.255:80",
+            "198.51.100.1:80",
+            "203.0.113.1:80",
+            "224.0.0.1:80",
+            "240.0.0.1:80",
+            "255.255.255.255:80",
+            "[::ffff:169.254.169.254]:80",
+            "[::1]:443",
+            "[fd00:ec2::254]:80",
+            "[2606:4700:4700::1111]:443",
+        ] {
+            assert!(!admits(at(private), None), "{private} must be refused");
+        }
     }
 
-    /// An admitted request really goes out, and the answer really comes back.
+    #[test]
+    fn the_emulators_host_is_open_except_the_runtimes_own_services() {
+        let own: &[u16] = &[9000, 9101, 14000];
+        assert!(admits(at("192.168.127.254:7070"), Some(own)));
+        assert!(admits(at("[::ffff:192.168.127.254]:7200"), Some(own)));
+        assert!(!admits(at("192.168.127.254:9000"), Some(own)), "its store");
+        assert!(!admits(at("192.168.127.254:14000"), Some(own)), "its CA");
+        assert!(
+            !admits(at("192.168.127.253:80"), Some(own)),
+            "its way to the metadata service"
+        );
+        assert!(
+            !admits(at("192.168.127.1:80"), Some(own)),
+            "the proxy's control API"
+        );
+        assert!(
+            !admits(at("192.168.127.254:7070"), None),
+            "only in the emulator"
+        );
+    }
+
+    /// The metadata service, however it is spelled — the check runs on what the name resolves
+    /// to, and glibc reads every one of these numerically, with no network.
+    #[tokio::test]
+    async fn every_spelling_of_the_metadata_service_is_refused() {
+        for host in [
+            "169.254.169.254",
+            "2852039166",
+            "0xa9fea9fe",
+            "0251.0376.0251.0376",
+            "169.254.43518",
+            "0xa9.0xfe.0xa9.0xfe",
+            "::ffff:169.254.169.254",
+            "::ffff:a9fe:a9fe",
+            "fd00:ec2::254",
+            "192.168.127.253",
+            "192.168.127.1",
+            "0",
+            "0.0.0.0",
+            "127.1",
+        ] {
+            assert!(
+                matches!(
+                    public_addrs(host, 80).await,
+                    Err(ErrorCode::DestinationIpProhibited)
+                ),
+                "{host} must be refused"
+            );
+        }
+        assert!(public_addrs("1.1.1.1", 443).await.is_ok());
+    }
+
+    /// A guest's request to this machine never connects, however it names it. A real listener
+    /// waits on loopback; without the check, the first of these lands.
+    #[tokio::test]
+    async fn a_request_to_this_machine_never_connects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        for host in [
+            "127.0.0.1",
+            "2130706433",
+            "0x7f000001",
+            "127.1",
+            "[::ffff:127.0.0.1]",
+            "0.0.0.0",
+            "localhost",
+        ] {
+            let origin = Origin {
+                tls: false,
+                host: host.into(),
+                port,
+            };
+            let req = request(&format!("http://{host}:{port}/"));
+            assert!(
+                matches!(
+                    send(origin, req, config(false)).await,
+                    Err(ErrorCode::DestinationIpProhibited)
+                ),
+                "{host} must be refused"
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "nothing reached the listener"
+        );
+    }
+
+    /// An admitted request really goes out, and the answer really comes back: in origin-form,
+    /// with the name it was addressed to as its `Host`.
     #[tokio::test]
     async fn an_admitted_request_reaches_the_origin() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -445,10 +599,10 @@ mod tests {
             head
         });
 
-        let list = EgressAllowlist::parse(&[format!("http://127.0.0.1:{port}")]).unwrap();
-        let req = request(&format!("http://127.0.0.1:{port}/v1/info?x=1"));
-        let origin = list.admits(&req, &config(false)).expect("admitted");
-        let response = send(origin, None, req, config(false)).await.expect("sent");
+        test_host("origin.test", IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let req = request(&format!("http://origin.test:{port}/v1/info?x=1"));
+        let origin = Origin::of(&req, false).expect("an origin");
+        let response = send(origin, req, config(false)).await.expect("sent");
         assert_eq!(response.resp.status(), 200);
         let body = response
             .resp
@@ -466,7 +620,7 @@ mod tests {
         );
         assert!(
             head.to_ascii_lowercase()
-                .contains(&format!("host: 127.0.0.1:{port}")),
+                .contains(&format!("host: origin.test:{port}")),
             "{head}"
         );
     }
