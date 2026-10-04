@@ -1419,7 +1419,7 @@ mod tests {
             "--master-key",
             &"aa".repeat(32),
             "--push-endpoint",
-            "http://127.0.0.1:9101",
+            "http://127.0.0.1:9180",
         ]);
         assert!(cli.notify_settings().is_err());
     }

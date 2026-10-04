@@ -21,7 +21,7 @@
 #   PREFIX        names the run: $WORK/$PREFIX, and every container and docker
 #                 label. Default `e2e`. It keeps two runs' files and containers
 #                 apart; it does not let them run at the same time, because
-#                 MinIO's :9000, the push stub's :9101 and the enclave's vsock CID
+#                 MinIO's :9000, the push stub's :9180 and the enclave's vsock CID
 #                 are fixed — the last two by the image, which dials them.
 #   HTTPS_PORT    host port gvproxy forwards to the enclave's :443, and the
 #                 port Pebble validates against. Default 8443.
@@ -501,19 +501,17 @@ enclave_start_parent() {
     if [[ -z "$PUSH_APP_ID" ]]; then
         python3 "$REPO/deploy/qemu-nitro/push-stub.py" "$PUSH_RECORD" > "$RUNDIR/push-stub.log" 2>&1 &
         pids+=($!)
-        local channel=http://127.0.0.1:9101/v1/apps/e2e/channels/gcm
+        # Listening, or dead because the port is taken. Whatever holds it — Dart DevTools, another
+        # run's stub — would answer the runtime in this stub's place: its boot refuses most answers
+        # that are not a push channel's, and a wake would land in somebody else's record. Asking
+        # the port proves nothing, since that listener answers too; the stub says once it is bound.
         for _ in $(seq 50); do
-            curl -sf -o /dev/null "$channel" && break
+            grep -q listening "$RUNDIR/push-stub.log" && break
+            kill -0 "${pids[-1]}" 2>/dev/null || break
             sleep 0.1
         done
-        curl -sf -o /dev/null "$channel" \
-            || { echo "the push stub never answered:" >&2; cat "$RUNDIR/push-stub.log" >&2; exit 1; }
-        # Answered by *this* stub? Another listener on :9101 answers too (Dart DevTools likes that
-        # port), and then the wake lands there instead — which run-e2e.sh's leg 6b reads as "never
-        # woke anybody", $TIMEOUT seconds later. A warning, not a failure: a run that never looks
-        # at a wake is unaffected.
-        kill -0 "${pids[-1]}" 2>/dev/null \
-            || echo "warning: the push stub died — :9101 is taken, so wake signals will go astray ($(tail -1 "$RUNDIR/push-stub.log"))" >&2
+        kill -0 "${pids[-1]}" 2>/dev/null && grep -q listening "$RUNDIR/push-stub.log" \
+            || { echo "the push stub is not serving on :9180:" >&2; cat "$RUNDIR/push-stub.log" >&2; exit 1; }
     fi
 
     # forward-cid 1 turns the guest's vsock connections into host vsock loopback

@@ -22,6 +22,9 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 RECORD = sys.argv[1] if len(sys.argv) > 1 else "/tmp/push-messages.jsonl"
+# The image dials this (flake.nix, S3FS_PUSH_ENDPOINT). Not 9100 and up: Dart DevTools takes those,
+# one per VS Code window, and whatever holds the port answers the runtime in the stub's place.
+PORT = 9180
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -82,5 +85,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     open(RECORD, "w", encoding="utf-8").close()
-    print(f"push-stub: listening on 9101, recording to {RECORD}", flush=True)
-    HTTPServer(("0.0.0.0", 9101), Handler).serve_forever()
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    # Only once bound: the harness takes this line to mean the port is the stub's.
+    print(f"push-stub: listening on {PORT}, recording to {RECORD}", flush=True)
+    server.serve_forever()

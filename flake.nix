@@ -517,7 +517,7 @@
         } // nixpkgs.lib.optionalAttrs (acmeContacts != [ ]) {
           S3FS_ACME_CONTACTS = nixpkgs.lib.concatStringsSep "," acmeContacts;
         } // nixpkgs.lib.optionalAttrs (pushAppId == null) {
-          S3FS_PUSH_ENDPOINT = "http://192.168.127.254:9101";
+          S3FS_PUSH_ENDPOINT = "http://192.168.127.254:9180";
         } // nixpkgs.lib.optionalAttrs (pushAppId != null) {
           S3FS_PUSH_APP_ID = pushAppId;
         } // nixpkgs.lib.optionalAttrs (allowedOrigins != [ ]) {

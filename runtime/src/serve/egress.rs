@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn the_emulators_host_is_open_except_the_runtimes_own_services() {
-        let own: &[u16] = &[9000, 9101, 14000];
+        let own: &[u16] = &[9000, 9180, 14000];
         assert!(admits(at("192.168.127.254:7070"), Some(own)));
         assert!(admits(at("[::ffff:192.168.127.254]:7200"), Some(own)));
         assert!(!admits(at("192.168.127.254:9000"), Some(own)), "its store");
