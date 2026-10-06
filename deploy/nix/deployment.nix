@@ -26,6 +26,21 @@
 
   region = "eu-west-2";
 
+  # The KMS key the master secret is minted under, and the SSM parameter that
+  # holds it sealed. The key's policy is what releases it — only to an
+  # attestation whose PCR0 and PCR16 it names — so the key id is not a secret;
+  # it is measured so that the host cannot point the enclave at a key with a
+  # looser policy.
+  kmsKeyId = "CHANGE-ME";
+  masterKeyParameter = "/CHANGE-ME/master-key";
+
+  # How long each root record is locked against deletion, in seconds (Object
+  # Lock, COMPLIANCE: nobody can shorten it, AWS support included). It is the
+  # horizon of the rollback guarantee, and how long the roots bucket outlives
+  # the deployment. Ten years for anything that holds real value; a test
+  # deployment can say a day (the least the runtime accepts) and be retired.
+  rootRetentionSecs = 10 * 365 * 24 * 60 * 60;
+
   # Domains for the serving certificate. Required, and not only for browsers:
   # the runtime obtains its certificate over ACME and nothing else, so an empty
   # list means no certificate and no HTTPS at all. A platform authenticator

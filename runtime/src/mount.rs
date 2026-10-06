@@ -30,6 +30,10 @@ pub struct MountConfig {
     /// Skip the `HeadBucket` startup probe.
     pub skip_bucket_probe: bool,
     pub request_timeout: Duration,
+    /// How long each root record, and every record the boot writes beside
+    /// them, is locked against deletion (Object Lock, COMPLIANCE). Rollback
+    /// protection lasts exactly this long, and so does the roots bucket.
+    pub root_retention: Duration,
 }
 
 impl MountConfig {
@@ -41,9 +45,23 @@ impl MountConfig {
             access_key_id: self.access_key_id.clone(),
             secret_access_key: self.secret_access_key.clone(),
             session_token: self.session_token.clone(),
+            // No keys is production: the instance's role, as the KMS and SSM
+            // clients use (`keys::kms_client`).
+            credentials_provider: self
+                .access_key_id
+                .is_none()
+                .then(crate::notify::pinpoint::instance_role),
             force_path_style: self.force_path_style,
             request_timeout: self.request_timeout,
         }
+    }
+
+    fn fs_config(&self) -> Config {
+        Config::builder()
+            .bucket_prefix(self.bucket_prefix.clone())
+            .mount_path(self.mount_path.clone())
+            .root_retention(Some(self.root_retention))
+            .build()
     }
 }
 
@@ -153,10 +171,7 @@ async fn finish(
     let data = backends.data.clone();
     let roots = backends.roots.clone();
 
-    let fs_config = Config::builder()
-        .bucket_prefix(config.bucket_prefix.clone())
-        .mount_path(config.mount_path.clone())
-        .build();
+    let fs_config = config.fs_config();
 
     // Derived twice — once here and once inside `Fs::mount` — rather than
     // reaching into the store for them. The derivation is cheap and pure, and
@@ -234,9 +249,8 @@ mod tests {
         assert!(parse_fs_id("").is_err());
     }
 
-    #[test]
-    fn the_roots_bucket_defaults_to_the_data_bucket() {
-        let cfg = MountConfig {
+    fn config() -> MountConfig {
+        MountConfig {
             bucket: "data".into(),
             roots_bucket: None,
             region: "us-east-1".into(),
@@ -251,8 +265,36 @@ mod tests {
             min_root_seq: None,
             skip_bucket_probe: true,
             request_timeout: Duration::from_secs(30),
-        };
+            root_retention: Duration::from_secs(86_400),
+        }
+    }
+
+    /// The image's retention reaches the root records, not the store's ten-year default.
+    #[test]
+    fn root_records_are_locked_for_the_configured_retention() {
+        let cfg = config();
+        assert_eq!(
+            cfg.fs_config().store.root_retention,
+            Some(cfg.root_retention)
+        );
+    }
+
+    #[test]
+    fn the_roots_bucket_defaults_to_the_data_bucket() {
+        let cfg = config();
         assert_eq!(cfg.roots_bucket.as_deref().unwrap_or(&cfg.bucket), "data");
         assert_eq!(cfg.backend_config("roots").bucket, "roots");
+    }
+
+    /// Production sets no keys. A store client without a provider signs nothing, and that shows
+    /// only on hardware, at the first request of the boot.
+    #[test]
+    fn without_keys_the_store_signs_as_the_instance_role() {
+        let mut cfg = config();
+        assert!(cfg.backend_config("data").credentials_provider.is_some());
+
+        cfg.access_key_id = Some("minio".into());
+        cfg.secret_access_key = Some("minio".into());
+        assert!(cfg.backend_config("data").credentials_provider.is_none());
     }
 }

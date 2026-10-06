@@ -253,7 +253,8 @@
       busybox = pkgs.pkgsStatic.busybox;
 
       # Which store the production image belongs to. Baked in, so PCR0 covers
-      # it — see deploy/nix/deployment.nix for why that has to be true.
+      # it — see deploy/nix/deployment.nix for why that has to be true. A
+      # deployment kept elsewhere builds its image with `lib.mkEif`.
       deployment = import ./deploy/nix/deployment.nix;
 
       # What both the production and emulator images are made of. Only the
@@ -276,7 +277,7 @@
           "--locked -p enclave-runtime --bin enclave-runtime --features testing";
       });
 
-      runtimeImage = {
+      runtimeImageFor = deployment: {
         name = "s3fs";
         # No guest here. It is fetched from the store at boot and measured
         # into PCR16 — see `guest-release` and S3FS_GUEST_OBJECT below.
@@ -352,10 +353,15 @@
           # S3FS_MASTER_KEY is deliberately absent, and the runtime *refuses*
           # to start if it is set alongside this: a key from configuration is a
           # key the parent instance holds, which is the whole thing this
-          # prevents. S3FS_KMS_KEY_ID and S3FS_MASTER_KEY_PARAMETER come from
-          # the deployment, since they name resources this repository does not
-          # own.
+          # prevents. The key and the parameter come from the deployment, since
+          # they name resources this repository does not own.
           S3FS_MASTER_KEY_SOURCE = "kms";
+          S3FS_KMS_KEY_ID = deployment.kmsKeyId;
+          S3FS_MASTER_KEY_PARAMETER = deployment.masterKeyParameter;
+
+          # How long root records are locked — the rollback guarantee's horizon,
+          # and how long the roots bucket outlives the deployment.
+          S3FS_ROOT_RETENTION_SECS = toString deployment.rootRetentionSecs;
 
           # Guest stdout and stderr go to CloudWatch as well as the console.
           # The enclave calls PutLogEvents itself, over the same path it uses
@@ -380,6 +386,16 @@
           # image could leak by carrying it.
         };
       };
+
+      runtimeImage = runtimeImageFor deployment;
+
+      # The production image for a deployment kept outside this repository —
+      # a file in deployment.nix's shape:
+      #
+      #   packages.x86_64-linux.eif = enclave-runtime.lib.x86_64-linux.mkEif (import ./deployment.nix);
+      #
+      # The result is `s3fs.eif` and `pcr.json`, as `packages.eif`.
+      mkEif = deployment: callEif (runtimeImageFor deployment);
 
       # The runtime configured for the emulator, as a function of the relying
       # party so a client developer can boot one their app can sign for:
@@ -415,7 +431,12 @@
         };
         closureRoots = [ enclave-runtime-testing busybox pkgs.cacert ];
         name = "s3fs-qemu";
-        env = runtimeImage.env // {
+        # The key settings go: this image keeps the static key below, and the
+        # runtime refuses one alongside KMS settings rather than pick between them.
+        env = builtins.removeAttrs runtimeImage.env [
+          "S3FS_KMS_KEY_ID"
+          "S3FS_MASTER_KEY_PARAMETER"
+        ] // {
           S3FS_CLOCK_SOURCE = "host";
 
           # QEMU's NSM does not sign at all: its source says "we don't
@@ -527,7 +548,7 @@
 
     in
     {
-      lib.${system} = { inherit eifQemu; };
+      lib.${system} = { inherit eifQemu mkEif; };
 
       packages.${system} = {
         inherit enclave-runtime guest-http guest-release nsm-selftest nitro-attest eif-build blobs;

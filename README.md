@@ -421,9 +421,9 @@ nix build .#guest-release --out-link guest-release  # guest.wasm, guest-pcr16.js
 nix build .#eif --rebuild                           # rebuild and compare
 ```
 
-1. Set the bucket identities, filesystem ID, region, guest object key, TLS domains, relying party and push application in [`deployment.nix`](deploy/nix/deployment.nix).
+1. Set the bucket identities, filesystem ID, region, KMS key and master-key parameter, root retention, guest object key, TLS domains, relying party and push application in [`deployment.nix`](deploy/nix/deployment.nix) — or, for a deployment kept in its own repository, in a file of the same shape built with `lib.x86_64-linux.mkEif`.
 2. Build the EIF and the guest, and keep PCR0 and PCR16 as release outputs.
-3. Provision from `deploy/tofu`. The KMS key, its policy and SSM access are provisioned separately for now; wire `S3FS_KMS_KEY_ID` and `S3FS_MASTER_KEY_PARAMETER` into the measured `runtimeImage.env` in `flake.nix`.
+3. Provision from `deploy/tofu`. The KMS key, its policy and SSM access are provisioned separately for now; the module's outputs (`role_arn`, `security_group_id`, …) are there for a deployment that adds them.
 4. Upload the approved component and bind KMS release to the approved measurements.
 5. Start the parent's enclave and gvproxy services. The parent forwards TLS; it never terminates it.
 6. From a client pinning the release measurements, verify the boot mode, the trusted devices, key release, the TLS attestation binding, the credential path and persistence.

@@ -46,6 +46,11 @@ use async_trait::async_trait;
 use nitro_nsm::Nsm;
 use s3fs_core::MasterSecret;
 
+use aws_credential_types::provider::SharedCredentialsProvider;
+use aws_credential_types::Credentials;
+
+use crate::notify::pinpoint::instance_role;
+
 /// A master secret in the form that is safe to store.
 ///
 /// Opaque bytes: what is inside depends on which [`MasterKeySource`] produced
@@ -227,37 +232,42 @@ pub fn open_key_source(
     }
 }
 
-/// Static credentials **when they are supplied**, and the default chain
-/// otherwise.
+/// Static credentials **when they are supplied**, and the parent instance's
+/// role otherwise — which is how production runs, since its image sets no keys.
 ///
-/// The earlier version of this comment said an enclave has no IMDS to walk to.
-/// That is wrong, and it misled real work: an enclave has no NIC of its own,
-/// but its egress is NATed by gvproxy through the parent, where
-/// `169.254.169.254` is perfectly reachable — so the default chain resolves to
-/// the **parent instance's role**. That is how production runs, since the
-/// production image sets no keys.
+/// Always a provider, never an absence of one. A client built from
+/// `Config::builder()` does not walk the default chain: given no provider it
+/// has no credentials at all, and production's clients once shipped like that
+/// — able to sign nothing, which shows only on hardware. The metadata service
+/// is reached at the address gvproxy maps for the runtime alone — see
+/// [`instance_role`].
 ///
 /// Explicit keys are for development and the QEMU harness, where the endpoint
 /// is MinIO and there is no instance role to borrow.
-fn kms_client(config: &MasterKeyConfig) -> aws_sdk_kms::Client {
-    use aws_sdk_kms::config::{BehaviorVersion, Credentials, Region};
-    let mut builder = aws_sdk_kms::Config::builder()
-        .behavior_version(BehaviorVersion::latest())
-        .region(Region::new(config.region.clone()));
-    if let Some(endpoint) = &config.kms_endpoint {
-        builder = builder.endpoint_url(endpoint);
-    }
-    if let (Some(akid), Some(sak)) = (
+fn credentials(config: &MasterKeyConfig) -> SharedCredentialsProvider {
+    match (
         config.access_key_id.as_deref(),
         config.secret_access_key.as_deref(),
     ) {
-        builder = builder.credentials_provider(Credentials::new(
+        (Some(akid), Some(sak)) => SharedCredentialsProvider::new(Credentials::new(
             akid,
             sak,
             config.session_token.clone(),
             None,
             "s3fs-static",
-        ));
+        )),
+        _ => instance_role(),
+    }
+}
+
+fn kms_client(config: &MasterKeyConfig) -> aws_sdk_kms::Client {
+    use aws_sdk_kms::config::{BehaviorVersion, Region};
+    let mut builder = aws_sdk_kms::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new(config.region.clone()))
+        .credentials_provider(credentials(config));
+    if let Some(endpoint) = &config.kms_endpoint {
+        builder = builder.endpoint_url(endpoint);
     }
     aws_sdk_kms::Client::from_conf(builder.build())
 }
@@ -266,24 +276,42 @@ fn kms_client(config: &MasterKeyConfig) -> aws_sdk_kms::Client {
 /// two builders are distinct types with coincidentally identical methods, and
 /// the macro that would unify them costs more to read than the repetition.
 fn ssm_client(config: &MasterKeyConfig) -> aws_sdk_ssm::Client {
-    use aws_sdk_ssm::config::{BehaviorVersion, Credentials, Region};
+    use aws_sdk_ssm::config::{BehaviorVersion, Region};
     let mut builder = aws_sdk_ssm::Config::builder()
         .behavior_version(BehaviorVersion::latest())
-        .region(Region::new(config.region.clone()));
+        .region(Region::new(config.region.clone()))
+        .credentials_provider(credentials(config));
     if let Some(endpoint) = &config.ssm_endpoint {
         builder = builder.endpoint_url(endpoint);
     }
-    if let (Some(akid), Some(sak)) = (
-        config.access_key_id.as_deref(),
-        config.secret_access_key.as_deref(),
-    ) {
-        builder = builder.credentials_provider(Credentials::new(
-            akid,
-            sak,
-            config.session_token.clone(),
-            None,
-            "s3fs-static",
-        ));
-    }
     aws_sdk_ssm::Client::from_conf(builder.build())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(access_key_id: Option<&str>) -> MasterKeyConfig {
+        MasterKeyConfig {
+            kind: MasterKeySourceKind::Kms,
+            master_key: None,
+            kms_key_id: Some("key".into()),
+            parameter: Some("/parameter".into()),
+            environment: "test".into(),
+            fs_id: [0; 16],
+            region: "us-east-1".into(),
+            kms_endpoint: None,
+            ssm_endpoint: None,
+            access_key_id: access_key_id.map(str::to_string),
+            secret_access_key: access_key_id.map(str::to_string),
+            session_token: None,
+        }
+    }
+
+    /// Production sets no keys, and must then sign as the instance; the harness signs with its own.
+    #[test]
+    fn without_keys_kms_and_ssm_sign_as_the_instance_role() {
+        assert!(format!("{:?}", credentials(&config(None))).contains("ImdsCredentialsProvider"));
+        assert!(format!("{:?}", credentials(&config(Some("minio")))).contains("s3fs-static"));
+    }
 }

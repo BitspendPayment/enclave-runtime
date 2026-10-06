@@ -66,6 +66,7 @@
 //! image environment that selects it is measured.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use nitro_attestation::{Expectations, Trust, VerifyOptions, AWS_NITRO_ROOT_G1_PEM};
@@ -589,7 +590,7 @@ async fn record_pair(
 
     match backends
         .roots
-        .put_blob_if_not_exists(locked(&key, document, config))
+        .put_blob_if_not_exists(locked(&key, document, config.root_retention))
         .await
     {
         Ok(_) => {}
@@ -653,7 +654,11 @@ async fn genesis(
     let key_object = sealed_key_key(&config.bucket_prefix, &config.fs_id);
     backends
         .roots
-        .put_blob_if_not_exists(locked(&key_object, sealed.as_bytes().to_vec(), config))
+        .put_blob_if_not_exists(locked(
+            &key_object,
+            sealed.as_bytes().to_vec(),
+            config.root_retention,
+        ))
         .await
         .map_err(|e| match e {
             // `AlreadyExists`, not `Conflict`: that is what both backends
@@ -680,7 +685,7 @@ async fn genesis(
     let receipt_object = receipt_key(&config.bucket_prefix, &config.fs_id);
     backends
         .roots
-        .put_blob_if_not_exists(locked(&receipt_object, document, config))
+        .put_blob_if_not_exists(locked(&receipt_object, document, config.root_retention))
         .await
         .map_err(|e| anyhow::anyhow!("writing the state-origin receipt: {e}"))?;
 
@@ -702,15 +707,11 @@ async fn genesis(
 
 /// Everything the boot machine writes goes under the same retention as the
 /// anchor chain: undeletable is the whole point.
-fn locked(key: &str, body: Vec<u8>, _config: &MountConfig) -> PutBlobInput {
-    let mut input = PutBlobInput::new(key, body.into());
-    if let Some(retention) = s3fs_core::store::StoreConfig::default().root_retention {
-        input = input.with_object_lock(ObjectLock {
-            mode: s3fs_core::backend::ObjectLockMode::Compliance,
-            retain_until: std::time::SystemTime::now() + retention,
-        });
-    }
-    input
+fn locked(key: &str, body: Vec<u8>, retention: Duration) -> PutBlobInput {
+    PutBlobInput::new(key, body.into()).with_object_lock(ObjectLock {
+        mode: s3fs_core::backend::ObjectLockMode::Compliance,
+        retain_until: std::time::SystemTime::now() + retention,
+    })
 }
 
 #[cfg(test)]
@@ -734,6 +735,23 @@ mod tests {
             pcr0: [pcr0; 48],
             pcr16: [pcr16; 48],
         }
+    }
+
+    /// The image's retention, not a default: a test deployment's records must
+    /// lapse when its image says, or its buckets outlive it by a decade.
+    #[test]
+    fn the_boot_records_are_locked_for_the_configured_retention() {
+        let day = Duration::from_secs(86_400);
+        let lock = locked("k", vec![], day).object_lock.expect("locked");
+        assert!(matches!(
+            lock.mode,
+            s3fs_core::backend::ObjectLockMode::Compliance
+        ));
+        let left = lock
+            .retain_until
+            .duration_since(std::time::SystemTime::now())
+            .expect("in the future");
+        assert!(left <= day && left > day - Duration::from_secs(60));
     }
 
     #[test]

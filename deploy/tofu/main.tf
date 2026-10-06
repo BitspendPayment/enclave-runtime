@@ -26,7 +26,8 @@ terraform {
 }
 
 provider "aws" {
-  region = var.region
+  region  = var.region
+  profile = var.aws_profile
 }
 
 locals {
@@ -99,6 +100,19 @@ resource "aws_security_group" "enclave" {
     to_port     = 443
     protocol    = "tcp"
     cidr_blocks = var.ingress_cidrs
+  }
+
+  # Services that share the parent and are no part of the enclave — they see
+  # only what reaches them, like anything else on the parent.
+  dynamic "ingress" {
+    for_each = var.extra_ingress_ports
+    content {
+      description = "Beside the enclave, on the parent"
+      from_port   = ingress.value
+      to_port     = ingress.value
+      protocol    = "tcp"
+      cidr_blocks = var.ingress_cidrs
+    }
   }
 
   # No SSH. Nothing here is meant to be reached by hand, and an open shell on

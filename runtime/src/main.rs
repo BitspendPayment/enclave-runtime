@@ -176,6 +176,18 @@ struct Cli {
     #[arg(long, env = "S3FS_MIN_ROOT_SEQ")]
     min_root_seq: Option<u64>,
 
+    /// How long each root record is locked against deletion, in seconds.
+    ///
+    /// COMPLIANCE retention: nobody can shorten it, so the rollback guarantee
+    /// lasts this long and so does the roots bucket. Ten years unless the image
+    /// says otherwise; a test deployment says a day, so it can be retired.
+    /// Baked into the image, so PCR0 tells a client which kind it is talking
+    /// to. Under a day is refused: it protects nothing worth the name.
+    #[arg(long, env = "S3FS_ROOT_RETENTION_SECS",
+          default_value_t = s3fs_core::store::config::DEFAULT_ROOT_RETENTION.as_secs(),
+          value_parser = clap::value_parser!(u64).range(86_400..))]
+    root_retention_secs: u64,
+
     /// Path the guest sees as its preopen root.
     #[arg(long, env = "S3FS_MOUNT_PATH", default_value = "/")]
     mount_path: String,
@@ -644,6 +656,7 @@ impl Cli {
             min_root_seq: self.min_root_seq,
             skip_bucket_probe: self.skip_bucket_probe,
             request_timeout: Duration::from_secs(self.s3_timeout_secs),
+            root_retention: Duration::from_secs(self.root_retention_secs),
         })
     }
 
@@ -1357,6 +1370,42 @@ mod tests {
         );
         // Changing the guest deadline must not move the S3 one.
         assert_eq!(cli.request_timeout_secs, 45);
+    }
+
+    /// Ten years unless the image says otherwise, what it says reaches the
+    /// mount, and under a day is refused.
+    #[test]
+    fn root_retention_is_ten_years_unless_the_image_says_otherwise() {
+        let key = "aa".repeat(32);
+        let cli = cli_from(&["--bucket", "b", "--master-key", &key]);
+        assert_eq!(
+            cli.mount_config().expect("valid").root_retention,
+            s3fs_core::store::config::DEFAULT_ROOT_RETENTION
+        );
+        let cli = cli_from(&[
+            "--bucket",
+            "b",
+            "--master-key",
+            &key,
+            "--root-retention-secs",
+            "86400",
+        ]);
+        assert_eq!(
+            cli.mount_config().expect("valid").root_retention,
+            Duration::from_secs(86_400)
+        );
+        assert!(Cli::try_parse_from([
+            "enclave-runtime",
+            "--master-key-source",
+            "static",
+            "--bucket",
+            "b",
+            "--master-key",
+            &key,
+            "--root-retention-secs",
+            "3600",
+        ])
+        .is_err());
     }
 
     /// Console-only is the default, and takes no client and no credentials.

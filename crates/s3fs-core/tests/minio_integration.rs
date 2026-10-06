@@ -57,6 +57,7 @@ async fn fresh_minio_with_bucket(bucket: &str) -> (ContainerAsync<MinIO>, AwsS3B
         access_key_id: Some("minioadmin".into()),
         secret_access_key: Some("minioadmin".into()),
         session_token: None,
+        credentials_provider: None,
         force_path_style: true,
         request_timeout: Duration::from_secs(30),
     };

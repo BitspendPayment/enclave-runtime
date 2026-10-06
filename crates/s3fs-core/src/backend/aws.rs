@@ -5,16 +5,16 @@
 //!
 //! Construction is via [`AwsS3BackendConfig`]: bucket + region + optional
 //! endpoint override (for MinIO, LocalStack, Yandex, R2, etc.) + optional
-//! static credentials. We deliberately do NOT walk the AWS credential chain
-//! here — the runner / host is responsible for sourcing creds (in the
-//! enclave, that comes from a Nitro KMS attestation flow).
+//! static credentials or a credentials provider. We deliberately do NOT walk
+//! the AWS credential chain here — the runner / host is responsible for
+//! sourcing creds (in the enclave runtime, the parent instance's role).
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::config::{Credentials, Region, SharedCredentialsProvider};
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
@@ -60,12 +60,15 @@ pub struct AwsS3BackendConfig {
     /// Endpoint override (e.g. `http://127.0.0.1:9000` for MinIO). Default
     /// is the standard AWS S3 regional endpoint when `None`.
     pub endpoint: Option<String>,
-    /// Static credentials. If all three are `None`, the SDK uses the
-    /// default credential chain (env vars, profile, IMDS, etc.). Inside an
-    /// enclave you should always pass these explicitly.
+    /// Static credentials, which win over `credentials_provider` when given.
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
     pub session_token: Option<String>,
+    /// Where credentials come from when no static ones are given — in an
+    /// enclave, the parent instance's role. With neither, the client has no
+    /// credentials at all: a bare `Config::builder()` does not walk the
+    /// default chain, and this crate deliberately does not either.
+    pub credentials_provider: Option<SharedCredentialsProvider>,
     /// MinIO and many other S3-compatible servers require path-style
     /// addressing rather than virtual-host style.
     pub force_path_style: bool,
@@ -82,6 +85,7 @@ impl AwsS3BackendConfig {
             access_key_id: None,
             secret_access_key: None,
             session_token: None,
+            credentials_provider: None,
             force_path_style: false,
             request_timeout: Duration::from_secs(30),
         }
@@ -142,6 +146,7 @@ impl AwsS3Backend {
         if let Some(ep) = &config.endpoint {
             conf_builder = conf_builder.endpoint_url(ep);
         }
+        conf_builder.set_credentials_provider(config.credentials_provider.clone());
         if let (Some(akid), Some(sak)) = (
             config.access_key_id.as_deref(),
             config.secret_access_key.as_deref(),

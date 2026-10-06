@@ -7,6 +7,29 @@ output "instance_id" {
   value = aws_instance.parent.id
 }
 
+# For a deployment that builds on this one rather than copying it: a KMS key
+# policy names the role, more ports open on the group, a volume lands in the
+# instance's zone, and the image's `guestLogGroup` must be this group.
+output "role_arn" {
+  value = aws_iam_role.parent.arn
+}
+
+output "role_name" {
+  value = aws_iam_role.parent.name
+}
+
+output "security_group_id" {
+  value = aws_security_group.enclave.id
+}
+
+output "availability_zone" {
+  value = aws_instance.parent.availability_zone
+}
+
+output "guest_log_group" {
+  value = aws_cloudwatch_log_group.guest.name
+}
+
 # What to run once it is up. The last command is the one that matters: it
 # checks that the certificate the connection was served is the one the enclave
 # attested, and that the runtime and guest behind it are the approved ones.

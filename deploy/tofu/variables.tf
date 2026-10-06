@@ -3,6 +3,14 @@ variable "region" {
   default = "eu-west-2"
 }
 
+# Named rather than left to the environment when this is used as a module: the
+# module's provider is its own, so an unset AWS_PROFILE would otherwise put half
+# a deployment in whichever account the default profile names.
+variable "aws_profile" {
+  type    = string
+  default = null
+}
+
 variable "environment" {
   type    = string
   default = "dev"
@@ -75,6 +83,12 @@ variable "ingress_cidrs" {
   type        = list(string)
   default     = ["0.0.0.0/0"]
   description = "Who may reach :443. Open by default because the endpoint is meant to be public and its TLS terminates inside the enclave."
+}
+
+variable "extra_ingress_ports" {
+  type        = list(number)
+  default     = []
+  description = "TCP ports besides 443 to open, for services that run on the parent beside the enclave. They are not the enclave's: TLS to them terminates on the parent."
 }
 
 variable "guest_log_retention_days" {

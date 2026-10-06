@@ -231,6 +231,7 @@ fn config() -> MountConfig {
         min_root_seq: None,
         skip_bucket_probe: true,
         request_timeout: std::time::Duration::from_secs(30),
+        root_retention: s3fs_core::store::config::DEFAULT_ROOT_RETENTION,
     }
 }
 
