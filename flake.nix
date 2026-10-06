@@ -85,6 +85,15 @@
         # aws-lc-sys drives cmake itself; letting Nix's cmake hook configure
         # the crate's own build tree makes it fail confusingly.
         dontUseCmakeConfigure = true;
+        # The build directory, kept out of the binary. Rust embeds source paths
+        # (panic locations, vendored crates) and C embeds `__FILE__`, and the
+        # directory is /build under a sandboxed Nix but /tmp/nix-build-<name>-0
+        # without one (nix-portable): the same inputs gave two PCR0s. Mapped to
+        # one name, the image no longer says where it was built.
+        preConfigure = ''
+          export RUSTFLAGS="''${RUSTFLAGS:-} --remap-path-prefix=$NIX_BUILD_TOP=/build"
+          export NIX_CFLAGS_COMPILE="''${NIX_CFLAGS_COMPILE:-} -ffile-prefix-map=$NIX_BUILD_TOP=/build"
+        '';
       };
 
       # ---- the runtime -----------------------------------------------------
