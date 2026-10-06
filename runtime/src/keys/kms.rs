@@ -21,6 +21,10 @@
 //! key at all**. That is the difference between an enclave checking itself and
 //! something outside it doing the checking.
 //!
+//! What this code does check is that policy, before every use of the key: one
+//! that anybody could edit, or that releases to anything but this enclave, is
+//! refused rather than trusted ([`super::policy`]).
+//!
 //! Both conditions belong on `kms:GenerateDataKey`, which genesis calls, as
 //! well as on `kms:Decrypt`, which every later boot calls. Leave one
 //! unconditioned and anything holding the role can call it: an unconditioned
@@ -55,7 +59,8 @@ use nitro_nsm::{AttestationRequest, Nsm};
 use s3fs_core::MasterSecret;
 
 use super::recipient::RecipientKey;
-use super::{MasterKeySource, SealedKey};
+use super::{policy, MasterKeySource, SealedKey};
+use crate::boot::Pair;
 
 /// Bytes of key material to ask KMS for. The block store's master secret.
 const MASTER_SECRET_LEN: i32 = 32;
@@ -229,6 +234,53 @@ impl KmsAttestedKey {
         Ok((key, info))
     }
 
+    /// Refuse a key this enclave could not trust with its secret: one whose
+    /// policy anybody could edit, or which releases to anything but this
+    /// enclave's PCR0 and PCR16 ([`policy`]). Read from KMS itself, over TLS
+    /// that ends in here, so the parent can withhold the answer but not forge it.
+    async fn verify_key(&self, key_id: &str) -> Result<()> {
+        let pair = Pair::read(self.nsm.as_ref())?;
+        let described = self
+            .kms
+            .describe_key()
+            .key_id(key_id)
+            .send()
+            .await
+            .context("KMS DescribeKey")?;
+        policy::check_key(described.key_metadata().context("KMS described no key")?)
+            .with_context(|| format!("refusing KMS key {key_id}"))?;
+        let policy = self
+            .kms
+            .get_key_policy()
+            .key_id(key_id)
+            .policy_name("default")
+            .send()
+            .await
+            .context("KMS GetKeyPolicy")?;
+        policy::check_policy(
+            policy.policy().context("KMS returned no key policy")?,
+            &pair.pcr0,
+            &pair.pcr16,
+        )
+        .with_context(|| format!("refusing KMS key {key_id}"))?;
+        // A grant outlives every later change to the policy, so one made while
+        // it was still open would survive it being locked.
+        let grants = self
+            .kms
+            .list_grants()
+            .key_id(key_id)
+            .send()
+            .await
+            .context("KMS ListGrants")?;
+        if !grants.grants().is_empty() || grants.truncated() {
+            bail!(
+                "refusing KMS key {key_id}: it has grants, and a grant gives its grantee what the \
+                 policy does not"
+            );
+        }
+        Ok(())
+    }
+
     async fn read_ciphertext(&self, pointer: &KeyPointer) -> Result<Vec<u8>> {
         let response = self
             .ssm
@@ -269,6 +321,7 @@ impl MasterKeySource for KmsAttestedKey {
     }
 
     async fn mint(&self) -> Result<(MasterSecret, SealedKey)> {
+        self.verify_key(&self.config.key_id).await?;
         let (key, recipient) = self.recipient()?;
 
         let mut request = self
@@ -348,6 +401,8 @@ impl MasterKeySource for KmsAttestedKey {
             );
         }
 
+        // The key this filesystem was created under, which is the one Decrypt names.
+        self.verify_key(&pointer.key_id).await?;
         let ciphertext = self.read_ciphertext(&pointer).await?;
         let (key, recipient) = self.recipient()?;
 
@@ -499,5 +554,177 @@ mod tests {
             ..config.clone()
         };
         assert_ne!(config.context(), staging.context());
+    }
+
+    /// The key is checked before it is used, through the real `mint`, against
+    /// KMS answers replayed in order.
+    mod verification {
+        use super::*;
+        use aws_sdk_kms::config::retry::RetryConfig;
+        use aws_sdk_kms::config::{BehaviorVersion, Credentials, Region};
+        use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+        use aws_smithy_types::body::SdkBody;
+        use nitro_nsm::fake::FakeNsm;
+        use nitro_nsm::PCR_GUEST;
+        use serde_json::json;
+
+        fn answer(status: u16, body: serde_json::Value) -> ReplayEvent {
+            ReplayEvent::new(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("https://kms.us-east-1.amazonaws.com/")
+                    .body(SdkBody::empty())
+                    .unwrap(),
+                http::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/x-amz-json-1.1")
+                    .body(SdkBody::from(body.to_string()))
+                    .unwrap(),
+            )
+        }
+
+        fn described() -> ReplayEvent {
+            answer(
+                200,
+                json!({ "KeyMetadata": {
+                    "KeyId": "k", "Origin": "AWS_KMS", "KeyManager": "CUSTOMER",
+                    "MultiRegion": false, "KeySpec": "SYMMETRIC_DEFAULT",
+                    "KeyUsage": "ENCRYPT_DECRYPT", "KeyState": "Enabled"
+                }}),
+            )
+        }
+
+        fn policy(policy: serde_json::Value) -> ReplayEvent {
+            answer(
+                200,
+                json!({ "Policy": policy.to_string(), "PolicyName": "default" }),
+            )
+        }
+
+        /// The locked shape, for this enclave's registers.
+        fn locked(pair: &Pair) -> serde_json::Value {
+            json!({ "Version": "2012-10-17", "Statement": [
+                { "Effect": "Allow", "Principal": { "AWS": "arn:aws:iam::1:root" },
+                  "Action": ["kms:DescribeKey", "kms:GetKeyPolicy", "kms:ScheduleKeyDeletion"],
+                  "Resource": "*" },
+                { "Effect": "Allow", "Principal": { "AWS": "arn:aws:iam::1:role/parent" },
+                  "Action": ["kms:Decrypt", "kms:GenerateDataKey"], "Resource": "*",
+                  "Condition": { "StringEqualsIgnoreCase": {
+                      "kms:RecipientAttestation:PCR0": hex::encode(pair.pcr0),
+                      "kms:RecipientAttestation:PCR16": hex::encode(pair.pcr16) } } }
+            ]})
+        }
+
+        /// An enclave with a measured guest, whose KMS answers `events` in order.
+        fn source(events: Vec<ReplayEvent>) -> (KmsAttestedKey, StaticReplayClient, Pair) {
+            let nsm = FakeNsm::new();
+            nsm.extend_pcr(PCR_GUEST, b"guest").unwrap();
+            nsm.lock_pcr(PCR_GUEST).unwrap();
+            let pair = Pair::read(&nsm).unwrap();
+            let replay = StaticReplayClient::new(events);
+            let kms = aws_sdk_kms::Client::from_conf(
+                aws_sdk_kms::Config::builder()
+                    .behavior_version(BehaviorVersion::latest())
+                    .region(Region::new("us-east-1"))
+                    .credentials_provider(Credentials::for_tests())
+                    .retry_config(RetryConfig::disabled())
+                    .http_client(replay.clone())
+                    .build(),
+            );
+            // Never reached: every test stops at or before KMS.
+            let ssm = aws_sdk_ssm::Client::from_conf(
+                aws_sdk_ssm::Config::builder()
+                    .behavior_version(aws_sdk_ssm::config::BehaviorVersion::latest())
+                    .region(aws_sdk_ssm::config::Region::new("us-east-1"))
+                    .credentials_provider(Credentials::for_tests())
+                    .http_client(StaticReplayClient::new(vec![]))
+                    .build(),
+            );
+            let config = KmsKeyConfig {
+                key_id: "k".into(),
+                parameter: "/p".into(),
+                environment: "test".into(),
+                fs_id: [7; 16],
+            };
+            let source = KmsAttestedKey::new(Arc::new(nsm), kms, ssm, config);
+            (source, replay, pair)
+        }
+
+        async fn mint_error(source: &KmsAttestedKey) -> String {
+            match source.mint().await {
+                Ok(_) => panic!("mint should fail"),
+                Err(err) => format!("{err:#}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn an_editable_key_is_refused_before_it_mints() {
+            let editable = json!({ "Version": "2012-10-17", "Statement": [
+                { "Effect": "Allow", "Principal": { "AWS": "arn:aws:iam::1:root" },
+                  "Action": "kms:*", "Resource": "*" }
+            ]});
+            let (source, replay, _) = source(vec![described(), policy(editable)]);
+            let err = mint_error(&source).await;
+            assert!(
+                err.contains("refusing KMS key k") && err.contains("allows kms:*"),
+                "{err}"
+            );
+            assert_eq!(
+                replay.actual_requests().count(),
+                2,
+                "GenerateDataKey was never sent"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_key_with_grants_is_refused() {
+            let (_, _, pair) = source(vec![]);
+            let grant = json!({ "Grants": [{ "GrantId": "g", "KeyId": "k" }], "Truncated": false });
+            let (source, _, _) =
+                source(vec![described(), policy(locked(&pair)), answer(200, grant)]);
+            let err = mint_error(&source).await;
+            assert!(err.contains("it has grants"), "{err}");
+        }
+
+        /// Every boot after genesis checks the key its filesystem names before
+        /// it reads the sealed copy.
+        #[tokio::test]
+        async fn an_editable_key_is_refused_before_it_opens() {
+            let editable = json!({ "Version": "2012-10-17", "Statement": [
+                { "Effect": "Allow", "Principal": { "AWS": "*" },
+                  "Action": "kms:PutKeyPolicy", "Resource": "*" }
+            ]});
+            let (source, replay, _) = source(vec![described(), policy(editable)]);
+            let sealed = KeyPointer {
+                parameter: "/p".into(),
+                key_id: "k".into(),
+                context: source.config.context(),
+                ciphertext_sha256: [0; 32],
+            }
+            .encode()
+            .unwrap();
+            let err = match source.open(&sealed).await {
+                Ok(_) => panic!("refused"),
+                Err(err) => format!("{err:#}"),
+            };
+            assert!(err.contains("allows kms:PutKeyPolicy"), "{err}");
+            assert_eq!(replay.actual_requests().count(), 2);
+        }
+
+        /// Past the checks, the next thing asked of KMS is the key itself.
+        #[tokio::test]
+        async fn a_locked_key_is_used() {
+            let (_, _, pair) = source(vec![]);
+            let stop = json!({ "__type": "DisabledException", "message": "the test stops here" });
+            let (source, replay, _) = source(vec![
+                described(),
+                policy(locked(&pair)),
+                answer(200, json!({ "Grants": [], "Truncated": false })),
+                answer(400, stop),
+            ]);
+            let err = mint_error(&source).await;
+            assert!(err.contains("GenerateDataKey"), "{err}");
+            assert_eq!(replay.actual_requests().count(), 4);
+        }
     }
 }

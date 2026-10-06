@@ -44,8 +44,10 @@ output "verify" {
     aws s3 cp guest-release/guest.wasm \
         s3://${length(var.buckets) > 1 ? var.buckets[1] : var.buckets[0]}/guest/guest.wasm
 
-    # The key policy's condition, on both kms:GenerateDataKey and kms:Decrypt.
-    # Replace PCR16 on a guest change; never add a second value beside it.
+    # The key policy's condition, on both kms:GenerateDataKey and kms:Decrypt,
+    # in a policy nobody can edit — the enclave refuses any other
+    # (runtime/src/keys/policy.rs). It names one pair for good: a new runtime
+    # or guest cannot open a store made under it.
     #   "kms:RecipientAttestation:PCR0":  "$(jq -r .PCR0 result/pcr.json)"
     #   "kms:RecipientAttestation:PCR16": "$(jq -r .PCR16 guest-release/guest-pcr16.json)"
 

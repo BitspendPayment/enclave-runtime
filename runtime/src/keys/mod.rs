@@ -33,6 +33,7 @@
 //! environment that selects it is measured, so PCR0 says which an enclave runs.
 
 mod kms;
+mod policy;
 mod recipient;
 mod static_key;
 
