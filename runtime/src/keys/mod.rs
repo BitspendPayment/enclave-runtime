@@ -32,6 +32,7 @@
 //! every boot mode without hardware. It is not protection, and the image
 //! environment that selects it is measured, so PCR0 says which an enclave runs.
 
+mod ber;
 mod kms;
 mod policy;
 mod recipient;

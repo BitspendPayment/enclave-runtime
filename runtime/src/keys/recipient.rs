@@ -144,8 +144,10 @@ impl RecipientKey {
 
 /// `ContentInfo` → `EnvelopedData`, refusing anything else.
 fn parse_enveloped(ciphertext: &[u8]) -> Result<EnvelopedData> {
-    let info =
-        ContentInfo::from_der(ciphertext).context("parsing CiphertextForRecipient as CMS")?;
+    // KMS sends BER; `cms` reads DER ([`super::ber`]).
+    let der =
+        super::ber::to_der(ciphertext).context("transcoding CiphertextForRecipient to DER")?;
+    let info = ContentInfo::from_der(&der).context("parsing CiphertextForRecipient as CMS")?;
     if info.content_type != ID_ENVELOPED_DATA {
         bail!(
             "expected CMS enveloped-data, found content type {}",
@@ -337,6 +339,61 @@ mod tests {
         let secret = [0x42u8; 32];
         let opened = key.unwrap_ciphertext(&well_formed(&key, &secret)).unwrap();
         assert_eq!(opened, secret);
+    }
+
+    /// What KMS actually sends: every constructed value indefinite-length,
+    /// every OCTET STRING — the wrapped key, the IV, the encrypted content —
+    /// chunked. The first boot on Nitro failed on exactly this.
+    #[test]
+    fn an_envelope_in_kms_ber_round_trips() {
+        let key = RecipientKey::generate().unwrap();
+        let secret = [0x42u8; 32];
+        let der = well_formed(&key, &secret);
+        let ber = as_kms_sends(&der);
+        assert_ne!(ber, der);
+        assert_eq!(key.unwrap_ciphertext(&ber).unwrap(), secret);
+    }
+
+    /// Re-encode one DER value the way KMS does.
+    fn as_kms_sends(der: &[u8]) -> Vec<u8> {
+        fn tlv(input: &[u8]) -> (u8, &[u8], &[u8]) {
+            let (len, at) = match input[1] {
+                short if short < 0x80 => (short as usize, 2),
+                long => {
+                    let n = (long & 0x7f) as usize;
+                    let len = input[2..2 + n]
+                        .iter()
+                        .fold(0, |l, &b| (l << 8) | b as usize);
+                    (len, 2 + n)
+                }
+            };
+            (input[0], &input[at..at + len], &input[at + len..])
+        }
+        fn chunked(id: u8, content: &[u8]) -> Vec<u8> {
+            let mut out = vec![id | 0x20, 0x80];
+            for chunk in content.chunks(5) {
+                out.extend_from_slice(&[0x04, chunk.len() as u8]);
+                out.extend_from_slice(chunk);
+            }
+            out.extend_from_slice(&[0, 0]);
+            out
+        }
+        let (id, content, _) = tlv(der);
+        match id {
+            0x04 | 0x80 if content.len() > 5 => chunked(id, content),
+            constructed if constructed & 0x20 != 0 => {
+                let mut out = vec![id, 0x80];
+                let mut rest = content;
+                while !rest.is_empty() {
+                    let (_, _, after) = tlv(rest);
+                    out.extend(as_kms_sends(&rest[..rest.len() - after.len()]));
+                    rest = after;
+                }
+                out.extend_from_slice(&[0, 0]);
+                out
+            }
+            _ => der.to_vec(),
+        }
     }
 
     /// A payload that is not a whole number of blocks, to prove the PKCS#7
