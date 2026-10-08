@@ -17,11 +17,12 @@
 //! That is a capability, not a convention, and it is why this is safe to do
 //! on a shared pool at all.
 //!
-//! ## Why the identifier is minted
+//! ## Where the identifier comes from
 //!
-//! Sixteen bytes from the NSM at first registration, stored with the
-//! credential — see [`crate::auth::credential`] — so a host cannot predict a
-//! tenant's directory and create it first.
+//! Sixteen bytes derived from the passkey's credential id — see
+//! [`crate::auth::credential::tenant_of`]. Nothing is stored for it: a host
+//! cannot create a dataset on the pool, so a predictable name gives it
+//! nothing.
 //!
 //! ## Why there is no separate register
 //!

@@ -43,8 +43,8 @@ struct SigningNsm {
     chain: nitro_attestation::testing::TestChain,
     pcrs: std::sync::Mutex<Vec<nitro_nsm::Pcr>>,
     /// Counted, so successive draws differ. A device that returned the same
-    /// bytes every time would mint one tenant id for every passkey, which is
-    /// the isolation property quietly inverted.
+    /// bytes every time would give every registration, challenge and token the
+    /// same id.
     draws: std::sync::atomic::AtomicU64,
 }
 

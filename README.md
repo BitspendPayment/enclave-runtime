@@ -73,7 +73,6 @@ A read that fails mid-run returns the last good reading and logs a warning. A fe
 |---|---|
 | Guest `wasi:random/random` | Every byte, straight from the device (256 bytes per NSM request) |
 | Guest `wasi:random/insecure-seed` | A fresh seed per instance, so no two instances share a hash seed |
-| Tenant IDs | 16 bytes at registration, so the host cannot predict a tenant's directory before it exists |
 | Authentication | Registration and challenge IDs, and the 32-byte single-use tokens that admit a request |
 
 If the device fails, `wasi:random` stops the process rather than return predictable bytes. The clock can serve a stale reading because a stale timestamp is still a real one and a caller can notice. Predictable bytes look random to the guest, and a key built from them can never be detected downstream. The production image sets `ENCLAVE_RANDOM_SOURCE=nsm`, and `auto` falls back to kernel entropy with an error-level log. The TLS key comes from the kernel pool through `aws-lc-rs`. Inside an enclave the NSM is that pool's only seed, and requiring `/dev/nsm` at boot proves the runtime is in an enclave.

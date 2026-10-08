@@ -69,7 +69,7 @@ A crash before the anchor rewinds to the previous one. What is lost was never ac
 
 | Path | What |
 |---|---|
-| `/tenants/<id>` | A dataset per tenant, created at registration. Ids are 16 bytes minted by the NSM. A guest without a gate (development only) gets the all-zero id. |
+| `/tenants/<id>` | A dataset per tenant, created at registration. An id is the first 16 bytes of a SHA-256 of the passkey's credential id. A guest without a gate (development only) gets the all-zero id. |
 | `/runtime/credentials/<id>` | Passkeys, CBOR, one file each. |
 | `/runtime/tasks/`, `/runtime/streams/` | JSON records, each written to a temporary file and renamed over the record. |
 | `/runtime/devices/<tenant>/<sha256(token)>` | Push registrations. |
