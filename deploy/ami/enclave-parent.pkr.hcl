@@ -15,7 +15,7 @@
 #   nix build .#gvproxy
 #   packer init deploy/ami
 #   packer build \
-#     -var eif=$(readlink -f result)/s3fs.eif \
+#     -var eif=$(readlink -f result)/enclave.eif \
 #     -var pcr_json=$(readlink -f result)/pcr.json \
 #     -var gvproxy=$(readlink -f result-1)/bin/gvproxy \
 #     deploy/ami
@@ -75,7 +75,7 @@ variable "enclave_memory_mib" {
 
 variable "ami_name_prefix" {
   type    = string
-  default = "s3fs-enclave-parent"
+  default = "enclave-parent"
 }
 
 locals {
@@ -88,7 +88,7 @@ source "amazon-ebs" "parent" {
   ssh_username  = "ec2-user"
 
   ami_name        = "${var.ami_name_prefix}-${local.timestamp}"
-  ami_description = "Nitro Enclaves parent: nitro-cli, gvproxy, and a pinned s3fs EIF"
+  ami_description = "Nitro Enclaves parent: nitro-cli, gvproxy, and a pinned enclave EIF"
 
   source_ami_filter {
     filters = {
@@ -100,7 +100,7 @@ source "amazon-ebs" "parent" {
     most_recent = true
   }
 
-  # The EIF alone is ~140 MiB; the default 8 GiB root leaves ample room but is
+  # The EIF alone is ~530 MiB; the default 8 GiB root leaves ample room but is
   # stated so a larger image does not silently fill the disk.
   launch_block_device_mappings {
     device_name           = "/dev/xvda"
@@ -128,7 +128,10 @@ build {
     inline = [
       "set -euxo pipefail",
       "sudo dnf -y update",
-      "sudo dnf -y install aws-nitro-enclaves-cli jq",
+      # nbdkit serves the pool's EBS volume to the enclave over vsock: stock,
+      # from the Amazon Linux repositories. See units/nbdkit.service.
+      "sudo dnf -y install aws-nitro-enclaves-cli jq nbdkit-server nbdkit-basic-plugins",
+      "nbdkit --version",
       "sudo usermod -aG ne ec2-user",
       "nitro-cli --version",
     ]
@@ -141,7 +144,7 @@ build {
 
   provisioner "file" {
     source      = var.eif
-    destination = "/opt/enclave/s3fs.eif"
+    destination = "/opt/enclave/enclave.eif"
   }
 
   # The measurements the image claims, kept next to it. This is what lets an
@@ -186,12 +189,14 @@ build {
       "set -euxo pipefail",
       "sudo install -m 0644 /tmp/units/gvproxy.service /etc/systemd/system/",
       "sudo install -D -m 0644 /tmp/units/gvproxy.yml /etc/gvproxy/config.yml",
+      "sudo install -m 0644 /tmp/units/nbdkit.service /etc/systemd/system/",
       "sudo install -m 0644 /tmp/units/enclave.service /etc/systemd/system/",
       "sudo install -m 0755 /tmp/units/enclave-start.sh /usr/local/bin/enclave-start",
-      "sudo systemctl enable gvproxy.service enclave.service",
+      "sudo systemctl enable gvproxy.service nbdkit.service enclave.service",
       # Fail the build rather than the boot: a unit that will not even parse is
       # discovered here, not at 3am on a machine with no shell access.
       "sudo systemd-analyze verify /etc/systemd/system/gvproxy.service",
+      "sudo systemd-analyze verify /etc/systemd/system/nbdkit.service",
       "sudo systemd-analyze verify /etc/systemd/system/enclave.service",
     ]
   }

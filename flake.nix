@@ -1,5 +1,5 @@
 {
-  description = "Reproducible AWS Nitro Enclave image (EIF) for the s3fs enclave runtime";
+  description = "Reproducible AWS Nitro Enclave image (EIF) for the enclave runtime";
 
   # Why this exists at all: PCR0 is a digest of the enclave image, and a KMS key
   # policy pins it while a client checks it. That number is only worth anything
@@ -44,21 +44,16 @@
       };
       craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-      # `cleanCargoSource` drops everything that is not Rust. Two things here
-      # are not Rust and are not optional:
-      #
-      #   .pem   the AWS Nitro root, embedded by `include_str!`
-      #   .wit   the vendored WASI interfaces, read from disk by `bindgen!`
-      #
-      # Losing either fails deep in the build naming something else entirely —
-      # the WIT one surfaces as `could not find 'wasi' in 'bindings'`.
+      # `cleanCargoSource` drops everything that is not Rust. One thing here
+      # is not Rust and is not optional: `.pem`, the AWS Nitro root, embedded
+      # by `include_str!`. Losing it fails deep in the build naming something
+      # else entirely.
       srcFilter = path: type:
         # Guests are separate workspaces. Including their sources here changes
         # the runtime's store path (and its image's PCR0) on guest-only edits.
         !(lib.hasPrefix "${toString ./.}/examples/" (toString path)
           || toString path == "${toString ./.}/examples")
         && ((lib.hasSuffix ".pem" path)
-        || (lib.hasSuffix ".wit" path)
         || (craneLib.filterCargoSources path type));
 
       workspaceSrc = lib.cleanSourceWith {
@@ -241,6 +236,13 @@
         inherit blobs eif-build;
       };
 
+      # Tenant data is on ZFS: AWS's enclave kernel built from source, plus NBD
+      # and dm-crypt, and the OpenZFS module built against it.
+      kernelZfs = pkgs.callPackage ./nix/kernel-zfs.nix { };
+      zfsModules = "${kernelZfs.zfsKmod}/lib/modules/${kernelZfs.kernel.modDirVersion}/extra";
+      # What the runtime runs to bring the pool up: zpool and zfs, and dmsetup.
+      zfsTools = [ kernelZfs.zfsUser pkgs.lvm2.bin ];
+
       # gvforwarder brings the tap device up and then shells out to a DHCP
       # client for its address — `udhcpc` if present, otherwise `dhclient`.
       # Neither is in the runtime's closure, and the symptom is a forwarder
@@ -287,14 +289,17 @@
       });
 
       runtimeImageFor = deployment: {
-        name = "s3fs";
+        name = "enclave";
+        kernel = kernelZfs.dir;
         # No guest here. It is fetched from the store at boot and measured
-        # into PCR16 — see `guest-release` and S3FS_GUEST_OBJECT below.
+        # into PCR16 — see `guest-release` and ENCLAVE_GUEST_OBJECT below.
         payload = {
           "enclave-runtime" = "${enclave-runtime}/bin/enclave-runtime";
           "usr/local/bin/gvforwarder" = "${gvproxy-static}/bin/gvforwarder";
+          "lib/zfs/spl.ko" = "${zfsModules}/spl.ko";
+          "lib/zfs/zfs.ko" = "${zfsModules}/zfs.ko";
         };
-        closureRoots = [ enclave-runtime busybox pkgs.cacert ];
+        closureRoots = [ enclave-runtime busybox pkgs.cacert ] ++ zfsTools;
         command = "/enclave-runtime";
         env = {
           # Without a trust store the AWS SDK panics with "no CA certificates
@@ -311,74 +316,73 @@
           # gvforwarder finds its DHCP client with exec.LookPath, so busybox's
           # own bin directory goes on PATH — no symlinks, and the lease script
           # it execs resolves through the same closure.
-          PATH = "${busybox}/bin:/usr/local/bin";
+          PATH = "${busybox}/bin:/usr/local/bin:${kernelZfs.zfsUser}/bin:${pkgs.lvm2.bin}/bin";
           # Where the guest comes from — not the guest, which is not in the
           # image. The runtime fetches this key from the roots bucket, extends
           # PCR16 with the object's hash and locks the register before it asks
           # KMS for a key. The location is measured here, by PCR0; what arrives
           # is measured there, by PCR16, so the object need not be trusted.
-          S3FS_GUEST_OBJECT = deployment.guestObject;
-          S3FS_BACKGROUND_TASKS = lib.boolToString deployment.backgroundTasks;
-          S3FS_BACKGROUND_CONCURRENCY = toString deployment.backgroundConcurrency;
+          ENCLAVE_GUEST_OBJECT = deployment.guestObject;
+          ENCLAVE_BACKGROUND_TASKS = lib.boolToString deployment.backgroundTasks;
+          ENCLAVE_BACKGROUND_CONCURRENCY = toString deployment.backgroundConcurrency;
           # Push notifications, through an AWS End User Messaging Push
           # application. Empty means off. Only the application is named: its FCM
           # channel holds the Firebase credential, and the runtime signs as the
           # instance's role, so no image carries a secret.
-          S3FS_PUSH_APP_ID = deployment.pushAppId;
+          ENCLAVE_PUSH_APP_ID = deployment.pushAppId;
           # The instance's role, for the runtime alone: gvproxy maps this one
           # address to the metadata service, which a guest cannot reach at any
           # address (`serve::egress` refuses the whole proxy network). `AWS_*`
           # never reaches a guest either.
           AWS_EC2_METADATA_SERVICE_ENDPOINT = "http://192.168.127.253";
-          S3FS_HTTP_LISTEN = "0.0.0.0:443";
+          ENCLAVE_HTTP_LISTEN = "0.0.0.0:443";
           # ACME, not self-signed: a platform authenticator will not attest
           # against a certificate a browser does not trust, so a self-signed one
           # would mean no passkey could ever register.
-          S3FS_TLS = "acme";
-          S3FS_NETWORK = "gvproxy";
-          S3FS_GVFORWARDER = "/usr/local/bin/gvforwarder";
-          S3FS_RANDOM_SOURCE = "nsm";
-          S3FS_CLOCK_SOURCE = "ptp";
+          ENCLAVE_TLS = "acme";
+          ENCLAVE_NETWORK = "gvproxy";
+          ENCLAVE_GVFORWARDER = "/usr/local/bin/gvforwarder";
+          ENCLAVE_RANDOM_SOURCE = "nsm";
+          ENCLAVE_CLOCK_SOURCE = "ptp";
 
           # The store this image is for. Attested, because a receipt only
-          # means "no filesystem here" if the host cannot choose "here".
-          S3FS_BUCKET = deployment.dataBucket;
-          S3FS_ROOTS_BUCKET = deployment.rootsBucket;
-          S3FS_BUCKET_PREFIX = deployment.bucketPrefix;
-          S3FS_ID = deployment.fsId;
+          # means "no pool here" if the host cannot choose "here".
+          ENCLAVE_ROOTS_BUCKET = deployment.rootsBucket;
+          ENCLAVE_BUCKET_PREFIX = deployment.bucketPrefix;
+          ENCLAVE_ID = deployment.fsId;
           AWS_REGION = deployment.region;
-          S3FS_TLS_DOMAINS = lib.concatStringsSep "," deployment.tlsDomains;
+          ENCLAVE_TLS_DOMAINS = lib.concatStringsSep "," deployment.tlsDomains;
 
           # A production image demands a receipt signed by AWS. The emulator
           # image overrides this, and because the environment is measured,
           # PCR0 tells a client which kind it is talking to.
-          S3FS_RECEIPT_TRUST = "required";
+          ENCLAVE_RECEIPT_TRUST = "required";
 
           # The master secret is minted by KMS inside the enclave and released
           # only against an attestation whose PCR0 and PCR16 match the key
           # policy. A wrong image or a wrong guest does not get a refused
           # mount — it gets no key at all.
           #
-          # S3FS_MASTER_KEY is deliberately absent, and the runtime *refuses*
+          # ENCLAVE_MASTER_KEY is deliberately absent, and the runtime *refuses*
           # to start if it is set alongside this: a key from configuration is a
           # key the parent instance holds, which is the whole thing this
           # prevents. The key and the parameter come from the deployment, since
           # they name resources this repository does not own.
-          S3FS_MASTER_KEY_SOURCE = "kms";
-          S3FS_KMS_KEY_ID = deployment.kmsKeyId;
-          S3FS_MASTER_KEY_PARAMETER = deployment.masterKeyParameter;
+          ENCLAVE_MASTER_KEY_SOURCE = "kms";
+          ENCLAVE_KMS_KEY_ID = deployment.kmsKeyId;
+          ENCLAVE_MASTER_KEY_PARAMETER = deployment.masterKeyParameter;
 
           # How long root records are locked — the rollback guarantee's horizon,
           # and how long the roots bucket outlives the deployment.
-          S3FS_ROOT_RETENTION_SECS = toString deployment.rootRetentionSecs;
+          ENCLAVE_ROOT_RETENTION_SECS = toString deployment.rootRetentionSecs;
 
           # Guest stdout and stderr go to CloudWatch as well as the console.
           # The enclave calls PutLogEvents itself, over the same path it uses
           # for S3 and KMS, so TLS terminates inside and the parent carries
           # ciphertext. The group and stream are created by Terraform; this
           # runtime holds `logs:PutLogEvents` and cannot make them.
-          S3FS_GUEST_LOG_GROUP = deployment.guestLogGroup;
-          S3FS_GUEST_LOG_STREAM = deployment.guestLogStream;
+          ENCLAVE_GUEST_LOG_GROUP = deployment.guestLogGroup;
+          ENCLAVE_GUEST_LOG_STREAM = deployment.guestLogStream;
 
           # Every request that could reach the guest needs a fresh WebAuthn
           # assertion bound to exactly that request. Without an RP id the
@@ -386,9 +390,9 @@
           # says so at startup — which is a development arrangement, not this
           # one. The domain must be the one the app's passkeys are scoped to,
           # and it must be browser-trusted, hence ACME rather than self-signed.
-          S3FS_WEBAUTHN_RP_ID = deployment.rpId;
-          S3FS_WEBAUTHN_ORIGIN = "https://" + deployment.rpId;
-          S3FS_WEBAUTHN_ALLOWED_ORIGINS = lib.concatStringsSep "," deployment.webauthnAllowedOrigins;
+          ENCLAVE_WEBAUTHN_RP_ID = deployment.rpId;
+          ENCLAVE_WEBAUTHN_ORIGIN = "https://" + deployment.rpId;
+          ENCLAVE_WEBAUTHN_ALLOWED_ORIGINS = lib.concatStringsSep "," deployment.webauthnAllowedOrigins;
           #
           # Registration is open: anyone who can reach the port may create a
           # tenant of their own. There is nothing to provision, and nothing an
@@ -403,7 +407,7 @@
       #
       #   packages.x86_64-linux.eif = enclave-runtime.lib.x86_64-linux.mkEif (import ./deployment.nix);
       #
-      # The result is `s3fs.eif` and `pcr.json`, as `packages.eif`.
+      # The result is `enclave.eif` and `pcr.json`, as `packages.eif`.
       mkEif = deployment: callEif (runtimeImageFor deployment);
 
       # The runtime configured for the emulator, as a function of the relying
@@ -428,6 +432,9 @@
         # the host's instance role (gvproxy maps `.253` to its metadata service). Null keeps the
         # stub on the host. Not a secret: the application's FCM channel holds the credential.
         pushAppId ? null,
+        # Testing only: die between a ZFS sync and its anchor's publish. See
+        # deploy/qemu-nitro/run-zfs-spike.sh.
+        zfsCrashBeforeAnchor ? false,
       }: callEif (runtimeImage // {
         payload = runtimeImage.payload // {
           "enclave-runtime" = "${enclave-runtime-testing}/bin/enclave-runtime";
@@ -438,15 +445,15 @@
           # production binary has no flag that would read one.
           "pebble-ca.pem" = ./deploy/qemu-nitro/pebble/ca.pem;
         };
-        closureRoots = [ enclave-runtime-testing busybox pkgs.cacert ];
-        name = "s3fs-qemu";
+        closureRoots = [ enclave-runtime-testing busybox pkgs.cacert ] ++ zfsTools;
+        name = "enclave-qemu";
         # The key settings go: this image keeps the static key below, and the
         # runtime refuses one alongside KMS settings rather than pick between them.
         env = builtins.removeAttrs runtimeImage.env [
-          "S3FS_KMS_KEY_ID"
-          "S3FS_MASTER_KEY_PARAMETER"
+          "ENCLAVE_KMS_KEY_ID"
+          "ENCLAVE_MASTER_KEY_PARAMETER"
         ] // {
-          S3FS_CLOCK_SOURCE = "host";
+          ENCLAVE_CLOCK_SOURCE = "host";
 
           # QEMU's NSM does not sign at all: its source says "we don't
           # actually sign the data, so we use -1 as the 'alg' value", and -1
@@ -463,9 +470,9 @@
           # relaxed variant of it. The root is reported on the console at
           # startup; `deploy/qemu-nitro/lib.sh` captures it for the clients.
           #
-          # Testing-only, like `S3FS_ACME_CA`: the production binary has no
+          # Testing-only, like `ENCLAVE_ACME_CA`: the production binary has no
           # such flag, so no deployment can sign its own attestations.
-          S3FS_COSIGN_ATTESTATIONS = "1";
+          ENCLAVE_COSIGN_ATTESTATIONS = "1";
 
           # And receipts stay content-checked, because that chain is minted
           # fresh at every boot. A receipt signed at genesis names a root the
@@ -473,7 +480,7 @@
           # every restart into a refusal to resume. Contents are still
           # verified — PCR0, PCR16 and the state_root — which is the whole
           # boot machine minus the one part that needs real hardware.
-          S3FS_RECEIPT_TRUST = "unsigned-emulator";
+          ENCLAVE_RECEIPT_TRUST = "unsigned-emulator";
           # A directory per client, which the e2e exercises with two client
           # certificates. Concurrency has to rise with it or every client
           # still queues behind every other and the per-client locks buy
@@ -483,7 +490,7 @@
           # key, and will not accept one that is unsigned. So the emulator
           # keeps the development key source. PCR0 differs between the two
           # images, so a client can tell which it is talking to.
-          S3FS_MASTER_KEY_SOURCE = "static";
+          ENCLAVE_MASTER_KEY_SOURCE = "static";
           # Real ACME, against a Pebble running on the host — the same code
           # path production takes, which is the whole reason to prefer it.
           #
@@ -498,30 +505,30 @@
           # loopback where gvproxy forwards :443 into this enclave — so the
           # TLS-ALPN-01 challenge arrives on the same port the service uses,
           # which is exactly the arrangement production runs.
-          S3FS_TLS = "acme";
-          S3FS_TLS_DOMAINS = nixpkgs.lib.concatStringsSep "," tlsDomains;
-          S3FS_ACME_DIRECTORY = acmeDirectory;
+          ENCLAVE_TLS = "acme";
+          ENCLAVE_TLS_DOMAINS = nixpkgs.lib.concatStringsSep "," tlsDomains;
+          ENCLAVE_ACME_DIRECTORY = acmeDirectory;
           # The e2e schedules work and waits for it to run. Production leaves
           # this off in deployment.nix; turning it on here changes only the
           # emulator's PCR0, and the harness checks PCR0 against its own
           # `nix build` rather than against a published number, so nothing
           # downstream moves. The guest is guest-http, which exports the
           # `run-task` the runtime refuses to start without when this is set.
-          S3FS_BACKGROUND_TASKS = "true";
+          ENCLAVE_BACKGROUND_TASKS = "true";
           # Notifications, against a stub on the host rather than AWS — which
           # would refuse an invented registration token anyway. What the e2e
           # checks is what the *runtime* sends, and the stub records exactly
           # that. The `http://` endpoint is the same downgrade
           # `--guest-log-endpoint` already is, and PCR0 records it. A real
           # application replaces both below.
-          S3FS_PUSH_APP_ID = "e2e";
+          ENCLAVE_PUSH_APP_ID = "e2e";
           # Off. Inherited from the production image, and there is no AWS
           # here to send to: the harness's credentials are MinIO's, which
           # CloudWatch would reject. Empty means off — the same shape as the
           # TLS override above, and the reason `guest_log_config` treats an
           # empty setting as unset rather than as a typo.
-          S3FS_GUEST_LOG_GROUP = "";
-          S3FS_GUEST_LOG_STREAM = "";
+          ENCLAVE_GUEST_LOG_GROUP = "";
+          ENCLAVE_GUEST_LOG_STREAM = "";
           # The gate, with a relying party the harness can drive. The e2e
           # exercises it with the software passkey the `testing` feature
           # provides, so the default is a name nothing else answers to.
@@ -531,27 +538,28 @@
           # domain publishes assetlinks.json naming the app, and the app claims
           # `android:apk-key-hash:<hash>` rather than the web origin. The rp id
           # is independent of the certificate's name, which stays enclave.test.
-          S3FS_WEBAUTHN_RP_ID = rpId;
-          S3FS_WEBAUTHN_ORIGIN = "https://${rpId}";
-          S3FS_ENDPOINT = "http://192.168.127.254:9000";
-          S3FS_FORCE_PATH_STYLE = "1";
-          S3FS_BUCKET = "e2e-data";
-          S3FS_ROOTS_BUCKET = "e2e-roots";
-          S3FS_MASTER_KEY = "00000000000000000000000000000000000000000000000000000000000000ab";
+          ENCLAVE_WEBAUTHN_RP_ID = rpId;
+          ENCLAVE_WEBAUTHN_ORIGIN = "https://${rpId}";
+          ENCLAVE_ENDPOINT = "http://192.168.127.254:9000";
+          ENCLAVE_FORCE_PATH_STYLE = "1";
+          ENCLAVE_ROOTS_BUCKET = "e2e-roots";
+          ENCLAVE_MASTER_KEY = "00000000000000000000000000000000000000000000000000000000000000ab";
           AWS_ACCESS_KEY_ID = "minioadmin";
           AWS_SECRET_ACCESS_KEY = "minioadmin";
           AWS_REGION = "us-east-1";
-          RUST_LOG = "info,s3fs=debug";
+          RUST_LOG = "info";
         } // nixpkgs.lib.optionalAttrs (acmeCa != null) {
-          S3FS_ACME_CA = acmeCa;
+          ENCLAVE_ACME_CA = acmeCa;
         } // nixpkgs.lib.optionalAttrs (acmeContacts != [ ]) {
-          S3FS_ACME_CONTACTS = nixpkgs.lib.concatStringsSep "," acmeContacts;
+          ENCLAVE_ACME_CONTACTS = nixpkgs.lib.concatStringsSep "," acmeContacts;
         } // nixpkgs.lib.optionalAttrs (pushAppId == null) {
-          S3FS_PUSH_ENDPOINT = "http://192.168.127.254:9180";
+          ENCLAVE_PUSH_ENDPOINT = "http://192.168.127.254:9180";
         } // nixpkgs.lib.optionalAttrs (pushAppId != null) {
-          S3FS_PUSH_APP_ID = pushAppId;
+          ENCLAVE_PUSH_APP_ID = pushAppId;
         } // nixpkgs.lib.optionalAttrs (allowedOrigins != [ ]) {
-          S3FS_WEBAUTHN_ALLOWED_ORIGINS = nixpkgs.lib.concatStringsSep "," allowedOrigins;
+          ENCLAVE_WEBAUTHN_ALLOWED_ORIGINS = nixpkgs.lib.concatStringsSep "," allowedOrigins;
+        } // nixpkgs.lib.optionalAttrs zfsCrashBeforeAnchor {
+          ENCLAVE_ZFS_CRASH_BEFORE_ANCHOR = "1";
         };
       });
 
@@ -600,6 +608,17 @@
           command = "/nsm-selftest";
           env = { };
           withClosure = false;
+        };
+
+        # The same self-test on the kernel built from source, to show it boots,
+        # reaches init's heartbeat over vsock and loads its own nsm.ko.
+        eif-selftest-zfskernel = callEif {
+          name = "selftest";
+          payload = { "nsm-selftest" = "${nsm-selftest}/bin/nsm-selftest"; };
+          command = "/nsm-selftest";
+          env = { };
+          withClosure = false;
+          kernel = kernelZfs.dir;
         };
 
         default = self.packages.${system}.eif;

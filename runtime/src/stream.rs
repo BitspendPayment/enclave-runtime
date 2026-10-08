@@ -65,15 +65,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
-use s3fs_core::{Fs, Inode, OpenFlags};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 
 use crate::serve::attest::{ResponseAttestor, ATTESTATION_HEADER};
 use crate::serve::egress::Origin;
-use crate::tenant::ensure_dir;
+use crate::zfs::Zfs;
 
-const DIR: &str = "/runtime/streams";
+/// Under `/runtime`.
+const DIR: &str = "streams";
 const MAX_RECORD: usize = 8 * 1024;
 /// One message, in either direction. Large enough for a key package and a
 /// transaction; small enough that a peer cannot make the runtime hold a lot.
@@ -194,8 +194,7 @@ struct Live {
 
 /// The registry, and the supervisor that keeps its instructions true.
 pub struct StreamRegistry {
-    fs: Arc<Fs>,
-    dir: Arc<Inode>,
+    dir: std::path::PathBuf,
     records: Mutex<BTreeMap<([u8; 16], String), StreamRecord>>,
     live: Mutex<BTreeMap<([u8; 16], String), Live>>,
     /// Woken when a record appears or goes. `notify_one`, never `notify_waiters`: there is exactly
@@ -226,11 +225,9 @@ pub struct StreamContext {
 }
 
 impl StreamRegistry {
-    pub async fn open_registry(fs: Arc<Fs>) -> Result<Arc<Self>> {
-        let runtime = ensure_dir(&fs, &fs.root(), "runtime").await?;
-        let dir = ensure_dir(&fs, &runtime, "streams").await?;
+    pub async fn open_registry(zfs: Arc<Zfs>) -> Result<Arc<Self>> {
+        let dir = zfs.runtime_dir(DIR).await?;
         let registry = Arc::new(Self {
-            fs,
             dir,
             records: Mutex::new(BTreeMap::new()),
             live: Mutex::new(BTreeMap::new()),
@@ -244,25 +241,24 @@ impl StreamRegistry {
         // disk is the whole of a connection's existence, so this is also the
         // answer to "what reconnects after a restart": this loop.
         let mut records = registry.records.lock().await;
-        for entry in registry.fs.read_dir(&registry.dir).await? {
-            if entry.name.ends_with(".tmp") {
-                registry.fs.unlink(&registry.dir, &entry.name).await?;
+        let mut entries = tokio::fs::read_dir(&registry.dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry
+                .file_name()
+                .into_string()
+                .ok()
+                .context("non-UTF-8 stream record name")?;
+            if name.ends_with(".tmp") {
+                tokio::fs::remove_file(entry.path()).await?;
                 continue;
             }
-            let h = registry
-                .fs
-                .open(&format!("{DIR}/{}", entry.name), OpenFlags::read_only())
-                .await?;
-            let bytes = registry.fs.pread(&h, 0, MAX_RECORD + 1).await;
-            registry.fs.close(&h).await?;
-            let bytes = bytes?;
+            let bytes = tokio::fs::read(entry.path()).await?;
             ensure!(bytes.len() <= MAX_RECORD, "oversized stream record");
             let record: StreamRecord =
                 serde_json::from_slice(&bytes).context("decoding a stream record")?;
             ensure!(
-                record.version == 1 && valid_id(&record.id) && record.key() == entry.name,
-                "malformed stream record {}",
-                entry.name
+                record.version == 1 && valid_id(&record.id) && record.key() == name,
+                "malformed stream record {name}"
             );
             records.insert((record.tenant, record.id.clone()), record);
         }
@@ -313,8 +309,9 @@ impl StreamRegistry {
     pub async fn close(&self, tenant: [u8; 16], id: &str) -> Result<()> {
         let mut records = self.records.lock().await;
         if let Some(record) = records.remove(&(tenant, id.to_string())) {
-            match self.fs.unlink(&self.dir, &record.key()).await {
-                Ok(()) | Err(s3fs_core::FsError::NotFound) => {}
+            match tokio::fs::remove_file(self.dir.join(record.key())).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
         }
@@ -434,22 +431,9 @@ impl StreamRegistry {
     async fn publish(&self, record: &StreamRecord) -> Result<()> {
         let bytes = serde_json::to_vec(record)?;
         ensure!(bytes.len() <= MAX_RECORD, "stream record exceeds limit");
-        let temp = format!("{}.tmp", record.key());
-        match self.fs.unlink(&self.dir, &temp).await {
-            Ok(()) | Err(s3fs_core::FsError::NotFound) => {}
-            Err(e) => return Err(e.into()),
-        }
-        let h = self
-            .fs
-            .open(&format!("{DIR}/{temp}"), OpenFlags::create_new())
-            .await?;
-        let write = self.fs.pwrite(&h, 0, &bytes).await;
-        let close = self.fs.close(&h).await;
-        write?;
-        close?; // close commits the contents before publication
-        self.fs
-            .rename(&self.dir, &temp, &self.dir, &record.key())
-            .await?;
+        let temp = self.dir.join(format!("{}.tmp", record.key()));
+        tokio::fs::write(&temp, &bytes).await?;
+        tokio::fs::rename(&temp, self.dir.join(record.key())).await?;
         Ok(())
     }
 
@@ -793,23 +777,10 @@ pub fn add_to_linker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3fs_core::backend::memory::MemoryBackend;
-    use s3fs_core::{Config, MasterSecret};
 
-    async fn registry() -> (Arc<StreamRegistry>, Arc<Fs>) {
-        let backend = Arc::new(MemoryBackend::new());
-        let fs = Fs::create(
-            backend.clone(),
-            backend.clone(),
-            &MasterSecret::from_bytes([7; 32]),
-            [8; 16],
-            Arc::new(Config::default()),
-        )
-        .await
-        .unwrap();
-        crate::tenant::tenant_root_by_id(&fs, [1; 16])
-            .await
-            .unwrap();
+    async fn registry() -> (Arc<StreamRegistry>, Arc<Zfs>) {
+        let fs = Zfs::scratch().await;
+        fs.tenant_dir([1; 16]).await.unwrap();
         let r = StreamRegistry::open_registry(fs.clone()).await.unwrap();
         (r, fs)
     }
@@ -921,7 +892,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_tenant_cannot_hold_unboundedly_many() {
-        let (r, _fs) = registry().await;
+        let (r, fs) = registry().await;
         for i in 0..PER_TENANT {
             r.open([1; 16], format!("esc{i}"), "https://svc.example".into())
                 .await
@@ -934,9 +905,7 @@ mod tests {
         assert!(format!("{err:#}").contains("at most"), "{err:#}");
 
         // Another tenant is unaffected: the cap is per tenant, not global.
-        crate::tenant::tenant_root_by_id(&r.fs, [2; 16])
-            .await
-            .unwrap();
+        fs.tenant_dir([2; 16]).await.unwrap();
         r.open([2; 16], "esc".into(), "https://svc.example".into())
             .await
             .expect("one tenant's quota is not another's");
@@ -1143,7 +1112,7 @@ mod tests {
         }
     }
 
-    async fn guest(fs: Arc<Fs>) -> Arc<crate::serve::ServeHandle> {
+    async fn guest(fs: Arc<Zfs>) -> Arc<crate::serve::ServeHandle> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm");
         let bytes = std::fs::read(path).expect("build examples/guest-http for wasm32-wasip2");

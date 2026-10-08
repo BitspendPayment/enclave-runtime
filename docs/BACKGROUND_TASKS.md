@@ -11,7 +11,7 @@ The guest must export `run-task` and may import the queue interface defined in
 [`wit/tasks/tasks.wit`](../wit/tasks/tasks.wit). The HTTP example implements both
 its usual `wasi:http` interface and this background interface.
 
-Enable `S3FS_BACKGROUND_TASKS=true` (or `--background-tasks true`) alongside
+Enable `ENCLAVE_BACKGROUND_TASKS=true` (or `--background-tasks true`) alongside
 WebAuthn authentication and tenant isolation. In the Nix deployment, set
 `backgroundTasks = true` in `deploy/nix/deployment.nix`. This image configuration
 change changes PCR0; rebuilding the example guest changes PCR16. Update the
@@ -24,9 +24,9 @@ build rather than a published number — and leaves the production default alone
 
 | Setting | Default | Purpose |
 |---|---:|---|
-| `S3FS_BACKGROUND_CONCURRENCY` | 1 | Maximum active background workers |
-| `S3FS_BACKGROUND_MAX_RECORDS` | 1024 | Total durable records, including terminal tasks |
-| `S3FS_BACKGROUND_PER_TENANT` | 64 | Records allowed per tenant |
+| `ENCLAVE_BACKGROUND_CONCURRENCY` | 1 | Maximum active background workers |
+| `ENCLAVE_BACKGROUND_MAX_RECORDS` | 1024 | Total durable records, including terminal tasks |
+| `ENCLAVE_BACKGROUND_PER_TENANT` | 64 | Records allowed per tenant |
 
 One guest attempt may run 600 seconds, and that is not a setting: work that drives a round with
 an outside service waits on its schedule, which is minutes.

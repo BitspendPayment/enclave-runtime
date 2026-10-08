@@ -34,10 +34,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::store::backend::Backend;
+use crate::store::StoreError;
 use anyhow::{bail, Context, Result};
 use nitro_nsm::{Nsm, PCR_GUEST, PCR_ZERO};
-use s3fs_core::backend::Backend;
-use s3fs_core::FsError;
 
 /// Larger than any guest this runtime has a use for.
 ///
@@ -82,7 +82,7 @@ async fn fetch_bounded(
             .get_blob(key, Some(0..limit + 1))
             .await
             .map_err(|e| match e {
-                FsError::NotFound => anyhow::anyhow!(
+                StoreError::NotFound => anyhow::anyhow!(
                     "no guest component at {key} in the roots bucket; upload the approved \
                      guest there before starting the enclave"
                 ),
@@ -183,10 +183,10 @@ pub fn measure_guest(nsm: &dyn Nsm, component: &[u8]) -> Result<[u8; 48]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::backend::memory::MemoryBackend;
+    use crate::store::backend::PutBlobInput;
     use nitro_nsm::fake::FakeNsm;
     use nitro_nsm::Pcr;
-    use s3fs_core::backend::memory::MemoryBackend;
-    use s3fs_core::backend::PutBlobInput;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     const GUEST: &[u8] = b"\0asm pretend component";

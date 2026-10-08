@@ -65,7 +65,7 @@ qemu)
         echo "not produce the device, so this mode cannot work without it." >&2
         exit 1; }
 
-    WORK="${TMPDIR:-/tmp}/s3fs-ptp-qemu"
+    WORK="${TMPDIR:-/tmp}/enclave-ptp-qemu"
     mkdir -p "$WORK"
     IMG="$WORK/noble.img"
     SEED="$WORK/seed.iso"
@@ -89,7 +89,7 @@ runcmd:
   - echo "PTP-CHECK-DONE"
   - poweroff
 EOF
-    echo "instance-id: s3fs-ptp" > "$WORK/meta-data"
+    echo "instance-id: enclave-ptp" > "$WORK/meta-data"
     cloud-localds "$SEED" "$WORK/user-data" "$WORK/meta-data"
 
     echo "== booting VM; ptp_kvm exposes the host clock as /dev/ptp0 inside =="

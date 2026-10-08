@@ -9,7 +9,7 @@
 //!
 //! ## Why the secret belongs to the stored state
 //!
-//! It used to arrive as `S3FS_MASTER_KEY`, from the parent instance. A parent
+//! It used to arrive as `ENCLAVE_MASTER_KEY`, from the parent instance. A parent
 //! that supplies the key *has* the key, and can decrypt the whole filesystem —
 //! so the party an enclave exists to exclude held the only thing that mattered.
 //! No amount of boot verification fixes that: an enclave could prove perfectly
@@ -43,10 +43,10 @@ pub use static_key::StaticKey;
 
 use std::sync::Arc;
 
+use crate::store::MasterSecret;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use nitro_nsm::Nsm;
-use s3fs_core::MasterSecret;
 
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
@@ -180,7 +180,7 @@ pub struct MasterKeyConfig {
 /// what they appear to.
 ///
 /// The refusals matter more than the construction. A production image that
-/// still carried `S3FS_MASTER_KEY` would work perfectly — silently using a key
+/// still carried `ENCLAVE_MASTER_KEY` would work perfectly — silently using a key
 /// the parent instance holds, giving up the whole point of KMS release — so
 /// supplying both is an error rather than a precedence rule. There is no
 /// ordering of "both were given" that is safe to guess at.
@@ -200,7 +200,7 @@ pub fn open_key_source(
             let hex = config
                 .master_key
                 .as_deref()
-                .context("--master-key-source=static needs --master-key (S3FS_MASTER_KEY)")?;
+                .context("--master-key-source=static needs --master-key (ENCLAVE_MASTER_KEY)")?;
             Ok(Box::new(StaticKey::from_hex(hex)?))
         }
         MasterKeySourceKind::Kms => {
@@ -214,9 +214,9 @@ pub fn open_key_source(
             let key_id = config
                 .kms_key_id
                 .as_deref()
-                .context("--master-key-source=kms needs --kms-key-id (S3FS_KMS_KEY_ID)")?;
+                .context("--master-key-source=kms needs --kms-key-id (ENCLAVE_KMS_KEY_ID)")?;
             let parameter = config.parameter.as_deref().context(
-                "--master-key-source=kms needs --master-key-parameter (S3FS_MASTER_KEY_PARAMETER)",
+                "--master-key-source=kms needs --master-key-parameter (ENCLAVE_MASTER_KEY_PARAMETER)",
             )?;
 
             Ok(Box::new(KmsAttestedKey::new(
@@ -256,7 +256,7 @@ fn credentials(config: &MasterKeyConfig) -> SharedCredentialsProvider {
             sak,
             config.session_token.clone(),
             None,
-            "s3fs-static",
+            "enclave-static",
         )),
         _ => instance_role(),
     }
@@ -314,6 +314,6 @@ mod tests {
     #[test]
     fn without_keys_kms_and_ssm_sign_as_the_instance_role() {
         assert!(format!("{:?}", credentials(&config(None))).contains("ImdsCredentialsProvider"));
-        assert!(format!("{:?}", credentials(&config(Some("minio")))).contains("s3fs-static"));
+        assert!(format!("{:?}", credentials(&config(Some("minio")))).contains("enclave-static"));
     }
 }

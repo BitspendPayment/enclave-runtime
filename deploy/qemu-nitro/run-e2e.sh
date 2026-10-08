@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # The whole stack, in an emulated enclave.
 #
-# Everything below has been verified in pieces — the block store against MinIO,
+# Everything below has been verified in pieces — the S3 backend against MinIO,
 # TLS and the attestation binding in unit tests, NSM entropy under QEMU. None
 # of it had ever run together, because until gvproxy the emulated enclave had
 # no way to reach anything.
 #
 #   host                                        QEMU enclave
 #   ────                                        ────────────
-#   MinIO :9000 ◀── gvproxy ──192.168.127.254──  s3fs mount, and the guest
+#   MinIO :9000 ◀── gvproxy ──192.168.127.254──  anchors, receipts, the guest
+#   nbd-stub.py vsock:10809 ◀── NBD over vsock ── the ZFS pool, on dm-crypt
 #   gvproxy --listen vsock://:1024 ────────────▶ gvforwarder → tap0 .2
 #           expose :8443 → 192.168.127.2:443 ──▶ rustls :443
 #   vhost-device-vsock --forward-cid 1
@@ -22,8 +23,8 @@
 #      reproducible build claimed.
 #   2. user_data binds the certificate from this connection's own handshake,
 #      so the TLS session terminates in the attested enclave.
-#   3. The guest's counter advances, so writes crossed gvproxy to MinIO and
-#      came back — the filesystem really is mounted over the emulated vsock.
+#   3. The guest's counter advances, so writes reached the pool on the parent's
+#      disk over vsock, were anchored in MinIO through gvproxy, and came back.
 #   4. The guest came from the store, not the image. The enclave measured the
 #      object it fetched into PCR16 and locked it; the attested PCR16 is the one
 #      the release build computed; and a substituted object boots an enclave
@@ -98,7 +99,7 @@ first="$(signed get --path /counter)" || fail "no answer from the guest"
 second="$(signed get --path /counter)" || fail "no answer from the guest"
 echo "counter: $first then $second"
 [[ "${second//[^0-9]/}" -eq $(( ${first//[^0-9]/} + 1 )) ]] \
-    || fail "the counter did not advance ($first → $second); writes are not reaching MinIO"
+    || fail "the counter did not advance ($first → $second); writes are not reaching the pool"
 
 say "2b/8 signed requests drive a real amount of filesystem work"
 # Two round trips to /counter prove the mount answers. They do not prove much
@@ -348,7 +349,7 @@ fi
 
 # Polled, not slept on. The first occurrence is due immediately, but
 # "immediately" still means a worker picking it up, instantiating the guest, and
-# writing the result through the filesystem to MinIO.
+# writing the result to the pool and anchoring it.
 completed=""
 for _ in $(seq "$TIMEOUT"); do
     record="$(signed get --path /tasks/e2e-job)" || fail "the task record became unreadable"
@@ -518,7 +519,7 @@ docker rm -f "$PREFIX-qemu-substitute" >/dev/null 2>&1 || true
 cat <<EOF
 
 == PASS ==
-  filesystem mounted over vsock through gvproxy, writes durable in MinIO
+  the ZFS pool on the parent's disk over vsock, every write anchored in MinIO
   the serving certificate was obtained over real ACME and chains to the CA
   TLS terminated in the enclave, certificate hash bound into the document
   every document verified by signature and certificate chain against a pinned

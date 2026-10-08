@@ -16,8 +16,6 @@ use std::sync::Arc;
 
 use enclave_runtime::{GuestEnvironment, HostClock, ServeConfig, TlsIdentity};
 use http_body_util::{BodyExt, Full};
-use s3fs_core::backend::memory::MemoryBackend;
-use s3fs_core::{Config, Fs, MasterSecret};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn component_path() -> PathBuf {
@@ -78,16 +76,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 /// and a document on every response would only add a signature to each
 /// assertion below without changing what any of them prove.
 async fn start() -> std::net::SocketAddr {
-    let backend = Arc::new(MemoryBackend::new());
-    let fs = Fs::create(
-        backend.clone(),
-        backend,
-        &MasterSecret::from_bytes([5u8; 32]),
-        [0u8; 16],
-        Arc::new(Config::default()),
-    )
-    .await
-    .expect("creating the filesystem");
+    let fs = enclave_runtime::Zfs::scratch().await;
 
     let bytes = std::fs::read(component_path()).unwrap_or_else(|e| {
         panic!(

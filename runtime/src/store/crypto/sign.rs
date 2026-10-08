@@ -9,7 +9,7 @@
 
 use aws_lc_rs::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
 
-use crate::errors::{FsError, FsResult};
+use crate::store::error::{StoreError, StoreResult};
 
 use super::keys::{ED25519_PUBLIC_KEY_LEN, ED25519_SIGNATURE_LEN};
 
@@ -23,23 +23,23 @@ pub fn sign(key: &Ed25519KeyPair, message: &[u8]) -> [u8; ED25519_SIGNATURE_LEN]
 
 /// Verify a detached signature.
 ///
-/// Returns [`FsError::Integrity`] on any failure. The caller must treat that
+/// Returns [`StoreError::Integrity`] on any failure. The caller must treat that
 /// as fatal for the mount: a bad root signature means the store is serving
 /// something we did not write.
 pub fn verify(
     public_key: &[u8; ED25519_PUBLIC_KEY_LEN],
     message: &[u8],
     signature: &[u8; ED25519_SIGNATURE_LEN],
-) -> FsResult<()> {
+) -> StoreResult<()> {
     UnparsedPublicKey::new(&ED25519, public_key)
         .verify(message, signature)
-        .map_err(|_| FsError::Integrity("root signature verification failed"))
+        .map_err(|_| StoreError::Integrity("root signature verification failed"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::keys::{KeyMaterial, MasterSecret};
+    use crate::store::crypto::keys::{KeyMaterial, MasterSecret};
 
     fn material(master: u8) -> KeyMaterial {
         KeyMaterial::derive(&MasterSecret::from_bytes([master; 32]), [0u8; 16]).unwrap()
@@ -59,7 +59,7 @@ mod tests {
         let sig = sign(km.signing_key(), b"root record bytes");
         assert!(matches!(
             verify(km.public_key(), b"root record bytez", &sig),
-            Err(FsError::Integrity(_))
+            Err(StoreError::Integrity(_))
         ));
     }
 

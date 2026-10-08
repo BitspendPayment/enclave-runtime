@@ -8,7 +8,8 @@
 #
 #   host                                        QEMU enclave
 #   ────                                        ────────────
-#   MinIO :9000 ◀── gvproxy ──192.168.127.254──  s3fs mount, and the guest
+#   MinIO :9000 ◀── gvproxy ──192.168.127.254──  anchors, boot records, the guest
+#   nbd-stub.py vsock:10809 ◀── NBD over vsock ── the ZFS pool, on dm-crypt
 #   gvproxy --listen vsock://:1024 ────────────▶ gvforwarder → tap0 .2
 #           expose :8443 → 192.168.127.2:443 ──▶ rustls :443
 #   vhost-device-vsock --forward-cid 1
@@ -64,6 +65,8 @@ RUNDIR="${RUNDIR:-$WORK/$PREFIX}"
 STORE_DIR="$WORK/$PREFIX-store"
 KEEP_STORE="${KEEP_STORE:-}"
 FRESH_STORE="${FRESH_STORE:-}"
+# Testing only: an image that dies between a ZFS sync and its anchor's publish.
+ZFS_CRASH_BEFORE_ANCHOR="${ZFS_CRASH_BEFORE_ANCHOR:-}"
 # A bundle records what its image was built with and which container images it runs on. Read
 # before the defaults below so those names reach them, and read here rather than only in
 # dev-enclave.sh so that run-e2e.sh can drive a bundle too. Every line of it is written so a
@@ -73,7 +76,7 @@ if [[ -n "$BUNDLE" && -f "$BUNDLE/image.env" ]]; then
     # shellcheck source=/dev/null
     source "$BUNDLE/image.env"
 fi
-IMAGE="${QEMU_IMAGE:-s3fs-qemu-nitro:latest}"
+IMAGE="${QEMU_IMAGE:-enclave-qemu-nitro:latest}"
 TIMEOUT="${TIMEOUT:-240}"
 QEMU_MEMORY="${QEMU_MEMORY:-3G}"
 STORE_BIND="${STORE_BIND:-}"
@@ -101,12 +104,11 @@ PEBBLE_IMAGE="${PEBBLE_IMAGE:-ghcr.io/letsencrypt/pebble@sha256:ddf230642b1a584f
 LABEL="enclave-harness=$PREFIX"
 
 # These do *not* follow PREFIX, and must not. They are baked into the emulator
-# image as S3FS_BUCKET and S3FS_ROOTS_BUCKET (flake.nix, `eif-qemu`), which
+# image as ENCLAVE_ROOTS_BUCKET (flake.nix, `eif-qemu`), which
 # means they are covered by PCR0 — an enclave image is its configuration as much
 # as its code. A run that named its buckets after itself would stand up a store
-# the enclave does not look in, and the enclave would fail at mount with
-# "connecting to the data bucket: not found".
-DATA_BUCKET=e2e-data
+# the enclave does not look in, and the enclave would fail at boot with
+# "connecting to the roots bucket: not found".
 ROOTS_BUCKET=e2e-roots
 
 say() { printf '\n== %s ==\n' "$*"; }
@@ -169,7 +171,7 @@ enclave_preflight() {
 # build's tools, so this is all it checks.
 enclave_preflight_host() {
     if [[ -n "$BUNDLE" ]]; then
-        [[ -f "$BUNDLE/eif/s3fs-qemu.eif" && -x "$BUNDLE/bin/gvproxy" ]] \
+        [[ -f "$BUNDLE/eif/enclave-qemu.eif" && -x "$BUNDLE/bin/gvproxy" ]] \
             || { echo "$BUNDLE is not a bundle: pack one with dev-enclave.sh --pack" >&2; exit 1; }
         VSOCK_BIN="$BUNDLE/bin/vhost-device-vsock"
         # The container images travel in the bundle, tagged as image.env names them. Loaded only
@@ -291,14 +293,14 @@ nix_expr() {
 enclave_build_image() {
     if [[ -n "$BUNDLE" ]]; then
         EIF_DIR="$BUNDLE/eif"
-        EIF="$EIF_DIR/s3fs-qemu.eif"
+        EIF="$EIF_DIR/enclave-qemu.eif"
         EXPECTED_PCR0="$(jq -r .PCR0 "$EIF_DIR/pcr.json")"
         echo "EIF   $EIF (prebuilt)"
         echo "PCR0  $EXPECTED_PCR0"
         return
     fi
     say "building the enclave image"
-    if [[ -n "${WEBAUTHN_RP_ID:-}${TLS_DOMAIN}${PUSH_APP_ID}" ]]; then
+    if [[ -n "${WEBAUTHN_RP_ID:-}${TLS_DOMAIN}${PUSH_APP_ID}${ZFS_CRASH_BEFORE_ANCHOR}" ]]; then
         # The same image configured differently. Not a package — flake outputs take no arguments —
         # so the flake's `lib.eifQemu` is called directly, which reading the flake by path needs
         # --impure for. dev-enclave.sh has already held every value to a shape that cannot break
@@ -321,13 +323,14 @@ enclave_build_image() {
             [[ -n "$ACME_CONTACT" ]] && args+=" acmeContacts = [ \"$ACME_CONTACT\" ];"
         fi
         [[ -n "$PUSH_APP_ID" ]] && args+=" pushAppId = \"$PUSH_APP_ID\";"
+        [[ -n "$ZFS_CRASH_BEFORE_ANCHOR" ]] && args+=" zfsCrashBeforeAnchor = true;"
         nix_expr "eif-qemu (${args# })" "$RUNDIR/eif" \
             "((builtins.getFlake \"git+file://$REPO\").lib.\${builtins.currentSystem}.eifQemu {$args })"
     else
         nix_build eif-qemu "$RUNDIR/eif"
     fi
     EIF_DIR="$(resolve_out_link "$RUNDIR/eif")"
-    EIF="$EIF_DIR/s3fs-qemu.eif"
+    EIF="$EIF_DIR/enclave-qemu.eif"
     EXPECTED_PCR0="$(jq -r .PCR0 "$EIF_DIR/pcr.json")"
     echo "EIF   $EIF ($(du -h "$EIF" | cut -f1))"
     echo "PCR0  $EXPECTED_PCR0"
@@ -464,9 +467,9 @@ enclave_start_store() {
     # The same recipe the SQLite CI job used. It lived in run-e2e.sh in full
     # until both copies had to agree with nothing making them agree.
     MINIO_LABEL="$LABEL" MINIO_BIND="$STORE_BIND" "$REPO/scripts/minio-up.sh" \
-        "$PREFIX-minio" 9000 "$DATA_BUCKET" "$ROOTS_BUCKET" $data_dir
+        "$PREFIX-minio" 9000 "$ROOTS_BUCKET" $data_dir
     upload_guest guest.wasm
-    echo "MinIO ready with $DATA_BUCKET and $ROOTS_BUCKET, and the guest at $ROOTS_BUCKET/guest/guest.wasm"
+    echo "MinIO ready with $ROOTS_BUCKET, and the guest at $ROOTS_BUCKET/guest/guest.wasm"
 }
 
 # Where the emulator image looks: `deployment.guestObject` in the roots bucket.
@@ -527,6 +530,14 @@ enclave_start_parent() {
     for _ in $(seq 50); do [[ -S "$RUNDIR/vhost.socket" ]] && break; sleep 0.1; done
     [[ -S "$RUNDIR/vhost.socket" ]] \
         || { echo "vhost-device-vsock never came up:" >&2; cat "$RUNDIR/vsock.log" >&2; exit 1; }
+
+    # Tenant data's disk, where nbdkit and an EBS volume are on Nitro. Kept
+    # with the store when the store is kept, so it is cleared and kept with it.
+    ZFS_IMG="$RUNDIR/zfs.img"
+    [[ -n "$KEEP_STORE" ]] && ZFS_IMG="$STORE_DIR/zfs.img"
+    [[ -e "$ZFS_IMG" ]] || truncate -s "${ZFS_SIZE:-4G}" "$ZFS_IMG"
+    python3 "$REPO/deploy/qemu-nitro/nbd-stub.py" 10809 "$ZFS_IMG" > "$RUNDIR/nbd.log" 2>&1 &
+    pids+=($!)
 
     # The enclave's only route to anything. Without it the runtime waits for the
     # gateway and then says so.
@@ -652,7 +663,7 @@ boot_enclave() {
         qemu-system-x86_64 \
             -M nitro-enclave,vsock=chr0,id="$PREFIX" \
             -accel kvm -cpu host \
-            -kernel /eif/s3fs-qemu.eif \
+            -kernel /eif/enclave-qemu.eif \
             -chardev socket,id=chr0,path=/run/vsock/vhost.socket \
             -m "$QEMU_MEMORY" -smp 2 -nographic -no-reboot >/dev/null
     docker logs -f "$1" > "$2" 2>&1 &
@@ -700,7 +711,7 @@ wait_for_serving() {
 # Capture the root this boot's attestation documents chain to, and point the
 # clients at it.
 #
-# The emulator image sets `S3FS_COSIGN_ATTESTATIONS`, so the runtime re-signs
+# The emulator image sets `ENCLAVE_COSIGN_ATTESTATIONS`, so the runtime re-signs
 # what QEMU's NSM produces — QEMU does not sign at all, and a client meeting an
 # unsigned document has to skip the signature, the chain and the validity
 # windows, which is most of what a client does. The contents stay the device's;
@@ -725,7 +736,7 @@ enclave_trust_root() {
         [[ -n "$b64" ]] && break
         sleep 1
     done
-    [[ -n "$b64" ]] || fail "the enclave never reported a trust root; is S3FS_COSIGN_ATTESTATIONS set in the image?"
+    [[ -n "$b64" ]] || fail "the enclave never reported a trust root; is ENCLAVE_COSIGN_ATTESTATIONS set in the image?"
 
     TRUST_ROOT="$RUNDIR/trust-root.der"
     printf '%s' "$b64" | base64 -d > "$TRUST_ROOT" \
@@ -859,7 +870,7 @@ enclave_bring_up() {
 
     say "waiting for the enclave to come up"
     wait_for_serving
-    plain | grep -E "enclave networking is up|guest measured into PCR16|mounted |serving +addr=" | tail -4
+    plain | grep -E "enclave networking is up|guest measured into PCR16|zfs pool|serving +addr=" | tail -4
 
     # Measured before anything asked for a key, and measured as the build said
     # it would be.
@@ -903,7 +914,7 @@ enclave_pack() {
 
     say "packing into $PACK_DIR"
     rm -rf "$PACK_DIR"; mkdir -p "$PACK_DIR/eif" "$PACK_DIR/bin" "$PACK_DIR/images"
-    cp -L "$EIF_DIR/s3fs-qemu.eif" "$EIF_DIR/pcr.json" "$PACK_DIR/eif/"
+    cp -L "$EIF_DIR/enclave-qemu.eif" "$EIF_DIR/pcr.json" "$PACK_DIR/eif/"
     cp -L "$GV_DIR/bin/gvproxy" "$ATTEST" "$PASSKEY" "$VSOCK_BIN" "$PACK_DIR/bin/"
     chmod -R u+w "$PACK_DIR"
 
@@ -920,7 +931,7 @@ enclave_pack() {
     # looks for.
     local qemu_id qemu_tag minio_image
     qemu_id="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
-    qemu_tag="s3fs-qemu-nitro:${qemu_id:7:12}"
+    qemu_tag="enclave-qemu-nitro:${qemu_id:7:12}"
     docker tag "$IMAGE" "$qemu_tag"
     say "saving $qemu_tag"
     docker save "$qemu_tag" | gzip -1 > "$PACK_DIR/images/qemu.tar.gz"

@@ -31,7 +31,7 @@ use super::{
     ListBlobsInput, ListBlobsOutput, MultipartId, ObjectLock, ObjectLockMode, PartUploadOutput,
     PutBlobInput,
 };
-use crate::errors::{FsError, FsResult};
+use crate::store::error::{StoreError, StoreResult};
 
 /// Apply Object Lock retention headers to a `PutObject` request.
 ///
@@ -104,7 +104,7 @@ impl AwsS3Backend {
     /// Build a client from the given config and run a sanity check
     /// (`HeadBucket`) before returning. Use `connect_unchecked` to skip the
     /// startup check.
-    pub async fn connect(config: AwsS3BackendConfig) -> FsResult<Self> {
+    pub async fn connect(config: AwsS3BackendConfig) -> StoreResult<Self> {
         let backend = Self::connect_unchecked(config).await?;
         // HeadBucket as a startup probe; surfaces creds / bucket-not-found
         // errors at construction time rather than on the first op.
@@ -119,7 +119,7 @@ impl AwsS3Backend {
     }
 
     /// Build a client without running the `HeadBucket` startup probe.
-    pub async fn connect_unchecked(config: AwsS3BackendConfig) -> FsResult<Self> {
+    pub async fn connect_unchecked(config: AwsS3BackendConfig) -> StoreResult<Self> {
         let mut conf_builder = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(Region::new(config.region.clone()))
@@ -156,7 +156,7 @@ impl AwsS3Backend {
                 sak,
                 config.session_token.clone(),
                 None, // expiry — None = static (no auto-refresh)
-                "s3fs-static",
+                "enclave-static",
             );
             conf_builder = conf_builder.credentials_provider(creds);
         }
@@ -195,7 +195,7 @@ impl Backend for AwsS3Backend {
         }
     }
 
-    async fn head_blob(&self, key: &str) -> FsResult<BlobMeta> {
+    async fn head_blob(&self, key: &str) -> StoreResult<BlobMeta> {
         let resp = self
             .client
             .head_object()
@@ -207,7 +207,7 @@ impl Backend for AwsS3Backend {
                 SdkError::ServiceError(svc)
                     if matches!(svc.err(), HeadObjectError::NotFound(_)) =>
                 {
-                    FsError::NotFound
+                    StoreError::NotFound
                 }
                 _ => map_sdk_error("HeadObject", e),
             })?;
@@ -227,7 +227,7 @@ impl Backend for AwsS3Backend {
         })
     }
 
-    async fn get_blob(&self, key: &str, range: Option<Range<u64>>) -> FsResult<GetBlobOutput> {
+    async fn get_blob(&self, key: &str, range: Option<Range<u64>>) -> StoreResult<GetBlobOutput> {
         let mut req = self.client.get_object().bucket(&self.bucket).key(key);
         if let Some(r) = &range {
             // S3 Range header is inclusive on both ends.
@@ -252,7 +252,7 @@ impl Backend for AwsS3Backend {
             .body
             .collect()
             .await
-            .map_err(|e| FsError::Io(format!("GetObject body: {e}")))?
+            .map_err(|e| StoreError::Io(format!("GetObject body: {e}")))?
             .into_bytes();
         let size = body.len() as u64;
 
@@ -270,7 +270,7 @@ impl Backend for AwsS3Backend {
         })
     }
 
-    async fn get_retained_blob(&self, key: &str) -> FsResult<GetBlobOutput> {
+    async fn get_retained_blob(&self, key: &str) -> StoreResult<GetBlobOutput> {
         // `ListObjectVersions` still reports a version that a delete marker is
         // hiding, so this is what tells "never written" from "hidden". The
         // prefix is not an exact match, hence the `Key == key` filter.
@@ -306,7 +306,7 @@ impl Backend for AwsS3Backend {
             key_marker = listed.next_key_marker;
             version_id_marker = listed.next_version_id_marker;
             if key_marker.is_none() {
-                return Err(FsError::Io(
+                return Err(StoreError::Io(
                     "ListObjectVersions: truncated without a continuation marker".into(),
                 ));
             }
@@ -321,7 +321,7 @@ impl Backend for AwsS3Backend {
             .into_iter()
             .rev()
             .find_map(|v| v.version_id)
-            .ok_or(FsError::NotFound)?;
+            .ok_or(StoreError::NotFound)?;
 
         let resp = self
             .client
@@ -345,7 +345,7 @@ impl Backend for AwsS3Backend {
             .body
             .collect()
             .await
-            .map_err(|e| FsError::Io(format!("GetObject(versionId) body: {e}")))?
+            .map_err(|e| StoreError::Io(format!("GetObject(versionId) body: {e}")))?
             .into_bytes();
         let size = body.len() as u64;
 
@@ -363,7 +363,7 @@ impl Backend for AwsS3Backend {
         })
     }
 
-    async fn put_blob(&self, input: PutBlobInput) -> FsResult<BlobMeta> {
+    async fn put_blob(&self, input: PutBlobInput) -> StoreResult<BlobMeta> {
         let key = input.key.clone();
         let body = ByteStream::from(input.body.to_vec());
         let mut req = self
@@ -398,7 +398,7 @@ impl Backend for AwsS3Backend {
         })
     }
 
-    async fn put_blob_if_not_exists(&self, input: PutBlobInput) -> FsResult<BlobMeta> {
+    async fn put_blob_if_not_exists(&self, input: PutBlobInput) -> StoreResult<BlobMeta> {
         let key = input.key.clone();
         let body = ByteStream::from(input.body.to_vec());
         let mut req = self
@@ -422,7 +422,7 @@ impl Backend for AwsS3Backend {
         let resp = req.send().await.map_err(|e| {
             // S3 returns 412 PreconditionFailed when If-None-Match: * fires.
             match service_code(&e) {
-                Some("PreconditionFailed") => FsError::AlreadyExists,
+                Some("PreconditionFailed") => StoreError::AlreadyExists,
                 _ => map_sdk_error("PutObject(if-none-match)", e),
             }
         })?;
@@ -437,7 +437,7 @@ impl Backend for AwsS3Backend {
         })
     }
 
-    async fn delete_blob(&self, key: &str) -> FsResult<()> {
+    async fn delete_blob(&self, key: &str) -> StoreResult<()> {
         self.client
             .delete_object()
             .bucket(&self.bucket)
@@ -448,7 +448,7 @@ impl Backend for AwsS3Backend {
         Ok(())
     }
 
-    async fn delete_blobs(&self, keys: &[String]) -> FsResult<()> {
+    async fn delete_blobs(&self, keys: &[String]) -> StoreResult<()> {
         if keys.is_empty() {
             return Ok(());
         }
@@ -479,7 +479,7 @@ impl Backend for AwsS3Backend {
         Ok(())
     }
 
-    async fn list_blobs(&self, input: ListBlobsInput<'_>) -> FsResult<ListBlobsOutput> {
+    async fn list_blobs(&self, input: ListBlobsInput<'_>) -> StoreResult<ListBlobsOutput> {
         let mut req = self
             .client
             .list_objects_v2()
@@ -535,7 +535,7 @@ impl Backend for AwsS3Backend {
         })
     }
 
-    async fn copy_blob(&self, input: CopyBlobInput) -> FsResult<BlobMeta> {
+    async fn copy_blob(&self, input: CopyBlobInput) -> StoreResult<BlobMeta> {
         let copy_source = format!("{}/{}", self.bucket, input.source_key);
         let mut req = self
             .client
@@ -572,7 +572,7 @@ impl Backend for AwsS3Backend {
         })
     }
 
-    async fn multipart_begin(&self, input: PutBlobInput) -> FsResult<MultipartId> {
+    async fn multipart_begin(&self, input: PutBlobInput) -> StoreResult<MultipartId> {
         let mut req = self
             .client
             .create_multipart_upload()
@@ -601,7 +601,7 @@ impl Backend for AwsS3Backend {
             .map_err(|e| map_sdk_error("CreateMultipartUpload", e))?;
         let upload_id = resp
             .upload_id
-            .ok_or_else(|| FsError::Io("CreateMultipartUpload returned no upload_id".into()))?;
+            .ok_or_else(|| StoreError::Io("CreateMultipartUpload returned no upload_id".into()))?;
         Ok(MultipartId(upload_id))
     }
 
@@ -611,7 +611,7 @@ impl Backend for AwsS3Backend {
         upload_id: &MultipartId,
         part_number: u32,
         body: Bytes,
-    ) -> FsResult<PartUploadOutput> {
+    ) -> StoreResult<PartUploadOutput> {
         let resp = self
             .client
             .upload_part()
@@ -635,7 +635,7 @@ impl Backend for AwsS3Backend {
         part_number: u32,
         source_key: &str,
         source_range: Range<u64>,
-    ) -> FsResult<PartUploadOutput> {
+    ) -> StoreResult<PartUploadOutput> {
         let copy_source = format!("{}/{}", self.bucket, source_key);
         // Inclusive end per S3.
         let copy_source_range = format!("bytes={}-{}", source_range.start, source_range.end - 1);
@@ -664,7 +664,7 @@ impl Backend for AwsS3Backend {
         key: &str,
         upload_id: &MultipartId,
         parts: Vec<CompletedPart>,
-    ) -> FsResult<BlobMeta> {
+    ) -> StoreResult<BlobMeta> {
         let sdk_parts: Vec<_> = parts
             .iter()
             .map(|p| {
@@ -698,7 +698,7 @@ impl Backend for AwsS3Backend {
         })
     }
 
-    async fn multipart_abort(&self, key: &str, upload_id: &MultipartId) -> FsResult<()> {
+    async fn multipart_abort(&self, key: &str, upload_id: &MultipartId) -> StoreResult<()> {
         self.client
             .abort_multipart_upload()
             .bucket(&self.bucket)
@@ -736,27 +736,27 @@ where
 
 /// Generic mapper: examines the service code and falls back to a category
 /// based on the SDK error variant.
-fn map_sdk_error<E, R>(_op: &'static str, e: SdkError<E, R>) -> FsError
+fn map_sdk_error<E, R>(_op: &'static str, e: SdkError<E, R>) -> StoreError
 where
     E: ProvideErrorMetadata + std::fmt::Debug,
     R: std::fmt::Debug,
 {
     if let Some(code) = service_code(&e) {
         return match code {
-            "NoSuchKey" | "NoSuchUpload" | "NoSuchBucket" | "NotFound" => FsError::NotFound,
-            "AccessDenied" | "Forbidden" => FsError::AccessDenied,
-            "PreconditionFailed" => FsError::Conflict,
-            "BucketAlreadyExists" | "BucketAlreadyOwnedByYou" => FsError::AlreadyExists,
-            "EntityTooLarge" | "EntityTooSmall" => FsError::Invalid("entity size"),
-            "RequestTimeout" | "SlowDown" | "RequestLimitExceeded" => FsError::IoTimeout,
-            _ => FsError::Io(format!("{e:?}")),
+            "NoSuchKey" | "NoSuchUpload" | "NoSuchBucket" | "NotFound" => StoreError::NotFound,
+            "AccessDenied" | "Forbidden" => StoreError::AccessDenied,
+            "PreconditionFailed" => StoreError::Conflict,
+            "BucketAlreadyExists" | "BucketAlreadyOwnedByYou" => StoreError::AlreadyExists,
+            "EntityTooLarge" | "EntityTooSmall" => StoreError::Invalid("entity size"),
+            "RequestTimeout" | "SlowDown" | "RequestLimitExceeded" => StoreError::IoTimeout,
+            _ => StoreError::Io(format!("{e:?}")),
         };
     }
     match &e {
-        SdkError::TimeoutError(_) => FsError::IoTimeout,
-        SdkError::DispatchFailure(_) => FsError::Network(format!("{e:?}")),
-        SdkError::ResponseError(_) => FsError::Io(format!("{e:?}")),
-        _ => FsError::Io(format!("{e:?}")),
+        SdkError::TimeoutError(_) => StoreError::IoTimeout,
+        SdkError::DispatchFailure(_) => StoreError::Network(format!("{e:?}")),
+        SdkError::ResponseError(_) => StoreError::Io(format!("{e:?}")),
+        _ => StoreError::Io(format!("{e:?}")),
     }
 }
 

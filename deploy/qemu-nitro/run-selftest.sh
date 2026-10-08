@@ -23,7 +23,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="${WORK:-$REPO/target/qemu-nitro}"
 RUNDIR="$WORK/run"
-IMAGE="${QEMU_IMAGE:-s3fs-qemu-nitro:latest}"
+IMAGE="${QEMU_IMAGE:-enclave-qemu-nitro:latest}"
 TIMEOUT="${TIMEOUT:-120}"
 CONSOLE="$RUNDIR/console.log"
 
@@ -31,7 +31,7 @@ CONSOLE="$RUNDIR/console.log"
 # used to assemble it is gone. `build-eif.sh` remains only as documentation of
 # the layout; `nix build` is what produces the bytes.
 command -v nix >/dev/null || { echo "nix is not on PATH; see deploy/nix/README.md" >&2; exit 1; }
-nix build "$REPO#eif-selftest" --out-link "$WORK/eif-selftest" 2>&1 | tail -2
+nix build "$REPO#${SELFTEST_ATTR:-eif-selftest}" --out-link "$WORK/eif-selftest" 2>&1 | tail -2
 EIF_DIR="$(readlink -f "$WORK/eif-selftest" 2>/dev/null || true)"
 # nix-portable keeps its store outside /nix except inside its own namespace; on
 # a normal Nix install the first branch always wins.

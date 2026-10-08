@@ -10,8 +10,8 @@
 //!   lives and is of no use to it — an enclave guest has no network of its own.
 //!
 //! Both fall under one rule that is easy to state and hard to get wrong:
-//! nothing whose name begins with `AWS_` or `S3FS_` is inherited. That covers
-//! `S3FS_MASTER_KEY` and the whole AWS credential set without anyone having to
+//! nothing whose name begins with `AWS_` or `ENCLAVE_` is inherited. That covers
+//! `ENCLAVE_MASTER_KEY` and the whole AWS credential set without anyone having to
 //! enumerate them, and it keeps working when a new one is added.
 //!
 //! An operator who genuinely needs one of those names can still set it
@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 
 /// Name prefixes that are never inherited from the host.
-pub const DENIED_PREFIXES: &[&str] = &["AWS_", "S3FS_"];
+pub const DENIED_PREFIXES: &[&str] = &["AWS_", "ENCLAVE_"];
 
 /// Names that are credentials wherever they appear. Setting one explicitly is
 /// permitted — the operator asked for it — but it is worth saying out loud.
@@ -30,7 +30,7 @@ const CREDENTIAL_NAMES: &[&str] = &[
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
     "AWS_SECURITY_TOKEN",
-    "S3FS_MASTER_KEY",
+    "ENCLAVE_MASTER_KEY",
 ];
 
 fn is_denied(name: &str) -> bool {
@@ -341,8 +341,8 @@ mod tests {
             ("AWS_ACCESS_KEY_ID", "AKIA..."),
             ("AWS_SESSION_TOKEN", "token"),
             ("AWS_REGION", "eu-west-2"),
-            ("S3FS_MASTER_KEY", "0011..."),
-            ("S3FS_BUCKET", "prod-data"),
+            ("ENCLAVE_MASTER_KEY", "0011..."),
+            ("ENCLAVE_BUCKET", "prod-data"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -365,7 +365,7 @@ mod tests {
         let env = GuestEnvPolicy::default().build_from(&host()).unwrap();
         for (name, _) in &env {
             assert!(
-                !name.starts_with("AWS_") && !name.starts_with("S3FS_"),
+                !name.starts_with("AWS_") && !name.starts_with("ENCLAVE_"),
                 "{name} reached the guest by inheritance"
             );
         }
@@ -378,7 +378,7 @@ mod tests {
     fn an_unanticipated_denied_variable_is_still_withheld() {
         let mut h = host();
         h.push(("AWS_SOMETHING_INVENTED_LATER".into(), "x".into()));
-        h.push(("S3FS_FUTURE_OPTION".into(), "y".into()));
+        h.push(("ENCLAVE_FUTURE_OPTION".into(), "y".into()));
         let env = GuestEnvPolicy::default().build_from(&h).unwrap();
         assert!(!names(&env).iter().any(|n| n.contains("INVENTED")));
         assert!(!names(&env).iter().any(|n| n.contains("FUTURE")));

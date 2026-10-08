@@ -1,7 +1,7 @@
 # Building the enclave image
 
 ```console
-$ nix build .#eif          # → result/s3fs.eif, result/pcr.json
+$ nix build .#eif          # → result/enclave.eif, result/pcr.json
 $ jq -r .PCR0 result/pcr.json
 42dfa2f7f828fd1dbb955a8d8c00537c4545d56467e850254f72bd80627c35fa…
 ```

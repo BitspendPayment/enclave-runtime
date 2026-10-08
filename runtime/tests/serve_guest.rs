@@ -19,8 +19,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 use enclave_runtime::{GuestEnvironment, HostClock, ServeHandle};
 use http_body_util::{BodyExt, Full};
-use s3fs_core::backend::memory::MemoryBackend;
-use s3fs_core::{Config, Fs, MasterSecret};
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
@@ -45,7 +43,7 @@ async fn handle_for(env: &[(String, String)]) -> ServeHandle {
 ///
 /// Separated so a test can build a *second* handle over the first one's
 /// storage — the only way to ask what survives a restart.
-async fn handle_over_with(fs: Arc<Fs>, env: &[(String, String)]) -> ServeHandle {
+async fn handle_over_with(fs: Arc<enclave_runtime::Zfs>, env: &[(String, String)]) -> ServeHandle {
     // Detached deliberately: the collector runs for as long as this
     // environment can send, which is what a test wants. Production drains it
     // explicitly instead.
@@ -75,19 +73,10 @@ async fn handle_over_with(fs: Arc<Fs>, env: &[(String, String)]) -> ServeHandle 
 
 /// A runtime filesystem plus a handle.
 async fn handle_for_with(env: &[(String, String)]) -> ServeHandle {
-    let backend = Arc::new(MemoryBackend::new());
     // `create`, not `mount`: mounting stopped formatting an empty store when
     // the boot machine landed, because a store that answers "nothing" is now a
     // refusal rather than an invitation to make a fresh filesystem.
-    let fs = Fs::create(
-        backend.clone(),
-        backend,
-        &MasterSecret::from_bytes([7u8; 32]),
-        [0u8; 16],
-        Arc::new(Config::default()),
-    )
-    .await
-    .expect("creating the memory-backed filesystem");
+    let fs = enclave_runtime::Zfs::scratch().await;
     handle_over_with(fs, env).await
 }
 

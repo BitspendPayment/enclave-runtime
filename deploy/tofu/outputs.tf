@@ -42,7 +42,7 @@ output "verify" {
     # policy does not name boots an enclave that can read nothing.
     nix build .#guest-release --out-link guest-release
     aws s3 cp guest-release/guest.wasm \
-        s3://${length(var.buckets) > 1 ? var.buckets[1] : var.buckets[0]}/guest/guest.wasm
+        s3://${var.roots_bucket}/guest/guest.wasm
 
     # The key policy's condition, on both kms:GenerateDataKey and kms:Decrypt,
     # in a policy nobody can edit — the enclave refuses any other

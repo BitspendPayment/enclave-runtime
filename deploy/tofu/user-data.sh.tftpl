@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Deployment configuration the image cannot know: which buckets, which region,
-# which domain. Written where the enclave.service unit picks it up.
+# Deployment configuration the image cannot know: which bucket, which region,
+# which domain, and which device is the pool's disk. Written where the
+# enclave.service and nbdkit.service units pick it up.
 #
 # Not a place for secrets. This file is readable from the instance metadata
 # service by anything on the box, and the parent is the party the enclave
@@ -12,11 +13,16 @@ set -euxo pipefail
 mkdir -p /etc/systemd/system/enclave.service.d
 cat > /etc/systemd/system/enclave.service.d/deployment.conf <<CONF
 [Service]
-Environment=S3FS_BUCKET=${data_bucket}
-Environment=S3FS_ROOTS_BUCKET=${roots_bucket}
+Environment=ENCLAVE_ROOTS_BUCKET=${roots_bucket}
 Environment=AWS_REGION=${region}
-Environment=S3FS_TLS_DOMAINS=${tls_domains}
+Environment=ENCLAVE_TLS_DOMAINS=${tls_domains}
 CONF
 
+# The pool's EBS volume, for nbdkit to serve over vsock.
+mkdir -p /etc/enclave
+cat > /etc/enclave/disk.env <<ENV
+POOL_DISK=${pool_disk}
+ENV
+
 systemctl daemon-reload
-systemctl restart enclave.service || true
+systemctl restart nbdkit.service enclave.service || true

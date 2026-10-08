@@ -40,7 +40,7 @@ use super::{
     Backend, BlobItem, BlobMeta, Capabilities, CompletedPart, CopyBlobInput, GetBlobOutput,
     ListBlobsInput, ListBlobsOutput, MultipartId, ObjectLock, PartUploadOutput, PutBlobInput,
 };
-use crate::errors::{FsError, FsResult};
+use crate::store::error::{StoreError, StoreResult};
 
 #[derive(Debug, Clone)]
 struct StoredBlob {
@@ -147,7 +147,7 @@ pub struct MemoryBackend {
     next_etag: Arc<AtomicU64>,
     /// Test-helper: an error the next PUT, conditional or not, returns
     /// instead of storing.
-    fail_next_put: Arc<RwLock<Option<FsError>>>,
+    fail_next_put: Arc<RwLock<Option<StoreError>>>,
 }
 
 impl Default for MemoryBackend {
@@ -167,7 +167,7 @@ impl MemoryBackend {
     }
 
     /// Test-helper: make the next PUT fail with `e`, storing nothing.
-    pub fn fail_next_put(&self, e: FsError) {
+    pub fn fail_next_put(&self, e: StoreError) {
         *self.fail_next_put.write() = Some(e);
     }
 
@@ -223,15 +223,15 @@ impl Backend for MemoryBackend {
         }
     }
 
-    async fn head_blob(&self, key: &str) -> FsResult<BlobMeta> {
+    async fn head_blob(&self, key: &str) -> StoreResult<BlobMeta> {
         let g = self.state.read();
-        let b = g.current(key).ok_or(FsError::NotFound)?;
+        let b = g.current(key).ok_or(StoreError::NotFound)?;
         Ok(self.meta_from_stored(key, b))
     }
 
-    async fn get_blob(&self, key: &str, range: Option<Range<u64>>) -> FsResult<GetBlobOutput> {
+    async fn get_blob(&self, key: &str, range: Option<Range<u64>>) -> StoreResult<GetBlobOutput> {
         let g = self.state.read();
-        let b = g.current(key).ok_or(FsError::NotFound)?;
+        let b = g.current(key).ok_or(StoreError::NotFound)?;
         let meta = self.meta_from_stored(key, b);
         let body = match range {
             None => b.body.clone(),
@@ -239,7 +239,7 @@ impl Backend for MemoryBackend {
                 let start = r.start.min(b.body.len() as u64) as usize;
                 let end = r.end.min(b.body.len() as u64) as usize;
                 if start > end {
-                    return Err(FsError::Invalid("range start > end"));
+                    return Err(StoreError::Invalid("range start > end"));
                 }
                 b.body.slice(start..end)
             }
@@ -248,16 +248,16 @@ impl Backend for MemoryBackend {
     }
 
     /// Reads straight through a delete marker, which is the whole point.
-    async fn get_retained_blob(&self, key: &str) -> FsResult<GetBlobOutput> {
+    async fn get_retained_blob(&self, key: &str) -> StoreResult<GetBlobOutput> {
         let g = self.state.read();
-        let b = g.retained(key).ok_or(FsError::NotFound)?;
+        let b = g.retained(key).ok_or(StoreError::NotFound)?;
         Ok(GetBlobOutput {
             meta: self.meta_from_stored(key, b),
             body: b.body.clone(),
         })
     }
 
-    async fn put_blob(&self, input: PutBlobInput) -> FsResult<BlobMeta> {
+    async fn put_blob(&self, input: PutBlobInput) -> StoreResult<BlobMeta> {
         if let Some(e) = self.fail_next_put.write().take() {
             return Err(e);
         }
@@ -276,13 +276,13 @@ impl Backend for MemoryBackend {
         // This fake models a non-versioned bucket, so an overwrite replaces
         // the retained version rather than adding a new one. Refuse it.
         if g.objects.get(&key).is_some_and(|b| b.is_retained(now)) {
-            return Err(FsError::AccessDenied);
+            return Err(StoreError::AccessDenied);
         }
         g.objects.insert(key.clone(), stored.clone());
         Ok(self.meta_from_stored(&key, &stored))
     }
 
-    async fn put_blob_if_not_exists(&self, input: PutBlobInput) -> FsResult<BlobMeta> {
+    async fn put_blob_if_not_exists(&self, input: PutBlobInput) -> StoreResult<BlobMeta> {
         if let Some(e) = self.fail_next_put.write().take() {
             return Err(e);
         }
@@ -293,7 +293,7 @@ impl Backend for MemoryBackend {
         // the first ever to write here. That is the attack this fake now
         // permits so it can be tested.
         if g.current(&input.key).is_some() {
-            return Err(FsError::AlreadyExists);
+            return Err(StoreError::AlreadyExists);
         }
         let now = SystemTime::now();
         g.pin_before_overwrite(&input.key, now);
@@ -312,14 +312,14 @@ impl Backend for MemoryBackend {
         Ok(self.meta_from_stored(&key, &stored))
     }
 
-    async fn delete_blob(&self, key: &str) -> FsResult<()> {
+    async fn delete_blob(&self, key: &str) -> StoreResult<()> {
         let now = SystemTime::now();
         let mut g = self.state.write();
         delete_one(&mut g, key, now);
         Ok(())
     }
 
-    async fn delete_blobs(&self, keys: &[String]) -> FsResult<()> {
+    async fn delete_blobs(&self, keys: &[String]) -> StoreResult<()> {
         let now = SystemTime::now();
         let mut g = self.state.write();
         for k in keys {
@@ -328,7 +328,7 @@ impl Backend for MemoryBackend {
         Ok(())
     }
 
-    async fn list_blobs(&self, input: ListBlobsInput<'_>) -> FsResult<ListBlobsOutput> {
+    async fn list_blobs(&self, input: ListBlobsInput<'_>) -> StoreResult<ListBlobsOutput> {
         let g = self.state.read();
         // `ListObjectsV2` lists current versions, so a marked key is absent
         // from it too. `ListObjectVersions` is the call that still sees them,
@@ -399,12 +399,12 @@ impl Backend for MemoryBackend {
         })
     }
 
-    async fn copy_blob(&self, input: CopyBlobInput) -> FsResult<BlobMeta> {
+    async fn copy_blob(&self, input: CopyBlobInput) -> StoreResult<BlobMeta> {
         let mut g = self.state.write();
         let src = g
             .objects
             .get(&input.source_key)
-            .ok_or(FsError::NotFound)?
+            .ok_or(StoreError::NotFound)?
             .clone();
 
         let now = SystemTime::now();
@@ -412,7 +412,7 @@ impl Backend for MemoryBackend {
             .get(&input.destination_key)
             .is_some_and(|b| b.is_retained(now))
         {
-            return Err(FsError::AccessDenied);
+            return Err(StoreError::AccessDenied);
         }
 
         let metadata = input.replace_metadata.unwrap_or(src.metadata);
@@ -433,7 +433,7 @@ impl Backend for MemoryBackend {
         Ok(self.meta_from_stored(&input.destination_key, &stored))
     }
 
-    async fn multipart_begin(&self, input: PutBlobInput) -> FsResult<MultipartId> {
+    async fn multipart_begin(&self, input: PutBlobInput) -> StoreResult<MultipartId> {
         let n = self.next_mpu_id.fetch_add(1, Ordering::Relaxed);
         let id = MultipartId(format!("mpu-{n}"));
         let object_lock = input.object_lock;
@@ -454,18 +454,18 @@ impl Backend for MemoryBackend {
         upload_id: &MultipartId,
         part_number: u32,
         body: Bytes,
-    ) -> FsResult<PartUploadOutput> {
+    ) -> StoreResult<PartUploadOutput> {
         if part_number == 0 || part_number > 10_000 {
-            return Err(FsError::Invalid("part_number out of range"));
+            return Err(StoreError::Invalid("part_number out of range"));
         }
         let e_tag = self.make_etag(&body);
         let mut g = self.state.write();
         let mpu = g
             .mpus
             .get_mut(upload_id)
-            .ok_or_else(|| FsError::Io(format!("unknown upload_id: {upload_id:?}")))?;
+            .ok_or_else(|| StoreError::Io(format!("unknown upload_id: {upload_id:?}")))?;
         if mpu.key != key {
-            return Err(FsError::Invalid("upload_id key mismatch"));
+            return Err(StoreError::Invalid("upload_id key mismatch"));
         }
         mpu.parts.insert(
             part_number,
@@ -484,25 +484,29 @@ impl Backend for MemoryBackend {
         part_number: u32,
         source_key: &str,
         source_range: Range<u64>,
-    ) -> FsResult<PartUploadOutput> {
+    ) -> StoreResult<PartUploadOutput> {
         if part_number == 0 || part_number > 10_000 {
-            return Err(FsError::Invalid("part_number out of range"));
+            return Err(StoreError::Invalid("part_number out of range"));
         }
         let mut g = self.state.write();
-        let src = g.objects.get(source_key).ok_or(FsError::NotFound)?.clone();
+        let src = g
+            .objects
+            .get(source_key)
+            .ok_or(StoreError::NotFound)?
+            .clone();
         let start = source_range.start as usize;
         let end = source_range.end as usize;
         if end > src.body.len() || start > end {
-            return Err(FsError::Invalid("source_range out of bounds"));
+            return Err(StoreError::Invalid("source_range out of bounds"));
         }
         let body = src.body.slice(start..end);
         let e_tag = self.make_etag(&body);
         let mpu = g
             .mpus
             .get_mut(upload_id)
-            .ok_or_else(|| FsError::Io(format!("unknown upload_id: {upload_id:?}")))?;
+            .ok_or_else(|| StoreError::Io(format!("unknown upload_id: {upload_id:?}")))?;
         if mpu.key != key {
-            return Err(FsError::Invalid("upload_id key mismatch"));
+            return Err(StoreError::Invalid("upload_id key mismatch"));
         }
         mpu.parts.insert(
             part_number,
@@ -519,16 +523,16 @@ impl Backend for MemoryBackend {
         key: &str,
         upload_id: &MultipartId,
         parts: Vec<CompletedPart>,
-    ) -> FsResult<BlobMeta> {
+    ) -> StoreResult<BlobMeta> {
         let mut g = self.state.write();
         let mpu = g
             .mpus
             .remove(upload_id)
-            .ok_or_else(|| FsError::Io(format!("unknown upload_id: {upload_id:?}")))?;
+            .ok_or_else(|| StoreError::Io(format!("unknown upload_id: {upload_id:?}")))?;
         if mpu.key != key {
             // Put it back; this is a programmer error, not a state mutation.
             g.mpus.insert(upload_id.clone(), mpu);
-            return Err(FsError::Invalid("upload_id key mismatch"));
+            return Err(StoreError::Invalid("upload_id key mismatch"));
         }
 
         // Validate parts in ascending order with matching ETags, assemble body.
@@ -539,9 +543,9 @@ impl Backend for MemoryBackend {
             let part = mpu
                 .parts
                 .get(&cp.part_number)
-                .ok_or(FsError::Invalid("missing part on complete"))?;
+                .ok_or(StoreError::Invalid("missing part on complete"))?;
             if part.e_tag != cp.e_tag {
-                return Err(FsError::Invalid("etag mismatch on complete"));
+                return Err(StoreError::Invalid("etag mismatch on complete"));
             }
             body_acc.extend_from_slice(&part.body);
         }
@@ -550,7 +554,7 @@ impl Backend for MemoryBackend {
         let e_tag = self.make_etag(&body);
         let now = SystemTime::now();
         if g.objects.get(key).is_some_and(|b| b.is_retained(now)) {
-            return Err(FsError::AccessDenied);
+            return Err(StoreError::AccessDenied);
         }
         let stored = StoredBlob {
             body,
@@ -564,11 +568,11 @@ impl Backend for MemoryBackend {
         Ok(self.meta_from_stored(key, &stored))
     }
 
-    async fn multipart_abort(&self, key: &str, upload_id: &MultipartId) -> FsResult<()> {
+    async fn multipart_abort(&self, key: &str, upload_id: &MultipartId) -> StoreResult<()> {
         let mut g = self.state.write();
         match g.mpus.get(upload_id) {
             None => Ok(()), // idempotent abort, like S3
-            Some(mpu) if mpu.key != key => Err(FsError::Invalid("upload_id key mismatch")),
+            Some(mpu) if mpu.key != key => Err(StoreError::Invalid("upload_id key mismatch")),
             Some(_) => {
                 g.mpus.remove(upload_id);
                 Ok(())
@@ -607,7 +611,10 @@ mod tests {
     #[tokio::test]
     async fn head_missing_returns_not_found() {
         let b = MemoryBackend::new();
-        assert!(matches!(b.head_blob("nope").await, Err(FsError::NotFound)));
+        assert!(matches!(
+            b.head_blob("nope").await,
+            Err(StoreError::NotFound)
+        ));
     }
 
     #[tokio::test]
@@ -639,7 +646,7 @@ mod tests {
         b.put_blob_if_not_exists(body()).await.unwrap();
         assert!(matches!(
             b.put_blob_if_not_exists(body()).await,
-            Err(FsError::AlreadyExists)
+            Err(StoreError::AlreadyExists)
         ));
     }
 
@@ -896,7 +903,7 @@ mod tests {
         b.multipart_abort("k", &id).await.unwrap();
         assert_eq!(b.mpu_count(), 0);
         // No object was ever committed.
-        assert!(matches!(b.head_blob("k").await, Err(FsError::NotFound)));
+        assert!(matches!(b.head_blob("k").await, Err(StoreError::NotFound)));
     }
 
     #[tokio::test]
@@ -946,11 +953,11 @@ mod tests {
         // Hidden from everything that reads the current version.
         assert!(matches!(
             b.get_blob("roots/0001", None).await,
-            Err(FsError::NotFound)
+            Err(StoreError::NotFound)
         ));
         assert!(matches!(
             b.head_blob("roots/0001").await,
-            Err(FsError::NotFound)
+            Err(StoreError::NotFound)
         ));
         let listed = b
             .list_blobs(ListBlobsInput {
@@ -982,7 +989,7 @@ mod tests {
         assert!(matches!(
             b.put_blob_if_not_exists(locked("origin/receipt", b"second", 3600))
                 .await,
-            Err(FsError::AlreadyExists)
+            Err(StoreError::AlreadyExists)
         ));
 
         b.delete_blob("origin/receipt").await.unwrap();
@@ -1005,7 +1012,7 @@ mod tests {
                 Bytes::from_static(b"forged")
             ))
             .await,
-            Err(FsError::AccessDenied)
+            Err(StoreError::AccessDenied)
         ));
         assert!(matches!(
             b.copy_blob(CopyBlobInput {
@@ -1015,7 +1022,7 @@ mod tests {
                 replace_content_type: None,
             })
             .await,
-            Err(FsError::AccessDenied)
+            Err(StoreError::AccessDenied)
         ));
         assert_eq!(
             b.get_blob("roots/0001", None).await.unwrap().body,
@@ -1041,7 +1048,7 @@ mod tests {
         b.delete_blob("roots/0001").await.unwrap();
         assert!(matches!(
             b.head_blob("roots/0001").await,
-            Err(FsError::NotFound)
+            Err(StoreError::NotFound)
         ));
     }
 

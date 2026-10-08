@@ -48,10 +48,16 @@ default = []
 # `nitro-attestation/testing` costs nothing new: it is `dep:rcgen` plus
 # `dep:time`, and rcgen is already enabled here by this very feature. It is
 # what lets `testing::Enclave` mint documents a client can actually verify.
-testing = ["dep:rcgen", "nitro-attestation/testing"]
+testing = ["dep:rcgen", "dep:tempfile", "nitro-attestation/testing"]
 
 [dependencies]
-s3fs-core = { path = "../crates/s3fs-core", features = ["aws"] }
+# The roots bucket: anchors, boot records, the guest, the ACME cache.
+aws-sdk-s3             = { workspace = true, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types       = { workspace = true }
+thiserror   = { workspace = true }
+parking_lot = { workspace = true }
+siphasher   = { workspace = true }
 nitro-nsm = { path = "../crates/nitro-nsm" }
 nitro-attestation = { path = "../crates/nitro-attestation" }
 
@@ -133,17 +139,19 @@ hex            = "0.4"
 # The PTP clock is read through the POSIX dynamic-clock mechanism. rustix is
 # already compiled into the tree via wasmtime, so this adds no build cost and
 # avoids a direct libc dependency.
-rustix      = { version = "1", features = ["time", "fs"] }
+rustix      = { version = "1", features = ["time", "fs", "net", "system"] }
 # Pinned to whatever `wasmtime-wasi` accepts for `secure_random`, which is
 # cap-rand's re-export of rand 0.8 — not a version to guess at.
 cap-rand    = "3"
 getrandom   = "0.3"
+# `zfs::Disk::Directory`: the pool stand-in for tests, under `testing`.
+tempfile    = { version = "3", optional = true }
 
 clap        = { version = "4", features = ["derive", "env"] }
 anyhow      = { workspace = true }
 async-trait = { workspace = true }
 bytes       = { workspace = true }
-tokio       = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "signal", "net", "io-util", "time"] }
+tokio       = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "signal", "net", "io-util", "time", "process", "fs"] }
 tracing     = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # CiphertextForRecipient — what KMS returns when the response is encrypted to
@@ -185,6 +193,10 @@ serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
+tempfile = "3"
+# `tests/minio_integration.rs`: the S3 backend against a real MinIO.
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["minio"] }
 # `StaticReplayClient`: canned HTTP responses for the CloudWatch client, so the
 # tests assert the request that is actually serialised rather than a mock of
 # one. A dev-dependency, so none of it reaches the image. It is already in the
@@ -193,7 +205,6 @@ serde = { version = "1.0.229", features = ["derive"] }
 aws-smithy-http-client = { version = "1", features = ["test-util"] }
 # `start_paused`: a timeout test should not spend the timeout.
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
-aws-smithy-types = { workspace = true }
 # Building canned HTTP requests/responses for the replay client.
 http = "1"
 # The HTTP/2 client half, for the streaming suites. Driving h2 from a real

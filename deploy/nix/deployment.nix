@@ -11,13 +11,12 @@
 # pinned to one will not release to the other, and clients pin different
 # measurements. The enclave's identity includes what it operates on.
 #
-# `S3FS_ID` is not a secret. It is the HKDF salt, so two filesystems under one
+# `ENCLAVE_ID` is not a secret. It is the HKDF salt, so two filesystems under one
 # master secret stay independent, and it must be supplied rather than read from
 # the store: the keys that verify a root record derive from it, so taking it
 # from the store would mean trusting the store to say which key checks its own
 # signature.
 {
-  dataBucket = "CHANGE-ME-data";
   rootsBucket = "CHANGE-ME-roots";
   bucketPrefix = "";
 

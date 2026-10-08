@@ -22,6 +22,9 @@
 # is the point of it. A hosted runner has no /dev/nsm, so this script only runs
 # where an enclave does. Run it by hand there; do not add it back to the
 # workflow expecting it to pass.
+#
+# And since the state moved to ZFS it also needs the parent's disk on vsock
+# (runtime/src/zfs.rs), which only the emulator's harness provides.
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 cd "$REPO"
@@ -35,27 +38,26 @@ MINIO_PORT=9002
 say "building enclave-runtime"
 cargo build --release -p enclave-runtime
 
-"$REPO/scripts/minio-up.sh" "$MINIO_CONTAINER" "$MINIO_PORT" sql-data sql-roots
+"$REPO/scripts/minio-up.sh" "$MINIO_CONTAINER" "$MINIO_PORT" sql-roots
 trap '"$REPO/scripts/minio-down.sh" "$MINIO_CONTAINER"' EXIT
 
 say "running the SQLite workload"
 export SQLITE_SCALE="${SQLITE_SCALE:-20000}"
-export S3FS_MASTER_KEY="00000000000000000000000000000000000000000000000000000000000000ef"
+export ENCLAVE_MASTER_KEY="00000000000000000000000000000000000000000000000000000000000000ef"
 # Required, with no default: the runtime will not guess where a master key comes
 # from. `static` is the development source that reads the key above — the same
 # one the QEMU emulator image uses, and for the same reason, since KMS will not
 # release a key against an unsigned attestation document.
-export S3FS_MASTER_KEY_SOURCE=static
-export S3FS_BUCKET=sql-data
-export S3FS_ROOTS_BUCKET=sql-roots
-export S3FS_ENDPOINT="http://127.0.0.1:$MINIO_PORT"
-export S3FS_FORCE_PATH_STYLE=1
+export ENCLAVE_MASTER_KEY_SOURCE=static
+export ENCLAVE_ROOTS_BUCKET=sql-roots
+export ENCLAVE_ENDPOINT="http://127.0.0.1:$MINIO_PORT"
+export ENCLAVE_FORCE_PATH_STYLE=1
 export AWS_ACCESS_KEY_ID=minioadmin
 export AWS_SECRET_ACCESS_KEY=minioadmin
 export AWS_REGION=us-east-1
-export S3FS_GUEST_PATH=examples/guest-sqlite/target/wasm32-wasip2/release/guest-sqlite.wasm
-export S3FS_TLS=off
-export S3FS_HTTP_LISTEN=127.0.0.1:8080
+export ENCLAVE_GUEST_PATH=examples/guest-sqlite/target/wasm32-wasip2/release/guest-sqlite.wasm
+export ENCLAVE_TLS=off
+export ENCLAVE_HTTP_LISTEN=127.0.0.1:8080
 
 ./target/release/enclave-runtime > runtime.log 2>&1 &
 runtime=$!

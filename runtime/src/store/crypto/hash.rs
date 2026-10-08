@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use crate::errors::{FsError, FsResult};
+use crate::store::error::{StoreError, StoreResult};
 
 /// Length of a hash in bytes.
 pub const HASH_LEN: usize = 32;
@@ -60,7 +60,7 @@ impl Hash256 {
     /// here would leak how many leading bytes of a forged block matched, which
     /// is enough to mount a byte-at-a-time forgery search against any code
     /// path that lets an attacker submit candidate blocks.
-    pub fn verify(&self, expected: &Hash256, context: &'static str) -> FsResult<()> {
+    pub fn verify(&self, expected: &Hash256, context: &'static str) -> StoreResult<()> {
         let mut diff = 0u8;
         for i in 0..HASH_LEN {
             diff |= self.0[i] ^ expected.0[i];
@@ -68,7 +68,7 @@ impl Hash256 {
         if diff == 0 {
             Ok(())
         } else {
-            Err(FsError::Integrity(context))
+            Err(StoreError::Integrity(context))
         }
     }
 }
@@ -149,7 +149,7 @@ mod tests {
         let other = Hash256::of(b"block!");
         assert!(matches!(
             h.verify(&other, "blkptr checksum"),
-            Err(FsError::Integrity("blkptr checksum"))
+            Err(StoreError::Integrity("blkptr checksum"))
         ));
     }
 

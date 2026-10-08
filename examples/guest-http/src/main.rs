@@ -235,6 +235,16 @@ async fn main(mut req: Request<Body>) -> Result<Response<Body>, Error> {
                 )),
             }
         }
+        // `/escape/` by metadata rather than contents: a stat that resolved
+        // outside this guest's directory would leak what is there even where
+        // a read is refused.
+        ("GET", p) if p.starts_with("/stat/") => {
+            let target = &p["/stat/".len()..];
+            match fs::metadata(target) {
+                Ok(m) => Ok(text(StatusCode::OK, format!("stat {target}: {} bytes\n", m.len()))),
+                Err(e) => Ok(text(StatusCode::NOT_FOUND, format!("refused {target}: {e}\n"))),
+            }
+        }
         // Known values on both streams, for the runtime's guest-logging
         // tests. Every case the line framer has to get right is here, written
         // the way a guest would actually write it: a line built from two

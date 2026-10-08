@@ -1,4 +1,4 @@
-//! `FsError` — the engine's internal error type.
+//! `StoreError` — the engine's internal error type.
 //!
 //! Translation to WASI Preview 2 `wasi:filesystem/types::error-code` happens in
 //! the `enclave-runtime` crate. Inside the engine we keep error variants close to
@@ -10,7 +10,7 @@ use thiserror::Error;
 /// `wasi:filesystem/types::error-code` while staying intelligible inside the
 /// engine itself.
 #[derive(Debug, Clone, Error)]
-pub enum FsError {
+pub enum StoreError {
     #[error("not found")]
     NotFound,
 
@@ -90,7 +90,7 @@ pub enum FsError {
 
     /// The store offered a root record older than one we have already
     /// accepted, or older than the configured floor. Distinct from
-    /// [`FsError::Integrity`] because the data is *valid* — correctly signed
+    /// [`StoreError::Integrity`] because the data is *valid* — correctly signed
     /// and internally consistent — just stale. That is the signature of a
     /// rollback attempt rather than corruption.
     #[error("rollback detected: root seq {found} is not newer than {expected}")]
@@ -106,20 +106,20 @@ pub enum FsError {
     Network(String),
 }
 
-impl FsError {
+impl StoreError {
     /// `true` if the error is plausibly transient and worth retrying with
     /// backoff (network blips, throttling, 5xx). Persistent errors like
     /// `NotFound` or `AccessDenied` return `false`.
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            FsError::IoTimeout | FsError::Network(_) | FsError::WouldBlock
+            StoreError::IoTimeout | StoreError::Network(_) | StoreError::WouldBlock
         )
     }
 }
 
 /// Convenience alias used throughout the crate.
-pub type FsResult<T> = Result<T, FsError>;
+pub type StoreResult<T> = Result<T, StoreError>;
 
 #[cfg(test)]
 mod tests {
@@ -127,21 +127,21 @@ mod tests {
 
     #[test]
     fn display_is_stable() {
-        assert_eq!(FsError::NotFound.to_string(), "not found");
+        assert_eq!(StoreError::NotFound.to_string(), "not found");
         assert_eq!(
-            FsError::Loop.to_string(),
+            StoreError::Loop.to_string(),
             "symlink loop or recursion limit exceeded"
         );
         assert_eq!(
-            FsError::Invalid("bad part number").to_string(),
+            StoreError::Invalid("bad part number").to_string(),
             "invalid argument: bad part number"
         );
         assert_eq!(
-            FsError::Integrity("blkptr checksum").to_string(),
+            StoreError::Integrity("blkptr checksum").to_string(),
             "integrity check failed: blkptr checksum"
         );
         assert_eq!(
-            FsError::Rollback {
+            StoreError::Rollback {
                 expected: 42,
                 found: 41
             }
@@ -154,8 +154,8 @@ mod tests {
     /// Retrying them would turn a detected attack into a spin loop.
     #[test]
     fn verification_failures_are_never_transient() {
-        assert!(!FsError::Integrity("root signature").is_transient());
-        assert!(!FsError::Rollback {
+        assert!(!StoreError::Integrity("root signature").is_transient());
+        assert!(!StoreError::Rollback {
             expected: 2,
             found: 1
         }
@@ -164,13 +164,13 @@ mod tests {
 
     #[test]
     fn is_transient_categorisation() {
-        assert!(FsError::IoTimeout.is_transient());
-        assert!(FsError::Network("dns".into()).is_transient());
-        assert!(FsError::WouldBlock.is_transient());
+        assert!(StoreError::IoTimeout.is_transient());
+        assert!(StoreError::Network("dns".into()).is_transient());
+        assert!(StoreError::WouldBlock.is_transient());
 
-        assert!(!FsError::NotFound.is_transient());
-        assert!(!FsError::AccessDenied.is_transient());
-        assert!(!FsError::Loop.is_transient());
-        assert!(!FsError::Conflict.is_transient());
+        assert!(!StoreError::NotFound.is_transient());
+        assert!(!StoreError::AccessDenied.is_transient());
+        assert!(!StoreError::Loop.is_transient());
+        assert!(!StoreError::Conflict.is_transient());
     }
 }

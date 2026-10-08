@@ -18,8 +18,6 @@ use enclave_runtime::{
     AuthEndpoints, ChallengeStore, FilesystemCredentials, Gate, GuestEnvironment, HostClock,
     PoolLimits, ServeConfig, SoftwareAuthenticator, Tenancy, TlsIdentity,
 };
-use s3fs_core::backend::memory::MemoryBackend;
-use s3fs_core::{Config, Fs, MasterSecret};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const RP_ID: &str = "enclave.test";
@@ -140,16 +138,7 @@ async fn start() -> Harness {
 }
 
 async fn start_with_background(background: bool) -> Harness {
-    let backend = Arc::new(MemoryBackend::new());
-    let fs = Fs::create(
-        backend.clone(),
-        backend,
-        &MasterSecret::from_bytes([9u8; 32]),
-        [0u8; 16],
-        Arc::new(Config::default()),
-    )
-    .await
-    .expect("filesystem");
+    let fs = enclave_runtime::Zfs::scratch().await;
 
     let bytes = std::fs::read(component_path()).unwrap_or_else(|e| {
         panic!(

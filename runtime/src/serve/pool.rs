@@ -1,13 +1,10 @@
-//! Live tenants: one filesystem, one warm instance and one lock per client.
+//! Live tenants: one directory, one warm instance and one lock per client.
 //!
 //! ## What is kept, and why that and not something else
 //!
-//! Mounting a client's filesystem derives key material, reads a signed root
-//! record, verifies it and opens the object set — measured at 51 µs against a
-//! `HashMap`, which in production is that plus two or three S3 round trips.
-//! Instantiating the guest is 24 µs and no I/O at all. So **the mount is what
-//! is worth keeping warm**; the instance rides along because it is nearly free
-//! and it is convenient to rebuild the two together.
+//! A client's directory is a dataset on the pool, found once; instantiating
+//! the guest is 24 µs and no I/O at all. The warm instance is what is kept, so
+//! a client's in-memory state survives between its requests, and the lock.
 //!
 //! ## The lock is a correctness mechanism, not only a cache
 //!
@@ -16,29 +13,26 @@
 //!
 //! Serialised against itself, because a cosigner reserving a nonce must not
 //! race its own second request. Not against anyone else, because a client's
-//! filesystem is theirs alone — separate `Store`, separate transaction lock —
-//! so there is nothing for two clients to contend over, and making them queue
-//! would mean one client's slow commit stalling everybody.
+//! dataset is theirs alone, so there is nothing for two clients to contend
+//! over in it. (Anchors are serialised across everyone — see [`crate::zfs`].)
 //!
 //! ## Why anonymous callers get nothing
 //!
 //! A slot is keyed by the SHA-256 of a client's TLS public key, which the
 //! handshake proves. A caller who presented no certificate has no key to be
-//! identified by, so they get a fresh instance over the runtime's own
-//! filesystem and never occupy a slot — otherwise anyone who could open a
-//! socket could fill the pool and evict every real client's mount.
+//! identified by, so they get a fresh instance and never occupy a slot —
+//! otherwise anyone who could open a socket could fill the pool and evict
+//! every real client's instance.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use s3fs_core::Inode;
-
 /// How large the pool may grow, and how long an idle tenant is kept.
 ///
-/// Both matter more than they look. A tenant costs a `BlockStore` cache —
-/// `block_cache_bytes`, 64 MiB by default — plus a wasm linear memory, so a
+/// Both matter more than they look. A tenant costs a wasm linear memory, so a
 /// pool sized by hope rather than arithmetic is an enclave that dies of memory
 /// exhaustion under exactly the load it was built for.
 #[derive(Debug, Clone)]
@@ -60,17 +54,16 @@ impl Default for PoolLimits {
     }
 }
 
-/// A client's view of the filesystem, and its warm instance.
+/// A client's directory, and its warm instance.
 ///
-/// `scope` is the directory this client's guest calls `/`. The filesystem
-/// itself is shared and is not here — one mount, one block cache, one
-/// transaction stream for every tenant.
+/// `dir` is the dataset this client's guest calls `/`. The pool itself is
+/// shared and is not here.
 ///
 /// `instance` is an `Option` so a trap can discard the poisoned linear memory
 /// while keeping the resolved directory. That is cheap either way; what it
 /// mainly buys is that one client's trap is visible to nobody else.
 pub struct LiveTenant<I> {
-    pub scope: Arc<Inode>,
+    pub dir: PathBuf,
     pub tenant_id: [u8; 16],
     pub instance: Option<I>,
     pub requests: u64,
@@ -154,11 +147,11 @@ impl<I> TenantPool<I> {
 
     /// Check out this client's slot, creating an empty one if needed.
     ///
-    /// The slot, not the tenant: the caller then takes the async lock and
-    /// builds the filesystem under it if it is not there yet. That ordering is
-    /// what makes two simultaneous first requests from one client produce
-    /// **one** filesystem — they find the same slot, and the second waits on
-    /// the lock the first is holding rather than racing it into a second mount.
+    /// The slot, not the tenant: the caller then takes the async lock and finds
+    /// or creates the client's dataset under it. That ordering is what makes
+    /// two simultaneous first requests from one client produce **one** — they
+    /// find the same slot, and the second waits on the lock the first is
+    /// holding rather than racing it into a second `zfs create`.
     pub fn checkout(&self, tenant: &[u8; 16]) -> Checkout<I> {
         let now = self.now();
         let mut slots = self.slots.lock().expect("tenant pool mutex poisoned");
@@ -181,9 +174,9 @@ impl<I> TenantPool<I> {
     /// Drop idle and over-cap tenants.
     ///
     /// Removing a slot from the map does not destroy it: a request already
-    /// holding the `Arc` keeps working and the filesystem unmounts when it
-    /// finishes. So eviction can never pull a filesystem out from under a call
-    /// in progress — it only stops future requests finding it.
+    /// holding the `Arc` keeps working and its instance goes when it finishes.
+    /// So eviction can never pull an instance out from under a call in
+    /// progress — it only stops future requests finding it.
     fn evict_while_full(&self, slots: &mut HashMap<[u8; 16], Arc<Slot<I>>>, now: u64) {
         let idle_ms = self.limits.idle_timeout.as_millis() as u64;
         slots.retain(|_, slot| {

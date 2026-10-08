@@ -140,7 +140,7 @@ pub struct AuthEndpoints {
     gate: Arc<Gate>,
     credentials: Arc<FilesystemCredentials>,
     entropy: Arc<dyn nitro_nsm::Nsm>,
-    fs: Arc<s3fs_core::Fs>,
+    zfs: Arc<crate::zfs::Zfs>,
     registrations: Mutex<HashMap<[u8; 16], PendingRegistration>>,
 }
 
@@ -148,14 +148,14 @@ impl AuthEndpoints {
     pub fn new(
         gate: Arc<Gate>,
         credentials: Arc<FilesystemCredentials>,
-        fs: Arc<s3fs_core::Fs>,
+        zfs: Arc<crate::zfs::Zfs>,
         entropy: Arc<dyn nitro_nsm::Nsm>,
     ) -> Self {
         AuthEndpoints {
             gate,
             credentials,
             entropy,
-            fs,
+            zfs,
             registrations: Mutex::new(HashMap::new()),
         }
     }
@@ -317,6 +317,14 @@ impl AuthEndpoints {
             },
         };
 
+        // The directory first, so the tenant's first request finds one rather
+        // than paying for it while a user waits — and so the credential's
+        // anchor below covers both.
+        if let Err(e) = self.zfs.tenant_dir(tenant_id).await {
+            tracing::error!(error = format!("{e:#}"), "creating a tenant directory");
+            return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+        }
+
         let credential_id = request.credential.raw_id.as_ref().to_vec();
         let record = StoredCredential {
             version: 1,
@@ -329,13 +337,6 @@ impl AuthEndpoints {
         if let Err(e) = self.credentials.register(&credential_id, record).await {
             tracing::error!(error = format!("{e:#}"), "storing a credential");
             return problem(hyper::StatusCode::CONFLICT, "could not register");
-        }
-
-        // The directory, so the tenant's first request finds one rather than
-        // paying for it while a user waits.
-        if let Err(e) = crate::tenant::tenant_root_by_id(&self.fs, tenant_id).await {
-            tracing::error!(error = format!("{e:#}"), "creating a tenant directory");
-            return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
         }
 
         tracing::info!(
@@ -532,28 +533,17 @@ mod tests {
     use crate::auth::challenge::{ChallengeStore, DEFAULT_CAPACITY, DEFAULT_TTL};
     use crate::auth::testing::{Relying, ORIGIN, RP_ID};
     use crate::auth::SoftwareAuthenticator;
+    use crate::zfs::Zfs;
     use http_body_util::BodyExt;
-    use s3fs_core::backend::memory::MemoryBackend;
-    use s3fs_core::{Config, Fs, MasterSecret};
 
     struct Fixture {
         endpoints: AuthEndpoints,
-        fs: Arc<Fs>,
+        fs: Arc<Zfs>,
         credentials: Arc<FilesystemCredentials>,
     }
 
     async fn fixture() -> Fixture {
-        let backend = Arc::new(MemoryBackend::new());
-        let fs = Fs::create(
-            backend.clone(),
-            backend,
-            &MasterSecret::from_bytes([7u8; 32]),
-            [0u8; 16],
-            Arc::new(Config::default()),
-        )
-        .await
-        .expect("filesystem");
-
+        let fs = Zfs::scratch().await;
         let credentials = Arc::new(FilesystemCredentials::new(fs.clone()));
         let gate = Arc::new(Gate::new(
             Relying::new().webauthn,
@@ -648,10 +638,9 @@ mod tests {
         assert_eq!(hex::encode(record.tenant_id), tenant_hex);
 
         // And the tenant's directory exists, so their first request is cheap.
-        assert!(crate::tenant::tenants(&f.fs)
-            .await
-            .unwrap()
-            .contains(&tenant_hex.to_string()));
+        let mut tenant = [0u8; 16];
+        hex::decode_to_slice(tenant_hex, &mut tenant).unwrap();
+        assert!(f.fs.tenant_path(tenant).is_dir());
     }
 
     /// Registration is open, and each one stands alone: a second, unrelated

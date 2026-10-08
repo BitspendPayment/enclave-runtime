@@ -4,7 +4,7 @@ A real enclave on your own machine, to develop a client against.
 
 ```bash
 sudo modprobe vsock_loopback                       # once per boot
-docker build -t s3fs-qemu-nitro:latest deploy/qemu-nitro   # QEMU with the nitro-enclave machine; ~680 MB
+docker build -t enclave-qemu-nitro:latest deploy/qemu-nitro   # QEMU with the nitro-enclave machine; ~680 MB
 cargo install vhost-device-vsock --root target/qemu-nitro/tools
 
 deploy/qemu-nitro/dev-enclave.sh --guest path/to/your-component.wasm
@@ -23,8 +23,8 @@ after the enclave starts serving: the e2e asserts and exits, this waits.
 
 The enclave boots as an EIF under QEMU's `nitro-enclave` machine — the same
 image format and the same boot path as production, measured into PCR0 by the
-hypervisor. It takes its address by DHCP over emulated vsock, mounts the
-encrypted block store over that link, fetches your component from the store and
+hypervisor. It takes its address by DHCP over emulated vsock, brings up its ZFS
+pool on a disk image served over vsock, fetches your component from the store and
 measures it into PCR16 before it can obtain a key, orders a certificate from a
 CA over RFC 8555 TLS-ALPN-01, and gates every request on a WebAuthn assertion
 bound to that exact request.
@@ -184,7 +184,7 @@ image with the image options given and puts into `DIR` everything a run needs:
 ```
 DIR/
 ├── image.env          every image option, the runtime revision, and the image tags below
-├── eif/               s3fs-qemu.eif, pcr.json
+├── eif/               enclave-qemu.eif, pcr.json
 ├── bin/               gvproxy (static); nitro-attest, passkey-client, vhost-device-vsock (libc only)
 ├── images/            qemu.tar.gz, minio.tar.gz — the container images, loaded on first run
 ├── deploy/qemu-nitro/ this harness, as it was when the image was built
@@ -248,7 +248,7 @@ so does deleting it by hand while the enclave is down.
 |---|---|
 | `no /dev/vsock` | `sudo modprobe vsock_loopback` |
 | `no /dev/kvm` | the `nitro-enclave` machine needs KVM; it will not run in a VM without nested virtualisation |
-| `missing QEMU image` | `docker build -t s3fs-qemu-nitro:latest deploy/qemu-nitro` |
+| `missing QEMU image` | `docker build -t enclave-qemu-nitro:latest deploy/qemu-nitro` |
 | `... is not tracked by git` | Nix flakes copy only tracked files; `git add deploy/qemu-nitro/` |
-| the enclave never reported a trust root | `S3FS_COSIGN_ATTESTATIONS` is unset in the image — check `eif-qemu`'s environment in `flake.nix` |
+| the enclave never reported a trust root | `ENCLAVE_COSIGN_ATTESTATIONS` is unset in the image — check `eif-qemu`'s environment in `flake.nix` |
 | a port is in use | `--port`, and `--name` if you want two at once |

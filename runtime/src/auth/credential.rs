@@ -1,16 +1,14 @@
 //! Registered passkeys, and the tenants they speak for.
 //!
-//! Records live in `/runtime/credentials/` in the shared filesystem — **above
-//! every tenant's scope**, so no guest can name them. That is not a convention
-//! here: `974dac2` made the resolver refuse every path that leaves a tenant's
-//! subtree, so a guest asking for `/runtime/credentials/…` gets its own
-//! `runtime/credentials/…`, which does not exist.
+//! Records live in `/runtime/credentials/` on the pool — **outside every
+//! tenant's directory**, so no guest can name them: a guest's only preopen is
+//! its own `/tenants/<id>`, and `wasmtime-wasi` resolves nothing above it.
 //!
-//! Being in the filesystem at all is what makes them trustworthy. The tree is
-//! covered by one signed root record and that record is attested by the boot
-//! receipt, so a host cannot add a credential, repoint one at another tenant,
-//! or un-revoke one without breaking a signature the enclave checks before it
-//! serves anything.
+//! Being on the pool at all is what makes them trustworthy. It is encrypted
+//! under a key the host never sees and pinned by an anchor the boot checks,
+//! so a host cannot add a credential, repoint one at another tenant, or
+//! un-revoke one — nor roll back to before a revocation — without the boot
+//! refusing the pool.
 //!
 //! ## The tenant id is minted, not derived
 //!
@@ -24,8 +22,8 @@
 //! ## Why the sign counter is not persisted per request
 //!
 //! The counter exists to spot a cloned authenticator. Writing it on every
-//! request would put a filesystem transaction — and in production a commit to
-//! S3 — in the path of every signature, to record a number that platform
+//! request would put an anchor — a pool sync and a write to S3 — in the path
+//! of every signature, to record a number that platform
 //! passkeys synced through iCloud or Google report as zero forever.
 //!
 //! So it is held in memory, checked for regression while the process lives,
@@ -38,17 +36,17 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
-use s3fs_core::{Fs, FsError, Inode, OpenFlags};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use webauthn_rs::prelude::Passkey;
 
 use crate::auth::gate::{CredentialRecord, CredentialStore};
-use crate::tenant::ensure_dir;
+use crate::zfs::Zfs;
 
-/// Runtime-owned state, above every tenant scope.
-pub const RUNTIME_DIR: &str = "runtime";
-/// Registered credentials, one file each.
+/// Registered credentials, one file each, under `/runtime`.
 pub const CREDENTIALS_DIR: &str = "credentials";
 
 /// Ceiling on a record. A `Passkey` is a few hundred bytes; this is loose
@@ -75,30 +73,39 @@ pub struct StoredCredential {
 
 const RECORD_VERSION: u32 = 1;
 
-/// Credentials in the shared filesystem, with the volatile parts in memory.
+/// Credentials on the pool, with the volatile parts in memory.
 pub struct FilesystemCredentials {
-    fs: Arc<Fs>,
-    /// Records read from the filesystem, plus the counters that are not
-    /// written back. Also the invalidation point: revocation updates both.
+    zfs: Arc<Zfs>,
+    /// Records read from the pool, plus the counters that are not written
+    /// back. Also the invalidation point: revocation updates both.
     cache: Mutex<HashMap<Vec<u8>, CredentialRecord>>,
 }
 
 impl FilesystemCredentials {
-    pub fn new(fs: Arc<Fs>) -> Self {
+    pub fn new(zfs: Arc<Zfs>) -> Self {
         FilesystemCredentials {
-            fs,
+            zfs,
             cache: Mutex::new(HashMap::new()),
         }
     }
 
-    async fn dir(&self) -> Result<Arc<Inode>> {
-        let root = self.fs.root();
-        let runtime = ensure_dir(&self.fs, &root, RUNTIME_DIR).await?;
-        ensure_dir(&self.fs, &runtime, CREDENTIALS_DIR).await
+    async fn path(&self, credential_id: &[u8]) -> Result<PathBuf> {
+        Ok(self
+            .zfs
+            .runtime_dir(CREDENTIALS_DIR)
+            .await?
+            .join(hex::encode(credential_id)))
     }
 
-    fn name(credential_id: &[u8]) -> String {
-        hex::encode(credential_id)
+    fn encode(record: &StoredCredential) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(record, &mut bytes).context("encoding a credential record")?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_RECORD_BYTES,
+            "credential record is {} bytes, over the {MAX_RECORD_BYTES} limit",
+            bytes.len()
+        );
+        Ok(bytes)
     }
 
     /// Write a credential, refusing to overwrite one that exists.
@@ -107,45 +114,25 @@ impl FilesystemCredentials {
     /// error rather than a silent repointing — which is what taking over
     /// somebody else's tenant would look like.
     pub async fn register(&self, credential_id: &[u8], record: StoredCredential) -> Result<()> {
-        let dir = self.dir().await?;
-        let path = format!(
-            "/{RUNTIME_DIR}/{CREDENTIALS_DIR}/{}",
-            Self::name(credential_id)
-        );
-        let _ = dir;
-
-        let mut bytes = Vec::new();
-        ciborium::into_writer(&record, &mut bytes).context("encoding a credential record")?;
-        anyhow::ensure!(
-            bytes.len() <= MAX_RECORD_BYTES,
-            "credential record is {} bytes, over the {MAX_RECORD_BYTES} limit",
-            bytes.len()
-        );
-
-        let handle = self
-            .fs
-            .open(&path, OpenFlags::create_new())
+        let path = self.path(credential_id).await?;
+        let bytes = Self::encode(&record)?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
             .await
-            .map_err(|e| anyhow::anyhow!(e))
-            .with_context(|| format!("creating {path}"))?;
-        self.fs
-            .pwrite(&handle, 0, &bytes)
+            .with_context(|| format!("creating {}", path.display()))?;
+        file.write_all(&bytes)
             .await
-            .map_err(|e| anyhow::anyhow!(e))
             .context("writing a credential record")?;
-        // Committed before the caller is told it is registered: a registration
-        // that had not reached the store would be a passkey the user believes
-        // works and the next boot has never heard of.
-        self.fs
-            .sync(&handle)
+        drop(file);
+        // Anchored before the caller is told it is registered: a registration
+        // the anchor did not cover would be a passkey the user believes works
+        // and the next boot has never heard of.
+        self.zfs
+            .anchor()
             .await
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("committing a credential record")?;
-        self.fs
-            .close(&handle)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("closing a credential record")?;
+            .context("anchoring a credential record")?;
 
         self.cache.lock().expect("credentials poisoned").insert(
             credential_id.to_vec(),
@@ -159,14 +146,18 @@ impl FilesystemCredentials {
         Ok(())
     }
 
-    /// Mark a credential unusable, in the filesystem and in memory.
+    /// Mark a credential unusable, on the pool and in memory.
     pub async fn revoke(&self, credential_id: &[u8]) -> Result<()> {
         let mut stored = self
             .read(credential_id)
             .await?
             .context("no such credential")?;
         stored.active = false;
-        self.overwrite(credential_id, &stored).await?;
+        tokio::fs::write(self.path(credential_id).await?, Self::encode(&stored)?)
+            .await
+            .context("writing a credential record")?;
+        // A revocation a rewind could undo is not one.
+        self.zfs.anchor().await.context("anchoring a revocation")?;
         // The cache is what the gate reads, so it must not outlive the
         // decision to revoke by even one request.
         if let Some(cached) = self
@@ -180,66 +171,20 @@ impl FilesystemCredentials {
         Ok(())
     }
 
-    async fn overwrite(&self, credential_id: &[u8], record: &StoredCredential) -> Result<()> {
-        let path = format!(
-            "/{RUNTIME_DIR}/{CREDENTIALS_DIR}/{}",
-            Self::name(credential_id)
-        );
-        let mut bytes = Vec::new();
-        ciborium::into_writer(record, &mut bytes).context("encoding a credential record")?;
-
-        let handle = self
-            .fs
-            .open(&path, OpenFlags::write_only())
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-            .with_context(|| format!("opening {path}"))?;
-        self.fs
-            .set_size(&handle, 0)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("truncating a credential record")?;
-        self.fs
-            .pwrite(&handle, 0, &bytes)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("writing a credential record")?;
-        self.fs
-            .sync(&handle)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("committing a credential record")?;
-        self.fs
-            .close(&handle)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("closing a credential record")?;
-        Ok(())
-    }
-
     async fn read(&self, credential_id: &[u8]) -> Result<Option<StoredCredential>> {
-        let path = format!(
-            "/{RUNTIME_DIR}/{CREDENTIALS_DIR}/{}",
-            Self::name(credential_id)
-        );
-        let handle = match self.fs.open(&path, OpenFlags::read_only()).await {
-            Ok(handle) => handle,
-            Err(FsError::NotFound) => return Ok(None),
-            Err(e) => return Err(anyhow::anyhow!(e)).with_context(|| format!("opening {path}")),
+        let path = self.path(credential_id).await?;
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let bytes = self.fs.pread(&handle, 0, MAX_RECORD_BYTES).await;
-        // Before `?`, so a read error does not leak the handle on every attempt.
-        self.fs
-            .close(&handle)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("closing a credential record")?;
-        let bytes = bytes
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("reading a credential record")?;
-
+        anyhow::ensure!(
+            bytes.len() <= MAX_RECORD_BYTES,
+            "credential record {} is over the {MAX_RECORD_BYTES} limit",
+            path.display()
+        );
         let stored: StoredCredential =
-            ciborium::from_reader(bytes.as_ref()).context("decoding a credential record")?;
+            ciborium::from_reader(bytes.as_slice()).context("decoding a credential record")?;
         anyhow::ensure!(
             stored.version == RECORD_VERSION,
             "credential record is version {}, this build understands {RECORD_VERSION}",
@@ -316,20 +261,9 @@ mod tests {
     use super::*;
     use crate::auth::testing::{Relying, RP_ID};
     use crate::auth::SoftwareAuthenticator;
-    use s3fs_core::backend::memory::MemoryBackend;
-    use s3fs_core::{Config, MasterSecret};
 
-    async fn shared_fs() -> Arc<Fs> {
-        let backend = Arc::new(MemoryBackend::new());
-        Fs::create(
-            backend.clone(),
-            backend,
-            &MasterSecret::from_bytes([7u8; 32]),
-            [0u8; 16],
-            Arc::new(Config::default()),
-        )
-        .await
-        .expect("the shared filesystem")
+    async fn shared_fs() -> Arc<Zfs> {
+        Zfs::scratch().await
     }
 
     fn stored(tenant_id: [u8; 16], passkey: Passkey) -> StoredCredential {
@@ -344,7 +278,7 @@ mod tests {
     }
 
     async fn registered() -> (
-        Arc<Fs>,
+        Arc<Zfs>,
         FilesystemCredentials,
         SoftwareAuthenticator,
         [u8; 16],
@@ -510,25 +444,23 @@ mod tests {
         );
     }
 
-    /// Records are runtime-owned and sit above every tenant scope, so a guest
-    /// cannot name them. This asserts the location, which is what the resolver
-    /// guarantee rests on.
+    /// Records are runtime-owned and sit outside every tenant's directory, so
+    /// no guest preopen reaches them. This asserts the location, which is what
+    /// that guarantee rests on.
     #[tokio::test]
-    async fn credentials_live_above_every_tenant_scope() {
-        let (fs, _store, auth, _) = registered().await;
-        let root = fs.root();
-        let runtime = fs.lookup_at(&root, RUNTIME_DIR).await.unwrap();
-        let creds = fs.lookup_at(&runtime, CREDENTIALS_DIR).await.unwrap();
-        assert!(fs
-            .lookup_at(&creds, &hex::encode(auth.credential_id()))
+    async fn credentials_live_outside_every_tenant_directory() {
+        let (zfs, _store, auth, _) = registered().await;
+        let record = zfs
+            .runtime_dir(CREDENTIALS_DIR)
             .await
-            .is_ok());
+            .unwrap()
+            .join(hex::encode(auth.credential_id()));
+        assert!(record.exists());
 
-        // A tenant's scope is a sibling of `/runtime`, never an ancestor.
-        let tenant = crate::tenant::tenant_root_by_id(&fs, [0x11; 16])
-            .await
-            .unwrap();
-        assert_ne!(tenant.scope.objid(), root.objid());
-        assert_ne!(tenant.scope.objid(), runtime.objid());
+        let (tenant, _) = zfs.tenant_dir([0x11; 16]).await.unwrap();
+        assert!(
+            !record.starts_with(&tenant),
+            "a tenant's directory contains the credentials"
+        );
     }
 }

@@ -508,8 +508,7 @@ mod tests {
     use super::pinpoint::testing::{Counted, Recorder, SENT};
     use super::*;
     use crate::clock::HostClock;
-    use s3fs_core::backend::memory::MemoryBackend;
-    use s3fs_core::{Config, Fs, MasterSecret};
+    use crate::zfs::Zfs;
 
     const ALICE: [u8; 16] = [1; 16];
     const BOB: [u8; 16] = [2; 16];
@@ -526,16 +525,7 @@ mod tests {
         Arc<DeviceRegistry>,
         Arc<Recorder>,
     ) {
-        let backend = Arc::new(MemoryBackend::new());
-        let fs = Fs::create(
-            backend.clone(),
-            backend,
-            &MasterSecret::from_bytes([3u8; 32]),
-            [0u8; 16],
-            Arc::new(Config::default()),
-        )
-        .await
-        .unwrap();
+        let fs = Zfs::scratch().await;
         let registry = DeviceRegistry::open(fs).await.unwrap();
         let clock = Arc::new(WallClockAdapter::new(Box::new(HostClock)).unwrap());
         let recorder = Recorder::with(replies);
@@ -562,16 +552,7 @@ mod tests {
     /// assertion about what is in flight becomes a race with that task. Holding
     /// the receiver and never reading it makes the queue stand still.
     async fn detached() -> (Arc<Notifier>, mpsc::Receiver<Wake>) {
-        let backend = Arc::new(MemoryBackend::new());
-        let fs = Fs::create(
-            backend.clone(),
-            backend,
-            &MasterSecret::from_bytes([4u8; 32]),
-            [0u8; 16],
-            Arc::new(Config::default()),
-        )
-        .await
-        .unwrap();
+        let fs = Zfs::scratch().await;
         let (tx, rx) = mpsc::channel::<Wake>(QUEUE_CAPACITY);
         let notifier = Arc::new(Notifier {
             registry: DeviceRegistry::open(fs).await.unwrap(),

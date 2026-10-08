@@ -82,7 +82,7 @@ done
 
 echo
 echo "gvproxy is up. Start the enclave with:"
-echo "  nitro-cli run-enclave --eif-path s3fs.eif --cpu-count 2 --memory 2048"
+echo "  nitro-cli run-enclave --eif-path enclave.eif --cpu-count 2 --memory 2048"
 echo
 echo "Forwarded: $FORWARD_PORTS → $ENCLAVE_IP"
 echo "API:       $API_SOCKET"

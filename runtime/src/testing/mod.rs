@@ -146,19 +146,10 @@ impl Enclave {
             AuthEndpoints, ChallengeStore, FilesystemCredentials, Gate, GuestEnvironment,
             HostClock, PoolLimits, ServeConfig, Tenancy, TlsIdentity,
         };
-        use s3fs_core::backend::memory::MemoryBackend;
-        use s3fs_core::{Config, Fs, MasterSecret};
 
-        let backend = Arc::new(MemoryBackend::new());
-        let fs = Fs::create(
-            backend.clone(),
-            backend,
-            &MasterSecret::from_bytes([9u8; 32]),
-            [0u8; 16],
-            Arc::new(Config::default()),
-        )
-        .await
-        .context("creating the harness filesystem")?;
+        // A directory standing in for the pool: the harness runs without root
+        // and without ZFS. What ZFS itself does is the emulator's to prove.
+        let fs = crate::zfs::Zfs::scratch().await;
 
         let nsm = Arc::new(SigningNsm::new()?);
         // As `main` does, before anything could attest: the documents this

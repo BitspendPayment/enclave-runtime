@@ -25,13 +25,13 @@
 //!
 //! rustls-acme hands its cache the account key and the certificate's private
 //! key as PEM. Both are sealed with AES-256-GCM under a key derived from the
-//! master secret and written as an ordinary object, so the parent instance
-//! stores ciphertext it cannot read.
+//! master secret and written as an ordinary object in the roots bucket, so the
+//! parent instance stores ciphertext it cannot read.
 //!
-//! Not in the filesystem: [`crate::wasi::host_preopens`] gives the guest a
-//! descriptor for the filesystem *root*, so anything kept there is readable by
-//! the guest — and a guest holding the TLS private key could impersonate the
-//! enclave to every client.
+//! In the bucket rather than on the pool, because the certificate is wanted
+//! before anything else is served — and a guest holding the TLS private key
+//! could impersonate the enclave to every client, so it is kept as far from
+//! guests' directories as anything the runtime holds.
 //!
 //! Caching is not an optimisation. Let's Encrypt allows five duplicate
 //! certificates per week; an enclave that re-issued on every boot would run
@@ -40,10 +40,10 @@
 use std::sync::{Arc, RwLock};
 
 use crate::serve::tls::TlsIdentity;
+use crate::store::backend::{Backend, PutBlobInput};
+use crate::store::crypto::KeyMaterial;
+use crate::store::StoreError;
 use anyhow::{Context, Result};
-use s3fs_core::backend::{Backend, PutBlobInput};
-use s3fs_core::crypto::KeyMaterial;
-use s3fs_core::FsError;
 
 /// The identity currently being served — a rustls config and the leaf that
 /// config presents, together.
@@ -162,7 +162,7 @@ impl SealedAcmeCache {
             }
             // A first boot has no cache. Everything else is a real failure and
             // must not be mistaken for one.
-            Err(FsError::NotFound) => Ok(None),
+            Err(StoreError::NotFound) => Ok(None),
             Err(e) => {
                 Err(anyhow::Error::msg(e.to_string())).with_context(|| format!("reading {key}"))
             }
@@ -518,7 +518,7 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3fs_core::crypto::MasterSecret;
+    use crate::store::crypto::MasterSecret;
 
     fn keys() -> Arc<KeyMaterial> {
         Arc::new(KeyMaterial::derive(&MasterSecret::from_bytes([3u8; 32]), [1u8; 16]).unwrap())

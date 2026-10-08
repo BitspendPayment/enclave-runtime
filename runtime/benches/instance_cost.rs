@@ -14,12 +14,12 @@
 //!   instantiate  ÷  dispatch/committing   →  what pooling could remove
 //! ```
 //!
-//! Against [`MemoryBackend`] there is no network, so `dispatch/committing`
-//! measures the engine's own cost — encryption, hashing, the copy-on-write
-//! rebuild, the commit. Against real S3 the round trips are added to the
-//! denominator and never to the numerator, so **the ratio measured here is the
-//! most favourable case pooling will ever see.** If it is small here, it is
-//! smaller in production.
+//! Over a directory standing in for the pool there is no anchor, so
+//! `dispatch/committing` measures the guest and its file I/O. In production an
+//! anchor — a pool sync and a write to S3 — is added to the denominator and
+//! never to the numerator, so **the ratio measured here is the most favourable
+//! case pooling will ever see.** If it is small here, it is smaller in
+//! production.
 //!
 //! ```bash
 //! (cd examples/guest-http && cargo build --release --target wasm32-wasip2)
@@ -35,9 +35,6 @@ use tokio::runtime::Runtime;
 use bytes::Bytes;
 use enclave_runtime::{GuestEnvironment, HostClock, ServeHandle};
 use http_body_util::{BodyExt, Full};
-use s3fs_core::backend::memory::MemoryBackend;
-use s3fs_core::backend::Backend;
-use s3fs_core::{Config, Fs, MasterSecret};
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
@@ -64,22 +61,13 @@ fn component_bytes() -> Vec<u8> {
     })
 }
 
-/// A handle over a memory-backed filesystem, compiled once.
+/// A handle over a scratch pool, compiled once.
 ///
 /// Compilation and `instantiate_pre` are startup costs the runtime pays once
 /// for the life of the process, so they belong in setup — measuring them here
 /// would drown the per-request number this benchmark exists to find.
 async fn handle() -> ServeHandle {
-    let backend = Arc::new(MemoryBackend::new());
-    let fs = Fs::create(
-        backend.clone(),
-        backend,
-        &MasterSecret::from_bytes([7u8; 32]),
-        [0u8; 16],
-        Arc::new(Config::default()),
-    )
-    .await
-    .expect("creating the memory-backed filesystem");
+    let fs = enclave_runtime::Zfs::scratch().await;
 
     // Detached deliberately: the collector runs for as long as this
     // environment can send, which is what a test wants. Production drains it
@@ -121,22 +109,6 @@ async fn get(handle: &ServeHandle, path: &str) {
     resp.into_body().collect().await.expect("collecting body");
 }
 
-/// A filesystem that already exists, so it can be mounted rather than created.
-async fn existing() -> (Arc<dyn Backend>, Arc<dyn Backend>) {
-    let data = Arc::new(MemoryBackend::new()) as Arc<dyn Backend>;
-    let roots = Arc::new(MemoryBackend::new()) as Arc<dyn Backend>;
-    Fs::create(
-        data.clone(),
-        roots.clone(),
-        &MasterSecret::from_bytes([7u8; 32]),
-        [0u8; 16],
-        Arc::new(Config::default()),
-    )
-    .await
-    .expect("creating the filesystem");
-    (data, roots)
-}
-
 fn bench(c: &mut Criterion) {
     let rt = runtime();
     let handle = rt.block_on(handle());
@@ -156,42 +128,11 @@ fn bench(c: &mut Criterion) {
         b.to_async(&rt).iter(|| get(&handle, "/memory"));
     });
 
-    // A whole request that reads, modifies, writes and commits — one
-    // transaction group, one root record. This is the denominator that matters,
-    // because it is the shape of real work, and against real S3 it grows while
-    // `instantiate` does not.
+    // A whole request that reads, modifies and writes a file. This is the
+    // denominator that matters, because it is the shape of real work, and with
+    // a real pool's anchor it grows while `instantiate` does not.
     group.bench_function("dispatch/committing", |b| {
         b.to_async(&rt).iter(|| get(&handle, "/counter"));
-    });
-
-    // What a *per-client* filesystem would cost to bring up: derive its key
-    // material, read its signed root record, verify the signature, open the
-    // object set. Against `MemoryBackend` this is the CPU floor and nothing
-    // else — in production the root record and the object set are reads against
-    // S3, so the real figure is this plus round trips.
-    //
-    // Worth measuring beside `instantiate`, because if instances are per client
-    // then so is this, and it is the larger of the two by orders of magnitude.
-    // Whatever a per-client design keeps warm, this is the thing worth keeping.
-    let rt2 = runtime();
-    let (data, roots) = rt2.block_on(existing());
-    group.bench_function("mount", |b| {
-        b.to_async(&rt2).iter(|| {
-            let data = data.clone();
-            let roots = roots.clone();
-            async move {
-                Fs::mount(
-                    data,
-                    roots,
-                    &MasterSecret::from_bytes([7u8; 32]),
-                    [0u8; 16],
-                    Arc::new(Config::default()),
-                    None,
-                )
-                .await
-                .expect("mounting")
-            }
-        });
     });
 
     group.finish();

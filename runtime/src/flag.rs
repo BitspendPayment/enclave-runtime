@@ -3,7 +3,7 @@
 //! clap's default `bool` handling insists on exactly `true` or `false` when a
 //! value arrives through `env`. That is fine on a command line, where the flag
 //! is usually written bare, and wrong for a deployment configured by
-//! environment: `ENV S3FS_FORCE_PATH_STYLE=1` is the obvious thing to put in a
+//! environment: `ENV ENCLAVE_FORCE_PATH_STYLE=1` is the obvious thing to put in a
 //! Dockerfile, and it fails at startup with a message about possible values.
 //!
 //! Inside an enclave that failure is expensive to diagnose — there is no shell

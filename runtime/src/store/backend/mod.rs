@@ -1,8 +1,10 @@
 //! `Backend` trait — the storage primitive surface.
 //!
 //! This trait abstracts over S3, S3-compatible (MinIO, R2), and an in-memory
-//! test fake. Methods correspond closely to S3 wire operations; the engine
-//! layered on top translates POSIX semantics into sequences of these calls.
+//! test fake. Methods correspond closely to S3 wire operations. What the
+//! runtime builds on them is the anchor chain ([`crate::zfs`]) and the boot
+//! records ([`crate::boot`]): conditional creates under Object Lock, and reads
+//! of the retained version beneath any delete marker.
 //!
 //! ## Method coverage
 //!
@@ -30,13 +32,11 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::errors::FsResult;
+use crate::store::error::StoreResult;
 
 pub mod memory;
 
-#[cfg(feature = "aws")]
 pub mod aws;
-#[cfg(feature = "aws")]
 pub use aws::{AwsS3Backend, AwsS3BackendConfig};
 
 /// Per-backend feature flags.
@@ -222,9 +222,9 @@ pub struct CompletedPart {
 pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
     fn capabilities(&self) -> Capabilities;
 
-    async fn head_blob(&self, key: &str) -> FsResult<BlobMeta>;
+    async fn head_blob(&self, key: &str) -> StoreResult<BlobMeta>;
 
-    async fn get_blob(&self, key: &str, range: Option<Range<u64>>) -> FsResult<GetBlobOutput>;
+    async fn get_blob(&self, key: &str, range: Option<Range<u64>>) -> StoreResult<GetBlobOutput>;
 
     /// Read the **retained** version of an object, seeing past a delete marker.
     ///
@@ -246,31 +246,31 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
     /// using a conditional PUT, which is to say not by us.
     ///
     /// Needs `s3:ListBucketVersions` in addition to `s3:GetObject`.
-    async fn get_retained_blob(&self, key: &str) -> FsResult<GetBlobOutput>;
+    async fn get_retained_blob(&self, key: &str) -> StoreResult<GetBlobOutput>;
 
-    async fn put_blob(&self, input: PutBlobInput) -> FsResult<BlobMeta>;
+    async fn put_blob(&self, input: PutBlobInput) -> StoreResult<BlobMeta>;
 
-    /// Atomic create. Returns [`crate::errors::FsError::AlreadyExists`] if the
+    /// Atomic create. Returns [`crate::store::error::StoreError::AlreadyExists`] if the
     /// key already has an object. Backends without conditional-PUT support
-    /// must return [`crate::errors::FsError::NotSupported`] from this method
+    /// must return [`crate::store::error::StoreError::NotSupported`] from this method
     /// and report `capabilities().conditional_put == false`.
-    async fn put_blob_if_not_exists(&self, input: PutBlobInput) -> FsResult<BlobMeta>;
+    async fn put_blob_if_not_exists(&self, input: PutBlobInput) -> StoreResult<BlobMeta>;
 
-    async fn delete_blob(&self, key: &str) -> FsResult<()>;
+    async fn delete_blob(&self, key: &str) -> StoreResult<()>;
 
     /// Batch delete. Default impl falls back to per-key `delete_blob`.
-    async fn delete_blobs(&self, keys: &[String]) -> FsResult<()> {
+    async fn delete_blobs(&self, keys: &[String]) -> StoreResult<()> {
         for k in keys {
             self.delete_blob(k).await?;
         }
         Ok(())
     }
 
-    async fn list_blobs(&self, input: ListBlobsInput<'_>) -> FsResult<ListBlobsOutput>;
+    async fn list_blobs(&self, input: ListBlobsInput<'_>) -> StoreResult<ListBlobsOutput>;
 
-    async fn copy_blob(&self, input: CopyBlobInput) -> FsResult<BlobMeta>;
+    async fn copy_blob(&self, input: CopyBlobInput) -> StoreResult<BlobMeta>;
 
-    async fn multipart_begin(&self, input: PutBlobInput) -> FsResult<MultipartId>;
+    async fn multipart_begin(&self, input: PutBlobInput) -> StoreResult<MultipartId>;
 
     async fn multipart_upload_part(
         &self,
@@ -278,7 +278,7 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
         upload_id: &MultipartId,
         part_number: u32,
         body: Bytes,
-    ) -> FsResult<PartUploadOutput>;
+    ) -> StoreResult<PartUploadOutput>;
 
     /// Server-side range copy into a part of an in-flight MPU. The load-bearing
     /// primitive for in-place updates and append.
@@ -289,14 +289,14 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
         part_number: u32,
         source_key: &str,
         source_range: Range<u64>,
-    ) -> FsResult<PartUploadOutput>;
+    ) -> StoreResult<PartUploadOutput>;
 
     async fn multipart_complete(
         &self,
         key: &str,
         upload_id: &MultipartId,
         parts: Vec<CompletedPart>,
-    ) -> FsResult<BlobMeta>;
+    ) -> StoreResult<BlobMeta>;
 
-    async fn multipart_abort(&self, key: &str, upload_id: &MultipartId) -> FsResult<()>;
+    async fn multipart_abort(&self, key: &str, upload_id: &MultipartId) -> StoreResult<()>;
 }

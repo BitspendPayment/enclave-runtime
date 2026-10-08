@@ -1,27 +1,29 @@
-//! Durable, tenant-bound background work. One queue owner per mounted filesystem.
+//! Durable, tenant-bound background work. One queue owner per pool.
 //!
-//! A synced temporary file is atomically renamed to publish each record. The
+//! A temporary file is atomically renamed to publish each record, and a
+//! finished attempt is anchored before anything is told it finished. The
 //! record itself is the scheduling index; notifications are only an optimization.
 //! Recovery tolerates unpublished temporary files, never malformed live records.
 //! Execution is at least once: handlers must deduplicate their effects by run ID.
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
-use s3fs_core::{Fs, Inode, OpenFlags};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 use wasmtime_wasi::HostWallClock;
 
 use crate::clock::WallClockAdapter;
 use crate::state::State;
-use crate::tenant::ensure_dir;
+use crate::zfs::Zfs;
 
 const MAX_PAYLOAD: usize = 64 * 1024;
 const MAX_RECORD: usize = 1024 * 1024;
 const MAX_ATTEMPTS: u32 = 5;
-const DIR: &str = "/runtime/tasks";
+/// Under `/runtime`.
+const DIR: &str = "tasks";
 
 /// How long one attempt at a background task may run. Fixed, not a setting: a task that drives a
 /// round with an outside service waits on that service's schedule, which is minutes, and a limit
@@ -110,8 +112,8 @@ struct Records {
     last_tenant: Option<[u8; 16]>,
 }
 pub struct TaskQueue {
-    fs: Arc<Fs>,
-    dir: Arc<Inode>,
+    zfs: Arc<Zfs>,
+    dir: PathBuf,
     clock: Arc<WallClockAdapter>,
     pub limits: TaskLimits,
     records: Mutex<Records>,
@@ -119,7 +121,7 @@ pub struct TaskQueue {
 }
 impl TaskQueue {
     pub async fn open(
-        fs: Arc<Fs>,
+        zfs: Arc<Zfs>,
         clock: Arc<WallClockAdapter>,
         limits: TaskLimits,
     ) -> Result<Arc<Self>> {
@@ -130,10 +132,9 @@ impl TaskQueue {
                 && !limits.timeout.is_zero(),
             "task limits must be positive"
         );
-        let runtime = ensure_dir(&fs, &fs.root(), "runtime").await?;
-        let dir = ensure_dir(&fs, &runtime, "tasks").await?;
+        let dir = zfs.runtime_dir(DIR).await?;
         let queue = Arc::new(Self {
-            fs,
+            zfs,
             dir,
             clock,
             limits,
@@ -141,28 +142,28 @@ impl TaskQueue {
             changed: Notify::new(),
         });
         let mut records = queue.records.lock().await;
-        for entry in queue.fs.read_dir(&queue.dir).await? {
-            if entry.name.ends_with(".tmp") {
-                queue.fs.unlink(&queue.dir, &entry.name).await?;
+        let mut entries = tokio::fs::read_dir(&queue.dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry
+                .file_name()
+                .into_string()
+                .ok()
+                .context("non-UTF-8 task record name")?;
+            if name.ends_with(".tmp") {
+                tokio::fs::remove_file(entry.path()).await?;
                 continue;
             }
             ensure!(
                 records.tasks.len() < queue.limits.max_records,
                 "task store exceeds configured quota"
             );
-            let h = queue
-                .fs
-                .open(&format!("{DIR}/{}", entry.name), OpenFlags::read_only())
-                .await?;
-            let bytes = queue.fs.pread(&h, 0, MAX_RECORD + 1).await;
-            queue.fs.close(&h).await?;
-            let bytes = bytes?;
+            let bytes = tokio::fs::read(entry.path()).await?;
             ensure!(bytes.len() <= MAX_RECORD, "oversized task record");
             let mut task: Task = serde_json::from_slice(&bytes).context("decoding task record")?;
             ensure!(
                 task.version == 1
                     && valid_id(&task.id)
-                    && task.key() == entry.name
+                    && task.key() == name
                     && task.payload.len() <= MAX_PAYLOAD
                     && task.result.len() <= MAX_PAYLOAD
                     && task.interval_ms.is_none_or(|i| i >= 1000),
@@ -199,23 +200,10 @@ impl TaskQueue {
     async fn write(&self, task: &Task) -> Result<()> {
         let bytes = serde_json::to_vec(task)?;
         ensure!(bytes.len() <= MAX_RECORD, "task record exceeds limit");
-        let temp = format!("{}.tmp", task.key());
-        // Remove an unpublished write left by a cancelled host call.
-        match self.fs.unlink(&self.dir, &temp).await {
-            Ok(()) | Err(s3fs_core::FsError::NotFound) => {}
-            Err(e) => return Err(e.into()),
-        }
-        let h = self
-            .fs
-            .open(&format!("{DIR}/{temp}"), OpenFlags::create_new())
-            .await?;
-        let write = self.fs.pwrite(&h, 0, &bytes).await;
-        let close = self.fs.close(&h).await;
-        write?;
-        close?; // close commits the complete contents before publication
-        self.fs
-            .rename(&self.dir, &temp, &self.dir, &task.key())
-            .await?;
+        // Truncates an unpublished write left by a cancelled host call.
+        let temp = self.dir.join(format!("{}.tmp", task.key()));
+        tokio::fs::write(&temp, &bytes).await?;
+        tokio::fs::rename(&temp, self.dir.join(task.key())).await?;
         Ok(())
     }
     pub async fn enqueue(
@@ -232,7 +220,7 @@ impl TaskQueue {
             interval_ms.is_none_or(|i| i >= 1000),
             "interval must be at least 1000 ms"
         );
-        crate::tenant::existing_tenant_root(&self.fs, tenant).await?;
+        self.zfs.existing_tenant_dir(tenant).await?;
         let mut r = self.records.lock().await;
         let k = key(tenant, &id);
         if let Some(old) = r.tasks.get(&k) {
@@ -300,7 +288,7 @@ impl TaskQueue {
             !r.active.contains(&k) && r.tasks.get(&k).context("no such task")?.terminal(),
             "task is still active"
         );
-        self.fs.unlink(&self.dir, &k).await?;
+        tokio::fs::remove_file(self.dir.join(&k)).await?;
         r.tasks.remove(&k);
         Ok(())
     }
@@ -403,6 +391,12 @@ impl TaskQueue {
             Ok(None) => unreachable!(),
         }
         self.write(&current).await?;
+        // The outcome and whatever the guest wrote reach the anchor together,
+        // before anything — a waiting client, a wake — can be told of it.
+        self.zfs
+            .anchor()
+            .await
+            .context("anchoring a task outcome")?;
         // A failure is logged with its reason. The record is sealed, so
         // otherwise the only thing an operator sees is that five attempts
         // failed. The text is what the guest could already print to its own
@@ -528,8 +522,9 @@ pub fn add_to_linker(linker: &mut wasmtime::component::Linker<State>) -> wasmtim
 mod tests {
     use super::*;
     use crate::clock::{HostClock, TrustedClock};
-    use s3fs_core::backend::memory::MemoryBackend;
-    use s3fs_core::{Config, MasterSecret};
+    use crate::store::backend::memory::MemoryBackend;
+    use crate::store::crypto::{KeyMaterial, MasterSecret};
+    use crate::zfs::{Disk, Zfs};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[derive(Debug, Clone)]
@@ -546,18 +541,9 @@ mod tests {
         }
     }
     async fn queue(limits: TaskLimits) -> (Arc<TaskQueue>, Clock) {
-        let backend = Arc::new(MemoryBackend::new());
-        let fs = Fs::create(
-            backend.clone(),
-            backend,
-            &MasterSecret::from_bytes([9; 32]),
-            [1; 16],
-            Arc::new(Config::default()),
-        )
-        .await
-        .unwrap();
+        let fs = Zfs::scratch().await;
         for tenant in [[1; 16], [2; 16]] {
-            crate::tenant::tenant_root_by_id(&fs, tenant).await.unwrap();
+            fs.tenant_dir(tenant).await.unwrap();
         }
         let clock = Clock(Arc::new(AtomicU64::new(1000)));
         let queue = TaskQueue::open(
@@ -627,7 +613,7 @@ mod tests {
         add(&q, 1, "job", 0).await;
         let task = q.due().await.unwrap();
         assert!(q.begin(&task).await.unwrap());
-        let fs = q.fs.clone();
+        let fs = q.zfs.clone();
         let timer = q.clock.clone();
         drop(q);
         let recovered = TaskQueue::open(fs, timer, Default::default())
@@ -646,7 +632,7 @@ mod tests {
         assert_eq!(result.status, Status::Completed);
         assert_eq!(result.result, b"done");
         let reopened = TaskQueue::open(
-            recovered.fs.clone(),
+            recovered.zfs.clone(),
             recovered.clock.clone(),
             Default::default(),
         )
@@ -759,18 +745,11 @@ mod tests {
         // separates five real invocations from one cached result replayed five
         // times. The directory itself exists because the guest creates it
         // before it looks at the payload.
-        let root = crate::tenant::existing_tenant_root(&q.fs, [1; 16])
-            .await
-            .unwrap();
-        let dir = q.fs.lookup_at(&root, "http-example").await.unwrap();
-        let tasks = q.fs.lookup_at(&dir, "tasks").await.unwrap();
-        let names: Vec<String> =
-            q.fs.read_dir(&tasks)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|e| e.name)
-                .collect();
+        let tasks = q.zfs.tenant_path([1; 16]).join("http-example/tasks");
+        let names: Vec<String> = std::fs::read_dir(tasks)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
         assert!(
             !names.iter().any(|n| n.starts_with("job")),
             "a task that only ever failed still wrote a result: {names:?}"
@@ -796,23 +775,14 @@ mod tests {
     #[tokio::test]
     async fn unpublished_files_are_ignored_but_live_corruption_is_refused() {
         let (q, _) = queue(Default::default()).await;
-        let h =
-            q.fs.open(&format!("{DIR}/orphan.tmp"), OpenFlags::create_new())
-                .await
-                .unwrap();
-        q.fs.pwrite(&h, 0, b"incomplete").await.unwrap();
-        q.fs.close(&h).await.unwrap();
-        let recovered = TaskQueue::open(q.fs.clone(), q.clock.clone(), Default::default())
+        std::fs::write(q.dir.join("orphan.tmp"), b"incomplete").unwrap();
+        let recovered = TaskQueue::open(q.zfs.clone(), q.clock.clone(), Default::default())
             .await
             .unwrap();
         assert!(recovered.due().await.is_none());
-        let h =
-            q.fs.open(&format!("{DIR}/bad"), OpenFlags::create_new())
-                .await
-                .unwrap();
-        q.fs.close(&h).await.unwrap();
+        std::fs::write(q.dir.join("bad"), b"").unwrap();
         assert!(
-            TaskQueue::open(q.fs.clone(), q.clock.clone(), Default::default())
+            TaskQueue::open(q.zfs.clone(), q.clock.clone(), Default::default())
                 .await
                 .is_err()
         );
@@ -829,7 +799,7 @@ mod tests {
         let bytes = std::fs::read(path).expect("build examples/guest-http for wasm32-wasip2");
         let (logs, _collector) = crate::guest_io::start(Arc::new(crate::TracingLogSink));
         let env = crate::GuestEnvironment::new(
-            q.fs.clone(),
+            q.zfs.clone(),
             Box::new(HostClock),
             Arc::new(nitro_nsm::fake::FakeNsm::new()),
             &[],
@@ -893,7 +863,7 @@ mod tests {
         );
         assert_eq!(request(&handle, 2, "GET", "/tasks/job", b"").await.0, 404);
         drop(handle);
-        let reopened = TaskQueue::open(q.fs.clone(), q.clock.clone(), Default::default())
+        let reopened = TaskQueue::open(q.zfs.clone(), q.clock.clone(), Default::default())
             .await
             .unwrap();
         clock.0.store(20_000, Ordering::Relaxed);
@@ -907,16 +877,7 @@ mod tests {
         );
         let record = reopened.status([1; 16], "job").await.unwrap();
         assert_eq!(record.result, b"alice");
-        assert!(q
-            .fs
-            .lookup_at(
-                &crate::tenant::existing_tenant_root(&q.fs, [2; 16])
-                    .await
-                    .unwrap(),
-                "http-example"
-            )
-            .await
-            .is_err());
+        assert!(!q.zfs.tenant_path([2; 16]).join("http-example").exists());
         assert_eq!(request(&handle, 1, "GET", "/tasks/job", b"").await.0, 200);
     }
     #[tokio::test]
@@ -952,21 +913,16 @@ mod tests {
         assert_eq!(request(&handle, 1, "GET", "/memory", b"").await.0, 200);
     }
     #[tokio::test]
-    async fn published_task_survives_a_fresh_filesystem_mount() {
+    async fn published_task_survives_reopening_the_pool() {
         let backend = Arc::new(MemoryBackend::new());
         let master = MasterSecret::from_bytes([7; 32]);
-        let fs = Fs::create(
-            backend.clone(),
-            backend.clone(),
-            &master,
-            [8; 16],
-            Arc::new(Config::default()),
-        )
-        .await
-        .unwrap();
-        crate::tenant::tenant_root_by_id(&fs, [1; 16])
+        let keys = Arc::new(KeyMaterial::derive(&master, [8; 16]).unwrap());
+        let disk = Disk::scratch().unwrap();
+        let day = Duration::from_secs(86_400);
+        let fs = Zfs::create(&disk, backend.clone(), keys.clone(), &master, "", day)
             .await
             .unwrap();
+        fs.tenant_dir([1; 16]).await.unwrap();
         let clock = Arc::new(WallClockAdapter::new(Box::new(HostClock)).unwrap());
         let q = TaskQueue::open(fs.clone(), clock.clone(), Default::default())
             .await
@@ -975,16 +931,9 @@ mod tests {
         let run_id = q.status([1; 16], "durable").await.unwrap().run_id();
         drop(q);
         drop(fs);
-        let fs = Fs::mount(
-            backend.clone(),
-            backend,
-            &master,
-            [8; 16],
-            Arc::new(Config::default()),
-            None,
-        )
-        .await
-        .unwrap();
+        let fs = Zfs::open(&disk, backend, keys, &master, "", day, None)
+            .await
+            .unwrap();
         let reopened = TaskQueue::open(fs, clock, Default::default())
             .await
             .unwrap();
@@ -1008,19 +957,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires built guest-http component"]
     async fn a_recurring_task_fires_again_through_the_running_scheduler() {
-        let backend = Arc::new(MemoryBackend::new());
-        let fs = Fs::create(
-            backend.clone(),
-            backend,
-            &MasterSecret::from_bytes([9; 32]),
-            [1; 16],
-            Arc::new(Config::default()),
-        )
-        .await
-        .unwrap();
-        crate::tenant::tenant_root_by_id(&fs, [1; 16])
-            .await
-            .unwrap();
+        let fs = Zfs::scratch().await;
+        fs.tenant_dir([1; 16]).await.unwrap();
         let q = TaskQueue::open(
             fs,
             Arc::new(WallClockAdapter::new(Box::new(HostClock)).unwrap()),
@@ -1043,21 +981,14 @@ mod tests {
         let names = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 assert!(!worker.is_finished(), "scheduler stopped");
-                if let Ok(root) = crate::tenant::existing_tenant_root(&q.fs, [1; 16]).await {
-                    if let Ok(dir) = q.fs.lookup_at(&root, "http-example").await {
-                        if let Ok(tasks) = q.fs.lookup_at(&dir, "tasks").await {
-                            let names: Vec<String> =
-                                q.fs.read_dir(&tasks)
-                                    .await
-                                    .unwrap()
-                                    .into_iter()
-                                    .map(|e| e.name)
-                                    .filter(|n| n.starts_with("beat"))
-                                    .collect();
-                            if names.len() >= 2 {
-                                return names;
-                            }
-                        }
+                let tasks = q.zfs.tenant_path([1; 16]).join("http-example/tasks");
+                if let Ok(entries) = std::fs::read_dir(tasks) {
+                    let names: Vec<String> = entries
+                        .map(|e| e.unwrap().file_name().into_string().unwrap())
+                        .filter(|n| n.starts_with("beat"))
+                        .collect();
+                    if names.len() >= 2 {
+                        return names;
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1136,13 +1067,10 @@ mod tests {
         let (q, _) = queue(Default::default()).await;
         let handle = guest(&q).await;
         add(&q, 1, "job", 0).await;
-        let parent = q.fs.lookup_at(&q.fs.root(), "tenants").await.unwrap();
-        q.fs.rmdir(&parent, &hex::encode([1; 16])).await.unwrap();
+        std::fs::remove_dir_all(q.zfs.tenant_path([1; 16])).unwrap();
         let task = q.due().await.unwrap();
         assert!(handle.run_background(&q, &task).await.is_err());
-        assert!(crate::tenant::existing_tenant_root(&q.fs, [1; 16])
-            .await
-            .is_err());
+        assert!(!q.zfs.tenant_path([1; 16]).exists());
     }
     #[tokio::test]
     #[ignore = "requires built guest-http component"]
@@ -1154,9 +1082,7 @@ mod tests {
         .await;
         let handle = guest(&q).await;
         for tenant in 1..=16 {
-            crate::tenant::tenant_root_by_id(&q.fs, [tenant; 16])
-                .await
-                .unwrap();
+            q.zfs.tenant_dir([tenant; 16]).await.unwrap();
             for job in 0..3 {
                 add(&q, tenant, &format!("job-{job}"), 0).await;
             }

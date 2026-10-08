@@ -1,20 +1,25 @@
-//! Turning configuration into a mounted filesystem.
+//! Turning configuration into a connection to the roots bucket.
+//!
+//! The bucket holds what must outlive any disk and that no host may rewrite:
+//! the pool's anchor chain, the state-origin receipt and pair records, the
+//! sealed master key's pointer, the guest, and the sealed ACME cache. The
+//! state itself is on the pool — see [`crate::zfs`].
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::store::backend::{AwsS3Backend, AwsS3BackendConfig, Backend};
 use anyhow::{Context, Result};
-use s3fs_core::backend::{AwsS3Backend, AwsS3BackendConfig, Backend};
-use s3fs_core::crypto::KeyMaterial;
-use s3fs_core::{Config, Fs, MasterSecret};
 
-/// Everything needed to open the store.
+/// How long each anchor and boot record is locked by default: ten years, per
+/// the deployment contract.
+pub const DEFAULT_ROOT_RETENTION: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
+/// Everything needed to reach the store.
 #[derive(Debug, Clone)]
 pub struct MountConfig {
-    /// Bucket holding the data slabs.
-    pub bucket: String,
-    /// Bucket holding the signed root records. `None` uses `bucket`.
-    pub roots_bucket: Option<String>,
+    /// The Object-Locked bucket: anchors, boot records, guest, ACME cache.
+    pub roots_bucket: String,
     pub region: String,
     pub endpoint: Option<String>,
     pub access_key_id: Option<String>,
@@ -22,24 +27,23 @@ pub struct MountConfig {
     pub session_token: Option<String>,
     pub force_path_style: bool,
     pub bucket_prefix: String,
-    pub mount_path: String,
     /// Filesystem identifier, the key-derivation salt.
     pub fs_id: [u8; 16],
-    /// Refuse to mount a root older than this.
+    /// Refuse a store whose newest anchor is older than this.
     pub min_root_seq: Option<u64>,
     /// Skip the `HeadBucket` startup probe.
     pub skip_bucket_probe: bool,
     pub request_timeout: Duration,
-    /// How long each root record, and every record the boot writes beside
-    /// them, is locked against deletion (Object Lock, COMPLIANCE). Rollback
-    /// protection lasts exactly this long, and so does the roots bucket.
+    /// How long each anchor, and every record the boot writes beside them, is
+    /// locked against deletion (Object Lock, COMPLIANCE). Rollback protection
+    /// lasts exactly this long, and so does the bucket.
     pub root_retention: Duration,
 }
 
 impl MountConfig {
-    fn backend_config(&self, bucket: &str) -> AwsS3BackendConfig {
+    fn backend_config(&self) -> AwsS3BackendConfig {
         AwsS3BackendConfig {
-            bucket: bucket.to_string(),
+            bucket: self.roots_bucket.clone(),
             region: self.region.clone(),
             endpoint: self.endpoint.clone(),
             access_key_id: self.access_key_id.clone(),
@@ -54,14 +58,6 @@ impl MountConfig {
             force_path_style: self.force_path_style,
             request_timeout: self.request_timeout,
         }
-    }
-
-    fn fs_config(&self) -> Config {
-        Config::builder()
-            .bucket_prefix(self.bucket_prefix.clone())
-            .mount_path(self.mount_path.clone())
-            .root_retention(Some(self.root_retention))
-            .build()
     }
 }
 
@@ -79,155 +75,16 @@ pub fn parse_fs_id(s: &str) -> Result<[u8; 16]> {
     Ok(out)
 }
 
-/// A mounted filesystem, plus the pieces a runtime needs alongside it.
-///
-/// `Debug` names the store rather than dumping the filesystem: an `Fs` renders
-/// its whole handle table, which is noise in a boot log and unbounded in a
-/// panic message.
-///
-/// The ACME cache writes sealed objects to the data bucket and seals them
-/// under a key derived from the same master secret, so it needs both — but it
-/// deliberately does *not* go through the filesystem, because the guest's
-/// preopen is the filesystem root and the blob contains a TLS private key.
-pub struct Mounted {
-    pub fs: Arc<Fs>,
-    pub data: Arc<dyn Backend>,
-    pub keys: Arc<KeyMaterial>,
-    pub bucket_prefix: String,
-}
-
-impl std::fmt::Debug for Mounted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Mounted")
-            .field("bucket_prefix", &self.bucket_prefix)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Both backends, connected but not yet mounted.
-///
-/// Separate from mounting because the boot machine has to *read* the store —
-/// the state-origin receipt lives in the roots bucket — before it can decide
-/// whether this is a genesis or a resume, and only after deciding does it know
-/// which master secret to use.
-pub struct Backends {
-    pub data: Arc<dyn Backend>,
-    pub roots: Arc<dyn Backend>,
-}
-
-/// Connect to both buckets.
-pub async fn connect(config: &MountConfig) -> Result<Backends> {
-    let data_cfg = config.backend_config(&config.bucket);
-    let data: Arc<dyn Backend> = Arc::new(if config.skip_bucket_probe {
-        AwsS3Backend::connect_unchecked(data_cfg).await?
+/// Connect to the roots bucket.
+pub async fn connect(config: &MountConfig) -> Result<Arc<dyn Backend>> {
+    let backend = if config.skip_bucket_probe {
+        AwsS3Backend::connect_unchecked(config.backend_config()).await?
     } else {
-        AwsS3Backend::connect(data_cfg)
+        AwsS3Backend::connect(config.backend_config())
             .await
-            .context("connecting to the data bucket")?
-    });
-
-    let roots_name = config.roots_bucket.as_deref().unwrap_or(&config.bucket);
-    let roots: Arc<dyn Backend> = if roots_name == config.bucket {
-        // One bucket for both. Simpler to operate, but the anchor and the
-        // reclaimable data then share a retention policy, which defeats the
-        // point of splitting them.
-        tracing::warn!(
-            bucket = %config.bucket,
-            "roots and data share a bucket; Object Lock retention cannot then \
-             differ between the rollback anchor and reclaimable block storage"
-        );
-        data.clone()
-    } else {
-        Arc::new(AwsS3Backend::connect_unchecked(config.backend_config(roots_name)).await?)
+            .context("connecting to the roots bucket")?
     };
-
-    Ok(Backends { data, roots })
-}
-
-/// Mount an existing filesystem with a secret the caller has already resolved.
-pub async fn mount_existing(
-    backends: &Backends,
-    config: &MountConfig,
-    master: &MasterSecret,
-) -> Result<Mounted> {
-    finish(backends, config, master, false).await
-}
-
-/// Create a filesystem. Only genesis calls this.
-pub async fn create(
-    backends: &Backends,
-    config: &MountConfig,
-    master: &MasterSecret,
-) -> Result<Mounted> {
-    finish(backends, config, master, true).await
-}
-
-async fn finish(
-    backends: &Backends,
-    config: &MountConfig,
-    master: &MasterSecret,
-    genesis: bool,
-) -> Result<Mounted> {
-    let data = backends.data.clone();
-    let roots = backends.roots.clone();
-
-    let fs_config = config.fs_config();
-
-    // Derived twice — once here and once inside `Fs::mount` — rather than
-    // reaching into the store for them. The derivation is cheap and pure, and
-    // threading them out would widen the store's API for one caller.
-    let derived = Arc::new(
-        KeyMaterial::derive(master, config.fs_id)
-            .map_err(|e| anyhow::anyhow!("deriving keys: {e}"))?,
-    );
-
-    let fs = if genesis {
-        Fs::create(
-            data.clone(),
-            roots,
-            master,
-            config.fs_id,
-            Arc::new(fs_config),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("creating filesystem: {e}"))?
-    } else {
-        Fs::mount(
-            data.clone(),
-            roots,
-            master,
-            config.fs_id,
-            Arc::new(fs_config),
-            config.min_root_seq,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("mounting filesystem: {e}"))?
-    };
-
-    // The operator's evidence of which committed state this process came up
-    // on. Under attestation this is what the health endpoint reports, and it
-    // is the number to compare against an external freshness floor.
-    let root = fs
-        .store()
-        .root()
-        .await
-        .map_err(|e| anyhow::anyhow!("reading root record: {e}"))?;
-    tracing::info!(
-        mode = if genesis { "genesis" } else { "resume" },
-        root_seq = root.seq,
-        txg = root.txg,
-        merkle_root = %root.merkle_root(),
-        data_bucket = %config.bucket,
-        roots_bucket = %config.roots_bucket.as_deref().unwrap_or(&config.bucket),
-        "mounted"
-    );
-
-    Ok(Mounted {
-        fs,
-        data,
-        keys: derived,
-        bucket_prefix: config.bucket_prefix.clone(),
-    })
+    Ok(Arc::new(backend))
 }
 
 #[cfg(test)]
@@ -251,8 +108,7 @@ mod tests {
 
     fn config() -> MountConfig {
         MountConfig {
-            bucket: "data".into(),
-            roots_bucket: None,
+            roots_bucket: "roots".into(),
             region: "us-east-1".into(),
             endpoint: None,
             access_key_id: None,
@@ -260,7 +116,6 @@ mod tests {
             session_token: None,
             force_path_style: false,
             bucket_prefix: String::new(),
-            mount_path: "/".into(),
             fs_id: [0u8; 16],
             min_root_seq: None,
             skip_bucket_probe: true,
@@ -269,32 +124,15 @@ mod tests {
         }
     }
 
-    /// The image's retention reaches the root records, not the store's ten-year default.
-    #[test]
-    fn root_records_are_locked_for_the_configured_retention() {
-        let cfg = config();
-        assert_eq!(
-            cfg.fs_config().store.root_retention,
-            Some(cfg.root_retention)
-        );
-    }
-
-    #[test]
-    fn the_roots_bucket_defaults_to_the_data_bucket() {
-        let cfg = config();
-        assert_eq!(cfg.roots_bucket.as_deref().unwrap_or(&cfg.bucket), "data");
-        assert_eq!(cfg.backend_config("roots").bucket, "roots");
-    }
-
     /// Production sets no keys. A store client without a provider signs nothing, and that shows
     /// only on hardware, at the first request of the boot.
     #[test]
     fn without_keys_the_store_signs_as_the_instance_role() {
         let mut cfg = config();
-        assert!(cfg.backend_config("data").credentials_provider.is_some());
+        assert!(cfg.backend_config().credentials_provider.is_some());
 
         cfg.access_key_id = Some("minio".into());
         cfg.secret_access_key = Some("minio".into());
-        assert!(cfg.backend_config("data").credentials_provider.is_none());
+        assert!(cfg.backend_config().credentials_provider.is_none());
     }
 }

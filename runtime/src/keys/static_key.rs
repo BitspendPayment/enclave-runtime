@@ -1,14 +1,14 @@
 //! The development key source: a secret from configuration, stored in the clear.
 
+use crate::store::MasterSecret;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use s3fs_core::MasterSecret;
 
 use super::{MasterKeySource, SealedKey};
 
 /// Marks a blob that is not sealed at all, so that nothing can mistake one for
 /// protection, and so a real source can refuse to open one.
-const UNSEALED_MAGIC: &[u8] = b"s3fs-UNSEALED-development-key-v1\n";
+const UNSEALED_MAGIC: &[u8] = b"enclave-UNSEALED-development-key-v1\n";
 
 /// A secret supplied by configuration, stored in the clear.
 ///
@@ -89,7 +89,7 @@ mod tests {
     }
 
     /// Resume recovers from the *blob*, not from configuration. A deployment
-    /// whose `S3FS_MASTER_KEY` has drifted must still open the filesystem it
+    /// whose `ENCLAVE_MASTER_KEY` has drifted must still open the filesystem it
     /// created, or the drift would be discovered as unreadable data.
     #[tokio::test]
     async fn opening_uses_the_blob_rather_than_the_configured_secret() {

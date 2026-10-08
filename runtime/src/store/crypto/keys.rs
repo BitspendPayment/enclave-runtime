@@ -13,35 +13,30 @@
 //!             HKDF-SHA384(salt = fs_uuid, info = purpose)
 //!         ┌──────────────────┼──────────────────┐
 //!         ▼                  ▼                  ▼
-//!   block AEAD key     Ed25519 seed        dir-hash key
-//!   (AES-256-GCM)      (root signing)      (keyed BLAKE3)
+//!   Ed25519 seed       runtime seal key     pool dm-crypt key
+//!   (anchor signing)   (AES-256-GCM)        (AES-XTS, via [`hkdf`])
 //! ```
 //!
 //! Separate keys per purpose so that a weakness in one use cannot be pivoted
-//! into another — in particular, the directory hash key is exposed to
-//! chosen-input attacks (a guest picks filenames) in a way the block key
-//! never is.
+//! into another.
 
 use aws_lc_rs::aead::{LessSafeKey, UnboundKey, AES_256_GCM};
 use aws_lc_rs::hkdf::{KeyType, Salt, HKDF_SHA384};
 use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::errors::{FsError, FsResult};
+use crate::store::error::{StoreError, StoreResult};
 
 /// HKDF info strings. Versioned so a future format revision can rotate
 /// derived keys without changing the master secret.
-const INFO_BLOCK: &[u8] = b"s3fs/block/v1";
-const INFO_ROOTSIGN: &[u8] = b"s3fs/rootsign/v1";
-const INFO_DIRHASH: &[u8] = b"s3fs/dirhash/v1";
+const INFO_ROOTSIGN: &[u8] = b"enclave/anchor-sign/v1";
 /// Seals the runtime's own secrets — the ACME account key and the TLS
-/// certificate's private key — which live outside the filesystem.
+/// certificate's private key — which live in the roots bucket.
 ///
-/// Outside, because a tenant's guest is confined to its own directory but the
-/// runtime's own material must be unreachable from *any* of them. A separate
-/// label keeps it cryptographically distinct from block data as well as
-/// physically separate.
-const INFO_RUNTIME_SEAL: &[u8] = b"s3fs/runtime-seal/v1";
+/// In the bucket rather than on the pool, because a certificate has to be
+/// served before anything else is, and a separate label keeps it
+/// cryptographically distinct from everything else derived here.
+const INFO_RUNTIME_SEAL: &[u8] = b"enclave/runtime-seal/v1";
 
 /// Length of an Ed25519 public key and of a raw signing seed.
 pub const ED25519_PUBLIC_KEY_LEN: usize = 32;
@@ -70,25 +65,25 @@ impl MasterSecret {
 
     /// Parse a 64-character hex string, as supplied by `--data-key` or an
     /// environment variable in development.
-    pub fn from_hex(s: &str) -> FsResult<Self> {
+    pub fn from_hex(s: &str) -> StoreResult<Self> {
         let s = s.trim();
         if s.len() != 64 {
-            return Err(FsError::Invalid("master key must be 64 hex characters"));
+            return Err(StoreError::Invalid("master key must be 64 hex characters"));
         }
         let mut out = [0u8; 32];
         for (i, byte) in out.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-                .map_err(|_| FsError::Invalid("master key is not valid hex"))?;
+                .map_err(|_| StoreError::Invalid("master key is not valid hex"))?;
         }
         Ok(MasterSecret(out))
     }
 
     /// Generate a fresh random secret. Used when formatting a new filesystem
     /// in development; production keys come from KMS.
-    pub fn generate() -> FsResult<Self> {
+    pub fn generate() -> StoreResult<Self> {
         let mut out = [0u8; 32];
         aws_lc_rs::rand::fill(&mut out)
-            .map_err(|_| FsError::Io("system RNG unavailable".to_string()))?;
+            .map_err(|_| StoreError::Io("system RNG unavailable".to_string()))?;
         Ok(MasterSecret(out))
     }
 }
@@ -109,20 +104,20 @@ impl KeyType for OkmLen {
     }
 }
 
-fn hkdf(secret: &MasterSecret, salt: &[u8], info: &[u8], out: &mut [u8]) -> FsResult<()> {
+/// HKDF-SHA384 from the master secret. Public for keys that live outside
+/// [`KeyMaterial`], such as the pool's dm-crypt key.
+pub fn hkdf(secret: &MasterSecret, salt: &[u8], info: &[u8], out: &mut [u8]) -> StoreResult<()> {
     let prk = Salt::new(HKDF_SHA384, salt).extract(&secret.0);
     prk.expand(&[info], OkmLen(out.len()))
         .and_then(|okm| okm.fill(out))
-        .map_err(|_| FsError::Io("HKDF expansion failed".to_string()))
+        .map_err(|_| StoreError::Io("HKDF expansion failed".to_string()))
 }
 
 /// All keys derived from one master secret, for one filesystem.
 pub struct KeyMaterial {
-    block_key: LessSafeKey,
     runtime_seal_key: LessSafeKey,
     signing_key: Ed25519KeyPair,
     public_key: [u8; ED25519_PUBLIC_KEY_LEN],
-    dir_hash_key: [u8; 32],
     fs_uuid: [u8; 16],
 }
 
@@ -130,49 +125,32 @@ impl KeyMaterial {
     /// Derive every per-purpose key.
     ///
     /// `fs_uuid` is the HKDF salt, so two filesystems formatted from the same
-    /// master secret still get independent keys. It is stored in the root
-    /// record, and is not a secret.
-    pub fn derive(master: &MasterSecret, fs_uuid: [u8; 16]) -> FsResult<Self> {
-        let mut block_bytes = [0u8; 32];
-        hkdf(master, &fs_uuid, INFO_BLOCK, &mut block_bytes)?;
-        let block_key = LessSafeKey::new(
-            UnboundKey::new(&AES_256_GCM, &block_bytes)
-                .map_err(|_| FsError::Io("AES key setup failed".to_string()))?,
-        );
-        block_bytes.zeroize();
-
+    /// master secret still get independent keys. It is in every anchor, and
+    /// is not a secret.
+    pub fn derive(master: &MasterSecret, fs_uuid: [u8; 16]) -> StoreResult<Self> {
         let mut seal_bytes = [0u8; 32];
         hkdf(master, &fs_uuid, INFO_RUNTIME_SEAL, &mut seal_bytes)?;
         let runtime_seal_key = LessSafeKey::new(
             UnboundKey::new(&AES_256_GCM, &seal_bytes)
-                .map_err(|_| FsError::Io("AES key setup failed".to_string()))?,
+                .map_err(|_| StoreError::Io("AES key setup failed".to_string()))?,
         );
         seal_bytes.zeroize();
 
         let mut seed = [0u8; 32];
         hkdf(master, &fs_uuid, INFO_ROOTSIGN, &mut seed)?;
         let signing_key = Ed25519KeyPair::from_seed_unchecked(&seed)
-            .map_err(|_| FsError::Io("Ed25519 key derivation failed".to_string()))?;
+            .map_err(|_| StoreError::Io("Ed25519 key derivation failed".to_string()))?;
         seed.zeroize();
 
         let mut public_key = [0u8; ED25519_PUBLIC_KEY_LEN];
         public_key.copy_from_slice(signing_key.public_key().as_ref());
 
-        let mut dir_hash_key = [0u8; 32];
-        hkdf(master, &fs_uuid, INFO_DIRHASH, &mut dir_hash_key)?;
-
         Ok(KeyMaterial {
-            block_key,
             runtime_seal_key,
             signing_key,
             public_key,
-            dir_hash_key,
             fs_uuid,
         })
-    }
-
-    pub fn block_key(&self) -> &LessSafeKey {
-        &self.block_key
     }
 
     /// Seals runtime secrets stored outside the filesystem. See
@@ -185,24 +163,14 @@ impl KeyMaterial {
         &self.signing_key
     }
 
-    /// Public half of the root-signing key. Written into each root record so
-    /// an external auditor can verify the chain without the master secret.
+    /// Public half of the anchor-signing key. Written into each anchor so an
+    /// external auditor can verify the chain without the master secret.
     pub fn public_key(&self) -> &[u8; ED25519_PUBLIC_KEY_LEN] {
         &self.public_key
     }
 
-    pub fn dir_hash_key(&self) -> &[u8; 32] {
-        &self.dir_hash_key
-    }
-
     pub fn fs_uuid(&self) -> &[u8; 16] {
         &self.fs_uuid
-    }
-}
-
-impl Drop for KeyMaterial {
-    fn drop(&mut self) {
-        self.dir_hash_key.zeroize();
     }
 }
 
@@ -232,7 +200,6 @@ mod tests {
         let a = KeyMaterial::derive(&master(), [1u8; 16]).unwrap();
         let b = KeyMaterial::derive(&master(), [1u8; 16]).unwrap();
         assert_eq!(a.public_key(), b.public_key());
-        assert_eq!(a.dir_hash_key(), b.dir_hash_key());
     }
 
     /// The salt is what keeps two filesystems formatted from the same master
@@ -242,7 +209,6 @@ mod tests {
         let a = KeyMaterial::derive(&master(), [1u8; 16]).unwrap();
         let b = KeyMaterial::derive(&master(), [2u8; 16]).unwrap();
         assert_ne!(a.public_key(), b.public_key());
-        assert_ne!(a.dir_hash_key(), b.dir_hash_key());
     }
 
     #[test]
@@ -250,17 +216,17 @@ mod tests {
         let a = KeyMaterial::derive(&MasterSecret::from_bytes([1u8; 32]), [0u8; 16]).unwrap();
         let b = KeyMaterial::derive(&MasterSecret::from_bytes([2u8; 32]), [0u8; 16]).unwrap();
         assert_ne!(a.public_key(), b.public_key());
-        assert_ne!(a.dir_hash_key(), b.dir_hash_key());
     }
 
-    /// Purpose separation: the signing seed and the directory hash key are
-    /// derived from the same secret and salt, differing only in the info
-    /// string. If those collided, the info strings would not be doing
-    /// anything.
+    /// Purpose separation: two keys from the same secret and salt, differing
+    /// only in the info string. If those collided, the info strings would not
+    /// be doing anything.
     #[test]
     fn purposes_are_separated() {
-        let km = KeyMaterial::derive(&master(), [0u8; 16]).unwrap();
-        assert_ne!(&km.dir_hash_key()[..], &km.public_key()[..]);
+        let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
+        hkdf(&master(), &[0u8; 16], INFO_ROOTSIGN, &mut a).unwrap();
+        hkdf(&master(), &[0u8; 16], INFO_RUNTIME_SEAL, &mut b).unwrap();
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -298,6 +264,6 @@ mod tests {
 
         let km = KeyMaterial::derive(&m, [0u8; 16]).unwrap();
         let s = format!("{km:?}");
-        assert!(!s.contains(&hex16(km.dir_hash_key())));
+        assert!(!s.contains("abab"));
     }
 }

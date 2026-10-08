@@ -21,8 +21,6 @@ use std::sync::{Arc, Mutex};
 use enclave_runtime::{GuestEnvironment, HostClock, ServeConfig, TlsIdentity};
 use nitro_attestation::testing::TestChain;
 use nitro_nsm::{AttestationRequest, Nsm};
-use s3fs_core::backend::memory::MemoryBackend;
-use s3fs_core::{Config, Fs, MasterSecret};
 
 fn component_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -149,16 +147,7 @@ struct Harness {
 }
 
 async fn start() -> Harness {
-    let backend = Arc::new(MemoryBackend::new());
-    let fs = Fs::create(
-        backend.clone(),
-        backend,
-        &MasterSecret::from_bytes([11u8; 32]),
-        [0u8; 16],
-        Arc::new(Config::default()),
-    )
-    .await
-    .expect("creating the filesystem");
+    let fs = enclave_runtime::Zfs::scratch().await;
 
     let nsm = Arc::new(SigningNsm::new());
     let guest_bytes = std::fs::read(component_path()).unwrap_or_else(|e| {

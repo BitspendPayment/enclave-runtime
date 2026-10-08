@@ -844,7 +844,7 @@ impl LogDestination for CloudWatchDestination {
 /// Decide whether an SDK error is worth retrying.
 ///
 /// Driven by the service's own error code, never by matching on a `Debug`
-/// string — the same discipline as `s3fs_core::backend::aws::map_sdk_error`.
+/// string — the same discipline as `crate::store::backend::aws::map_sdk_error`.
 fn classify<E, R>(error: aws_sdk_cloudwatchlogs::error::SdkError<E, R>) -> PutError
 where
     E: aws_sdk_cloudwatchlogs::error::ProvideErrorMetadata + std::fmt::Debug,
