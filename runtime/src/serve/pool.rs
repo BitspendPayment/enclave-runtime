@@ -1,12 +1,13 @@
-//! Live tenants: one directory, one warm instance and one lock per client.
+//! Live tenants: one lock per client.
 //!
-//! ## What is kept, and why that and not something else
+//! ## Only the lock is kept
 //!
-//! A client's directory is a dataset on the pool, found once; instantiating
-//! the guest is 24 µs and no I/O at all. The warm instance is what is kept, so
-//! a client's in-memory state survives between its requests, and the lock.
+//! Every request, task run and message gets a fresh instance over its
+//! tenant's dataset, dropped when the call ends — instantiating is 24 µs and no
+//! I/O. Nothing a guest holds in memory survives a call, so there is nothing
+//! to invalidate when background work changes the dataset underneath it.
 //!
-//! ## The lock is a correctness mechanism, not only a cache
+//! ## The lock is a correctness mechanism
 //!
 //! Each client has its own `tokio::Mutex`, and that is the whole concurrency
 //! model: **a client is serialised against itself and against nobody else.**
@@ -16,32 +17,26 @@
 //! dataset is theirs alone, so there is nothing for two clients to contend
 //! over in it. (Anchors are serialised across everyone — see [`crate::zfs`].)
 //!
-//! ## Why anonymous callers get nothing
+//! ## Keyed by tenant id
 //!
-//! A slot is keyed by the SHA-256 of a client's TLS public key, which the
-//! handshake proves. A caller who presented no certificate has no key to be
-//! identified by, so they get a fresh instance and never occupy a slot —
-//! otherwise anyone who could open a socket could fill the pool and evict
-//! every real client's instance.
+//! The id the gate resolved from a passkey assertion. Callers with no tenant
+//! never get a slot; they share one lock of their own in the serving path.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// How large the pool may grow, and how long an idle tenant is kept.
+/// How many tenants' locks are held, and how long an idle one is kept.
 ///
-/// Both matter more than they look. A tenant costs a wasm linear memory, so a
-/// pool sized by hope rather than arithmetic is an enclave that dies of memory
-/// exhaustion under exactly the load it was built for.
+/// A slot is a lock and two counters, so the cap bounds a map, not memory
+/// worth worrying about. It stays because registration is open: without one,
+/// every passkey that ever called would keep an entry for the life of the
+/// process.
 #[derive(Debug, Clone)]
 pub struct PoolLimits {
     pub max_tenants: usize,
     pub idle_timeout: Duration,
-    /// Calls one instance serves before it is rebuilt. Wasm linear memory
-    /// never shrinks, so an instance that lives forever only grows.
-    pub max_requests_per_instance: u64,
 }
 
 impl Default for PoolLimits {
@@ -49,24 +44,8 @@ impl Default for PoolLimits {
         PoolLimits {
             max_tenants: 64,
             idle_timeout: Duration::from_secs(900),
-            max_requests_per_instance: 10_000,
         }
     }
-}
-
-/// A client's directory, and its warm instance.
-///
-/// `dir` is the dataset this client's guest calls `/`. The pool itself is
-/// shared and is not here.
-///
-/// `instance` is an `Option` so a trap can discard the poisoned linear memory
-/// while keeping the resolved directory. That is cheap either way; what it
-/// mainly buys is that one client's trap is visible to nobody else.
-pub struct LiveTenant<I> {
-    pub dir: PathBuf,
-    pub tenant_id: [u8; 16],
-    pub instance: Option<I>,
-    pub requests: u64,
 }
 
 /// One client's slot.
@@ -75,26 +54,26 @@ pub struct LiveTenant<I> {
 /// eviction sweep has to compare tenants without awaiting on any of them, and a
 /// sweep that could block on a busy tenant would be a sweep that stalls the
 /// server it is tidying.
-pub struct Slot<I> {
+pub struct Slot {
     /// `Arc`'d so a request can take an *owned* guard and carry it into the
     /// task that runs the guest — the lock has to outlive the response head,
     /// and a borrowed guard could not.
-    tenant: Arc<tokio::sync::Mutex<Option<LiveTenant<I>>>>,
+    lock: Arc<tokio::sync::Mutex<()>>,
     last_used: AtomicU64,
     in_flight: AtomicUsize,
 }
 
-impl<I> Slot<I> {
+impl Slot {
     fn new(now: u64) -> Self {
         Slot {
-            tenant: Arc::new(tokio::sync::Mutex::new(None)),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
             last_used: AtomicU64::new(now),
             in_flight: AtomicUsize::new(0),
         }
     }
 
-    pub fn tenant(&self) -> &Arc<tokio::sync::Mutex<Option<LiveTenant<I>>>> {
-        &self.tenant
+    pub fn lock(&self) -> &Arc<tokio::sync::Mutex<()>> {
+        &self.lock
     }
 }
 
@@ -102,33 +81,33 @@ impl<I> Slot<I> {
 ///
 /// Holding this is what marks the tenant busy, so the sweep leaves it alone;
 /// dropping it releases that mark however the request ended, including a panic.
-pub struct Checkout<I> {
-    slot: Arc<Slot<I>>,
+pub struct Checkout {
+    slot: Arc<Slot>,
 }
 
-impl<I> Checkout<I> {
-    pub fn slot(&self) -> &Arc<Slot<I>> {
+impl Checkout {
+    pub fn slot(&self) -> &Arc<Slot> {
         &self.slot
     }
 }
 
-impl<I> Drop for Checkout<I> {
+impl Drop for Checkout {
     fn drop(&mut self) {
         self.slot.in_flight.fetch_sub(1, Ordering::Release);
     }
 }
 
-pub struct TenantPool<I> {
+pub struct TenantPool {
     /// A `std::sync::Mutex`, not a `tokio` one, and never held across an
     /// await: everything under it is a hash lookup and an `Arc` clone. The
     /// *per-tenant* lock is the async one, and it is a different lock for a
     /// different job.
-    slots: Mutex<HashMap<[u8; 16], Arc<Slot<I>>>>,
+    slots: Mutex<HashMap<[u8; 16], Arc<Slot>>>,
     limits: PoolLimits,
     started: Instant,
 }
 
-impl<I> TenantPool<I> {
+impl TenantPool {
     pub fn new(limits: PoolLimits) -> Self {
         TenantPool {
             slots: Mutex::new(HashMap::new()),
@@ -152,7 +131,7 @@ impl<I> TenantPool<I> {
     /// two simultaneous first requests from one client produce **one** — they
     /// find the same slot, and the second waits on the lock the first is
     /// holding rather than racing it into a second `zfs create`.
-    pub fn checkout(&self, tenant: &[u8; 16]) -> Checkout<I> {
+    pub fn checkout(&self, tenant: &[u8; 16]) -> Checkout {
         let now = self.now();
         let mut slots = self.slots.lock().expect("tenant pool mutex poisoned");
 
@@ -173,11 +152,9 @@ impl<I> TenantPool<I> {
 
     /// Drop idle and over-cap tenants.
     ///
-    /// Removing a slot from the map does not destroy it: a request already
-    /// holding the `Arc` keeps working and its instance goes when it finishes.
-    /// So eviction can never pull an instance out from under a call in
-    /// progress — it only stops future requests finding it.
-    fn evict_while_full(&self, slots: &mut HashMap<[u8; 16], Arc<Slot<I>>>, now: u64) {
+    /// Only slots nobody has checked out, so a lock is never dropped while a
+    /// call holds it; a later request for that tenant simply makes a new one.
+    fn evict_while_full(&self, slots: &mut HashMap<[u8; 16], Arc<Slot>>, now: u64) {
         let idle_ms = self.limits.idle_timeout.as_millis() as u64;
         slots.retain(|_, slot| {
             slot.in_flight.load(Ordering::Acquire) > 0
@@ -195,9 +172,8 @@ impl<I> TenantPool<I> {
                     slots.remove(&key);
                 }
                 // Every tenant is busy. Refusing to evict is right: the
-                // alternative is unmounting a filesystem someone is mid-commit
-                // on. The pool runs slightly over its cap until they finish,
-                // which the global concurrency limit already bounds.
+                // alternative is a second lock for a tenant whose first is
+                // held. The pool runs over its cap until they finish.
                 None => break,
             }
         }
@@ -217,11 +193,7 @@ impl<I> TenantPool<I> {
 mod tests {
     use super::*;
 
-    /// A stand-in for the wasm instance: the pool never looks inside one.
-    #[derive(Debug, PartialEq, Eq)]
-    struct FakeInstance(u32);
-
-    fn pool(max: usize) -> TenantPool<FakeInstance> {
+    fn pool(max: usize) -> TenantPool {
         TenantPool::new(PoolLimits {
             max_tenants: max,
             ..Default::default()
@@ -235,7 +207,7 @@ mod tests {
 
         {
             let first = pool.checkout(&client);
-            *first.slot().tenant().lock().await = None;
+            drop(first.slot().lock().lock().await);
         }
         let again = pool.checkout(&client);
         assert_eq!(pool.len(), 1, "a second request made a second slot");
@@ -262,9 +234,9 @@ mod tests {
         let a = pool.checkout(&[0xaa; 16]);
         let b = pool.checkout(&[0xbb; 16]);
 
-        let held = a.slot().tenant().lock().await;
+        let held = a.slot().lock().lock().await;
         // B proceeds while A's lock is held, and needs no timeout to do it.
-        let other = b.slot().tenant().lock().await;
+        let other = b.slot().lock().lock().await;
         drop(other);
         drop(held);
     }
@@ -279,9 +251,9 @@ mod tests {
         let second = pool.checkout(&client);
         assert!(Arc::ptr_eq(first.slot(), second.slot()));
 
-        let held = first.slot().tenant().lock().await;
+        let held = first.slot().lock().lock().await;
         assert!(
-            second.slot().tenant().try_lock().is_err(),
+            second.slot().lock().try_lock().is_err(),
             "two requests from one client held the tenant at once"
         );
         drop(held);

@@ -31,18 +31,6 @@ impl State {
             egress: crate::serve::GuestEgress,
         }
     }
-
-    /// Whether the guest left anything behind in the resource table.
-    ///
-    /// It matters for a *pooled* instance: the host pushes an
-    /// `incoming-request` and a `response-outparam` per call and never removes
-    /// them, so everything here is reclaimed by the guest dropping its
-    /// handles. A guest that does not is not leaking unboundedly — the table
-    /// is a slab with a free list — but it is leaving entries a later request
-    /// from the same client could still address.
-    pub fn resources_settled(&self) -> bool {
-        self.table.is_empty()
-    }
 }
 
 impl WasiView for State {

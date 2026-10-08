@@ -1034,7 +1034,7 @@ mod tests {
         .await;
         let pool = Arc::new(crate::Tenancy::new(Default::default()));
         let checkout = pool.pool().checkout(&[1; 16]);
-        let lock = checkout.slot().tenant().clone().lock_owned().await;
+        let lock = checkout.slot().lock().clone().lock_owned().await;
         let handle = guest_with_pool(&q, pool).await;
         add(&q, 1, "blocked", 0).await;
         add(&q, 2, "ready", 0).await;

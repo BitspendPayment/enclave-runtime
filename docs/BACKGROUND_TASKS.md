@@ -78,8 +78,8 @@ run-task(task-id, payload) -> result<result-bytes, error-string>
 
 This export is not an HTTP endpoint. It receives the correct tenant's directory
 as `/` and an execution deadline. It uses a fresh guest
-instance under the same pool lock as HTTP calls; any warm HTTP instance is
-dropped first so it cannot retain stale database handles across the mutation.
+instance under the same pool lock as HTTP calls, which also get a fresh
+instance each, so nothing in memory outlives the call that made it.
 A missing tenant directory causes failure, never recreation.
 
 The background callback can inspect task status, but cannot enqueue, cancel or

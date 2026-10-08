@@ -1,25 +1,24 @@
 //! What a fresh guest instance actually costs, and what a request costs around
 //! it.
 //!
-//! This benchmark exists to answer one question with a number rather than an
-//! intuition: **is per-client instance pooling worth its complexity?** Pooling
-//! saves exactly one thing — the instantiation in the middle of every request —
-//! and buys it at the price of per-client lifecycle, eviction, and a
-//! concurrency model where two clients run at once. That trade is only worth
-//! making if instantiation is a large fraction of a request.
+//! Every request gets a fresh instance, and this benchmark keeps that choice
+//! honest with a number: **what fraction of a request is instantiation?**
+//! Keeping instances between requests would save exactly that, at the price of
+//! state that outlives the call that made it. It is only worth reconsidering
+//! if the fraction grows large.
 //!
 //! So the interesting output is not any single line, it is the ratio:
 //!
 //! ```text
-//!   instantiate  ÷  dispatch/committing   →  what pooling could remove
+//!   instantiate  ÷  dispatch/committing   →  what keeping instances could remove
 //! ```
 //!
 //! Over a directory standing in for the pool there is no anchor, so
 //! `dispatch/committing` measures the guest and its file I/O. In production an
 //! anchor — a pool sync and a write to S3 — is added to the denominator and
 //! never to the numerator, so **the ratio measured here is the most favourable
-//! case pooling will ever see.** If it is small here, it is smaller in
-//! production.
+//! case keeping instances will ever see.** If it is small here, it is smaller
+//! in production.
 //!
 //! ```bash
 //! (cd examples/guest-http && cargo build --release --target wasm32-wasip2)
@@ -115,8 +114,8 @@ fn bench(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("guest");
 
-    // The numerator. Exactly what a warm pool would skip: a fresh `Store` and
-    // an `instantiate_async`, with no request dispatched through it.
+    // The numerator. What every request pays: a fresh `Store` and an
+    // `instantiate_async`, with no request dispatched through it.
     group.bench_function("instantiate", |b| {
         b.to_async(&rt)
             .iter(|| async { handle.verify_instantiates().await.expect("instantiates") });

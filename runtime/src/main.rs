@@ -337,30 +337,17 @@ struct Cli {
     #[arg(long, env = "ENCLAVE_PUSH_ENDPOINT")]
     push_endpoint: Option<String>,
 
-    /// Clients kept warm at once.
+    /// Clients whose lock is held at once.
     ///
-    /// A warm client costs a wasm linear memory and nothing else — the
-    /// filesystem and its block cache are shared — so this bounds instance
-    /// memory rather than cache memory. Past it, the least recently used idle
-    /// client is dropped; one serving a request is never evicted.
+    /// A held client is a lock and two counters; instances are per request
+    /// and never kept. Past it, the least recently used idle client's lock is
+    /// dropped; one serving a request is never evicted.
     #[arg(long, env = "ENCLAVE_MAX_TENANTS", default_value_t = 64)]
     max_tenants: usize,
 
-    /// Seconds a mounted client may sit idle before it is dropped.
+    /// Seconds an idle client's lock is kept before it is dropped.
     #[arg(long, env = "ENCLAVE_TENANT_IDLE_SECS", default_value_t = 900)]
     tenant_idle_secs: u64,
-
-    /// Requests one client's instance serves before it is rebuilt.
-    ///
-    /// Wasm linear memory never shrinks, so an instance that lived forever
-    /// would only grow. Rebuilding costs ~24 µs and keeps the mount, which is
-    /// the part that costs S3 round trips.
-    #[arg(
-        long,
-        env = "ENCLAVE_MAX_REQUESTS_PER_INSTANCE",
-        default_value_t = 10_000
-    )]
-    max_requests_per_instance: u64,
 
     /// The WebAuthn relying-party id — the domain passkeys are scoped to.
     ///
@@ -915,10 +902,9 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     // enclave exists to exclude.
     let attestation = Some(entropy.clone());
 
-    // Per-client views of the one filesystem. Each client's guest sees
-    // its own directory as `/`; the mount, the block cache and the
-    // transaction stream are shared, so a client costs a directory
-    // rather than a mount.
+    // Per-client views of the one pool. Each client's guest sees its
+    // own dataset as `/`, through a fresh instance per request, so a
+    // client costs a dataset and a lock.
     //
     // A client is serialised against itself and nobody else, so two
     // clients can execute guest code at the same time. A guest is
@@ -927,7 +913,6 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         let limits = enclave_runtime::PoolLimits {
             max_tenants: cli.max_tenants,
             idle_timeout: Duration::from_secs(cli.tenant_idle_secs),
-            max_requests_per_instance: cli.max_requests_per_instance,
         };
         tracing::info!(
             max_tenants = limits.max_tenants,
@@ -1758,11 +1743,10 @@ mod tests {
         .contains("--master-key-parameter"));
     }
 
-    /// Warm clients are bounded by default. Each costs a wasm linear memory,
-    /// so an unbounded pool is an enclave that dies of memory exhaustion under
-    /// the load it was built for.
+    /// Held clients are bounded by default. Registration is open, so an
+    /// unbounded pool would keep an entry for every passkey that ever called.
     #[test]
-    fn the_warm_client_count_is_bounded_by_default() {
+    fn the_held_client_count_is_bounded_by_default() {
         let cli = cli_from(&["--roots-bucket", "b"]);
         assert_eq!(cli.max_tenants, 64);
         assert!(cli.tenant_idle_secs > 0, "idle tenants are never reclaimed");

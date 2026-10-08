@@ -1,6 +1,6 @@
 //! The gate: no verified assertion, no guest.
 //!
-//! Everything a request must survive before a tenant exists, let alone a warm
+//! Everything a request must survive before a tenant exists, let alone an
 //! instance. [`Gate::verify`] is the only way past it and it either returns a
 //! [`Verified`] tenant or a [`Denied`]; there is no third outcome and no
 //! caller-supplied way to skip it.

@@ -81,9 +81,9 @@ pub use notify::{
 pub use random::{open_entropy, GuestRandom, HostEntropy, RandomSource};
 pub use run::{read_component, GuestEnvironment, GuestOutcome, EXIT_RUNTIME_FAILURE};
 pub use serve::{
-    apply_tenant, serve_component, AcmeConfig, CertificateSlot, GuestEgress, GuestInstance,
-    PoolLimits, SealedAcmeCache, ServeConfig, ServeHandle, Server, Tenancy, TenantPool,
-    TlsIdentity, TlsMode, X_ENCLAVE_TENANT,
+    apply_tenant, serve_component, AcmeConfig, CertificateSlot, GuestEgress, PoolLimits,
+    SealedAcmeCache, ServeConfig, ServeHandle, Server, Tenancy, TenantPool, TlsIdentity, TlsMode,
+    X_ENCLAVE_TENANT,
 };
 pub use state::State;
 pub use tenant::Arrival;

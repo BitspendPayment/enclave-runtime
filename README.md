@@ -197,7 +197,7 @@ Background work cannot grant itself more work, connections or devices. It can on
 
 ### Instances are disposable
 
-A healthy HTTP instance may be reused for the same tenant, but `run-task` and `on-message` always get fresh ones, and any instance can be discarded after a trap, an eviction or a restart. Keep durable state in files and sync or close them before returning, because files a discarded instance left open are released unflushed. A tenant's requests, tasks and message callbacks run one at a time; different tenants run concurrently.
+Every request, `run-task` and `on-message` call gets a fresh instance, dropped when the call ends, so nothing in memory survives from one call to the next. Keep durable state in files and sync or close them before returning, because files an instance left open are released unflushed when it is dropped. A tenant's requests, tasks and message callbacks run one at a time; different tenants run concurrently.
 
 ### All together: a background job wakes its owner
 

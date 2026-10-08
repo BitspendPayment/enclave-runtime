@@ -32,7 +32,7 @@ use crate::run::GuestEnvironment;
 use crate::serve::acme::CertificateSlot;
 use crate::serve::attest::{nonce_from_headers, ResponseAttestor};
 use crate::serve::client::apply_tenant;
-use crate::serve::pool::{LiveTenant, PoolLimits, TenantPool};
+use crate::serve::pool::{PoolLimits, TenantPool};
 use crate::serve::progress::{Counting, StreamProgress};
 use crate::state::State;
 use nitro_nsm::Nsm;
@@ -151,17 +151,15 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// holds it until the process ends.
 const DEFAULT_MAX_INTERACTION: Duration = Duration::from_secs(300);
 
-/// A guest instance and the store it is bound to.
+/// A guest instance and the store it is bound to, for one call.
 ///
 /// The two travel together because `instantiate_async` binds a `Proxy` to one
 /// store: separating them would produce a handle that looks usable and
 /// resolves against the wrong memory.
-pub struct GuestInstance {
+struct GuestInstance {
     store: Store<State>,
     proxy: wasmtime_wasi_http::p2::bindings::Proxy,
-    /// Shared with this store's epoch callback, which was installed once and
-    /// outlives every request the instance serves. Reset per call rather than
-    /// replaced, so the callback never holds a stale one.
+    /// Shared with this store's epoch callback.
     progress: Arc<StreamProgress>,
 }
 
@@ -205,9 +203,9 @@ pub struct ServeHandle {
 ///
 /// No backends and no mounting: there is one filesystem, and a client costs a
 /// directory in it. What is per-client is the *view* — which directory the
-/// guest calls `/` — plus a warm instance and a lock.
+/// guest calls `/` — and a lock.
 pub struct Tenancy {
-    pool: TenantPool<GuestInstance>,
+    pool: TenantPool,
 }
 
 impl std::fmt::Debug for Tenancy {
@@ -225,7 +223,7 @@ impl Tenancy {
         }
     }
 
-    pub fn pool(&self) -> &TenantPool<GuestInstance> {
+    pub fn pool(&self) -> &TenantPool {
         &self.pool
     }
 }
@@ -300,7 +298,7 @@ impl ServeHandle {
         &self.guest
     }
 
-    /// Give each authenticated client their own filesystem and warm instance.
+    /// Give each authenticated client their own filesystem and lock.
     pub fn with_tenancy(mut self, tenancy: Arc<Tenancy>) -> Self {
         self.tenancy = Some(tenancy);
         self
@@ -367,10 +365,7 @@ impl ServeHandle {
             .as_ref()
             .context("held connections require tenants")?;
         let checkout = tenancy.pool.checkout(&tenant);
-        let mut guard = checkout.slot().tenant().clone().lock_owned().await;
-        if let Some(t) = guard.as_mut() {
-            t.instance = None;
-        }
+        let _guard = checkout.slot().lock().clone().lock_owned().await;
         let work = async {
             let state = self.tenant_state(tenant).await?;
             let mut store = Store::new(self.pre.engine(), state);
@@ -419,8 +414,7 @@ impl ServeHandle {
             .context("the guest took too long to answer a message")?
     }
 
-    /// A fresh instance shares the tenant lock; drop its warm HTTP instance so
-    /// no cached database handles survive a background mutation.
+    /// One task run: a fresh instance, under the same tenant lock as requests.
     pub(crate) async fn run_background(
         &self,
         queue: &Arc<crate::tasks::TaskQueue>,
@@ -431,14 +425,11 @@ impl ServeHandle {
             .as_ref()
             .context("background tasks require tenants")?;
         let checkout = tenancy.pool.checkout(&task.tenant);
-        let Ok(mut guard) = checkout.slot().tenant().clone().try_lock_owned() else {
+        let Ok(_guard) = checkout.slot().lock().clone().try_lock_owned() else {
             return Ok(None);
         };
         if !queue.begin(task).await? {
             return Ok(Some(Vec::new()));
-        }
-        if let Some(tenant) = guard.as_mut() {
-            tenant.instance = None;
         }
         let work = async {
             let state = self.tenant_state(task.tenant).await?;
@@ -568,7 +559,7 @@ impl ServeHandle {
         }
     }
 
-    /// One request, in this client's own filesystem and warm instance.
+    /// One request, in this client's own filesystem and a fresh instance.
     ///
     /// The lock is held for the whole call — including the body, because
     /// `call_handle` does not return until the guest has finished writing it —
@@ -592,39 +583,17 @@ impl ServeHandle {
         // however the request ends.
         let checkout = tenancy.pool.checkout(&tenant_id);
         // Owned, so it can move into the task below and outlive this function.
-        let mut guard = checkout.slot().tenant().clone().lock_owned().await;
+        let guard = checkout.slot().lock().clone().lock_owned().await;
 
-        if guard.is_none() {
-            // First use of this slot, under the lock — so two simultaneous
-            // first requests from one client resolve to one directory, the
-            // second waiting here rather than racing the first.
-            let (dir, arrival) = self.guest.zfs().tenant_dir(tenant_id).await?;
-            tracing::info!(
-                tenant = %hex::encode(tenant_id),
-                arrival = ?arrival,
-                "tenant directory ready"
-            );
-            *guard = Some(LiveTenant {
-                dir,
-                tenant_id,
-                instance: None,
-                requests: 0,
-            });
+        // Under the lock, so two simultaneous first requests from one client
+        // resolve to one directory, the second waiting here rather than racing
+        // the first into a second `zfs create`.
+        let (dir, arrival) = self.guest.zfs().tenant_dir(tenant_id).await?;
+        if arrival == crate::tenant::Arrival::New {
+            tracing::info!(tenant = %hex::encode(tenant_id), "tenant directory created");
         }
 
-        let tenant = guard.as_mut().expect("just built");
-        // Rebuilt when absent, and when this one has served long enough: wasm
-        // linear memory never shrinks, so an instance that lived forever would
-        // only grow. Cheap — ~24 µs, and no I/O, because there is no
-        // filesystem to bring up with it.
-        let stale = tenant.requests >= tenancy.pool.limits().max_requests_per_instance;
-        if tenant.instance.is_none() || stale {
-            tenant.instance = Some(self.instantiate(&tenant.dir).await?);
-            tenant.requests = 0;
-        }
-        tenant.requests += 1;
-
-        let instance = tenant.instance.as_mut().expect("just built");
+        let mut instance = self.instantiate(&dir).await?;
         instance.store.data_mut().streams =
             self.streams
                 .as_ref()
@@ -650,11 +619,6 @@ impl ServeHandle {
                     tenant: tenant_id,
                     interactive: true,
                 });
-        // Reset every request: the epoch deadline is absolute, so a reused
-        // store would otherwise inherit whatever the last request left. The
-        // same is true of the progress this call will be judged on.
-        instance.store.set_epoch_deadline(self.watchdog());
-        instance.progress.reset();
         let progress = instance.progress.clone();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         // Wrapped before it becomes a guest resource, which is the last point
@@ -674,40 +638,22 @@ impl ServeHandle {
         let zfs = self.guest.zfs().clone();
         let (anchored_tx, anchored_rx) = tokio::sync::oneshot::channel();
         let task = tokio::task::spawn(async move {
-            // Moved in so the lock outlives the response head. A pooled store
-            // must not be handed to this tenant's next request until the call
-            // has finished writing its body — which is also what makes "one
-            // active request per tenant" true rather than "one set of headers
-            // at a time". Released when this future completes, fails, or is
-            // aborted.
-            let mut guard = guard;
+            // Moved in so the lock outlives the response head: this tenant's
+            // next request waits until the call has finished writing its body,
+            // which is what makes "one active request per tenant" true rather
+            // than "one set of headers at a time". The instance is moved in
+            // too, so it dies with the call however the call ends — finished,
+            // trapped or aborted.
+            let _guard = guard;
             let _checkout = checkout;
-            let tenant = guard.as_mut().expect("held across the call");
-            // Taken out of the slot for the duration, and put back only on a
-            // clean finish. Held *by reference* instead — as this once did —
-            // and an aborted call leaves the instance where it sits: `abort`
-            // drops this future at the await below, so nothing after it runs,
-            // and the next request for this tenant re-enters a store whose
-            // `call_handle` was cancelled part-way through. Ownership is what
-            // makes "an interrupted instance is never reused" true for the
-            // abort path and not only for the trap path, because a dropped
-            // future drops what it owns.
-            let mut instance = tenant.instance.take().expect("built before the call");
+            let mut instance = instance;
             let result = instance
                 .proxy
                 .wasi_http_incoming_handler()
                 .call_handle(&mut instance.store, req, out)
                 .await;
-
-            // One client's instance, and nothing else. The filesystem is
-            // shared and untouched; the next caller for this client gets a
-            // fresh instance over the same directory.
             if result.is_err() {
-                tracing::warn!("guest trapped; this client's instance will be rebuilt");
-            } else if !instance.store.data().resources_settled() {
-                tracing::debug!("guest left resources behind; rebuilding its instance");
-            } else {
-                tenant.instance = Some(instance);
+                tracing::warn!("guest trapped; its instance dies with the call");
             }
             // Still under the tenant's lock, so its next request cannot write
             // before this one's writes are anchored.
@@ -729,8 +675,7 @@ impl ServeHandle {
 
     /// Build an instance whose guest sees `dir` as `/`.
     ///
-    /// The one place a store and an instance are made, so the per-request path
-    /// and the per-tenant path cannot drift in what a guest is handed.
+    /// Every tenant request gets one, used for that call and dropped with it.
     async fn instantiate(&self, dir: &std::path::Path) -> Result<GuestInstance> {
         let mut store = Store::new(self.pre.engine(), self.guest.new_state(Some(dir))?);
         let progress = Arc::new(StreamProgress::new());

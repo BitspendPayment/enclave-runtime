@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The criterion bench, in the form the tracker can read.
 #
-# `instance_cost` measures what a warm instance saves over a fresh one, and it
-# runs the real component — so the guest has to be built before cargo is asked
+# `instance_cost` measures what the fresh instance every request gets costs,
+# and it runs the real component — so the guest has to be built before cargo is asked
 # for a number, or the bench panics with a build hint instead of producing one.
 #
 # `--output-format bencher` is criterion's libtest-compatible output, which is

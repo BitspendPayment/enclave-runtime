@@ -190,24 +190,23 @@ echo "PCR16 release:  $EXPECTED_PCR16"
 echo "      attested: $(grep -oE '^PCR16 +[0-9a-f]+' "$RUNDIR/attest.log" | awk '{print $2}')"
 
 # ---------------------------------------------------------------------------
-# 5/8 — one instance per tenant, and one approval per interaction.
+# 5/8 — one instance per request, and one approval per interaction.
 # ---------------------------------------------------------------------------
-say "5/8  a tenant keeps its instance, and no two tenants share one"
+say "5/8  every request gets a fresh instance, and no two tenants share one"
 
 # `/memory` counts in the guest's linear memory and writes nowhere. What it
-# answers is the whole per-tenant model in one number.
+# answers is the whole instance model in one number.
 #
-# The image runs with warm instances, so the *same* tenant asking twice must
-# see the count rise — that is the instance being kept. A *different* tenant
-# must see 1, because the boundary between two clients is a `Store` and not
-# anything the guest does. An earlier version of this leg asserted the
-# opposite, having been written before warm instances existed; it contradicted
-# the image it was testing.
+# Every request gets a fresh instance, so the *same* tenant asking twice must
+# see 1 both times: a second call inheriting the first one's memory would be
+# running on state it never approved. A *different* tenant must see 1 too,
+# because the boundary between two clients is a `Store` and not anything the
+# guest does.
 m1="$(signed get --path /memory)"
 m2="$(signed get --path /memory)"
 echo "alice memory: $m1 then $m2"
-[[ "${m2//[^0-9]/}" -eq $(( ${m1//[^0-9]/} + 1 )) ]] \
-    || fail "a tenant's instance was not kept between its requests ($m1, $m2)"
+[[ "${m1//[^0-9]/}" -eq 1 && "${m2//[^0-9]/}" -eq 1 ]] \
+    || fail "a tenant's request reused an instance ($m1, $m2)"
 
 signed2 enrol >/dev/null || fail "the second registration failed"
 b1="$(signed2 get --path /memory)"
@@ -530,7 +529,7 @@ cat <<EOF
   the guest was unreachable without a passkey assertion
   a passkey enrolled and its signed requests were served
   an approval for one route did not authorize another
-  a tenant kept its warm instance, and no two tenants shared one
+  every request got a fresh instance, and no two tenants shared one
   one tenant could not read another's file
   guest stdout and stderr arrived framed and marked as untrusted
   work approved by one interaction ran later, for its owner alone, with no
