@@ -74,7 +74,7 @@ jobs:
   # There is deliberately no SQLite job. The runtime measures its guest into
   # PCR16 before it will serve, and that reads the NSM — which a hosted runner
   # does not have, so the binary refuses to start there at all. The workload
-  # lives on in scripts/ci-sqlite.sh for a machine with an enclave.
+  # runs in the emulator instead: docs/STORAGE.md, "Running SQLite".
   e2e:
     name: the whole stack, in an emulated enclave
     runs-on: ubuntu-latest

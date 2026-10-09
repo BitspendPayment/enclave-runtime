@@ -341,14 +341,9 @@ resource "aws_instance" "parent" {
     http_put_response_hop_limit = 1
   }
 
-  # Configuration the image cannot know: which bucket, which domain the
-  # certificate is for, and which device is the pool's disk. Not secrets — the
-  # master key is not passed here; it comes from KMS gated on PCR0 rather than
-  # from anywhere on this machine.
+  # Which device is the pool's disk: the one thing the parent needs that the
+  # image cannot know. The enclave's settings are in the image, measured.
   user_data = templatefile("${path.module}/user-data.sh.tftpl", {
-    roots_bucket = var.roots_bucket
-    region       = var.region
-    tls_domains  = join(",", var.tls_domains)
     # How the volume appears to the parent: NVMe, named by its id.
     pool_disk = "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${replace(aws_ebs_volume.pool.id, "-", "")}"
   })

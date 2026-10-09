@@ -51,12 +51,6 @@ variable "roots_bucket" {
   EOT
 }
 
-variable "tls_domains" {
-  type        = list(string)
-  default     = []
-  description = "Domains for the enclave's certificate. Required for ACME; a self-signed certificate needs none, since attestation rather than a CA is what a client checks."
-}
-
 variable "vpc_cidr" {
   type    = string
   default = "10.42.0.0/16"

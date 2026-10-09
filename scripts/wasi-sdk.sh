@@ -2,8 +2,8 @@
 # Put wasi-sdk where the SQLite guest's C toolchain can find it.
 #
 # Idempotent: with the SDK already unpacked this exits immediately, which is
-# what makes the CI cache worth having and what lets a developer run
-# ci-sqlite.sh repeatedly without re-downloading 110 MB.
+# what makes the CI cache worth having and what lets a developer rebuild the
+# SQLite guest repeatedly without re-downloading 110 MB.
 #
 # The download used to be `curl -sSL` with no `-f`. Without it a non-2xx
 # response is written to the tarball as HTML and the failure surfaces two steps

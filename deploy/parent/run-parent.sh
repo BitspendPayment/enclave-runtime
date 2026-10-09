@@ -44,7 +44,7 @@ gvproxy not found. Install it from containers/gvisor-tap-vsock:
     go install github.com/containers/gvisor-tap-vsock/cmd/gvproxy@latest
 
 or take a release binary. The matching `gvforwarder` goes *inside* the enclave
-image, not here — see deploy/Dockerfile.
+image, not here — flake.nix builds it in.
 EOF
     exit 1
 }

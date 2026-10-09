@@ -1,22 +1,13 @@
 #!/usr/bin/env bash
-# Deployment configuration the image cannot know: which bucket, which region,
-# which domain, and which device is the pool's disk. Written where the
-# enclave.service and nbdkit.service units pick it up.
+# The one thing the parent needs that the image cannot know: which device is
+# the pool's disk, written where nbdkit.service picks it up. The enclave's own
+# settings — bucket, region, domains — are in the image and measured into PCR0;
+# nothing here reaches it.
 #
 # Not a place for secrets. This file is readable from the instance metadata
 # service by anything on the box, and the parent is the party the enclave
-# excludes. The master key is deliberately absent — until M8 it is supplied
-# out of band, and after M8 it comes from KMS gated on PCR0, which is a
-# statement about the enclave's code rather than about this machine.
+# excludes.
 set -euxo pipefail
-
-mkdir -p /etc/systemd/system/enclave.service.d
-cat > /etc/systemd/system/enclave.service.d/deployment.conf <<CONF
-[Service]
-Environment=ENCLAVE_ROOTS_BUCKET=${roots_bucket}
-Environment=AWS_REGION=${region}
-Environment=ENCLAVE_TLS_DOMAINS=${tls_domains}
-CONF
 
 # The pool's EBS volume, for nbdkit to serve over vsock.
 mkdir -p /etc/enclave
