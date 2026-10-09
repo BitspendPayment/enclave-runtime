@@ -40,7 +40,8 @@ use nitro_nsm::Nsm;
 /// How the guest is served.
 #[derive(Debug)]
 pub struct ServeConfig {
-    /// Opt-in standing authorization for tenant-bound durable tasks.
+    /// Limits for tenant-bound durable tasks, which run when the guest exports `run-task`.
+    /// `None` turns them off whatever the guest exports.
     pub background_tasks: Option<crate::tasks::TaskLimits>,
     /// Opt-in push notifications. The registry and the forwarder are opened
     /// here rather than by the caller, because both need the mounted
@@ -1577,10 +1578,18 @@ pub async fn serve_component(
     if let Some(tenancy) = &config.tenancy {
         handle = handle.with_tenancy(tenancy.clone());
     }
-    if let Some(limits) = config.background_tasks.take() {
+    // Whether there are tasks is the guest's to say, by exporting `run-task`: the guest is
+    // measured into PCR16, so its exports already are the decision, and a setting beside them
+    // could only disagree.
+    let runs_tasks = handle
+        .background_pre
+        .component()
+        .get_export_index(None, "run-task")
+        .is_some();
+    if let Some(limits) = config.background_tasks.take().filter(|_| runs_tasks) {
         anyhow::ensure!(
             config.authentication.is_some(),
-            "background tasks require authentication"
+            "the guest exports run-task, and background tasks require authentication"
         );
         let queue = crate::tasks::TaskQueue::open(
             handle.environment().zfs().clone(),
@@ -1664,8 +1673,8 @@ pub async fn serve_component(
         Some((auth, gate)) => server = server.with_authentication(auth, gate),
         None => tracing::warn!(
             "serving with NO authentication: every request reaches the guest without a \
-             WebAuthn assertion. Set --webauthn-rp-id and --webauthn-origin for anything \
-             that is not a development run."
+             WebAuthn assertion. Set --webauthn-rp-id for anything that is not a \
+             development run."
         ),
     }
 

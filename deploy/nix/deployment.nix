@@ -68,37 +68,28 @@
   # be served too. Measured by PCR0 like `rpId`: adding an app is a new image.
   webauthnAllowedOrigins = [ ];
 
-  # Where guest stdout and stderr go, on top of the enclave console.
+  # Where guest stdout and stderr go, on top of the enclave console: this
+  # group's `guest` stream, or "" for the console only.
   #
   # Both must already exist — `deploy/tofu` creates them, and the enclave holds
-  # `logs:PutLogEvents` and nothing more, so it cannot create them itself. They
-  # are baked into the image and therefore measured by PCR0, which is why a
+  # `logs:PutLogEvents` and nothing more, so it cannot create them itself. The
+  # group is baked into the image and therefore measured by PCR0, which is why a
   # client can tell from an attestation where an enclave ships guest output.
   #
   # The group must match `aws_cloudwatch_log_group.guest` in `deploy/tofu`,
   # which names it "/${name_prefix}-${environment}/guest".
   guestLogGroup = "/CHANGE-ME-production/guest";
-  guestLogStream = "guest";
 
-  # Where the runtime fetches its guest: a key in `rootsBucket`, used verbatim
-  # (`bucketPrefix` is not applied).
+  # The guest is not here either. The runtime fetches it from
+  # `guest/guest.wasm` in `rootsBucket` (`bucketPrefix` is not applied) and
+  # measures it into PCR16 before it asks KMS for a key, so changing the guest
+  # is an upload and a key-policy edit, not a new image. Background tasks run
+  # when the guest exports `run-task`.
   #
-  # The key is measured by PCR0 like everything else here. The object behind it
-  # is measured by the enclave into PCR16 at boot, before it asks KMS for a key,
-  # so it need not be trusted: changing the guest is an upload and a key-policy
-  # edit, not a new image. Upload `guest-release/guest.wasm` here.
-  guestObject = "guest/guest.wasm";
-
-  # Opt in only for a guest implementing enclave:tasks/background@0.1.0.
-  # Each task is authorized by an authenticated tenant interaction. Queued
-  # work survives restarts; only this active enclave may own its scheduler.
-  backgroundTasks = false;
-  backgroundConcurrency = 1;
-
-  # The guest's own settings are not here. They travel in the guest file, written
-  # into it by `deploy/qemu-nitro/guest-env.py` before it is uploaded as
-  # `guestObject`, so they are measured into PCR16 with its code and the image
-  # serves any deployment of any guest. A guest reaches the public internet and
+  # Nor are the guest's own settings. They travel in the guest file, written
+  # into it by `deploy/qemu-nitro/guest-env.py` before it is uploaded, so they
+  # are measured into PCR16 with its code and the image serves any deployment
+  # of any guest. A guest reaches the public internet and
   # nothing else, by address — see `runtime/src/serve/egress.rs` — so there is no
   # list of where it may send.
 

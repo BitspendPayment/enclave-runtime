@@ -11,7 +11,7 @@
 //!   zfs     parent's disk   ──▶ /tenants, /runtime   anchored after each write
 //!   guest   object or file  ──▶ PCR16, locked    before any key is asked for
 //!   net     vsock + tap     ──▶ a network        gvforwarder against gvproxy
-//!   env     GuestEnvPolicy  ──▶ Vec<(K, V)>      inherit minus a denylist
+//!   env     guest file      ──▶ Vec<(K, V)>      its settings section, measured
 //!   linker  wasmtime-wasi   ──▶ Linker<State>    all of WASI, plus our own
 //!   run     component       ──▶ GuestOutcome     once, with its exit code
 //!   serve   component       ──▶ TLS + HTTP       until stopped
@@ -54,7 +54,6 @@ pub use auth::{
 };
 pub use boot::{boot, BootConfig, BootMode, Booted, Pair, ReceiptTrust};
 pub use clock::{open_clock, ClockSource, HostClock, PtpClock, TrustedClock, DEFAULT_PTP_DEVICE};
-pub use env::GuestEnvPolicy;
 pub use flag::parse_bool_flag;
 pub use guest::{fetch_guest, measure_guest, GuestSource, MAX_GUEST_BYTES};
 pub use guest_io::cloudwatch::{
@@ -66,9 +65,11 @@ pub use guest_io::{
     FanOutSink, GuestLogCollector, GuestLogRecord, GuestLogSink, GuestLogs, GuestStream,
     TracingLogSink, GUEST_LOG_TARGET,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use keys::StaticKey;
 pub use keys::{
     open_key_source, KeyPointer, KmsAttestedKey, KmsKeyConfig, MasterKeyConfig, MasterKeySource,
-    MasterKeySourceKind, SealedKey, StaticKey,
+    MasterKeySourceKind, SealedKey,
 };
 pub use linker::build_linker;
 pub use mount::{connect, parse_fs_id, MountConfig, DEFAULT_ROOT_RETENTION};

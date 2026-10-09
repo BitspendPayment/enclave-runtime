@@ -142,8 +142,7 @@ scripts/wasi-sdk.sh
 scripts/build-guest.sh sqlite
 
 deploy/qemu-nitro/dev-enclave.sh \
-  --guest examples/guest-sqlite/target/wasm32-wasip2/release/guest-sqlite.wasm \
-  --guest-env ENCLAVE_BACKGROUND_TASKS=false
+  --guest examples/guest-sqlite/target/wasm32-wasip2/release/guest-sqlite.wasm
 ```
 
 The two pragmas WASI requires are unchanged:

@@ -75,7 +75,7 @@ pub fn build_relying_party(
 ) -> anyhow::Result<webauthn_rs::Webauthn> {
     use anyhow::Context as _;
     let url = webauthn_rs::prelude::Url::parse(origin)
-        .with_context(|| format!("--webauthn-origin {origin:?} is not a URL"))?;
+        .with_context(|| format!("the origin {origin:?} is not a URL"))?;
     let mut builder = webauthn_rs::WebauthnBuilder::new(rp_id, &url)
         .with_context(|| format!("relying party {rp_id:?} at {origin:?}"))?;
     for allowed in allowed_origins {

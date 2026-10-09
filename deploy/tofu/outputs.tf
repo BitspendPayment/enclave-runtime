@@ -36,8 +36,8 @@ output "guest_log_group" {
 output "verify" {
   value = <<-EOT
     # Before the first start, and for every guest change: upload the guest the
-    # key policy pins. The key must match `guestObject` in
-    # deploy/nix/deployment.nix. The enclave measures what it fetches into
+    # key policy pins, at guest/guest.wasm, where every image looks. The
+    # enclave measures what it fetches into
     # PCR16 and asks KMS for its key with that measurement, so an object the
     # policy does not name boots an enclave that can read nothing.
     nix build .#guest-release --out-link guest-release

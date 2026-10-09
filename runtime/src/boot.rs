@@ -273,16 +273,14 @@ fn sealed_key_key(prefix: &str, fs_uuid: &[u8; 16]) -> String {
 }
 
 /// How a receipt is checked. QEMU's NSM does not sign, so the harness needs a
-/// concession that production must never have.
+/// concession that production must never have — and does not: the concession is
+/// compiled into `testing` builds alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiptTrust {
     /// Signature and chain to the AWS Nitro root.
     Required,
     /// Contents only, because the emulated NSM produces unsigned documents.
-    ///
-    /// Set by the emulator image and never by a production one — and because
-    /// the image's environment is measured, PCR0 itself tells a client which
-    /// kind it is talking to.
+    #[cfg(any(test, feature = "testing"))]
     UnsignedEmulator,
 }
 
@@ -290,6 +288,7 @@ impl ReceiptTrust {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "required" | "signed" => Ok(ReceiptTrust::Required),
+            #[cfg(any(test, feature = "testing"))]
             "unsigned-emulator" | "unsigned" => Ok(ReceiptTrust::UnsignedEmulator),
             other => Err(format!(
                 "expected one of required, unsigned-emulator; got {other:?}"
@@ -346,9 +345,8 @@ fn open_receipt(
     let verified = match trust {
         ReceiptTrust::Required => verify_as_signed(document, AWS_NITRO_ROOT_G1_PEM.as_bytes())?,
         // The emulator's NSM does not sign, so there is nothing to verify and
-        // the contents are read as-is. Only an image built for the emulator
-        // reaches here, and because the image's environment is measured, PCR0
-        // says which kind of image a client is talking to.
+        // the contents are read as-is. Only a `testing` build has this arm.
+        #[cfg(any(test, feature = "testing"))]
         ReceiptTrust::UnsignedEmulator => nitro_attestation::Verified {
             document: nitro_attestation::parse(document).context("parsing the receipt")?,
             trust: Trust::Unsigned,

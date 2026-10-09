@@ -3,13 +3,14 @@
 //! clap's default `bool` handling insists on exactly `true` or `false` when a
 //! value arrives through `env`. That is fine on a command line, where the flag
 //! is usually written bare, and wrong for a deployment configured by
-//! environment: `ENV ENCLAVE_FORCE_PATH_STYLE=1` is the obvious thing to put in a
-//! Dockerfile, and it fails at startup with a message about possible values.
+//! environment: `ENCLAVE_FORCE_PATH_STYLE=1` is the obvious thing to put in an
+//! image's environment, and it fails at startup with a message about possible
+//! values.
 //!
 //! Inside an enclave that failure is expensive to diagnose — there is no shell
 //! to go and check, and the only symptom is an enclave that will not start.
 
-/// Parse a boolean the way a person writing a Dockerfile would expect.
+/// Parse a boolean the way a person writing an environment file would expect.
 ///
 /// Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`, in any case. An
 /// empty value is `false`, matching the shell convention that an unset-looking

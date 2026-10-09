@@ -149,7 +149,8 @@
 
       # What an operator uploads to the roots bucket, and the PCR16 a key policy
       # pins for it. The guest is not in the enclave image: the runtime fetches
-      # `deployment.guestObject` at boot and measures it into PCR16.
+      # `guest/guest.wasm` from the roots bucket at boot and measures it into
+      # PCR16.
       #
       # `guest-pcr16.json` comes from `nitro-attest --measure`, the function a
       # client verifies with, so the number in the policy and the number a
@@ -291,8 +292,8 @@
       runtimeImageFor = deployment: {
         name = "enclave";
         kernel = kernelZfs.dir;
-        # No guest here. It is fetched from the store at boot and measured
-        # into PCR16 — see `guest-release` and ENCLAVE_GUEST_OBJECT below.
+        # No guest here. It is fetched from `guest/guest.wasm` in the roots
+        # bucket at boot and measured into PCR16 — see `guest-release`.
         payload = {
           "enclave-runtime" = "${enclave-runtime}/bin/enclave-runtime";
           "usr/local/bin/gvforwarder" = "${gvproxy-static}/bin/gvforwarder";
@@ -301,6 +302,9 @@
         };
         closureRoots = [ enclave-runtime busybox pkgs.cacert ] ++ zfsTools;
         command = "/enclave-runtime";
+        # Only what differs between deployments. Everything else — KMS, PTP, the
+        # NSM, gvproxy, ACME on :443 — is a constant in the runtime, and the
+        # emulator's alternatives exist only in its `testing` build.
         env = {
           # Without a trust store the AWS SDK panics with "no CA certificates
           # found" before it makes a single request — including against a
@@ -317,14 +321,6 @@
           # own bin directory goes on PATH — no symlinks, and the lease script
           # it execs resolves through the same closure.
           PATH = "${busybox}/bin:/usr/local/bin:${kernelZfs.zfsUser}/bin:${pkgs.lvm2.bin}/bin";
-          # Where the guest comes from — not the guest, which is not in the
-          # image. The runtime fetches this key from the roots bucket, extends
-          # PCR16 with the object's hash and locks the register before it asks
-          # KMS for a key. The location is measured here, by PCR0; what arrives
-          # is measured there, by PCR16, so the object need not be trusted.
-          ENCLAVE_GUEST_OBJECT = deployment.guestObject;
-          ENCLAVE_BACKGROUND_TASKS = lib.boolToString deployment.backgroundTasks;
-          ENCLAVE_BACKGROUND_CONCURRENCY = toString deployment.backgroundConcurrency;
           # Push notifications, through an AWS End User Messaging Push
           # application. Empty means off. Only the application is named: its FCM
           # channel holds the Firebase credential, and the runtime signs as the
@@ -335,15 +331,6 @@
           # address (`serve::egress` refuses the whole proxy network). `AWS_*`
           # never reaches a guest either.
           AWS_EC2_METADATA_SERVICE_ENDPOINT = "http://192.168.127.253";
-          ENCLAVE_HTTP_LISTEN = "0.0.0.0:443";
-          # ACME, not self-signed: a platform authenticator will not attest
-          # against a certificate a browser does not trust, so a self-signed one
-          # would mean no passkey could ever register.
-          ENCLAVE_TLS = "acme";
-          ENCLAVE_NETWORK = "gvproxy";
-          ENCLAVE_GVFORWARDER = "/usr/local/bin/gvforwarder";
-          ENCLAVE_RANDOM_SOURCE = "nsm";
-          ENCLAVE_CLOCK_SOURCE = "ptp";
 
           # The store this image is for. Attested, because a receipt only
           # means "no pool here" if the host cannot choose "here".
@@ -351,24 +338,16 @@
           ENCLAVE_BUCKET_PREFIX = deployment.bucketPrefix;
           ENCLAVE_ID = deployment.fsId;
           AWS_REGION = deployment.region;
+          # ACME, which a platform authenticator needs: it will not attest
+          # against a certificate a browser does not trust.
           ENCLAVE_TLS_DOMAINS = lib.concatStringsSep "," deployment.tlsDomains;
-
-          # A production image demands a receipt signed by AWS. The emulator
-          # image overrides this, and because the environment is measured,
-          # PCR0 tells a client which kind it is talking to.
-          ENCLAVE_RECEIPT_TRUST = "required";
 
           # The master secret is minted by KMS inside the enclave and released
           # only against an attestation whose PCR0 and PCR16 match the key
           # policy. A wrong image or a wrong guest does not get a refused
-          # mount — it gets no key at all.
-          #
-          # ENCLAVE_MASTER_KEY is deliberately absent, and the runtime *refuses*
-          # to start if it is set alongside this: a key from configuration is a
-          # key the parent instance holds, which is the whole thing this
-          # prevents. The key and the parameter come from the deployment, since
-          # they name resources this repository does not own.
-          ENCLAVE_MASTER_KEY_SOURCE = "kms";
+          # mount — it gets no key at all. The key and the parameter come from
+          # the deployment, since they name resources this repository does not
+          # own.
           ENCLAVE_KMS_KEY_ID = deployment.kmsKeyId;
           ENCLAVE_MASTER_KEY_PARAMETER = deployment.masterKeyParameter;
 
@@ -379,10 +358,10 @@
           # Guest stdout and stderr go to CloudWatch as well as the console.
           # The enclave calls PutLogEvents itself, over the same path it uses
           # for S3 and KMS, so TLS terminates inside and the parent carries
-          # ciphertext. The group and stream are created by Terraform; this
-          # runtime holds `logs:PutLogEvents` and cannot make them.
+          # ciphertext. The group and its `guest` stream are created by
+          # Terraform; this runtime holds `logs:PutLogEvents` and cannot make
+          # them.
           ENCLAVE_GUEST_LOG_GROUP = deployment.guestLogGroup;
-          ENCLAVE_GUEST_LOG_STREAM = deployment.guestLogStream;
 
           # Every request that could reach the guest needs a fresh WebAuthn
           # assertion bound to exactly that request. Without an RP id the
@@ -391,7 +370,6 @@
           # one. The domain must be the one the app's passkeys are scoped to,
           # and it must be browser-trusted, hence ACME rather than self-signed.
           ENCLAVE_WEBAUTHN_RP_ID = deployment.rpId;
-          ENCLAVE_WEBAUTHN_ORIGIN = "https://" + deployment.rpId;
           ENCLAVE_WEBAUTHN_ALLOWED_ORIGINS = lib.concatStringsSep "," deployment.webauthnAllowedOrigins;
           #
           # Registration is open: anyone who can reach the port may create a
@@ -481,10 +459,6 @@
           # verified — PCR0, PCR16 and the state_root — which is the whole
           # boot machine minus the one part that needs real hardware.
           ENCLAVE_RECEIPT_TRUST = "unsigned-emulator";
-          # A directory per client, which the e2e exercises with two client
-          # certificates. Concurrency has to rise with it or every client
-          # still queues behind every other and the per-client locks buy
-          # nothing.
           # And it cannot use KMS at all, for the same reason: KMS verifies
           # the attestation document carrying the enclave's recipient public
           # key, and will not accept one that is unsigned. So the emulator
@@ -505,16 +479,8 @@
           # loopback where gvproxy forwards :443 into this enclave — so the
           # TLS-ALPN-01 challenge arrives on the same port the service uses,
           # which is exactly the arrangement production runs.
-          ENCLAVE_TLS = "acme";
           ENCLAVE_TLS_DOMAINS = nixpkgs.lib.concatStringsSep "," tlsDomains;
           ENCLAVE_ACME_DIRECTORY = acmeDirectory;
-          # The e2e schedules work and waits for it to run. Production leaves
-          # this off in deployment.nix; turning it on here changes only the
-          # emulator's PCR0, and the harness checks PCR0 against its own
-          # `nix build` rather than against a published number, so nothing
-          # downstream moves. The guest is guest-http, which exports the
-          # `run-task` the runtime refuses to start without when this is set.
-          ENCLAVE_BACKGROUND_TASKS = "true";
           # Notifications, against a stub on the host rather than AWS — which
           # would refuse an invented registration token anyway. What the e2e
           # checks is what the *runtime* sends, and the stub records exactly
@@ -524,11 +490,10 @@
           ENCLAVE_PUSH_APP_ID = "e2e";
           # Off. Inherited from the production image, and there is no AWS
           # here to send to: the harness's credentials are MinIO's, which
-          # CloudWatch would reject. Empty means off — the same shape as the
-          # TLS override above, and the reason `guest_log_config` treats an
-          # empty setting as unset rather than as a typo.
+          # CloudWatch would reject. Empty means off, which is why
+          # `guest_log_config` treats an empty setting as unset rather than as
+          # a typo.
           ENCLAVE_GUEST_LOG_GROUP = "";
-          ENCLAVE_GUEST_LOG_STREAM = "";
           # The gate, with a relying party the harness can drive. The e2e
           # exercises it with the software passkey the `testing` feature
           # provides, so the default is a name nothing else answers to.
@@ -539,7 +504,6 @@
           # `android:apk-key-hash:<hash>` rather than the web origin. The rp id
           # is independent of the certificate's name, which stays enclave.test.
           ENCLAVE_WEBAUTHN_RP_ID = rpId;
-          ENCLAVE_WEBAUTHN_ORIGIN = "https://${rpId}";
           ENCLAVE_ENDPOINT = "http://192.168.127.254:9000";
           ENCLAVE_FORCE_PATH_STYLE = "1";
           ENCLAVE_ROOTS_BUCKET = "e2e-roots";
@@ -585,8 +549,8 @@
         eif = callEif runtimeImage;
 
         # The same runtime, configured for the emulator. Neither image contains
-        # the guest: the e2e uploads `guest-release` to MinIO, at the key
-        # `deployment.guestObject` names, and the enclave measures it there.
+        # the guest: the e2e uploads `guest-release` to MinIO, at
+        # `guest/guest.wasm`, and the enclave measures it there.
         #
         # A different image, and therefore a *different PCR0* — which is the
         # honest outcome: an enclave image is its configuration as much as its

@@ -35,11 +35,13 @@ done
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$REPO/target/release/enclave-runtime"
-# clock-check never mounts anything, but the CLI requires these.
-DUMMY_ARGS=(--clock-check --clock-source ptp --bucket unused
-            --master-key 00000000000000000000000000000000000000000000000000000000000000ab)
+# A `testing` build, since only it lets a check choose its clock and entropy:
+# a production binary always reads PTP and the NSM, and neither machine here has
+# an NSM. --self-check exits before anything mounts, but the CLI requires a bucket.
+DUMMY_ARGS=(--self-check --roots-bucket unused --clock-source ptp --random-source host)
 
-[[ -x "$BIN" ]] || { echo "build it first: cargo build --release -p enclave-runtime" >&2; exit 1; }
+[[ -x "$BIN" ]] || {
+    echo "build it first: cargo build --release -p enclave-runtime --features testing" >&2; exit 1; }
 
 case "$MODE" in
 container)

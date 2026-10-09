@@ -178,7 +178,7 @@ impl Enclave {
         // which is what a harness wants. Production drains it explicitly.
         let (logs, _collector) = crate::guest_io::start(Arc::new(crate::TracingLogSink));
         // As the binary does it: what the guest file carries is the guest's environment.
-        let env = crate::env::with_guest_settings(Vec::new(), &builder.guest)?;
+        let env = crate::env::from_guest(&builder.guest)?;
         let guest_env = GuestEnvironment::new(fs, Box::new(HostClock), entropy, &env, &[], logs)
             .context("building the guest environment")?;
 

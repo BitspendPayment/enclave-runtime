@@ -15,7 +15,7 @@ so the harness supplies its own.
 
 | | |
 |---|---|
-| `ca.pem` | The root. Baked into `eif-qemu` at `/pebble-ca.pem` and named by `S3FS_ACME_CA`, so it is covered by PCR0 like any other configuration. |
+| `ca.pem` | The root. Baked into `eif-qemu` at `/pebble-ca.pem` and named by `ENCLAVE_ACME_CA`, so it is covered by PCR0 like any other configuration. |
 | `cert.pem`, `key.pem` | Pebble's API certificate, SANs `192.168.127.254`, `127.0.0.1`, `localhost`, `pebble`. Mounted into the container. |
 
 The CA's private key is **deliberately not here**: it was destroyed after

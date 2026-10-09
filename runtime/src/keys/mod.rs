@@ -36,9 +36,11 @@ mod ber;
 mod kms;
 mod policy;
 mod recipient;
+#[cfg(any(test, feature = "testing"))]
 mod static_key;
 
 pub use kms::{KeyPointer, KmsAttestedKey, KmsKeyConfig};
+#[cfg(any(test, feature = "testing"))]
 pub use static_key::StaticKey;
 
 use std::sync::Arc;
@@ -130,9 +132,8 @@ impl<T: MasterKeySource + ?Sized> MasterKeySource for Box<T> {
 
 /// Which implementation of [`MasterKeySource`] a deployment runs.
 ///
-/// No default anywhere. An enclave's key handling is the one setting that
-/// should never be inherited by omission, and because the value comes from the
-/// image environment, PCR0 records which of the two an enclave was built with.
+/// A production build has only [`KmsAttestedKey`]: the static key is compiled into `testing`
+/// builds alone, so no setting can make a production binary take its key from configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MasterKeySourceKind {
     /// [`KmsAttestedKey`] — the production path.
@@ -140,6 +141,7 @@ pub enum MasterKeySourceKind {
     /// [`StaticKey`] — development and the QEMU harness, which cannot use KMS
     /// because an emulated NSM does not sign its attestations and KMS will not
     /// accept an unsigned one.
+    #[cfg(any(test, feature = "testing"))]
     Static,
 }
 
@@ -147,6 +149,7 @@ impl MasterKeySourceKind {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "kms" | "kms-attested" => Ok(MasterKeySourceKind::Kms),
+            #[cfg(any(test, feature = "testing"))]
             "static" | "unsealed" => Ok(MasterKeySourceKind::Static),
             other => Err(format!("expected one of kms, static; got {other:?}")),
         }
@@ -189,6 +192,7 @@ pub fn open_key_source(
     nsm: Arc<dyn Nsm>,
 ) -> Result<Box<dyn MasterKeySource>> {
     match config.kind {
+        #[cfg(any(test, feature = "testing"))]
         MasterKeySourceKind::Static => {
             if config.kms_key_id.is_some() || config.parameter.is_some() {
                 bail!(
@@ -214,9 +218,9 @@ pub fn open_key_source(
             let key_id = config
                 .kms_key_id
                 .as_deref()
-                .context("--master-key-source=kms needs --kms-key-id (ENCLAVE_KMS_KEY_ID)")?;
+                .context("KMS release needs --kms-key-id (ENCLAVE_KMS_KEY_ID)")?;
             let parameter = config.parameter.as_deref().context(
-                "--master-key-source=kms needs --master-key-parameter (ENCLAVE_MASTER_KEY_PARAMETER)",
+                "KMS release needs --master-key-parameter (ENCLAVE_MASTER_KEY_PARAMETER)",
             )?;
 
             Ok(Box::new(KmsAttestedKey::new(

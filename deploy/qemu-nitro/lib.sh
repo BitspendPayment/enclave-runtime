@@ -472,7 +472,7 @@ enclave_start_store() {
     echo "MinIO ready with $ROOTS_BUCKET, and the guest at $ROOTS_BUCKET/guest/guest.wasm"
 }
 
-# Where the emulator image looks: `deployment.guestObject` in the roots bucket.
+# Where every image looks: `guest/guest.wasm` in the roots bucket.
 upload_guest() {
     local image
     image="$("$REPO/scripts/minio-image.sh")"
