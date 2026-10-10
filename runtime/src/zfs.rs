@@ -1,12 +1,18 @@
-//! Storage: one ZFS pool holds everything the enclave keeps.
+//! Storage: a ZFS pool per tenant, plus a control pool, on one disk.
 //!
 //! ```text
-//!   /tenants/<id>          a dataset per tenant, the guest's preopen
-//!   /runtime/...           credentials, tasks, streams, devices
-//!   pool "enclave"         checksum=sha256, sync=disabled, atime=off
-//!   /dev/mapper/zcrypt     plain dm-crypt, key from the master secret
-//!   /dev/nbd0              the parent's disk, over vsock
+//!   /pools/<id>/data       a tenant's pool, mounted here: the guest's preopen
+//!   /runtime/...           credentials, tasks, streams, devices, the catalog
+//!   pool "enclave"         region 0: the control pool (records + catalog)
+//!   pool "p<id>"           region N: a tenant's pool, one data dataset
+//!   /dev/mapper/zcrypt-*   plain dm-crypt per region, a key per pool
+//!   /dev/nbd0              the parent's disk, cut into equal regions, over vsock
 //! ```
+//!
+//! Each pool sits on its own region of the one disk and anchors on its own
+//! chain. A tenant's data is theirs alone, so one tenant's anchor can never
+//! cover another's write; the control pool holds the catalog that maps a
+//! tenant to its region and pool, out of every guest's reach.
 //!
 //! dm-crypt is what makes the host's disk safe to read. Without the key the
 //! host can only replay sectors it once saw or scramble them, and to ZFS both
@@ -485,14 +491,14 @@ struct Pool {
     roots: Arc<dyn Backend>,
     /// The global bucket prefix, under which the generation chain lives.
     prefix: String,
-    /// This pool's anchor-chain prefix in the bucket; `{prefix}zfs/` for the
-    /// one pool today, `{prefix}zfs/pools/<id>/` once there is a pool per
-    /// tenant. Anchors hang off it, generations do not: they are global.
+    /// This pool's anchor-chain prefix in the bucket: `{prefix}zfs/control/`
+    /// for the control pool, `{prefix}zfs/pools/<id>/` for a tenant's. Anchors
+    /// hang off it; generations do not, they are global under `{prefix}`.
     anchor_prefix: String,
     retention: Duration,
     /// The zpool's name, e.g. `enclave`.
     name: String,
-    /// The dm-crypt device the pool sits on, e.g. `/dev/mapper/zcrypt`.
+    /// The dm-crypt device the pool sits on, e.g. `/dev/mapper/zcrypt-control`.
     mapped: String,
     /// Which pool this is, and its identity, signed into every anchor.
     kind: PoolKind,
