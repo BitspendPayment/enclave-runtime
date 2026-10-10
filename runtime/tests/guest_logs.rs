@@ -70,7 +70,7 @@ async fn handle_with(sink: Arc<MemorySink>) -> (ServeHandle, enclave_runtime::Gu
     let (logs, collector) = enclave_runtime::guest_io::start(sink);
     let guest = GuestEnvironment::new(
         fs,
-        Box::new(HostClock),
+        Arc::new(HostClock),
         Arc::new(nitro_nsm::fake::FakeNsm::new()),
         &[],
         &[],

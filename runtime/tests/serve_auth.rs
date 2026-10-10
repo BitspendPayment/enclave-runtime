@@ -176,7 +176,7 @@ async fn start_with_background(background: bool) -> Harness {
     // explicitly instead.
     let (logs, _collector) =
         enclave_runtime::guest_io::start(std::sync::Arc::new(enclave_runtime::TracingLogSink));
-    let guest = GuestEnvironment::new(fs, Box::new(HostClock), entropy, &[], &[], logs)
+    let guest = GuestEnvironment::new(fs, Arc::new(HostClock), entropy, &[], &[], logs)
         .expect("guest environment");
     let tls = TlsIdentity::self_signed(&[RP_ID.to_string()]).expect("tls identity");
 

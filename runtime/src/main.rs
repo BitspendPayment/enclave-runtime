@@ -535,6 +535,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         },
         &entropy,
         &keys,
+        &clock,
     )
     .await?;
 

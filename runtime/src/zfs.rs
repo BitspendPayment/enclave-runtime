@@ -77,7 +77,19 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use zeroize::Zeroize;
 
+use crate::clock::TrustedClock;
 use crate::tenant::Arrival;
+
+/// The absolute time an Object Lock should hold until: the enclave's *trusted*
+/// time (PTP on Nitro), never the host's system clock — a host that wound its
+/// clock back could otherwise shorten the lock and make an anchor, a
+/// generation record or the sealed key deletable early.
+fn retain_until(
+    clock: &Arc<dyn TrustedClock>,
+    retention: Duration,
+) -> Result<std::time::SystemTime> {
+    Ok(std::time::UNIX_EPOCH + clock.now()? + retention)
+}
 
 pub const POOL: &str = "enclave";
 const NBD_DEVICE: &str = "/dev/nbd0";
@@ -414,6 +426,7 @@ async fn claim_generation(
     keys: &KeyMaterial,
     prefix: &str,
     retention: Duration,
+    clock: &Arc<dyn TrustedClock>,
 ) -> Result<u64> {
     for _ in 0..1024 {
         let generation = chain_tip(roots, |g| generation_key(prefix, g))
@@ -423,7 +436,7 @@ async fn claim_generation(
         let body = seal_generation(keys, generation);
         let input = PutBlobInput::new(key.clone(), body.clone()).with_object_lock(ObjectLock {
             mode: ObjectLockMode::Compliance,
-            retain_until: std::time::SystemTime::now() + retention,
+            retain_until: retain_until(clock, retention)?,
         });
         match roots.put_blob_if_not_exists(input).await {
             Ok(_) if roots.get_retained_blob(&key).await?.body == body => {
@@ -496,6 +509,8 @@ struct Pool {
     /// hang off it; generations do not, they are global under `{prefix}`.
     anchor_prefix: String,
     retention: Duration,
+    /// Trusted time, for Object Lock retain-until (see [`retain_until`]).
+    clock: Arc<dyn TrustedClock>,
     /// The zpool's name, e.g. `enclave`.
     name: String,
     /// The dm-crypt device the pool sits on, e.g. `/dev/mapper/zcrypt-control`.
@@ -532,16 +547,20 @@ impl Pool {
     /// Genesis for one pool: create it on its blank device and publish anchor
     /// 0. Refuses a device that already holds a pool, and a chain that already
     /// has anchors. The generation is the manager's, claimed once per boot.
+    #[allow(clippy::too_many_arguments)]
     async fn create(
         disk: &Disk,
         roots: Arc<dyn Backend>,
         keys: Arc<KeyMaterial>,
         prefix: &str,
         retention: Duration,
+        clock: Arc<dyn TrustedClock>,
         spec: PoolSpec,
         generation: u64,
     ) -> Result<Arc<Pool>> {
-        let mut zfs = Pool::attach(disk, roots, keys, prefix, retention, spec, generation);
+        let mut zfs = Pool::attach(
+            disk, roots, keys, prefix, retention, clock, spec, generation,
+        );
         ensure!(
             zfs.find_tip().await?.is_none(),
             "this pool's chain already has anchors; genesis would start a second history"
@@ -619,18 +638,22 @@ impl Pool {
     /// chain from outside; `expect_genesis` pins which history it must be (a
     /// tenant pool against its catalog entry).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn open(
         disk: &Disk,
         roots: Arc<dyn Backend>,
         keys: Arc<KeyMaterial>,
         prefix: &str,
         retention: Duration,
+        clock: Arc<dyn TrustedClock>,
         spec: PoolSpec,
         generation: u64,
         min_seq: Option<u64>,
         expect_genesis: Option<Hash256>,
     ) -> Result<Arc<Pool>> {
-        let mut zfs = Pool::attach(disk, roots, keys, prefix, retention, spec, generation);
+        let mut zfs = Pool::attach(
+            disk, roots, keys, prefix, retention, clock, spec, generation,
+        );
         let seq = zfs
             .find_tip()
             .await?
@@ -710,12 +733,14 @@ impl Pool {
     /// Build a pool's handle on a device the manager has already mapped. No
     /// device or dm-crypt work and no generation claim: the manager does both
     /// once and passes the result in.
+    #[allow(clippy::too_many_arguments)]
     fn attach(
         disk: &Disk,
         roots: Arc<dyn Backend>,
         keys: Arc<KeyMaterial>,
         prefix: &str,
         retention: Duration,
+        clock: Arc<dyn TrustedClock>,
         spec: PoolSpec,
         generation: u64,
     ) -> Pool {
@@ -726,6 +751,7 @@ impl Pool {
             prefix: prefix.to_string(),
             anchor_prefix: spec.anchor_prefix,
             retention,
+            clock,
             name: spec.name,
             mapped: spec.mapped,
             kind: spec.kind,
@@ -926,7 +952,7 @@ impl Pool {
         let key = self.anchor_key(seq);
         let input = PutBlobInput::new(key.clone(), body.clone()).with_object_lock(ObjectLock {
             mode: ObjectLockMode::Compliance,
-            retain_until: std::time::SystemTime::now() + self.retention,
+            retain_until: retain_until(&self.clock, self.retention)?,
         });
         match self.roots.put_blob_if_not_exists(input).await {
             Ok(_) => {}
@@ -992,6 +1018,7 @@ pub struct Zfs {
     master: MasterSecret,
     prefix: String,
     retention: Duration,
+    clock: Arc<dyn TrustedClock>,
     /// Real ZFS, or a directory stand-in for tests.
     is_pool: bool,
     region_sectors: u64,
@@ -1027,6 +1054,7 @@ impl std::fmt::Debug for Zfs {
 impl Zfs {
     /// Genesis: bring up the disk, create the control pool in region 0, publish
     /// its anchor 0. Tenant pools are created as tenants arrive.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         disk: &Disk,
         roots: Arc<dyn Backend>,
@@ -1034,10 +1062,11 @@ impl Zfs {
         master: &MasterSecret,
         prefix: &str,
         retention: Duration,
+        clock: Arc<dyn TrustedClock>,
     ) -> Result<Arc<Zfs>> {
         let (root_base, is_pool, disk_sectors) = bring_up(disk)?;
         let region_sectors = DEFAULT_REGION_MIB * SECTORS_PER_MIB;
-        let generation = claim_generation(&roots, &keys, prefix, retention).await?;
+        let generation = claim_generation(&roots, &keys, prefix, retention, &clock).await?;
         let (spec, _) = control_spec(
             master,
             &keys,
@@ -1054,6 +1083,7 @@ impl Zfs {
             keys.clone(),
             prefix,
             retention,
+            clock.clone(),
             spec,
             generation,
         )
@@ -1065,6 +1095,7 @@ impl Zfs {
             master,
             prefix,
             retention,
+            clock,
             is_pool,
             region_sectors,
             disk_sectors,
@@ -1076,6 +1107,7 @@ impl Zfs {
 
     /// Resume: bring up the disk and import the control pool at its anchor.
     /// `min_seq` floors the control chain from outside.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         disk: &Disk,
         roots: Arc<dyn Backend>,
@@ -1084,10 +1116,11 @@ impl Zfs {
         prefix: &str,
         retention: Duration,
         min_seq: Option<u64>,
+        clock: Arc<dyn TrustedClock>,
     ) -> Result<Arc<Zfs>> {
         let (root_base, is_pool, disk_sectors) = bring_up(disk)?;
         let region_sectors = DEFAULT_REGION_MIB * SECTORS_PER_MIB;
-        let generation = claim_generation(&roots, &keys, prefix, retention).await?;
+        let generation = claim_generation(&roots, &keys, prefix, retention, &clock).await?;
         let (spec, _) = control_spec(
             master,
             &keys,
@@ -1104,6 +1137,7 @@ impl Zfs {
             keys.clone(),
             prefix,
             retention,
+            clock.clone(),
             spec,
             generation,
             min_seq,
@@ -1117,6 +1151,7 @@ impl Zfs {
             master,
             prefix,
             retention,
+            clock,
             is_pool,
             region_sectors,
             disk_sectors,
@@ -1140,6 +1175,7 @@ impl Zfs {
             &master,
             "",
             Duration::from_secs(3600),
+            Arc::new(crate::clock::HostClock),
         )
         .await
         .expect("a scratch pool")
@@ -1153,6 +1189,7 @@ impl Zfs {
         master: &MasterSecret,
         prefix: &str,
         retention: Duration,
+        clock: Arc<dyn TrustedClock>,
         is_pool: bool,
         region_sectors: u64,
         disk_sectors: u64,
@@ -1167,6 +1204,7 @@ impl Zfs {
             master: master.clone(),
             prefix: prefix.to_string(),
             retention,
+            clock,
             is_pool,
             region_sectors,
             disk_sectors,
@@ -1298,6 +1336,7 @@ impl Zfs {
             self.keys.clone(),
             &self.prefix,
             self.retention,
+            self.clock.clone(),
             spec,
             self.generation,
             None,
@@ -1318,6 +1357,7 @@ impl Zfs {
             self.keys.clone(),
             &self.prefix,
             self.retention,
+            self.clock.clone(),
             spec,
             self.generation,
         )
@@ -2099,9 +2139,13 @@ timestamp    message
         )
         .is_err());
         // The 2-field marker shape is not a successor and is refused.
-        assert!(
-            admit(&tip, Some(846), &format!("{}-{}", tip.seq, hex::encode(tip.nonce)), 42).is_err()
-        );
+        assert!(admit(
+            &tip,
+            Some(846),
+            &format!("{}-{}", tip.seq, hex::encode(tip.nonce)),
+            42
+        )
+        .is_err());
     }
 
     #[test]
@@ -2188,14 +2232,31 @@ timestamp    message
         let disk = Disk::scratch().unwrap();
         let day = Duration::from_secs(86_400);
 
-        let first = Zfs::create(&disk, backend.clone(), km.clone(), &master, "", day)
-            .await
-            .unwrap();
+        let first = Zfs::create(
+            &disk,
+            backend.clone(),
+            km.clone(),
+            &master,
+            "",
+            day,
+            Arc::new(crate::clock::HostClock),
+        )
+        .await
+        .unwrap();
         assert_eq!(first.control.generation, 0);
         for expected in 1..=2 {
-            let next = Zfs::open(&disk, backend.clone(), km.clone(), &master, "", day, None)
-                .await
-                .unwrap();
+            let next = Zfs::open(
+                &disk,
+                backend.clone(),
+                km.clone(),
+                &master,
+                "",
+                day,
+                None,
+                Arc::new(crate::clock::HostClock),
+            )
+            .await
+            .unwrap();
             assert_eq!(next.control.generation, expected);
             let c = &next.control;
             assert!(generation_exists(&c.roots, &c.keys, &c.prefix, expected)

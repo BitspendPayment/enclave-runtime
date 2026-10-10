@@ -527,7 +527,7 @@ mod tests {
     ) {
         let fs = Zfs::scratch().await;
         let registry = DeviceRegistry::open(fs).await.unwrap();
-        let clock = Arc::new(WallClockAdapter::new(Box::new(HostClock)).unwrap());
+        let clock = Arc::new(WallClockAdapter::new(Arc::new(HostClock)).unwrap());
         let recorder = Recorder::with(replies);
         let client = PinpointClient::new(
             NotifyConfig {
@@ -556,7 +556,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Wake>(QUEUE_CAPACITY);
         let notifier = Arc::new(Notifier {
             registry: DeviceRegistry::open(fs).await.unwrap(),
-            clock: Arc::new(WallClockAdapter::new(Box::new(HostClock)).unwrap()),
+            clock: Arc::new(WallClockAdapter::new(Arc::new(HostClock)).unwrap()),
             tx,
             inflight: Mutex::new(HashSet::new()),
             counters: Arc::new(Counters::default()),

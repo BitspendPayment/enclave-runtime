@@ -35,6 +35,11 @@ use enclave_runtime::store::backend::{
 };
 use enclave_runtime::store::{MasterSecret, StoreError};
 use enclave_runtime::{Disk, MasterKeySource, MountConfig, SealedKey, StaticKey};
+use std::sync::Arc as StdArc;
+
+fn test_clock() -> StdArc<dyn enclave_runtime::TrustedClock> {
+    StdArc::new(enclave_runtime::HostClock)
+}
 use nitro_attestation::testing::TestChain;
 use nitro_attestation::AttestationDocument;
 use nitro_nsm::{AttestationRequest, Nsm, Pcr, PCR_GUEST, PCR_ZERO};
@@ -261,7 +266,15 @@ async fn boot_on(
     nsm: &Arc<TestNsm>,
 ) -> anyhow::Result<enclave_runtime::Booted> {
     let nsm: Arc<dyn Nsm> = nsm.clone();
-    enclave_runtime::boot(&roots, &config(), &boot_config(store), &nsm, &key()).await
+    enclave_runtime::boot(
+        &roots,
+        &config(),
+        &boot_config(store),
+        &nsm,
+        &key(),
+        &test_clock(),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -509,9 +522,16 @@ async fn an_unmeasured_guest_is_refused_before_any_key_is_asked_for() {
         asked: AtomicUsize::new(0),
     };
 
-    let err = enclave_runtime::boot(&store.roots, &config(), &boot_config(&store), &nsm, &keys)
-        .await
-        .expect_err("must refuse");
+    let err = enclave_runtime::boot(
+        &store.roots,
+        &config(),
+        &boot_config(&store),
+        &nsm,
+        &keys,
+        &test_clock(),
+    )
+    .await
+    .expect_err("must refuse");
     assert!(
         format!("{err:#}").contains("PCR16 is not locked"),
         "{err:#}"

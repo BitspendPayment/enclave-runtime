@@ -558,7 +558,7 @@ mod tests {
         let clock = Clock(Arc::new(AtomicU64::new(1000)));
         let queue = TaskQueue::open(
             fs,
-            Arc::new(WallClockAdapter::new(Box::new(clock.clone())).unwrap()),
+            Arc::new(WallClockAdapter::new(Arc::new(clock.clone())).unwrap()),
             limits,
         )
         .await
@@ -815,7 +815,7 @@ mod tests {
         let (logs, _collector) = crate::guest_io::start(Arc::new(crate::TracingLogSink));
         let env = crate::GuestEnvironment::new(
             q.zfs.clone(),
-            Box::new(HostClock),
+            Arc::new(HostClock),
             Arc::new(nitro_nsm::fake::FakeNsm::new()),
             &[],
             &[],
@@ -934,11 +934,19 @@ mod tests {
         let keys = Arc::new(KeyMaterial::derive(&master, [8; 16]).unwrap());
         let disk = Disk::scratch().unwrap();
         let day = Duration::from_secs(86_400);
-        let fs = Zfs::create(&disk, backend.clone(), keys.clone(), &master, "", day)
-            .await
-            .unwrap();
+        let fs = Zfs::create(
+            &disk,
+            backend.clone(),
+            keys.clone(),
+            &master,
+            "",
+            day,
+            Arc::new(HostClock),
+        )
+        .await
+        .unwrap();
         fs.tenant_dir([1; 16]).await.unwrap();
-        let clock = Arc::new(WallClockAdapter::new(Box::new(HostClock)).unwrap());
+        let clock = Arc::new(WallClockAdapter::new(Arc::new(HostClock)).unwrap());
         let q = TaskQueue::open(fs.clone(), clock.clone(), Default::default())
             .await
             .unwrap();
@@ -946,9 +954,18 @@ mod tests {
         let run_id = q.status([1; 16], "durable").await.unwrap().run_id();
         drop(q);
         drop(fs);
-        let fs = Zfs::open(&disk, backend, keys, &master, "", day, None)
-            .await
-            .unwrap();
+        let fs = Zfs::open(
+            &disk,
+            backend,
+            keys,
+            &master,
+            "",
+            day,
+            None,
+            Arc::new(HostClock),
+        )
+        .await
+        .unwrap();
         let reopened = TaskQueue::open(fs, clock, Default::default())
             .await
             .unwrap();
@@ -976,7 +993,7 @@ mod tests {
         fs.tenant_dir([1; 16]).await.unwrap();
         let q = TaskQueue::open(
             fs,
-            Arc::new(WallClockAdapter::new(Box::new(HostClock)).unwrap()),
+            Arc::new(WallClockAdapter::new(Arc::new(HostClock)).unwrap()),
             Default::default(),
         )
         .await

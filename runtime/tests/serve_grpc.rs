@@ -146,7 +146,7 @@ async fn grpc_handle() -> ServeHandle {
         enclave_runtime::guest_io::start(Arc::new(enclave_runtime::TracingLogSink));
     let guest = GuestEnvironment::new(
         fs,
-        Box::new(HostClock),
+        Arc::new(HostClock),
         Arc::new(nitro_nsm::fake::FakeNsm::new()),
         &[],
         &[],

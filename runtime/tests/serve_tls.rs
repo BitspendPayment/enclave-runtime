@@ -134,7 +134,7 @@ async fn start_inner(slot: Option<enclave_runtime::CertificateSlot>) -> Harness 
     // explicitly instead.
     let (logs, _collector) =
         enclave_runtime::guest_io::start(std::sync::Arc::new(enclave_runtime::TracingLogSink));
-    let guest = GuestEnvironment::new(fs, Box::new(HostClock), nsm.clone(), &[], &[], logs)
+    let guest = GuestEnvironment::new(fs, Arc::new(HostClock), nsm.clone(), &[], &[], logs)
         .expect("guest environment");
     let identity =
         Arc::new(TlsIdentity::self_signed(&["enclave.test".to_string()]).expect("tls identity"));

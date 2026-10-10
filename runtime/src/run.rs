@@ -82,7 +82,7 @@ impl GuestEnvironment {
     /// nothing marking it as untrusted.
     pub fn new(
         zfs: Arc<crate::zfs::Zfs>,
-        clock: Box<dyn TrustedClock>,
+        clock: std::sync::Arc<dyn TrustedClock>,
         entropy: Arc<dyn Nsm>,
         env: &[(String, String)],
         args: &[String],

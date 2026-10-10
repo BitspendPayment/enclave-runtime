@@ -65,7 +65,7 @@
 //! image environment that selects it is measured.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::store::backend::{Backend, ObjectLock, PutBlobInput};
 use crate::store::{MasterSecret, StoreError};
@@ -341,6 +341,7 @@ fn open_receipt(
     trust: ReceiptTrust,
     purpose: &str,
     expected: &Expectations,
+    now: SystemTime,
 ) -> Result<nitro_attestation::Verified> {
     let verified = match trust {
         ReceiptTrust::Required => verify_as_signed(document, AWS_NITRO_ROOT_G1_PEM.as_bytes())?,
@@ -357,7 +358,7 @@ fn open_receipt(
     // and expiring one would make a filesystem unmountable by the passage of
     // time.
     verified
-        .expect(expected, std::time::SystemTime::now())
+        .expect(expected, now)
         .with_context(|| format!("the {purpose} receipt does not say what it must"))?;
     Ok(verified)
 }
@@ -404,6 +405,7 @@ pub async fn boot(
     boot_config: &BootConfig,
     nsm: &Arc<dyn Nsm>,
     key_source: &dyn MasterKeySource,
+    clock: &Arc<dyn crate::clock::TrustedClock>,
 ) -> Result<Booted> {
     let prefix = &mount_config.bucket_prefix;
     let fs_uuid = &mount_config.fs_id;
@@ -435,6 +437,7 @@ pub async fn boot(
                 &mount_config.bucket_prefix,
                 mount_config.root_retention,
                 mount_config.min_root_seq,
+                clock.clone(),
             )
             .await
             .context("opening the pool")?;
@@ -442,7 +445,8 @@ pub async fn boot(
             let identity = identity_of(&zfs, mount_config, &sealed);
             let state_root = identity.state_root();
 
-            verify_origin(&receipt, boot_config.trust, &state_root)?;
+            let now = trusted_now(clock)?;
+            verify_origin(&receipt, boot_config.trust, &state_root, now)?;
             let first = record_pair(
                 roots,
                 mount_config,
@@ -450,6 +454,7 @@ pub async fn boot(
                 nsm.as_ref(),
                 &pair,
                 &state_root,
+                now,
             )
             .await?;
 
@@ -468,7 +473,18 @@ pub async fn boot(
         }
 
         // ---- genesis -------------------------------------------------------
-        (None, None) => genesis(roots, mount_config, boot_config, nsm, key_source, pair).await,
+        (None, None) => {
+            genesis(
+                roots,
+                mount_config,
+                boot_config,
+                nsm,
+                key_source,
+                pair,
+                clock,
+            )
+            .await
+        }
 
         // ---- the attack ----------------------------------------------------
         (Some(_), None) => bail!(
@@ -511,12 +527,18 @@ fn derive_keys(master: &MasterSecret, config: &MountConfig) -> Result<Arc<KeyMat
 /// this point KMS has released the key to *this* pair, and that is the decision
 /// that matters — see the module docs. What KMS cannot say is whether the state
 /// loaded is the state genesis recorded, and that is the question here.
-fn verify_origin(receipt: &[u8], trust: ReceiptTrust, state_root: &[u8; 32]) -> Result<()> {
+fn verify_origin(
+    receipt: &[u8],
+    trust: ReceiptTrust,
+    state_root: &[u8; 32],
+    now: SystemTime,
+) -> Result<()> {
     open_receipt(
         receipt,
         trust,
         "state-origin",
         &Expectations::default().user_data(receipt_payload(PURPOSE_STATE_ORIGIN, state_root)),
+        now,
     )?;
     Ok(())
 }
@@ -527,6 +549,7 @@ fn verify_pair_record(
     trust: ReceiptTrust,
     pair: &Pair,
     state_root: &[u8; 32],
+    now: SystemTime,
 ) -> Result<()> {
     open_receipt(
         document,
@@ -536,6 +559,7 @@ fn verify_pair_record(
             .pcr0(pair.pcr0.to_vec())
             .pcr(PCR_GUEST as u32, pair.pcr16.to_vec())
             .user_data(receipt_payload(PURPOSE_PAIR, state_root)),
+        now,
     )?;
     Ok(())
 }
@@ -548,6 +572,7 @@ fn verify_pair_record(
 /// included — so an object planted there ahead of a pair's first boot would
 /// otherwise stand in for the real record for good, Object Lock keeping it as
 /// faithfully as it would the genuine one.
+#[allow(clippy::too_many_arguments)]
 async fn record_pair(
     roots: &Arc<dyn Backend>,
     config: &MountConfig,
@@ -555,11 +580,12 @@ async fn record_pair(
     nsm: &dyn Nsm,
     pair: &Pair,
     state_root: &[u8; 32],
+    now: SystemTime,
 ) -> Result<bool> {
     let key = pair.record_key(&config.bucket_prefix, &config.fs_id);
 
     if let Some(existing) = maybe_get(roots, &key).await? {
-        verify_pair_record(&existing, trust, pair, state_root).with_context(|| {
+        verify_pair_record(&existing, trust, pair, state_root, now).with_context(|| {
             format!(
                 "the record at {key} does not describe this runtime and guest holding this \
                  state. Refusing to boot rather than leave it standing as this pair's record."
@@ -578,11 +604,11 @@ async fn record_pair(
     // be a record of nothing, locked in place for the retention period — and on
     // real hardware, this is where a guest register missing from documents
     // would first show.
-    verify_pair_record(&document, trust, pair, state_root)
+    verify_pair_record(&document, trust, pair, state_root, now)
         .context("the NSM's own document does not carry this runtime and guest")?;
 
     match roots
-        .put_blob_if_not_exists(locked(&key, document, config.root_retention))
+        .put_blob_if_not_exists(locked(&key, document, config.root_retention, now))
         .await
     {
         Ok(_) => {}
@@ -592,7 +618,7 @@ async fn record_pair(
             let theirs = maybe_get(roots, &key)
                 .await?
                 .with_context(|| format!("{key} was reported present and then was not"))?;
-            verify_pair_record(&theirs, trust, pair, state_root).with_context(|| {
+            verify_pair_record(&theirs, trust, pair, state_root, now).with_context(|| {
                 format!(
                     "another writer's record at {key} does not describe this runtime and \
                      guest holding this state. Refusing to boot."
@@ -631,6 +657,7 @@ async fn genesis(
     nsm: &Arc<dyn Nsm>,
     key_source: &dyn MasterKeySource,
     pair: Pair,
+    clock: &Arc<dyn crate::clock::TrustedClock>,
 ) -> Result<Booted> {
     tracing::info!(
         pcr0 = %hex::encode(pair.pcr0),
@@ -638,6 +665,7 @@ async fn genesis(
         "no pool here: creating one and recording its origin"
     );
 
+    let now = trusted_now(clock)?;
     let (master, sealed) = key_source.mint().await.context("minting a master key")?;
 
     // Written first and *conditionally*: this is the genesis lease. Two cold
@@ -649,6 +677,7 @@ async fn genesis(
             &key_object,
             sealed.as_bytes().to_vec(),
             config.root_retention,
+            now,
         ))
         .await
         .map_err(|e| match e {
@@ -670,6 +699,7 @@ async fn genesis(
         &master,
         &config.bucket_prefix,
         config.root_retention,
+        clock.clone(),
     )
     .await
     .context("creating the pool")?;
@@ -685,7 +715,12 @@ async fn genesis(
 
     let receipt_object = receipt_key(&config.bucket_prefix, &config.fs_id);
     roots
-        .put_blob_if_not_exists(locked(&receipt_object, document, config.root_retention))
+        .put_blob_if_not_exists(locked(
+            &receipt_object,
+            document,
+            config.root_retention,
+            now,
+        ))
         .await
         .map_err(|e| anyhow::anyhow!("writing the state-origin receipt: {e}"))?;
 
@@ -696,6 +731,7 @@ async fn genesis(
         nsm.as_ref(),
         &pair,
         &state_root,
+        now,
     )
     .await?;
 
@@ -716,11 +752,19 @@ async fn genesis(
 
 /// Everything the boot machine writes goes under the same retention as the
 /// anchor chain: undeletable is the whole point.
-fn locked(key: &str, body: Vec<u8>, retention: Duration) -> PutBlobInput {
+fn locked(key: &str, body: Vec<u8>, retention: Duration, now: SystemTime) -> PutBlobInput {
     PutBlobInput::new(key, body.into()).with_object_lock(ObjectLock {
         mode: crate::store::backend::ObjectLockMode::Compliance,
-        retain_until: std::time::SystemTime::now() + retention,
+        // `now` is the enclave's trusted (PTP) time, not the host clock: a host
+        // that wound its clock back could otherwise shorten this lock and make
+        // the record deletable early — the rollback the lock exists to stop.
+        retain_until: now + retention,
     })
+}
+
+/// The enclave's trusted wall-clock time as a `SystemTime`.
+fn trusted_now(clock: &Arc<dyn crate::clock::TrustedClock>) -> Result<SystemTime> {
+    Ok(SystemTime::UNIX_EPOCH + clock.now()?)
 }
 
 #[cfg(test)]
@@ -750,7 +794,9 @@ mod tests {
     #[test]
     fn the_boot_records_are_locked_for_the_configured_retention() {
         let day = Duration::from_secs(86_400);
-        let lock = locked("k", vec![], day).object_lock.expect("locked");
+        let lock = locked("k", vec![], day, SystemTime::now())
+            .object_lock
+            .expect("locked");
         assert!(matches!(
             lock.mode,
             crate::store::backend::ObjectLockMode::Compliance

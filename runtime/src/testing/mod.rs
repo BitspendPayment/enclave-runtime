@@ -179,7 +179,7 @@ impl Enclave {
         let (logs, _collector) = crate::guest_io::start(Arc::new(crate::TracingLogSink));
         // As the binary does it: what the guest file carries is the guest's environment.
         let env = crate::env::from_guest(&builder.guest)?;
-        let guest_env = GuestEnvironment::new(fs, Box::new(HostClock), entropy, &env, &[], logs)
+        let guest_env = GuestEnvironment::new(fs, Arc::new(HostClock), entropy, &env, &[], logs)
             .context("building the guest environment")?;
 
         let push = if builder.notify {

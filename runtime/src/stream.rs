@@ -1130,7 +1130,7 @@ mod tests {
         let (logs, _collector) = crate::guest_io::start(Arc::new(crate::TracingLogSink));
         let env = crate::GuestEnvironment::new(
             fs,
-            Box::new(crate::clock::HostClock),
+            Arc::new(crate::clock::HostClock),
             Arc::new(nitro_nsm::fake::FakeNsm::new()),
             &[],
             &[],

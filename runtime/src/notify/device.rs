@@ -572,18 +572,35 @@ mod tests {
         let keys = Arc::new(KeyMaterial::derive(&master, [8u8; 16]).unwrap());
         let disk = Disk::scratch().unwrap();
         let day = std::time::Duration::from_secs(86_400);
-        let fs = Zfs::create(&disk, backend.clone(), keys.clone(), &master, "", day)
-            .await
-            .unwrap();
+        let fs = Zfs::create(
+            &disk,
+            backend.clone(),
+            keys.clone(),
+            &master,
+            "",
+            day,
+            Arc::new(crate::clock::HostClock),
+        )
+        .await
+        .unwrap();
         let r = DeviceRegistry::open(fs.clone()).await.unwrap();
         r.register(ALICE, &token("a"), 1000).await.unwrap();
         r.register(BOB, &token("b"), 2000).await.unwrap();
         drop(r);
         drop(fs);
 
-        let fs = Zfs::open(&disk, backend, keys, &master, "", day, None)
-            .await
-            .unwrap();
+        let fs = Zfs::open(
+            &disk,
+            backend,
+            keys,
+            &master,
+            "",
+            day,
+            None,
+            Arc::new(crate::clock::HostClock),
+        )
+        .await
+        .unwrap();
         let reopened = DeviceRegistry::open(fs).await.unwrap();
         assert_eq!(reopened.count(ALICE).await, 1);
         assert_eq!(reopened.count(BOB).await, 1);
