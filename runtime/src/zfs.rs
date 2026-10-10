@@ -87,21 +87,56 @@ const ZFS_PARAMS: &str = "zfs_txg_timeout=3600 zfs_txg_history=4096 \
     zfs_arc_max=268435456 zfs_dirty_data_max=268435456 zfs_dirty_data_sync_percent=90 \
     spa_load_verify_data=0 zfs_dbgmsg_enable=1";
 
-const ANCHOR_MAGIC: &[u8; 8] = b"ZFSANCH1";
+const ANCHOR_MAGIC: &[u8; 8] = b"ZFSANCH2";
 
-// magic | seq | prev | fs_uuid | pool_guid | txg | nonce | pubkey | sig
+// magic | seq | prev | fs_uuid | kind | pool_id | tenant_id | pool_guid | txg | nonce | pubkey | sig
 const OFF_SEQ: usize = 8;
 const OFF_PREV: usize = OFF_SEQ + 8;
 const OFF_FS_UUID: usize = OFF_PREV + 32;
-const OFF_POOL_GUID: usize = OFF_FS_UUID + 16;
+const OFF_KIND: usize = OFF_FS_UUID + 16;
+const OFF_POOL_ID: usize = OFF_KIND + 1;
+const OFF_TENANT_ID: usize = OFF_POOL_ID + 16;
+const OFF_POOL_GUID: usize = OFF_TENANT_ID + 16;
 const OFF_TXG: usize = OFF_POOL_GUID + 8;
 const OFF_NONCE: usize = OFF_TXG + 8;
 const OFF_PUBKEY: usize = OFF_NONCE + 32;
 const SIGNED_LEN: usize = OFF_PUBKEY + ED25519_PUBLIC_KEY_LEN;
 pub const ANCHOR_LEN: usize = SIGNED_LEN + ED25519_SIGNATURE_LEN;
 
+/// The control pool holds the catalog and runtime records; a tenant pool holds
+/// one tenant's data. Which a pool is settles what an anchor speaks for, so it
+/// is signed into the anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolKind {
+    Control,
+    Tenant,
+}
+
+impl PoolKind {
+    fn byte(self) -> u8 {
+        match self {
+            PoolKind::Control => 0,
+            PoolKind::Tenant => 1,
+        }
+    }
+    fn from_byte(b: u8) -> Option<PoolKind> {
+        match b {
+            0 => Some(PoolKind::Control),
+            1 => Some(PoolKind::Tenant),
+            _ => None,
+        }
+    }
+}
+
+/// The one control pool's id: a fixed sentinel, never a random tenant id.
+const CONTROL_POOL_ID: [u8; 16] = *b"enclave-control!";
+
 fn u64_at(b: &[u8], off: usize) -> u64 {
     u64::from_be_bytes(b[off..off + 8].try_into().expect("8 bytes"))
+}
+
+fn id_at(b: &[u8], off: usize) -> [u8; 16] {
+    b[off..off + 16].try_into().expect("16 bytes")
 }
 
 /// One anchored pool state, chained to the one before it.
@@ -109,6 +144,13 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 pub struct Anchor {
     pub seq: u64,
     pub prev: Hash256,
+    pub kind: PoolKind,
+    /// Which pool this anchor speaks for: a fixed sentinel for the control
+    /// pool, a random id for a tenant's. Signed in, and checked on load, so
+    /// the host cannot serve one pool's anchor as another's.
+    pub pool_id: [u8; 16],
+    /// The tenant the pool belongs to, or zero for the control pool.
+    pub tenant_id: [u8; 16],
     pub pool_guid: u64,
     pub txg: u64,
     /// Also in the pool, as `enclave:anchor`: what tells this state apart
@@ -118,9 +160,13 @@ pub struct Anchor {
 }
 
 impl Anchor {
+    #[allow(clippy::too_many_arguments)]
     pub fn seal(
         keys: &KeyMaterial,
         prev: Option<&Anchor>,
+        kind: PoolKind,
+        pool_id: [u8; 16],
+        tenant_id: [u8; 16],
         pool_guid: u64,
         txg: u64,
         nonce: [u8; 32],
@@ -132,6 +178,9 @@ impl Anchor {
         b.extend_from_slice(&seq.to_be_bytes());
         b.extend_from_slice(prev_hash.as_bytes());
         b.extend_from_slice(keys.fs_uuid());
+        b.push(kind.byte());
+        b.extend_from_slice(&pool_id);
+        b.extend_from_slice(&tenant_id);
         b.extend_from_slice(&pool_guid.to_be_bytes());
         b.extend_from_slice(&txg.to_be_bytes());
         b.extend_from_slice(&nonce);
@@ -141,6 +190,9 @@ impl Anchor {
         Anchor {
             seq,
             prev: prev_hash,
+            kind,
+            pool_id,
+            tenant_id,
             pool_guid,
             txg,
             nonce,
@@ -169,6 +221,7 @@ impl Anchor {
         bytes: &[u8],
         keys: &KeyMaterial,
         expected_seq: u64,
+        expected_pool_id: [u8; 16],
     ) -> StoreResult<Anchor> {
         if bytes.len() != ANCHOR_LEN || &bytes[..8] != ANCHOR_MAGIC {
             return Err(StoreError::Integrity("zfs anchor: not an anchor"));
@@ -180,11 +233,16 @@ impl Anchor {
         }
         let sig: [u8; ED25519_SIGNATURE_LEN] = bytes[SIGNED_LEN..].try_into().expect("64 bytes");
         sign::verify(keys.public_key(), &bytes[..SIGNED_LEN], &sig)?;
-        if &bytes[OFF_FS_UUID..OFF_POOL_GUID] != keys.fs_uuid() {
+        if &bytes[OFF_FS_UUID..OFF_KIND] != keys.fs_uuid() {
             return Err(StoreError::Integrity(
                 "zfs anchor: belongs to another filesystem",
             ));
         }
+        if id_at(bytes, OFF_POOL_ID) != expected_pool_id {
+            return Err(StoreError::Integrity("zfs anchor: belongs to another pool"));
+        }
+        let kind = PoolKind::from_byte(bytes[OFF_KIND])
+            .ok_or(StoreError::Integrity("zfs anchor: unknown pool kind"))?;
         let seq = u64_at(bytes, OFF_SEQ);
         if seq != expected_seq {
             return Err(StoreError::Integrity(
@@ -200,6 +258,9 @@ impl Anchor {
         Ok(Anchor {
             seq,
             prev,
+            kind,
+            pool_id: id_at(bytes, OFF_POOL_ID),
+            tenant_id: id_at(bytes, OFF_TENANT_ID),
             pool_guid: u64_at(bytes, OFF_POOL_GUID),
             txg: u64_at(bytes, OFF_TXG),
             nonce: bytes[OFF_NONCE..OFF_PUBKEY].try_into().expect("32 bytes"),
@@ -296,6 +357,10 @@ pub struct Zfs {
     name: String,
     /// The dm-crypt device the pool sits on, e.g. `/dev/mapper/zcrypt`.
     mapped: String,
+    /// Which pool this is, and its identity, signed into every anchor.
+    kind: PoolKind,
+    pool_id: [u8; 16],
+    tenant_id: [u8; 16],
     /// `/` on the pool; a directory for [`Disk::Directory`].
     root: PathBuf,
     pool: bool,
@@ -520,6 +585,9 @@ impl Zfs {
             retention,
             name: POOL.to_string(),
             mapped: MAPPED.to_string(),
+            kind: PoolKind::Control,
+            pool_id: CONTROL_POOL_ID,
+            tenant_id: [0u8; 16],
             root,
             pool,
             pool_guid: 0,
@@ -653,7 +721,16 @@ impl Zfs {
                 self.generation + 1
             );
         }
-        let anchor = Anchor::seal(&self.keys, prev, self.pool_guid, txg, nonce);
+        let anchor = Anchor::seal(
+            &self.keys,
+            prev,
+            self.kind,
+            self.pool_id,
+            self.tenant_id,
+            self.pool_guid,
+            txg,
+            nonce,
+        );
         self.publish(seq, anchor.encoded()).await?;
         #[cfg(feature = "testing")]
         hook("after-publish", format!("seq={seq} txg={txg}")).await;
@@ -737,6 +814,7 @@ impl Zfs {
             &self.retained(&self.anchor_key(seq)).await?,
             &self.keys,
             seq,
+            self.pool_id,
         )?)
     }
 
@@ -1196,6 +1274,28 @@ mod tests {
         KeyMaterial::derive(&MasterSecret::from_bytes([master; 32]), [1u8; 16]).unwrap()
     }
 
+    /// A tenant-pool anchor, for the codec and admission tests. `guid` stands
+    /// in for the pool guid; the pool id is fixed so chaining can be checked.
+    const TEST_POOL_ID: [u8; 16] = [0x7c; 16];
+    fn tseal(
+        k: &KeyMaterial,
+        prev: Option<&Anchor>,
+        guid: u64,
+        txg: u64,
+        nonce: [u8; 32],
+    ) -> Anchor {
+        Anchor::seal(
+            k,
+            prev,
+            PoolKind::Tenant,
+            TEST_POOL_ID,
+            [0x7a; 16],
+            guid,
+            txg,
+            nonce,
+        )
+    }
+
     #[test]
     fn witness_is_the_newest_committed_txg_that_wrote() {
         // As /proc/spl/kstat/zfs/<pool>/txgs prints it: a raw kstat header,
@@ -1267,8 +1367,8 @@ timestamp    message
     #[test]
     fn only_the_anchored_state_and_its_descendants_are_admitted() {
         let k = keys(7);
-        let a0 = Anchor::seal(&k, None, 42, 100, [9u8; 32]);
-        let tip = Anchor::seal(&k, Some(&a0), 42, 846, [8u8; 32]);
+        let a0 = tseal(&k, None, 42, 100, [9u8; 32]);
+        let tip = tseal(&k, Some(&a0), 42, 846, [8u8; 32]);
         let mine = tip.property();
         assert!(
             admit(&tip, Some(846), &mine, 42).is_ok(),
@@ -1360,28 +1460,39 @@ timestamp    message
     #[test]
     fn anchor_round_trips_and_chains() {
         let k = keys(7);
-        let a0 = Anchor::seal(&k, None, 42, 4, [9u8; 32]);
-        let a1 = Anchor::seal(&k, Some(&a0), 42, 9, [8u8; 32]);
+        let a0 = tseal(&k, None, 42, 4, [9u8; 32]);
+        let a1 = tseal(&k, Some(&a0), 42, 9, [8u8; 32]);
         assert_eq!(a1.encoded().len(), ANCHOR_LEN);
-        assert_eq!(Anchor::decode_and_verify(&a0.encoded(), &k, 0).unwrap(), a0);
-        let back = Anchor::decode_and_verify(&a1.encoded(), &k, 1).unwrap();
+        assert_eq!(
+            Anchor::decode_and_verify(&a0.encoded(), &k, 0, TEST_POOL_ID).unwrap(),
+            a0
+        );
+        let back = Anchor::decode_and_verify(&a1.encoded(), &k, 1, TEST_POOL_ID).unwrap();
         assert_eq!((back.seq, back.txg, back.prev), (1, 9, a0.hash()));
+        assert_eq!(
+            (back.kind, back.pool_id, back.tenant_id),
+            (PoolKind::Tenant, TEST_POOL_ID, [0x7a; 16])
+        );
     }
 
     #[test]
     fn anchor_refuses_tampering_replay_and_strangers() {
         let k = keys(7);
-        let a = Anchor::seal(&k, None, 42, 4, [9u8; 32]);
+        let a = tseal(&k, None, 42, 4, [9u8; 32]);
         let mut flipped = a.encoded().to_vec();
         flipped[OFF_TXG + 7] ^= 1;
-        assert!(Anchor::decode_and_verify(&flipped, &k, 0).is_err());
+        assert!(Anchor::decode_and_verify(&flipped, &k, 0, TEST_POOL_ID).is_err());
         assert!(
-            Anchor::decode_and_verify(&a.encoded(), &k, 1).is_err(),
+            Anchor::decode_and_verify(&a.encoded(), &k, 1, TEST_POOL_ID).is_err(),
             "replayed at another seq"
         );
         assert!(
-            Anchor::decode_and_verify(&a.encoded(), &keys(8), 0).is_err(),
+            Anchor::decode_and_verify(&a.encoded(), &keys(8), 0, TEST_POOL_ID).is_err(),
             "another master"
+        );
+        assert!(
+            Anchor::decode_and_verify(&a.encoded(), &k, 0, [0x99; 16]).is_err(),
+            "another pool's id"
         );
     }
 }
