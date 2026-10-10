@@ -14,7 +14,7 @@
 # firewall problem rather than a missing enclave.
 set -euo pipefail
 
-EIF="${EIF:-/opt/enclave/s3fs.eif}"
+EIF="${EIF:-/opt/enclave/enclave.eif}"
 CPU_COUNT="${CPU_COUNT:-2}"
 MEMORY_MIB="${MEMORY_MIB:-3072}"
 ENCLAVE_IP="${ENCLAVE_IP:-192.168.127.2}"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Start MinIO and create the two buckets the runtime expects.
+# Start MinIO and create the bucket the runtime expects.
 #
-#   minio-up.sh <container> <host-port> <data-bucket> <roots-bucket> [data-dir]
+#   minio-up.sh <container> <host-port> <roots-bucket> [data-dir]
 #
 # Without data-dir the store lives inside the container and goes with it, which
 # is what tests want. With one it lives in that host directory and outlives the
@@ -12,16 +12,15 @@
 # how the harness and CI end up testing subtly different stores.
 #
 # The roots bucket is created `--with-lock` deliberately: object lock is what
-# makes a published root record impossible to roll back, so a store without it
+# makes a published anchor impossible to roll back, so a store without it
 # would pass tests that a real deployment could not.
 
 set -euo pipefail
 
 container="${1:?container name}"
 port="${2:?host port}"
-data="${3:?data bucket}"
-roots="${4:?roots bucket}"
-data_dir="${5:-}"
+roots="${3:?roots bucket}"
+data_dir="${4:-}"
 
 # Built from source the first time; minio-image.sh says why.
 image="$("$(dirname "${BASH_SOURCE[0]}")/minio-image.sh")"
@@ -68,8 +67,7 @@ fi
 # restarts a store between runs, and "already there" is success.
 docker run --rm --network host "${label[@]}" --entrypoint sh "$image" -c "
     mc alias set m http://127.0.0.1:$port minioadmin minioadmin >/dev/null
-    mc mb m/$data >/dev/null 2>&1 || true
     mc mb --with-lock m/$roots >/dev/null 2>&1 || true" >/dev/null \
-    || { echo "could not create $data and $roots" >&2; exit 1; }
+    || { echo "could not create $roots" >&2; exit 1; }
 
-echo "MinIO ready on :$port with $data and $roots"
+echo "MinIO ready on :$port with $roots"

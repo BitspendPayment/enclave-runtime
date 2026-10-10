@@ -36,13 +36,13 @@ output "guest_log_group" {
 output "verify" {
   value = <<-EOT
     # Before the first start, and for every guest change: upload the guest the
-    # key policy pins. The key must match `guestObject` in
-    # deploy/nix/deployment.nix. The enclave measures what it fetches into
+    # key policy pins, at guest/guest.wasm, where every image looks. The
+    # enclave measures what it fetches into
     # PCR16 and asks KMS for its key with that measurement, so an object the
     # policy does not name boots an enclave that can read nothing.
     nix build .#guest-release --out-link guest-release
     aws s3 cp guest-release/guest.wasm \
-        s3://${length(var.buckets) > 1 ? var.buckets[1] : var.buckets[0]}/guest/guest.wasm
+        s3://${var.roots_bucket}/guest/guest.wasm
 
     # The key policy's condition, on both kms:GenerateDataKey and kms:Decrypt,
     # in a policy nobody can edit — the enclave refuses any other

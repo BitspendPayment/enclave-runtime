@@ -167,8 +167,8 @@ data "aws_iam_policy_document" "buckets" {
       "s3:PutObjectRetention",
     ]
     resources = concat(
-      [for b in var.buckets : "arn:aws:s3:::${b}"],
-      [for b in var.buckets : "arn:aws:s3:::${b}/*"],
+      ["arn:aws:s3:::${var.roots_bucket}"],
+      ["arn:aws:s3:::${var.roots_bucket}/*"],
     )
   }
 
@@ -341,18 +341,48 @@ resource "aws_instance" "parent" {
     http_put_response_hop_limit = 1
   }
 
-  # Configuration the image cannot know: which buckets, and which domain the
-  # certificate is for. Not secrets — the master key is not passed here, and
-  # once M8 lands it comes from KMS gated on PCR0 rather than from anywhere on
-  # this machine.
+  # Which device is the pool's disk: the one thing the parent needs that the
+  # image cannot know. The enclave's settings are in the image, measured.
   user_data = templatefile("${path.module}/user-data.sh.tftpl", {
-    data_bucket  = var.buckets[0]
-    roots_bucket = length(var.buckets) > 1 ? var.buckets[1] : var.buckets[0]
-    region       = var.region
-    tls_domains  = join(",", var.tls_domains)
+    # How the volume appears to the parent: NVMe, named by its id.
+    pool_disk = "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${replace(aws_ebs_volume.pool.id, "-", "")}"
   })
 
   user_data_replace_on_change = true
 
   tags = local.tags
+}
+
+# ---------------------------------------------------------------------------
+# The pool's disk
+# ---------------------------------------------------------------------------
+
+# Where everything the enclave keeps lives: a ZFS pool on dm-crypt, served to
+# the enclave by nbdkit on the parent (deploy/ami/units/nbdkit.service). The
+# parent sees only ciphertext; the anchor chain in the roots bucket is what
+# makes a rolled-back or substituted volume refused at boot — restoring an
+# older snapshot of this volume is exactly that, and the enclave will not
+# serve it.
+#
+# Never destroyed by a plan: this volume *is* the state. Losing it leaves
+# anchors no disk can satisfy, and the enclave refuses to start rather than
+# begin again.
+resource "aws_ebs_volume" "pool" {
+  availability_zone = aws_subnet.public.availability_zone
+  size              = var.pool_size_gib
+  type              = "gp3"
+  # Amazon's at-rest encryption, beneath the enclave's own dm-crypt.
+  encrypted = true
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  tags = merge(local.tags, { Name = "${local.name}-pool" })
+}
+
+resource "aws_volume_attachment" "pool" {
+  device_name = "/dev/sdf"
+  volume_id   = aws_ebs_volume.pool.id
+  instance_id = aws_instance.parent.id
 }

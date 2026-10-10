@@ -17,6 +17,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 say "unit tests"
 cargo test --workspace --lib
+# The runtime's settings are parsed in the binary, whose tests `--lib` skips.
+cargo test -p enclave-runtime --bin enclave-runtime
 
 # Integration suites run only where they are named, and this one ran nowhere
 # before. It is the boot machine — genesis, resume, upgrades and the refusals —

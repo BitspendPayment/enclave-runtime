@@ -53,8 +53,8 @@ One setting. Empty means off.
 
 | Setting | Purpose |
 |---|---|
-| `S3FS_PUSH_APP_ID` | The push application. Baked into the image, so PCR0 covers it. Not a secret |
-| `S3FS_PUSH_ENDPOINT` | Send to a stub instead, signed with a placeholder. Only a `testing` build has it |
+| `ENCLAVE_PUSH_APP_ID` | The push application. Baked into the image, so PCR0 covers it. Not a secret |
+| `ENCLAVE_PUSH_ENDPOINT` | Send to a stub instead, signed with a placeholder. Only a `testing` build has it |
 
 Requests go to `pinpoint.<region>.amazonaws.com` in the runtime's region, signed
 (SigV4, service `mobiletargeting`) at the trusted clock's time as the instance's

@@ -11,25 +11,20 @@ The guest must export `run-task` and may import the queue interface defined in
 [`wit/tasks/tasks.wit`](../wit/tasks/tasks.wit). The HTTP example implements both
 its usual `wasi:http` interface and this background interface.
 
-Enable `S3FS_BACKGROUND_TASKS=true` (or `--background-tasks true`) alongside
-WebAuthn authentication and tenant isolation. In the Nix deployment, set
-`backgroundTasks = true` in `deploy/nix/deployment.nix`. This image configuration
-change changes PCR0; rebuilding the example guest changes PCR16. Update the
-approved measurements through your normal deployment process.
+There is no setting: tasks run when the guest exports `run-task`. The guest is
+measured into PCR16, so its exports already are the decision, and a setting beside
+them could only disagree. A guest that exports it needs WebAuthn authentication,
+or the runtime refuses to start.
 
-The emulator image turns it on independently, in `eif-qemu`'s environment in
-`flake.nix`, so the end-to-end harness can exercise this path. That override
-changes only the emulator's PCR0 — which the harness checks against its own
-build rather than a published number — and leaves the production default alone.
+| Limit | Value |
+|---|---:|
+| Active background workers | 1 |
+| Durable records, including terminal tasks | 1024 |
+| Records per tenant | 64 |
+| One guest attempt | 600 s |
 
-| Setting | Default | Purpose |
-|---|---:|---|
-| `S3FS_BACKGROUND_CONCURRENCY` | 1 | Maximum active background workers |
-| `S3FS_BACKGROUND_MAX_RECORDS` | 1024 | Total durable records, including terminal tasks |
-| `S3FS_BACKGROUND_PER_TENANT` | 64 | Records allowed per tenant |
-
-One guest attempt may run 600 seconds, and that is not a setting: work that drives a round with
-an outside service waits on its schedule, which is minutes.
+None of these is a setting. An attempt gets minutes because work that drives a round
+with an outside service waits on that service's schedule.
 
 All limits must be positive. Background workers have separate admission from
 interactive requests and yield on epoch ticks. They use the same tenant lock,
@@ -78,8 +73,8 @@ run-task(task-id, payload) -> result<result-bytes, error-string>
 
 This export is not an HTTP endpoint. It receives the correct tenant's directory
 as `/` and an execution deadline. It uses a fresh guest
-instance under the same pool lock as HTTP calls; any warm HTTP instance is
-dropped first so it cannot retain stale database handles across the mutation.
+instance under the same pool lock as HTTP calls, which also get a fresh
+instance each, so nothing in memory outlives the call that made it.
 A missing tenant directory causes failure, never recreation.
 
 The background callback can inspect task status, but cannot enqueue, cancel or

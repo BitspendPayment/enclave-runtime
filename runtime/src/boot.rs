@@ -1,16 +1,15 @@
 //! Deciding whether this enclave is entitled to the state it is about to load.
 //!
-//! `Store::open` used to end with `None => Store::format(…)`: an enclave
-//! pointed at an empty store made a fresh filesystem and served it. It was
-//! correctly signed, correctly hash-chained, and completely wrong — every
-//! check the design makes passed, because they all attested to the *new*
-//! filesystem while the guest saw an empty database where its data should have
-//! been.
+//! An enclave pointed at an empty store could make a fresh pool and serve it.
+//! It would be correctly signed, correctly anchored, and completely wrong —
+//! every check the design makes would pass, because they would all attest to
+//! the *new* pool while the guest saw an empty database where its data should
+//! have been.
 //!
-//! `store/root.rs` already documents the neighbouring risk, rollback: *"a cold
-//! mount cannot distinguish 'the tip is N' from 'the tip is N, and the store is
-//! hiding N+1'"*. This is the worse one it does not name — a cold mount cannot
-//! distinguish "this filesystem is new" from "everything has been hidden".
+//! [`crate::zfs`] documents the neighbouring risk, rollback: a cold boot cannot
+//! tell "the newest anchor is N" from "the store is hiding N+1". This is the
+//! worse one — a cold boot cannot tell "this pool is new" from "everything has
+//! been hidden".
 //!
 //! ## The receipt
 //!
@@ -39,7 +38,7 @@
 //! - **TLS to S3, validated inside the enclave**: the parent proxies the
 //!   bytes but cannot substitute them. It can block, which fails closed.
 //!
-//! What remains out of scope, unchanged from `root.rs`: S3 lying about `HEAD`.
+//! What remains out of scope, as for the anchors: S3 lying about `HEAD`.
 //! That is AWS, whom we already trust for the signature on the receipt itself.
 //!
 //! ## Which code may hold the state
@@ -66,32 +65,35 @@
 //! image environment that selects it is measured.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use crate::store::backend::{Backend, ObjectLock, PutBlobInput};
+use crate::store::{MasterSecret, StoreError};
 use anyhow::{bail, Context, Result};
 use nitro_attestation::{Expectations, Trust, VerifyOptions, AWS_NITRO_ROOT_G1_PEM};
 use nitro_nsm::{AttestationRequest, Nsm, PCR_GUEST, PCR_ZERO};
-use s3fs_core::backend::{Backend, ObjectLock, PutBlobInput};
-use s3fs_core::{FsError, MasterSecret};
 
 use crate::keys::{MasterKeySource, SealedKey};
-use crate::mount::{Backends, MountConfig, Mounted};
+use crate::mount::MountConfig;
+use crate::store::crypto::KeyMaterial;
+use crate::zfs::{Disk, Zfs};
 
 /// `user_data` purpose for the receipt genesis writes.
-const PURPOSE_STATE_ORIGIN: &str = "s3fs-state-origin";
+const PURPOSE_STATE_ORIGIN: &str = "state-origin";
 /// `user_data` purpose for the record a runtime and guest leave the first time
 /// they hold this state.
-const PURPOSE_PAIR: &str = "s3fs-pair";
+const PURPOSE_PAIR: &str = "state-pair";
 
 /// Schema string inside the `state_root` pre-image. Bump it and every existing
 /// receipt stops verifying, which is the intended effect of changing what a
-/// receipt means.
-const STATE_ROOT_SCHEMA: &str = "s3fs/state-origin/v1";
+/// receipt means. `v2` is the per-tenant pool layout: a control pool and a
+/// pool per tenant, versus the single pool `v1` named.
+const STATE_ROOT_SCHEMA: &str = "zfs/state-origin/v2";
 
 /// Which boot this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootMode {
-    /// No receipt and no filesystem: create both.
+    /// No receipt and no pool: create both.
     Genesis,
     /// This runtime and guest have held this state before.
     Resume,
@@ -179,7 +181,10 @@ fn register(value: &[u8], index: u16) -> Result<[u8; 48]> {
 #[derive(Debug)]
 pub struct Booted {
     pub mode: BootMode,
-    pub mounted: Mounted,
+    /// The pool, opened at its newest anchor or just created.
+    pub zfs: Arc<Zfs>,
+    /// Derived from the master secret for this filesystem id.
+    pub keys: Arc<KeyMaterial>,
     pub state_root: [u8; 32],
     /// The runtime image and guest this enclave is running.
     pub pair: Pair,
@@ -199,16 +204,15 @@ pub struct Booted {
 /// The identity a receipt commits to.
 ///
 /// Every field is something an attacker could otherwise vary while leaving the
-/// rest of the design intact: the filesystem, the store it lives in, the
-/// history it descends from, and the key that reads it.
+/// rest of the design intact: the filesystem, the bucket its anchors live in,
+/// the history it descends from, and the key that reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateIdentity {
     pub fs_uuid: [u8; 16],
-    pub data_bucket: String,
     pub roots_bucket: String,
     pub bucket_prefix: String,
-    /// Hash of the seq-0 record: *which* history, not merely which bucket.
-    pub genesis_root_hash: [u8; 32],
+    /// Hash of anchor 0: *which* pool history, not merely which bucket.
+    pub genesis_anchor_hash: [u8; 32],
     /// SHA-256 of the **sealed** key. Never the key: a receipt is readable by
     /// anyone who can read the bucket it sits in.
     pub sealed_key_sha256: [u8; 32],
@@ -224,10 +228,9 @@ impl StateIdentity {
         let value = ciborium::Value::Array(vec![
             ciborium::Value::Text(STATE_ROOT_SCHEMA.into()),
             ciborium::Value::Bytes(self.fs_uuid.to_vec()),
-            ciborium::Value::Text(self.data_bucket.clone()),
             ciborium::Value::Text(self.roots_bucket.clone()),
             ciborium::Value::Text(self.bucket_prefix.clone()),
-            ciborium::Value::Bytes(self.genesis_root_hash.to_vec()),
+            ciborium::Value::Bytes(self.genesis_anchor_hash.to_vec()),
             ciborium::Value::Bytes(self.sealed_key_sha256.to_vec()),
         ]);
         let mut encoded = Vec::new();
@@ -271,16 +274,14 @@ fn sealed_key_key(prefix: &str, fs_uuid: &[u8; 16]) -> String {
 }
 
 /// How a receipt is checked. QEMU's NSM does not sign, so the harness needs a
-/// concession that production must never have.
+/// concession that production must never have — and does not: the concession is
+/// compiled into `testing` builds alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiptTrust {
     /// Signature and chain to the AWS Nitro root.
     Required,
     /// Contents only, because the emulated NSM produces unsigned documents.
-    ///
-    /// Set by the emulator image and never by a production one — and because
-    /// the image's environment is measured, PCR0 itself tells a client which
-    /// kind it is talking to.
+    #[cfg(any(test, feature = "testing"))]
     UnsignedEmulator,
 }
 
@@ -288,6 +289,7 @@ impl ReceiptTrust {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "required" | "signed" => Ok(ReceiptTrust::Required),
+            #[cfg(any(test, feature = "testing"))]
             "unsigned-emulator" | "unsigned" => Ok(ReceiptTrust::UnsignedEmulator),
             other => Err(format!(
                 "expected one of required, unsigned-emulator; got {other:?}"
@@ -306,6 +308,8 @@ impl ReceiptTrust {
 /// of unknown origin.
 pub struct BootConfig {
     pub trust: ReceiptTrust,
+    /// Where the pool lives: the parent's disk, or a directory in tests.
+    pub disk: Disk,
 }
 
 /// Read an origin record, distinguishing "absent" from "could not read" — and
@@ -327,7 +331,7 @@ pub struct BootConfig {
 async fn maybe_get(backend: &Arc<dyn Backend>, key: &str) -> Result<Option<Vec<u8>>> {
     match backend.get_retained_blob(key).await {
         Ok(out) => Ok(Some(out.body.to_vec())),
-        Err(FsError::NotFound) => Ok(None),
+        Err(StoreError::NotFound) => Ok(None),
         Err(e) => Err(anyhow::Error::msg(e.to_string())).with_context(|| format!("reading {key}")),
     }
 }
@@ -338,13 +342,13 @@ fn open_receipt(
     trust: ReceiptTrust,
     purpose: &str,
     expected: &Expectations,
+    now: SystemTime,
 ) -> Result<nitro_attestation::Verified> {
     let verified = match trust {
         ReceiptTrust::Required => verify_as_signed(document, AWS_NITRO_ROOT_G1_PEM.as_bytes())?,
         // The emulator's NSM does not sign, so there is nothing to verify and
-        // the contents are read as-is. Only an image built for the emulator
-        // reaches here, and because the image's environment is measured, PCR0
-        // says which kind of image a client is talking to.
+        // the contents are read as-is. Only a `testing` build has this arm.
+        #[cfg(any(test, feature = "testing"))]
         ReceiptTrust::UnsignedEmulator => nitro_attestation::Verified {
             document: nitro_attestation::parse(document).context("parsing the receipt")?,
             trust: Trust::Unsigned,
@@ -355,7 +359,7 @@ fn open_receipt(
     // and expiring one would make a filesystem unmountable by the passage of
     // time.
     verified
-        .expect(expected, std::time::SystemTime::now())
+        .expect(expected, now)
         .with_context(|| format!("the {purpose} receipt does not say what it must"))?;
     Ok(verified)
 }
@@ -397,15 +401,15 @@ fn verify_as_signed(document: &[u8], trust_root: &[u8]) -> Result<nitro_attestat
 
 /// Decide the mode, resolve the key, and mount or create.
 pub async fn boot(
-    backends: &Backends,
+    roots: &Arc<dyn Backend>,
     mount_config: &MountConfig,
     boot_config: &BootConfig,
     nsm: &Arc<dyn Nsm>,
     key_source: &dyn MasterKeySource,
+    clock: &Arc<dyn crate::clock::TrustedClock>,
 ) -> Result<Booted> {
     let prefix = &mount_config.bucket_prefix;
     let fs_uuid = &mount_config.fs_id;
-    let roots = &backends.roots;
 
     // Before anything is read from the store or asked of KMS.
     let pair = Pair::read(nsm.as_ref())?;
@@ -425,19 +429,33 @@ pub async fn boot(
                 .open(&sealed)
                 .await
                 .context("opening this filesystem's master key")?;
-            let mounted = crate::mount::mount_existing(backends, mount_config, &master).await?;
+            let keys = derive_keys(&master, mount_config)?;
+            let zfs = Zfs::open(
+                &boot_config.disk,
+                roots.clone(),
+                keys.clone(),
+                &master,
+                &mount_config.bucket_prefix,
+                mount_config.root_retention,
+                mount_config.min_root_seq,
+                clock.clone(),
+            )
+            .await
+            .context("opening the pool")?;
 
-            let identity = identity_of(&mounted, mount_config, &sealed).await?;
+            let identity = identity_of(&zfs, mount_config, &sealed);
             let state_root = identity.state_root();
 
-            verify_origin(&receipt, boot_config.trust, &state_root)?;
+            let now = trusted_now(clock)?;
+            verify_origin(&receipt, boot_config.trust, &state_root, now)?;
             let first = record_pair(
-                backends,
+                roots,
                 mount_config,
                 boot_config.trust,
                 nsm.as_ref(),
                 &pair,
                 &state_root,
+                now,
             )
             .await?;
 
@@ -447,7 +465,8 @@ pub async fn boot(
                 } else {
                     BootMode::Resume
                 },
-                mounted,
+                zfs,
+                keys,
                 state_root,
                 pair,
                 master,
@@ -457,12 +476,13 @@ pub async fn boot(
         // ---- genesis -------------------------------------------------------
         (None, None) => {
             genesis(
-                backends,
+                roots,
                 mount_config,
-                boot_config.trust,
+                boot_config,
                 nsm,
                 key_source,
                 pair,
+                clock,
             )
             .await
         }
@@ -484,32 +504,22 @@ pub async fn boot(
     }
 }
 
-/// Recompute the identity of a filesystem that is already mounted.
-async fn identity_of(
-    mounted: &Mounted,
-    config: &MountConfig,
-    sealed: &SealedKey,
-) -> Result<StateIdentity> {
-    // The seq-0 record, read past the session floor because it is history
-    // rather than the live tip.
-    let genesis_root = mounted
-        .fs
-        .store()
-        .snapshot_root(0)
-        .await
-        .map_err(|e| anyhow::anyhow!("reading the genesis root record: {e}"))?;
-
-    Ok(StateIdentity {
+/// The identity of the pool that was just opened or created.
+fn identity_of(zfs: &Zfs, config: &MountConfig, sealed: &SealedKey) -> StateIdentity {
+    StateIdentity {
         fs_uuid: config.fs_id,
-        data_bucket: config.bucket.clone(),
-        roots_bucket: config
-            .roots_bucket
-            .clone()
-            .unwrap_or_else(|| config.bucket.clone()),
+        roots_bucket: config.roots_bucket.clone(),
         bucket_prefix: config.bucket_prefix.clone(),
-        genesis_root_hash: *genesis_root.hash().as_bytes(),
+        genesis_anchor_hash: zfs.genesis_hash(),
         sealed_key_sha256: sealed.sha256(),
-    })
+    }
+}
+
+fn derive_keys(master: &MasterSecret, config: &MountConfig) -> Result<Arc<KeyMaterial>> {
+    Ok(Arc::new(
+        KeyMaterial::derive(master, config.fs_id)
+            .map_err(|e| anyhow::anyhow!("deriving keys: {e}"))?,
+    ))
 }
 
 /// Check the origin receipt names the state that was just loaded.
@@ -518,12 +528,18 @@ async fn identity_of(
 /// this point KMS has released the key to *this* pair, and that is the decision
 /// that matters — see the module docs. What KMS cannot say is whether the state
 /// loaded is the state genesis recorded, and that is the question here.
-fn verify_origin(receipt: &[u8], trust: ReceiptTrust, state_root: &[u8; 32]) -> Result<()> {
+fn verify_origin(
+    receipt: &[u8],
+    trust: ReceiptTrust,
+    state_root: &[u8; 32],
+    now: SystemTime,
+) -> Result<()> {
     open_receipt(
         receipt,
         trust,
         "state-origin",
         &Expectations::default().user_data(receipt_payload(PURPOSE_STATE_ORIGIN, state_root)),
+        now,
     )?;
     Ok(())
 }
@@ -534,6 +550,7 @@ fn verify_pair_record(
     trust: ReceiptTrust,
     pair: &Pair,
     state_root: &[u8; 32],
+    now: SystemTime,
 ) -> Result<()> {
     open_receipt(
         document,
@@ -543,6 +560,7 @@ fn verify_pair_record(
             .pcr0(pair.pcr0.to_vec())
             .pcr(PCR_GUEST as u32, pair.pcr16.to_vec())
             .user_data(receipt_payload(PURPOSE_PAIR, state_root)),
+        now,
     )?;
     Ok(())
 }
@@ -555,18 +573,20 @@ fn verify_pair_record(
 /// included — so an object planted there ahead of a pair's first boot would
 /// otherwise stand in for the real record for good, Object Lock keeping it as
 /// faithfully as it would the genuine one.
+#[allow(clippy::too_many_arguments)]
 async fn record_pair(
-    backends: &Backends,
+    roots: &Arc<dyn Backend>,
     config: &MountConfig,
     trust: ReceiptTrust,
     nsm: &dyn Nsm,
     pair: &Pair,
     state_root: &[u8; 32],
+    now: SystemTime,
 ) -> Result<bool> {
     let key = pair.record_key(&config.bucket_prefix, &config.fs_id);
 
-    if let Some(existing) = maybe_get(&backends.roots, &key).await? {
-        verify_pair_record(&existing, trust, pair, state_root).with_context(|| {
+    if let Some(existing) = maybe_get(roots, &key).await? {
+        verify_pair_record(&existing, trust, pair, state_root, now).with_context(|| {
             format!(
                 "the record at {key} does not describe this runtime and guest holding this \
                  state. Refusing to boot rather than leave it standing as this pair's record."
@@ -585,22 +605,21 @@ async fn record_pair(
     // be a record of nothing, locked in place for the retention period — and on
     // real hardware, this is where a guest register missing from documents
     // would first show.
-    verify_pair_record(&document, trust, pair, state_root)
+    verify_pair_record(&document, trust, pair, state_root, now)
         .context("the NSM's own document does not carry this runtime and guest")?;
 
-    match backends
-        .roots
-        .put_blob_if_not_exists(locked(&key, document, config.root_retention))
+    match roots
+        .put_blob_if_not_exists(locked(&key, document, config.root_retention, now))
         .await
     {
         Ok(_) => {}
         // Another first boot of this pair got there first. Its record stands,
         // provided it says what this one would have.
-        Err(FsError::AlreadyExists) => {
-            let theirs = maybe_get(&backends.roots, &key)
+        Err(StoreError::AlreadyExists) => {
+            let theirs = maybe_get(roots, &key)
                 .await?
                 .with_context(|| format!("{key} was reported present and then was not"))?;
-            verify_pair_record(&theirs, trust, pair, state_root).with_context(|| {
+            verify_pair_record(&theirs, trust, pair, state_root, now).with_context(|| {
                 format!(
                     "another writer's record at {key} does not describe this runtime and \
                      guest holding this state. Refusing to boot."
@@ -633,31 +652,33 @@ async fn record_pair(
 /// leaves a store the next boot resumes; that boot writes the record and
 /// reports an upgrade, which for once is not one.
 async fn genesis(
-    backends: &Backends,
+    roots: &Arc<dyn Backend>,
     config: &MountConfig,
-    trust: ReceiptTrust,
+    boot_config: &BootConfig,
     nsm: &Arc<dyn Nsm>,
     key_source: &dyn MasterKeySource,
     pair: Pair,
+    clock: &Arc<dyn crate::clock::TrustedClock>,
 ) -> Result<Booted> {
     tracing::info!(
         pcr0 = %hex::encode(pair.pcr0),
         pcr16 = %hex::encode(pair.pcr16),
-        "no filesystem here: creating one and recording its origin"
+        "no pool here: creating one and recording its origin"
     );
 
+    let now = trusted_now(clock)?;
     let (master, sealed) = key_source.mint().await.context("minting a master key")?;
 
     // Written first and *conditionally*: this is the genesis lease. Two cold
     // boots race here and exactly one wins, so they cannot create divergent
-    // filesystems under different keys.
+    // pools under different keys.
     let key_object = sealed_key_key(&config.bucket_prefix, &config.fs_id);
-    backends
-        .roots
+    roots
         .put_blob_if_not_exists(locked(
             &key_object,
             sealed.as_bytes().to_vec(),
             config.root_retention,
+            now,
         ))
         .await
         .map_err(|e| match e {
@@ -665,14 +686,25 @@ async fn genesis(
             // return from a failed conditional PUT (`backend/mod.rs`), and
             // matching `Conflict` here meant this arm never fired — a genesis
             // race reported the generic message instead of the specific one.
-            FsError::AlreadyExists => anyhow::anyhow!(
+            StoreError::AlreadyExists => anyhow::anyhow!(
                 "another enclave is performing genesis on this filesystem right now"
             ),
             other => anyhow::anyhow!("storing the sealed master key: {other}"),
         })?;
 
-    let mounted = crate::mount::create(backends, config, &master).await?;
-    let identity = identity_of(&mounted, config, &sealed).await?;
+    let keys = derive_keys(&master, config)?;
+    let zfs = Zfs::create(
+        &boot_config.disk,
+        roots.clone(),
+        keys.clone(),
+        &master,
+        &config.bucket_prefix,
+        config.root_retention,
+        clock.clone(),
+    )
+    .await
+    .context("creating the pool")?;
+    let identity = identity_of(&zfs, config, &sealed);
     let state_root = identity.state_root();
 
     let document = nsm
@@ -683,22 +715,36 @@ async fn genesis(
         .context("asking the NSM for a state-origin receipt")?;
 
     let receipt_object = receipt_key(&config.bucket_prefix, &config.fs_id);
-    backends
-        .roots
-        .put_blob_if_not_exists(locked(&receipt_object, document, config.root_retention))
+    roots
+        .put_blob_if_not_exists(locked(
+            &receipt_object,
+            document,
+            config.root_retention,
+            now,
+        ))
         .await
         .map_err(|e| anyhow::anyhow!("writing the state-origin receipt: {e}"))?;
 
-    record_pair(backends, config, trust, nsm.as_ref(), &pair, &state_root).await?;
+    record_pair(
+        roots,
+        config,
+        boot_config.trust,
+        nsm.as_ref(),
+        &pair,
+        &state_root,
+        now,
+    )
+    .await?;
 
     tracing::info!(
         state_root = %hex::encode(state_root),
-        "genesis complete; this filesystem now has an attested origin"
+        "genesis complete; this pool now has an attested origin"
     );
 
     Ok(Booted {
         mode: BootMode::Genesis,
-        mounted,
+        zfs,
+        keys,
         state_root,
         pair,
         master,
@@ -707,11 +753,19 @@ async fn genesis(
 
 /// Everything the boot machine writes goes under the same retention as the
 /// anchor chain: undeletable is the whole point.
-fn locked(key: &str, body: Vec<u8>, retention: Duration) -> PutBlobInput {
+fn locked(key: &str, body: Vec<u8>, retention: Duration, now: SystemTime) -> PutBlobInput {
     PutBlobInput::new(key, body.into()).with_object_lock(ObjectLock {
-        mode: s3fs_core::backend::ObjectLockMode::Compliance,
-        retain_until: std::time::SystemTime::now() + retention,
+        mode: crate::store::backend::ObjectLockMode::Compliance,
+        // `now` is the enclave's trusted (PTP) time, not the host clock: a host
+        // that wound its clock back could otherwise shorten this lock and make
+        // the record deletable early — the rollback the lock exists to stop.
+        retain_until: now + retention,
     })
+}
+
+/// The enclave's trusted wall-clock time as a `SystemTime`.
+fn trusted_now(clock: &Arc<dyn crate::clock::TrustedClock>) -> Result<SystemTime> {
+    Ok(SystemTime::UNIX_EPOCH + clock.now()?)
 }
 
 #[cfg(test)]
@@ -722,10 +776,9 @@ mod tests {
     fn identity() -> StateIdentity {
         StateIdentity {
             fs_uuid: [1u8; 16],
-            data_bucket: "data".into(),
             roots_bucket: "roots".into(),
             bucket_prefix: String::new(),
-            genesis_root_hash: [2u8; 32],
+            genesis_anchor_hash: [2u8; 32],
             sealed_key_sha256: [3u8; 32],
         }
     }
@@ -742,10 +795,12 @@ mod tests {
     #[test]
     fn the_boot_records_are_locked_for_the_configured_retention() {
         let day = Duration::from_secs(86_400);
-        let lock = locked("k", vec![], day).object_lock.expect("locked");
+        let lock = locked("k", vec![], day, SystemTime::now())
+            .object_lock
+            .expect("locked");
         assert!(matches!(
             lock.mode,
-            s3fs_core::backend::ObjectLockMode::Compliance
+            crate::store::backend::ObjectLockMode::Compliance
         ));
         let left = lock
             .retain_until
@@ -769,10 +824,6 @@ mod tests {
         a.fs_uuid = [9u8; 16];
         assert_ne!(a.state_root(), base, "filesystem id");
 
-        let mut b = identity();
-        b.data_bucket = "elsewhere".into();
-        assert_ne!(b.state_root(), base, "data bucket");
-
         let mut c = identity();
         c.roots_bucket = "elsewhere".into();
         assert_ne!(c.state_root(), base, "roots bucket");
@@ -782,7 +833,7 @@ mod tests {
         assert_ne!(d.state_root(), base, "prefix");
 
         let mut e = identity();
-        e.genesis_root_hash = [9u8; 32];
+        e.genesis_anchor_hash = [9u8; 32];
         assert_ne!(e.state_root(), base, "history");
 
         let mut f = identity();
@@ -796,7 +847,7 @@ mod tests {
     #[test]
     fn swapping_fields_is_not_the_same_state() {
         let mut swapped = identity();
-        std::mem::swap(&mut swapped.data_bucket, &mut swapped.roots_bucket);
+        std::mem::swap(&mut swapped.roots_bucket, &mut swapped.bucket_prefix);
         assert_ne!(swapped.state_root(), identity().state_root());
     }
 
@@ -819,8 +870,8 @@ mod tests {
         let mut expected = vec![0xa2];
         expected.push(0x67);
         expected.extend_from_slice(b"purpose");
-        expected.push(0x71);
-        expected.extend_from_slice(b"s3fs-state-origin");
+        expected.push(0x6c);
+        expected.extend_from_slice(b"state-origin");
         expected.push(0x6a);
         expected.extend_from_slice(b"state_root");
         expected.extend_from_slice(&[0x58, 0x20]);

@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/nitro-attestation",
     "crates/nitro-nsm",
-    "crates/s3fs-core",
     "runtime",
 ]
 
@@ -12,7 +11,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/joshua/s3-wasi-fs"
+repository = "https://github.com/BitspendPayment/enclave-runtime"
 
 [workspace.dependencies]
 tokio       = { version = "1", default-features = false }
@@ -23,20 +22,15 @@ anyhow      = "1"
 async-trait = "0.1"
 futures     = "0.3"
 parking_lot = "0.12"
-fastrand    = "2"
 siphasher   = "1"
-hashlink    = "0.9"
-bitvec      = "1"
-percent-encoding = "2"
 
 # Scrubs key material on drop. Enclave memory is unreadable from outside, but
 # key bytes should not outlive their use inside it either.
 zeroize     = { version = "1", features = ["zeroize_derive"] }
-# Merkle-tree block checksums and the root-record hash chain. BLAKE3 is the
-# hot path (every block read verifies one), so its SIMD backends matter.
+# The anchor chain's hashes and the boot's state root.
 blake3      = "1"
-# AEAD (AES-256-GCM), Ed25519 root signatures, HKDF key derivation. aws-lc-rs
-# is the AWS-native, FIPS-capable stack — the same primitives KMS speaks.
+# AES-256-GCM, Ed25519 anchor signatures, HKDF key derivation. aws-lc-rs is
+# the AWS-native, FIPS-capable stack — the same primitives KMS speaks.
 aws-lc-rs   = { version = "1", default-features = false, features = ["aws-lc-sys"] }
 
 aws-config             = { version = "1", default-features = false }

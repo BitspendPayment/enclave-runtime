@@ -1,0 +1,38 @@
+# The enclave's disk: the pool's EBS volume, served over vsock.
+#
+# An enclave has no devices. The pool lives on an EBS volume attached to this
+# instance, and this hands its blocks to the enclave as NBD on vsock port
+# 10809, where the runtime attaches it as /dev/nbd0 (runtime/src/zfs.rs).
+#
+# Everything it serves is dm-crypt ciphertext under a key this machine never
+# sees, and the enclave checks every block it reads against ZFS's checksums
+# and the anchor in S3. So this can stop serving, which stops the enclave, but
+# it cannot make the enclave read anything wrong or old. Stock nbdkit from the
+# Amazon Linux repositories, unmodified.
+[Unit]
+Description=nbdkit, the enclave's disk
+Before=enclave.service
+
+[Service]
+Type=exec
+# POOL_DISK, written by user-data: /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol<id>.
+EnvironmentFile=/etc/enclave/disk.env
+# The volume is attached after the instance boots, so wait for it rather than
+# fail and leave the enclave to discover a missing disk on its own.
+ExecStartPre=/bin/sh -c 'for i in $(seq 300); do [ -b "$POOL_DISK" ] && exit 0; sleep 1; done; echo "no block device at $POOL_DISK" >&2; exit 1'
+ExecStart=/usr/sbin/nbdkit --foreground --vsock --port 10809 file ${POOL_DISK}
+Restart=always
+RestartSec=2
+
+# It serves one block device to one untrusted enclave, so it gets no more of
+# the host than that needs.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

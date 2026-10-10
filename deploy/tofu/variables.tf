@@ -18,7 +18,7 @@ variable "environment" {
 
 variable "name_prefix" {
   type    = string
-  default = "s3fs-enclave"
+  default = "enclave"
 }
 
 variable "ami_id" {
@@ -40,27 +40,15 @@ variable "instance_type" {
   description = "Enclave-capable instance type with >= 4 vCPUs"
 }
 
-variable "buckets" {
-  type        = list(string)
+variable "roots_bucket" {
+  type        = string
   description = <<-EOT
-    [data_bucket, roots_bucket]. They should differ: the roots bucket carries
-    Object Lock COMPLIANCE retention and is the entire rollback guarantee,
-    while the data bucket stays unlocked so dead copy-on-write blocks remain
-    reclaimable. Both must already exist — this deployment deliberately does
-    not create them, because COMPLIANCE retention cannot be undone by anyone,
-    including AWS support.
+    The Object-Locked bucket: the pool's anchor chain, the boot records, the
+    guest and the sealed ACME cache. Its COMPLIANCE retention is the entire
+    rollback guarantee; the state itself is on the pool's disk. It must
+    already exist — this deployment deliberately does not create it, because
+    COMPLIANCE retention cannot be undone by anyone, including AWS support.
   EOT
-
-  validation {
-    condition     = length(var.buckets) >= 1 && length(var.buckets) <= 2
-    error_message = "Give one bucket, or two as [data, roots]."
-  }
-}
-
-variable "tls_domains" {
-  type        = list(string)
-  default     = []
-  description = "Domains for the enclave's certificate. Required for ACME; a self-signed certificate needs none, since attestation rather than a CA is what a client checks."
 }
 
 variable "vpc_cidr" {
@@ -101,4 +89,10 @@ variable "push_app_id" {
   description = "The AWS End User Messaging Push application wake signals go through, as the image names it (pushAppId), or empty for none. The parent's role may send through this one application."
   type        = string
   default     = ""
+}
+
+variable "pool_size_gib" {
+  type        = number
+  default     = 32
+  description = "Size of the EBS volume holding the enclave's ZFS pool."
 }

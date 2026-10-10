@@ -1,171 +1,214 @@
 # Storage
 
-The encrypted filesystem behind `wasi:filesystem`. A guest uses ordinary file APIs; this document describes what happens underneath, how the store's identity is checked at boot, how SQLite runs on it, and how to embed the engine without the runtime.
+Each tenant's files live on a ZFS pool of their own, and the runtime's own records on a **control pool**. All the pools share one disk the untrusted parent serves over vsock, cut into equal regions, each region its own encrypted device with a key the parent never sees. After each change a pool's state is pinned by a signed **anchor** in an Object-Locked S3 bucket, one chain per pool. A guest uses ordinary file APIs: `wasi:filesystem` is `wasmtime-wasi`'s, over its tenant pool's `data` dataset and nothing else.
 
-The engine began as **s3-wasi-fs** and remains independently usable through `s3fs-core`, without Wasmtime or enclave hardware.
+This replaced the runtime's original storage engine, s3fs: a copy-on-write filesystem of its own on S3. The design goal is the same: the host cannot read the state, alter it, or roll it back unnoticed. The machinery underneath is ZFS, which has decades of production use behind it.
 
 ## How it works
 
-### From a pathname to a root record
+### The stack
 
 ```text
-wasi:filesystem descriptors and streams
-                 │
-                 ▼
-Fs: paths, links, directories, handles, buffered records
-                 │
-                 ▼
-Directory B+tree ──► object IDs ──► dnode array
-                                     │
-                            indirect block trees
-                                     │
-                         encrypted blocks in slabs
-                                     │
-                         signed root record + chain
+  /pools/<pool_id>/data          a tenant's pool, mounted here: the guest's only preopen
+  /runtime/{credentials,tasks,streams,devices,catalog}   on the control pool
+  pool "enclave"   (region 0)    the control pool: records and the tenant catalog
+  pool "p<pool_id>" (region N)   a tenant's pool: one data dataset
+  /dev/mapper/zcrypt-<id>        per-region plain dm-crypt, aes-xts-plain64, a key per pool
+  /dev/nbd0                      the parent's disk, cut into equal regions: NBD over vsock 10809
 ```
 
-Files and directories are addressed by object ID. Directory entries live in a separator-indexed B+tree. Dnodes describe objects and point into variable-width indirect block trees. Modified paths are rebuilt copy-on-write, so a commit publishes a new tree while older roots continue to describe their original state.
+### A pool per tenant
 
-Blocks carry AES-256-GCM authentication and BLAKE3 checksums. Their authentication binds them to their expected position, preventing a valid block from simply being moved elsewhere in the tree. Keys derive from a 32-byte master secret and filesystem identity through HKDF. The data bucket holds slab objects; the roots bucket holds the signed history and runtime bootstrap objects.
+The disk is divided into fixed, 4 KiB-aligned regions (`region_bounds` in [`zfs.rs`](../runtime/src/zfs.rs)). Region 0 is the control pool; each tenant is allocated one of the rest on first use. A region is mapped as its own `dm-crypt` device, `zcrypt-<pool_id>`, with a key derived `HKDF(master, fs_uuid, "zfs/dmcrypt/v2" ‖ kind ‖ pool_id)` — domain-separated, so one region's key never decrypts another's. On it sits one pool, `p<pool_id>`, with a single `data` dataset the guest sees as `/`.
 
-Verifying a root authenticates the pointers beneath it; each block is verified when read. Mounting does **not** eagerly read or scrub every file.
+The **control pool** holds the runtime's records and the **catalog**: one entry per tenant giving its pool id, its region, and the hash of its pool's anchor 0. The catalog is on the control pool, out of every guest's reach, and validated at boot (regions distinct, in range, none the control pool's; pool ids distinct), so the host cannot point a tenant at another's pool. A tenant's pool id is random and minted once, so a deleted tenant's history can never be restarted under a guessed id.
 
-### Commit and recovery
+An anchor names the pool it speaks for — a kind (control or tenant), the pool id, and the tenant id, all signed (`ZFSANCH2`) — and a boot refuses an anchor whose pool id is not the one it expected. Each pool anchors on its own chain, under `zfs/control/anchors/` or `zfs/pools/<pool_id>/anchors/`, with its own last-anchor lock, so two tenants anchor independently: one held mid-anchor does not stop another. A tenant pool is imported the first time that tenant is used and kept for the life of the process; the number of pools is bounded by how many regions the disk holds, and registration is refused once none is free.
 
-A transaction stages changed blocks and dnodes, uploads its slabs, waits for those uploads, then publishes a signed root with a conditional PUT. Publishing that root is the visibility boundary. A failed upload must not publish a tree pointing to missing data. Failed file sync retains dirty buffers for a retry.
+Because a tenant's data is its own pool, the same-nonce cross-tenant steal the single pool was prone to — one tenant's write landing between another's anchor marker and its sync — cannot happen: an anchor only ever covers its own pool, and a tenant is serialised against itself. Each pool is still verified on import exactly as a boot verifies the control pool (below), so a rolled-back or forked tenant disk is refused when that tenant is next used.
 
-The current transaction protocol also publishes a claim before a newly opened session encrypts blocks, and reclaims after an abandoned or failed transaction. Its purpose is to avoid reusing `(transaction group, block sequence)` as an AEAD nonce after a crash or competing mount. S3 accepts a conditional PUT over a delete marker, so publication then reads back the retained version: a mount whose record was not written first loses, even when its PUT succeeded.
+**Capacity.** A region is 200 MiB (`DEFAULT_REGION_MIB`); a disk of _D_ holds ⌊_D_ / region⌋ pools, control included. A tenant that fills its region gets `ENOSPC`; the disk filling up refuses new registrations, not existing tenants. Growing capacity means a larger disk (more regions); a region is never grown in place, and there is one disk, not one volume per tenant.
 
-This is a **single-writer filesystem**. Independent writable mounts and multiple active schedulers are not a supported deployment model. A conflict poisons the losing mount rather than silently merging histories.
+The region size is **fixed for the life of a store**, not a runtime flag. A region's offset on the disk is its index times its size, so changing the size would move every tenant's region out from under its dm-crypt mapping and read it as corruption. To make it a deployment setting it would have to be chosen at genesis, committed in the control pool's anchored state, and checked to match on every resume — otherwise a changed flag silently relocates every pool. Until then it is a constant, changed only by rebuilding the image, and a store carries the size it was created with.
 
-### Filesystem behavior
+- **The pool.** The enclave loads `spl.ko` and `zfs.ko` at boot. They are built against a kernel compiled from AWS's own enclave recipe; see [the parent side](#the-parent-side).
+- **The disk.** The parent's NBD server is reached over vsock. The kernel refuses a vsock socket for NBD, so it is handed one end of a Unix socket pair, and two threads copy between that and the vsock connection.
+- **The roots bucket** holds what must outlive any disk and that no host may rewrite. That is the anchor chain, the state-origin receipt and pair records, the sealed master key's pointer, the guest, and the sealed ACME cache.
 
-| Operation or property | Behavior |
+### What the host can do to the disk
+
+Without the dm-crypt key, the host can only replay sectors it once saw or scramble them. To ZFS both look like ordinary corruption, which its checksums exist to catch. Every block pointer carries its child's checksum (SHA-256 for datasets, fletcher4 for the pool's own metadata), so a stale or scrambled block fails its parent's check on read. Plain dm-crypt has no header, so nothing is parsed from the disk before it is decrypted.
+
+That leaves three things the host can do:
+- make the disk unreadable, which is denial of service and fails closed;
+- see which sectors are touched, and when;
+- serve an older disk entirely, or one mixing sectors from several. That is the rollback the anchor exists for.
+
+#### What this rests on
+
+- **dm-crypt is confidentiality, not integrity.** Plain AES-XTS authenticates nothing. What it buys is that the host cannot choose plaintext: it can put back a sector's old ciphertext, which decrypts to that sector's old contents, or change it, which decrypts to noise.
+- **ZFS checksums are not MACs.** They are unkeyed. They catch a replayed or scrambled block because the host cannot make a block whose checksum matches what its parent expects. SHA-256 makes that collision-resistant for dataset blocks. The pool's own metadata uses fletcher4, which is not collision-resistant: there the claim rests on the host being limited to old versions of a sector or noise, never content it chose.
+- **The uberblock is the root.** Its own checksum is SHA-256, but any uberblock this pool ever wrote is valid, so which state it names is settled by the anchor: the txg the kernel reports loading, and the nonce inside that state.
+
+None of this has been checked against a host deliberately mixing old and new sectors of one pool; that is still to be tested.
+
+### The anchor
+
+ZFS pins a pool state by its uberblock, but a txg number does not name one: forks reuse numbers, and the uberblocks of every state the disk held may still be on it for the host to serve. So each anchor writes a fresh random value into the pool itself:
+
+1. `zpool sync`. If no txg has written anything since the last anchor, stop: there is nothing new to anchor.
+2. `zfs set enclave:anchor=<seq>-<nonce>-<previous anchor's hash>`, the marker. This is a sync task: it returns once everything written before it is on the disk.
+3. `zpool sync` again. The property change's frees are deferred two txgs; without this sync every later call would see a write and anchor again.
+4. Read the newest txg that wrote anything, from `/proc/spl/kstat/zfs/enclave/txgs`. This is the anchored txg.
+5. Sign `seq | prev hash | fs id | pool guid | txg | nonce` with the anchor key, and publish it to `zfs/anchors/<seq>` with a conditional PUT under Object Lock COMPLIANCE. Read the retained version back, since a delete marker could otherwise let a second writer's PUT through.
+
+Anchors are serialised across the whole enclave, and each runs in a task of its own, so a caller that gives up cannot cut one short. A failure before the marker changes nothing. Any failure from the marker on stops anchoring for good, an uncertain publish included: retrying could publish over a lost race.
+
+The marker's txg is older than the anchored one, and other tenants write meanwhile. A write landing between the two is covered by the anchor, and its own anchor call finds nothing newer and is acknowledged. So the disk as of the marker holds the anchor's nonce without that write, and the nonce alone does not pin the state.
+
+On boot, the runtime imports the newest state on the disk, unmounted, and reads which txg it loaded from the kernel's own notes on that import (`spa_load(enclave, …): using uberblock with txg=N`, in `/proc/spl/kstat/zfs/dbgmsg`, from the last load that ended `LOADED`). It reads the marker from the loaded pool, and admits the pool only if:
+- its guid is the anchored pool's;
+- the loaded txg is no older than the anchored txg;
+- its marker is the newest anchor's, or that of the next anchor (one written but never published) naming the newest as its predecessor.
+
+| Disk | What happens |
 |---|---|
-| Read/write/stat/list/sync | Implemented through the core `Fs` API and WASI adapter. File writes are buffered; sync/close drives durability. |
-| Rename | Directory-entry changes commit atomically; moving a directory does not copy every descendant. Moves into the directory's own subtree are rejected. |
-| Sparse files | Growth creates holes; reads return zeroes without materializing all intervening blocks. |
-| Hard links | Multiple directory entries reference one object, with a maintained link count. |
-| Symlinks | Supported, with a default traversal limit of 40 and resolution confined to the guest's filesystem scope. |
-| Unlink while open | The open handle retains access until its final close. |
-| Identity and metadata | Object identity, link counts, and timestamps come from the filesystem rather than inferred S3 filenames. |
-| Snapshots | Historical root records can be opened read-only through `Fs::open_snapshot` or the store API; they share unchanged blocks. They are not an automatic guest-visible snapshot directory. |
-| Freshness | The session floor only rises. `--min-root-seq` supplies an external floor for a cold mount. |
-| Space reclamation | Garbage collection is not implemented. Historical and orphaned slabs consume storage. |
+| At the anchor | Admitted. |
+| Ahead of the anchor (the enclave synced, then died before publishing) | Admitted as it is. Nothing past the anchor was acknowledged, and nothing is rewound. |
+| As of the anchor's marker, before its sync | Holds the right nonce, but loaded an older txg. **Refused.** |
+| Behind the anchor (rolled back) | An older txg and an older marker. **Refused.** |
+| An abandoned fork | Its marker is not the newest anchor's, nor one naming it. **Refused.** |
 
-The detailed [compatibility matrix](COMPATIBILITY.md) describes WASI/POSIX differences. This is a WASI filesystem implementation and embeddable Rust engine, not a host FUSE mount or a general replacement for a Linux filesystem.
+There is no rewind. Before this, boot imported with `zpool import -T <anchored txg>`, which takes the newest uberblock *at or below* that txg and, if that one fails to load, quietly tries older ones. Three txgs after an anchor, its blocks can already have been reused.
 
-### Defaults and cost model
+Anchors are found by their retained versions, by galloping then bisecting, because they are contiguous and none can be deleted. A host cannot hide the newest one behind a delete marker. A cold boot cannot know on its own whether the store is still adding them; `--min-root-seq` sets a floor from outside.
 
-| Store setting | Default |
-|---|---:|
-| Record size | 128 KiB |
-| Maximum slab size | 64 MiB |
-| Decrypted block-cache budget | 64 MiB |
-| Concurrent slab PUTs | 8 |
-| Root-chain links checked at mount | 1 |
-| Per-root COMPLIANCE retention | 10 × 365 days |
+### When a write is durable
 
-[`StoreConfig`](../crates/s3fs-core/src/store/config.rs) validates these settings. Record sizes must be powers of two from 4 KiB through 1 MiB. Retention is finite: an operational retention policy must account for the history a deployment still relies on.
+`sync=disabled`: `fsync` returns without making anything durable, because durability is the anchor. Nothing is acknowledged until the anchor covering it exists:
 
-S3 round trips dominate durable mutations. Batching application work reduces commit overhead; smaller writes may still rewrite a whole record and its tree path. Tenant handlers can execute concurrently, but their commits share one transaction lock. Snapshot sharing avoids copying the whole filesystem, while retaining old state still costs space for its changed blocks.
+| Write made by | Anchored before |
+|---|---|
+| A request | The response ends. A streamed body streams as written, and only its end (with any trailers, such as gRPC's status) waits. A body with `Content-Length` is held whole, because a client counting bytes would otherwise act on it first. So is a response that cannot have a body (to a HEAD, or a 1xx, 204 or 304), which would otherwise be complete when its head went out. |
+| A held connection's message run | Its reply is sent. |
+| A background task | Its outcome is recorded. Its attempt is also anchored before it runs, so a task that crashes the enclave still spends the attempt rather than looping on it for ever. |
+| A wake | The invocation that raised it is anchored. A `wake` the guest raises during a request, a message or a task is held and delivered only once that invocation's writes are durable — never before, since a wake tells an owner to come and look. If the anchor fails, the wake is dropped. |
+| A passkey registration | The response. The tenant's pool is created and its catalog entry written and anchored on the control pool first, then the credential, so both are durable before the user is told they are registered. |
+| A passkey revocation | The response; the credential is on the control pool, anchored before the response. |
+
+One effect still precedes its anchor: a **stream dial or send** (`enclave:streams`). When a guest opens a stream or sends on one, the runtime dials or `POST`s the far side during the invocation, before that invocation's record is anchored. It is left this way deliberately — the dial carries no committed state (it is an attested request, and the far side deduplicates, so a crash before the anchor simply rewinds the stream record and the supervisor re-establishes or drops it on the next boot), and deferring it would mean reworking the reconnect supervisor. Moving it behind the anchor, like wakes, is the remaining piece of the one-operation boundary.
+
+After a crash, the boot goes on from whatever reached the disk. Writes no anchor covered may be there or not; none was acknowledged.
+
+### Layout
+
+| Path | What |
+|---|---|
+| `/pools/<pool_id>/data` | A tenant's pool, mounted here, created on first use. A tenant id is the first 16 bytes of a SHA-256 of the passkey's credential id; a guest without a gate (development only) gets the all-zero id. The pool id is random, in the catalog. |
+| `/runtime/catalog/<tenant>` | One JSON entry per tenant: pool id, region, genesis hash. On the control pool. |
+| `/runtime/credentials/<id>` | Passkeys, CBOR, one file each. On the control pool. |
+| `/runtime/tasks/`, `/runtime/streams/` | JSON records, each written to a temporary file and renamed over the record. On the control pool. |
+| `/runtime/devices/<tenant>/<sha256(token)>` | Push registrations. On the control pool. |
+
+No guest can reach `/runtime` (it is on the control pool) or another tenant (it is a different pool, a different encrypted device). A guest's only preopen is its own pool's `data` dataset, and `wasmtime-wasi` resolves paths through `cap-std`, which refuses `..` past the preopen, absolute paths and symlinks out of it. The runtime's records stay on the control pool for now; moving each tenant's records into its own pool is a later step.
+
+### Defaults
+
+| Setting | Value | Why |
+|---|---|---|
+| `checksum` | `sha256` | Collision-resistant checksums for dataset blocks |
+| `sync` | `disabled` | Durability is the anchor, not the ZIL |
+| `atime` | `off` | Reads must not write |
+| `failmode` | `panic` | A pool that lost its disk stops the enclave; the next boot decides |
+| `zfs_txg_timeout` | 3600 s | No txg on a timer; syncs come from anchors |
+| `zfs_arc_max`, `zfs_dirty_data_max` | 256 MiB | Enclave memory is fixed |
+| Anchor retention | 10 years (`--root-retention-secs`) | COMPLIANCE: nobody can shorten it |
+
+### Cost
+
+Measured on the QEMU emulator, with the disk served by `nbd-stub.py` over userspace vsock forwarding, so these numbers are pessimistic:
+
+| What | Measured |
+|---|---|
+| Anchor, mean: the first `zpool sync` | 59 ms |
+| Anchor, mean: both syncs, `zfs set` and the publish | 105 ms |
+| Signed POST that writes a file, p50 (client round trip, assertion included) | 260 ms |
+| Signed GET that writes nothing, p50 | 183 ms; no anchor is published |
+
+100 POSTs and 100 GETs produced 100 anchors: a request that writes nothing pays one empty `zpool sync` and no S3 round trip.
 
 ## State identity at boot
 
-A missing store is not automatically an invitation to create an empty replacement. The boot machine checks the retained state-origin receipt, the sealed-key object, the genesis root, and the record for the running runtime/guest pair.
+A missing store is not an invitation to create an empty one. The boot checks the retained state-origin receipt, the sealed-key object, and the pair record for the running runtime and guest.
 
-The origin commitment includes the filesystem ID, data and roots buckets, prefix, genesis root hash, and the SHA-256 of the sealed-key representation. It is encoded with a domain tag and CBOR, then hashed with BLAKE3. The receipt attests to that commitment.
+The receipt commits to BLAKE3 over CBOR of `("zfs/state-origin/v1", fs id, roots bucket, prefix, hash of anchor 0, sha256 of the sealed key)`.
 
 | Observed state | Outcome |
 |---|---|
-| No origin receipt and no existing state | Genesis: provision key material, create the store, publish origin and pair records. |
-| State exists without its receipt, or receipt exists without required state | Refuse to boot. |
-| Origin and this runtime/guest pair verify | Resume. |
-| Origin verifies but this pair has no record | Upgrade path: record the new pair after key release and state verification. |
-| Existing origin/pair record is inconsistent or invalid | Refuse to boot. |
+| No receipt and no sealed key | **Genesis.** Mint the key, take the lease (a conditional PUT of the sealed key), create the control pool in region 0 and publish its anchor 0, attest the receipt, and record the pair. Tenant pools come later, as tenants arrive. |
+| Receipt and key verify; this pair has a record | **Resume:** import the control pool at its newest anchor, as above, and validate the catalog. Tenant pools are imported on demand, each verified the same way. |
+| Receipt and key verify; this pair has no record | **Upgrade:** record the new pair. |
+| Only one of receipt and key | Refuse. |
+| A pool on the disk but no anchor, or anchors but genesis | Refuse. |
 
-Bucket identity and policy live in the measured image. Otherwise, a host could point an approved runtime at a different empty bucket and make a new store look legitimate.
+The bucket's identity lives in the measured image: `ENCLAVE_ROOTS_BUCKET` is part of PCR0. Otherwise a host could point an approved runtime at an empty bucket and make a new store look legitimate.
 
-[`Backend::get_retained_blob`](../crates/s3fs-core/src/backend/mod.rs) reads object versions beneath delete markers. The S3 backend follows version-list pagination and fetches a selected version by ID. Missing version-list permissions cause a failure rather than a false report that no record exists. The retained version is the oldest one listed, and root publication uses the same read to confirm it wrote first.
+## The parent side
+
+| | Emulator | Nitro |
+|---|---|---|
+| Disk | A sparse file served by [`deploy/qemu-nitro/nbd-stub.py`](../deploy/qemu-nitro/nbd-stub.py) | A gp3 EBS volume ([`deploy/tofu`](../deploy/tofu/main.tf), `pool_size_gib`), served by stock nbdkit from the Amazon Linux 2023 repositories ([`nbdkit.service`](../deploy/ami/units/nbdkit.service)) |
+| Kernel | [`nix/kernel-zfs.nix`](../nix/kernel-zfs.nix) | Same image |
+
+[`nix/kernel-zfs.nix`](../nix/kernel-zfs.nix) is AWS's `aws-nitro-enclaves-sdk-bootstrap` recipe: Linux 6.6, their config, and their two patches, including the vsock fix that stops parent and enclave deadlocking when both send queues fill. It adds NBD and dm-crypt, and builds OpenZFS against the result. The build user and host are pinned, so the kernel's version string, and with it PCR0, is the same on every machine.
+
+[`deploy/qemu-nitro/run-zfs-spike.sh`](../deploy/qemu-nitro/run-zfs-spike.sh) plays the hostile host:
+- two tenants write, and cross-tenant paths are refused;
+- a restart resumes;
+- a rolled-back disk is refused;
+- a crash between sync and publish resumes from the disk it left;
+- the abandoned fork is refused;
+- the disk as of an anchor's marker, before its sync, is refused.
+
+The testing build stops at named points in an anchor and asks the host, over vsock port 9101, whether to go on (`hook` in [`zfs.rs`](../runtime/src/zfs.rs), answered by [`test-hooks.py`](../deploy/qemu-nitro/test-hooks.py)). A leg can hold an anchor there, copy the disk at that exact moment, or kill the enclave between two steps.
+
+### The flaw the last leg is for
+
+The boot once admitted the disk as of an anchor's marker. Leg 7 found it on the emulator:
+1. Alice's anchor was held after its marker, and the disk was copied.
+2. Bob's write was acknowledged behind it; one anchor (111, txg 846) covered both.
+3. Served the copy, the kernel logged `spa_load(enclave, config untrusted): using uberblock with txg=845`.
+4. The boot logged `zfs pool resumed at its anchor seq=111 txg=846`, and bob's acknowledged file was gone.
+
+Leg 6 showed the same flaw in an honest crash. Three txgs past anchor 107, `-T 810` failed on txg 810 (`couldn't get 'config' value in MOS directory [error=5]`, its blocks already reused) and ZFS fell back to 809, the anchor's own marker. A boot requiring the exact txg would have refused that disk forever, which is why the boot now admits the newest state rather than rewinding.
 
 ## Running SQLite
 
-SQLite is the main application-level filesystem workload: real C code performs page-granular random I/O, rollback-journal updates, and integrity checks. [`guest-sqlite`](../examples/guest-sqlite/) covers DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, schema changes, `VACUUM`, JSON, FTS5, and R-Tree where available.
-
-Build it using wasi-sdk:
+[`guest-sqlite`](../examples/guest-sqlite/) covers DDL, transactions, savepoints, constraints, joins, CTEs, window functions, blobs, triggers, schema changes, `VACUUM`, JSON, FTS5 and R-Tree. Build it with wasi-sdk:
 
 ```bash
 scripts/wasi-sdk.sh
 scripts/build-guest.sh sqlite
 
 deploy/qemu-nitro/dev-enclave.sh \
-  --guest examples/guest-sqlite/target/wasm32-wasip2/release/guest-sqlite.wasm \
-  --guest-env S3FS_BACKGROUND_TASKS=false
+  --guest examples/guest-sqlite/target/wasm32-wasip2/release/guest-sqlite.wasm
 ```
 
-SQLite exports the HTTP handler, not `run-task`, so the override disables the emulator's default background-task startup requirement. Using the printed pins, request `/` with `passkey-client` to run the workload. The response reports `OK` or a failure; timings go to guest output. Each run removes and recreates its benchmark database, so use a dedicated development tenant and do not treat `/` as a health check. `SQLITE_SCALE` controls the workload size; the current example defaults to 2,000 rows.
-
-The two required pragmas are:
+The two pragmas WASI requires are unchanged:
 
 ```rust
-conn.pragma_update(None, "temp_store", "MEMORY")?;
-conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+conn.pragma_update(None, "temp_store", "MEMORY")?;     // no access(2) under WASI
+conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?; // no fcntl locks under WASI
 ```
 
-SQLite's temporary-directory probing and advisory locking assume syscalls that this WASI environment does not supply. Use the default rollback-journal mode (`DELETE`). WAL requires the shared-memory/mapping facilities this configuration lacks. Runtime serialization protects one tenant from concurrent callbacks; the guest must still avoid opening competing SQLite connections inside its own invocation.
+Use the default rollback journal (`DELETE`). WAL needs shared memory that WASI does not provide. SQLite has not yet been measured on the pool; the earlier figures were for s3fs and no longer apply.
 
-### Recorded workload results
+## Limits
 
-The following are the repository's earlier measurements against local MinIO with 20,000 accounts and 40,000 entries. They were **not rerun for this documentation update**, are not current release benchmarks, and should not be extrapolated to remote S3 latency.
-
-| Phase | Elapsed | Rate |
-|---|---:|---:|
-| Bulk insert, 20,000 rows in one transaction | 142 ms | 140,884 rows/s |
-| Point select by row ID | 2.5 ms | 405,948 queries/s |
-| Indexed select | 1.3 ms | 785,850 queries/s |
-| Update 500 rows in one transaction | 63 ms | 7,963 rows/s |
-| Blob write | 128 ms | 18.5 MB/s |
-| Blob read and verify | 41 ms | 57.8 MB/s |
-| Incremental blob I/O, 512 KiB scattered | 242 ms | 2.2 MB/s |
-| `VACUUM` | 471 ms | — |
-| `PRAGMA integrity_check` | 136 ms | — |
-| 25 inserts, autocommit | 1,796 ms | 14 rows/s |
-| 25 inserts, one SQL transaction | 69 ms | 364 rows/s |
-
-The practical lesson is to batch writes. A SQL transaction is not necessarily one block-store commit—journal and filesystem sync operations matter—but it can greatly reduce durable round trips compared with repeated autocommit statements.
-
-## Use the storage engine directly
-
-`s3fs-core` can be embedded independently. This complete example creates an in-memory filesystem, commits a file, remounts it, and reads it back. It needs `s3fs-core` and Tokio with macros and a runtime; no NSM, Wasmtime, Docker, or AWS credentials are involved.
-
-```rust
-use std::sync::Arc;
-use s3fs_core::{backend::memory::MemoryBackend, Config, Fs, MasterSecret, OpenFlags};
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let data = Arc::new(MemoryBackend::new());
-    let roots = Arc::new(MemoryBackend::new());
-    let secret = MasterSecret::from_bytes([7; 32]); // Example only.
-    let fs_id = [3; 16];
-    let config = Arc::new(Config::default());
-
-    let fs = Fs::create(data.clone(), roots.clone(), &secret, fs_id, config.clone()).await?;
-    let file = fs.open("/hello.txt", OpenFlags::create_new()).await?;
-    fs.pwrite(&file, 0, b"hello from encrypted storage").await?;
-    fs.sync(&file).await?;
-    fs.close(&file).await?;
-    drop(fs);
-
-    let fs = Fs::mount(data, roots, &secret, fs_id, config, None).await?;
-    let file = fs.open("/hello.txt", OpenFlags::read_only()).await?;
-    let bytes = fs.pread(&file, 0, 64).await?;
-    assert_eq!(bytes.as_ref(), b"hello from encrypted storage");
-    fs.close(&file).await?;
-    Ok(())
-}
-```
-
-For S3, enable **`s3fs-core`'s** `aws` feature and supply separate `AwsS3Backend` instances for the data and roots buckets. Create the roots bucket with Object Lock support and appropriate retention. Keep the master secret and filesystem ID outside untrusted storage; they select the keys used to verify the store. Use `Fs::create` only for an intentional new filesystem and `Fs::mount` for an existing one.
-
-An embedded consumer owns its provisioning, boot policy, freshness floor, and handle lifecycle. The runtime's origin receipts, tenant gate, and KMS orchestration are higher layers, not automatic side effects of calling the core API.
+- **One writer per pool.** One enclave imports each pool; there is no second mount to race. A per-boot generation fence (`zfs/generations/<g>`) stops a second enclave the host starts from letting the first go on to acknowledge a write it has forked away from.
+- **Anchors are per pool**, so two tenants anchor independently; each anchor is a pool sync plus an S3 round trip. A request also anchors the control pool when it leaves a record there (that cost drops to nothing for a pure-data request once the operation boundary tracks it).
+- **A tenant's records are still on the control pool.** Until they move into the tenant's own pool, a request that writes one anchors the control pool too, which serialises those writes across tenants.
+- **No tenant-pool eviction yet.** A tenant pool is kept imported for the life of the process; the cap is how many regions the disk holds.
+- **The image carries ZFS userspace.** The nixpkgs build references systemd, Python and nfs-utils, about 370 MB of the image. Repackaging only `zpool`, `zfs` and their libraries would recover most of it.
+- **EBS is single-AZ.** Restoring a snapshot is a rollback, and the boot refuses it. Disaster recovery means recovering the newest disk, not an older one.
+- **The host sees access patterns:** which sectors, when, and how much.

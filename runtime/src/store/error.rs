@@ -1,0 +1,176 @@
+//! `StoreError` — the engine's internal error type.
+//!
+//! Translation to WASI Preview 2 `wasi:filesystem/types::error-code` happens in
+//! the `enclave-runtime` crate. Inside the engine we keep error variants close to
+//! POSIX-flavored categories so call sites are obvious.
+
+use thiserror::Error;
+
+/// Filesystem-engine error. Variants are picked to map cleanly onto
+/// `wasi:filesystem/types::error-code` while staying intelligible inside the
+/// engine itself.
+#[derive(Debug, Clone, Error)]
+pub enum StoreError {
+    #[error("not found")]
+    NotFound,
+
+    #[error("access denied")]
+    AccessDenied,
+
+    #[error("already exists")]
+    AlreadyExists,
+
+    #[error("is a directory")]
+    IsDirectory,
+
+    #[error("not a directory")]
+    NotDirectory,
+
+    #[error("directory not empty")]
+    NotEmpty,
+
+    #[error("name too long")]
+    NameTooLong,
+
+    #[error("illegal byte sequence in path or key")]
+    IllegalByteSequence,
+
+    #[error("file too large")]
+    FileTooLarge,
+
+    #[error("operation not supported")]
+    NotSupported,
+
+    #[error("operation not permitted")]
+    NotPermitted,
+
+    #[error("invalid argument: {0}")]
+    Invalid(&'static str),
+
+    #[error("out of memory")]
+    OutOfMemory,
+
+    #[error("symlink loop or recursion limit exceeded")]
+    Loop,
+
+    #[error("cross-device link or rename")]
+    CrossDevice,
+
+    #[error("bad descriptor")]
+    BadDescriptor,
+
+    #[error("would block")]
+    WouldBlock,
+
+    /// Optimistic-concurrency conflict, e.g. a conditional `PutObject`
+    /// returned `PreconditionFailed`. Translation depends on context (caller
+    /// decides whether to map to `Exist`, `WouldBlock`, or `Invalid`).
+    #[error("precondition / CAS conflict")]
+    Conflict,
+
+    /// A block, dnode, or root record failed verification: checksum mismatch
+    /// against the parent block pointer, AEAD authentication failure, a bad
+    /// root signature, or a broken `prev_root_hash` chain link.
+    ///
+    /// This is never transient and must never be retried or degraded around.
+    /// Producing it poisons the mount: the store is either lying or corrupt,
+    /// and in both cases the only safe response is to stop serving bytes.
+    /// The store holds no filesystem.
+    ///
+    /// Distinct from `NotFound`, which is about a path inside a mounted
+    /// filesystem. This says the *store* is empty, and it is returned rather
+    /// than quietly formatting one: an enclave pointed at an empty store must
+    /// be able to tell "this filesystem is new" from "everything has been
+    /// hidden", and only the caller knows which it is entitled to assume.
+    #[error("the store holds no filesystem")]
+    NoFilesystem,
+
+    #[error("integrity check failed: {0}")]
+    Integrity(&'static str),
+
+    /// The store offered a root record older than one we have already
+    /// accepted, or older than the configured floor. Distinct from
+    /// [`StoreError::Integrity`] because the data is *valid* — correctly signed
+    /// and internally consistent — just stale. That is the signature of a
+    /// rollback attempt rather than corruption.
+    #[error("rollback detected: root seq {found} is not newer than {expected}")]
+    Rollback { expected: u64, found: u64 },
+
+    #[error("i/o timeout")]
+    IoTimeout,
+
+    #[error("i/o error: {0}")]
+    Io(String),
+
+    #[error("network error: {0}")]
+    Network(String),
+}
+
+impl StoreError {
+    /// `true` if the error is plausibly transient and worth retrying with
+    /// backoff (network blips, throttling, 5xx). Persistent errors like
+    /// `NotFound` or `AccessDenied` return `false`.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            StoreError::IoTimeout | StoreError::Network(_) | StoreError::WouldBlock
+        )
+    }
+}
+
+/// Convenience alias used throughout the crate.
+pub type StoreResult<T> = Result<T, StoreError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_is_stable() {
+        assert_eq!(StoreError::NotFound.to_string(), "not found");
+        assert_eq!(
+            StoreError::Loop.to_string(),
+            "symlink loop or recursion limit exceeded"
+        );
+        assert_eq!(
+            StoreError::Invalid("bad part number").to_string(),
+            "invalid argument: bad part number"
+        );
+        assert_eq!(
+            StoreError::Integrity("blkptr checksum").to_string(),
+            "integrity check failed: blkptr checksum"
+        );
+        assert_eq!(
+            StoreError::Rollback {
+                expected: 42,
+                found: 41
+            }
+            .to_string(),
+            "rollback detected: root seq 41 is not newer than 42"
+        );
+    }
+
+    /// Integrity and rollback failures are adversarial signals, not blips.
+    /// Retrying them would turn a detected attack into a spin loop.
+    #[test]
+    fn verification_failures_are_never_transient() {
+        assert!(!StoreError::Integrity("root signature").is_transient());
+        assert!(!StoreError::Rollback {
+            expected: 2,
+            found: 1
+        }
+        .is_transient());
+    }
+
+    #[test]
+    fn is_transient_categorisation() {
+        assert!(StoreError::IoTimeout.is_transient());
+        assert!(StoreError::Network("dns".into()).is_transient());
+        assert!(StoreError::WouldBlock.is_transient());
+
+        assert!(!StoreError::NotFound.is_transient());
+        assert!(!StoreError::AccessDenied.is_transient());
+        assert!(!StoreError::Loop.is_transient());
+        assert!(!StoreError::Conflict.is_transient());
+    }
+}

@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# The two criterion benches, in the form the tracker can read.
+# The criterion bench, in the form the tracker can read.
 #
-# `instance_cost` measures what a warm instance saves over a fresh one, and it
-# runs the real component — so the guest has to be built before cargo is asked
+# `instance_cost` measures what the fresh instance every request gets costs,
+# and it runs the real component — so the guest has to be built before cargo is asked
 # for a number, or the bench panics with a build hint instead of producing one.
-# `fs_hot_paths` runs over the in-memory backend and needs nothing.
 #
 # `--output-format bencher` is criterion's libtest-compatible output, which is
 # what github-action-benchmark reads as `tool: cargo`. Criterion's own format is
@@ -25,14 +24,12 @@ say "benchmarks"
 # after `--` is handed to *every* target cargo runs, and in bench profile that
 # includes each crate's libtest harness — which does not know `--output-format`,
 # rejects it, and fails the whole run before a single benchmark executes. Naming
-# the two `harness = false` criterion targets keeps the flag with the only
-# harnesses that understand it.
+# the `harness = false` criterion target keeps the flag with the only harness
+# that understands it.
 #
 # lib.sh sets `pipefail`, so a failing cargo still fails the script despite tee.
 : > "$REPO/bench.txt"
 cargo bench -p enclave-runtime --bench instance_cost -- --output-format bencher \
-    | tee -a "$REPO/bench.txt"
-cargo bench -p s3fs-core --bench fs_hot_paths -- --output-format bencher \
     | tee -a "$REPO/bench.txt"
 
 echo "wrote $REPO/bench.txt"

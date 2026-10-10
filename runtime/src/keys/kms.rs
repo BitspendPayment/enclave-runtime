@@ -50,19 +50,20 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::store::MasterSecret;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use aws_sdk_kms::primitives::Blob;
 use aws_sdk_kms::types::{KeyEncryptionMechanism, RecipientInfo};
 use base64::Engine as _;
 use nitro_nsm::{AttestationRequest, Nsm};
-use s3fs_core::MasterSecret;
 
 use super::recipient::RecipientKey;
 use super::{policy, MasterKeySource, SealedKey};
 use crate::boot::Pair;
 
-/// Bytes of key material to ask KMS for. The block store's master secret.
+/// Bytes of key material to ask KMS for: the master secret everything
+/// derives from — the pool's dm-crypt key and the anchor-signing key among it.
 const MASTER_SECRET_LEN: i32 = 32;
 
 /// Version tag on the pointer record, so a future format is a clear error
@@ -489,7 +490,7 @@ mod tests {
     /// a production build treating a plaintext key as metadata.
     #[test]
     fn a_static_key_blob_is_not_a_pointer() {
-        let mut blob = b"s3fs-UNSEALED-development-key-v1\n".to_vec();
+        let mut blob = b"enclave-UNSEALED-development-key-v1\n".to_vec();
         blob.extend_from_slice(&[7u8; 32]);
         assert!(KeyPointer::decode(&SealedKey::from_bytes(blob)).is_err());
     }

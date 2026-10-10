@@ -25,8 +25,6 @@ use bytes::Bytes;
 use enclave_runtime::guest_io::{GuestLogRecord, GuestLogSink, GuestStream};
 use enclave_runtime::{GuestEnvironment, HostClock, ServeHandle};
 use http_body_util::{BodyExt, Full};
-use s3fs_core::backend::memory::MemoryBackend;
-use s3fs_core::{Config, Fs, MasterSecret};
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
@@ -65,23 +63,14 @@ impl MemorySink {
 }
 
 async fn handle_with(sink: Arc<MemorySink>) -> (ServeHandle, enclave_runtime::GuestLogCollector) {
-    let backend = Arc::new(MemoryBackend::new());
-    let fs = Fs::create(
-        backend.clone(),
-        backend,
-        &MasterSecret::from_bytes([7u8; 32]),
-        [0u8; 16],
-        Arc::new(Config::default()),
-    )
-    .await
-    .expect("creating the memory-backed filesystem");
+    let fs = enclave_runtime::Zfs::scratch().await;
 
     // Started before the handle exists, so there is no window in which a guest
     // could write with nothing consuming it.
     let (logs, collector) = enclave_runtime::guest_io::start(sink);
     let guest = GuestEnvironment::new(
         fs,
-        Box::new(HostClock),
+        Arc::new(HostClock),
         Arc::new(nitro_nsm::fake::FakeNsm::new()),
         &[],
         &[],

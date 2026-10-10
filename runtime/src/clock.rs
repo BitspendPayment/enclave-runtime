@@ -148,22 +148,22 @@ impl ClockSource {
 /// `Auto` falls back at `warn` rather than silently: a misconfigured enclave
 /// running on host time must not look identical in the logs to a correctly
 /// configured one.
-pub fn open_clock(source: ClockSource, device: &Path) -> Result<Box<dyn TrustedClock>> {
+pub fn open_clock(source: ClockSource, device: &Path) -> Result<std::sync::Arc<dyn TrustedClock>> {
     match source {
         ClockSource::Host => {
             tracing::warn!(clock = "host", "using the host clock; time is untrusted");
-            Ok(Box::new(HostClock))
+            Ok(std::sync::Arc::new(HostClock))
         }
         ClockSource::Ptp => {
             let clock = PtpClock::open(device)
                 .context("clock source 'ptp' was required but the device could not be opened")?;
             tracing::info!(clock = %clock.describe(), "clock source");
-            Ok(Box::new(clock))
+            Ok(std::sync::Arc::new(clock))
         }
         ClockSource::Auto => match PtpClock::open(device) {
             Ok(clock) => {
                 tracing::info!(clock = %clock.describe(), "clock source");
-                Ok(Box::new(clock))
+                Ok(std::sync::Arc::new(clock))
             }
             Err(e) => {
                 tracing::warn!(
@@ -171,7 +171,7 @@ pub fn open_clock(source: ClockSource, device: &Path) -> Result<Box<dyn TrustedC
                     error = format!("{e:#}"),
                     "PTP clock unavailable, falling back to the host clock; time is untrusted"
                 );
-                Ok(Box::new(HostClock))
+                Ok(std::sync::Arc::new(HostClock))
             }
         },
     }
@@ -186,12 +186,12 @@ pub fn open_clock(source: ClockSource, device: &Path) -> Result<Box<dyn TrustedC
 /// more damaging downstream — expired certificates, rejected tokens, dates in
 /// 1970 — than one that is a few milliseconds stale.
 pub struct WallClockAdapter {
-    clock: Box<dyn TrustedClock>,
+    clock: std::sync::Arc<dyn TrustedClock>,
     last_good: Mutex<Duration>,
 }
 
 impl WallClockAdapter {
-    pub fn new(clock: Box<dyn TrustedClock>) -> Result<Self> {
+    pub fn new(clock: std::sync::Arc<dyn TrustedClock>) -> Result<Self> {
         let initial = clock.now()?;
         Ok(WallClockAdapter {
             clock,
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn the_adapter_passes_readings_and_resolution_through() {
         let fake = FakeClock::new(1_700_000_000_000_000_000);
-        let adapter = WallClockAdapter::new(Box::new(fake)).unwrap();
+        let adapter = WallClockAdapter::new(std::sync::Arc::new(fake)).unwrap();
         assert_eq!(
             adapter.now(),
             Duration::from_nanos(1_700_000_000_000_000_000)
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn a_failed_read_serves_the_last_good_value() {
         let fake = FakeClock::new(1_000);
-        let adapter = WallClockAdapter::new(Box::new(fake.clone())).unwrap();
+        let adapter = WallClockAdapter::new(std::sync::Arc::new(fake.clone())).unwrap();
 
         // Advance, read, then break the device.
         fake.nanos.store(5_000, Ordering::SeqCst);
@@ -323,7 +323,7 @@ mod tests {
     fn a_clock_that_cannot_be_read_at_all_fails_to_construct() {
         let fake = FakeClock::new(0);
         fake.fail.store(true, Ordering::SeqCst);
-        assert!(WallClockAdapter::new(Box::new(fake.clone())).is_err());
+        assert!(WallClockAdapter::new(std::sync::Arc::new(fake.clone())).is_err());
     }
 
     #[test]

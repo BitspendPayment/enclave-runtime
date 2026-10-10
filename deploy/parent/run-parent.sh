@@ -44,7 +44,7 @@ gvproxy not found. Install it from containers/gvisor-tap-vsock:
     go install github.com/containers/gvisor-tap-vsock/cmd/gvproxy@latest
 
 or take a release binary. The matching `gvforwarder` goes *inside* the enclave
-image, not here — see deploy/Dockerfile.
+image, not here — flake.nix builds it in.
 EOF
     exit 1
 }
@@ -82,7 +82,7 @@ done
 
 echo
 echo "gvproxy is up. Start the enclave with:"
-echo "  nitro-cli run-enclave --eif-path s3fs.eif --cpu-count 2 --memory 2048"
+echo "  nitro-cli run-enclave --eif-path enclave.eif --cpu-count 2 --memory 2048"
 echo
 echo "Forwarded: $FORWARD_PORTS → $ENCLAVE_IP"
 echo "API:       $API_SOCKET"

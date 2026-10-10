@@ -46,6 +46,10 @@
   # Shell run inside the assembled rootfs/, for anything a plain file copy
   # cannot express — symlinks, scripts, permissions.
 , extraSetup ? ""
+  # bzImage, bzImage.config, cmdline and nsm.ko. AWS's prebuilt ones unless a
+  # kernel built from source is passed (nix/kernel-zfs.nix). `init` always
+  # comes from the blobs: it does not depend on the kernel.
+, kernel ? "${blobs}/blobs/x86_64"
 }:
 
 let
@@ -77,7 +81,7 @@ stdenvNoCC.mkDerivation {
     # ---- ramdisk 1: what boots -----------------------------------------
     mkdir -p rd1
     cp ${blobs}/blobs/x86_64/init rd1/init
-    cp ${blobs}/blobs/x86_64/nsm.ko rd1/nsm.ko
+    cp ${kernel}/nsm.ko rd1/nsm.ko
     chmod +x rd1/init
 
     # ---- ramdisk 2: what runs ------------------------------------------
@@ -148,9 +152,9 @@ stdenvNoCC.mkDerivation {
     # exception.
     faketime -f '@1970-01-01 00:00:01' \
     eif_build \
-      --kernel ${blobs}/blobs/x86_64/bzImage \
-      --kernel_config ${blobs}/blobs/x86_64/bzImage.config \
-      --cmdline "$(cat ${blobs}/blobs/x86_64/cmdline)" \
+      --kernel ${kernel}/bzImage \
+      --kernel_config ${kernel}/bzImage.config \
+      --cmdline "$(cat ${kernel}/cmdline)" \
       --ramdisk ramdisk1.cpio \
       --ramdisk ramdisk2.cpio \
       --output ${name}.eif \

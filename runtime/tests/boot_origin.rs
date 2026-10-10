@@ -29,15 +29,20 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use enclave_runtime::boot::{BootConfig, BootMode, Pair, ReceiptTrust};
-use enclave_runtime::{Backends, MasterKeySource, MountConfig, SealedKey, StaticKey};
-use nitro_attestation::testing::TestChain;
-use nitro_attestation::AttestationDocument;
-use nitro_nsm::{AttestationRequest, Nsm, Pcr, PCR_GUEST, PCR_ZERO};
-use s3fs_core::backend::{
+use enclave_runtime::store::backend::{
     memory::MemoryBackend, Backend, BlobMeta, Capabilities, CompletedPart, CopyBlobInput,
     GetBlobOutput, ListBlobsInput, ListBlobsOutput, MultipartId, PartUploadOutput, PutBlobInput,
 };
-use s3fs_core::{FsError, MasterSecret};
+use enclave_runtime::store::{MasterSecret, StoreError};
+use enclave_runtime::{Disk, MasterKeySource, MountConfig, SealedKey, StaticKey};
+use std::sync::Arc as StdArc;
+
+fn test_clock() -> StdArc<dyn enclave_runtime::TrustedClock> {
+    StdArc::new(enclave_runtime::HostClock)
+}
+use nitro_attestation::testing::TestChain;
+use nitro_attestation::AttestationDocument;
+use nitro_nsm::{AttestationRequest, Nsm, Pcr, PCR_GUEST, PCR_ZERO};
 
 const GUEST_A: &[u8] = b"guest component A";
 const GUEST_B: &[u8] = b"guest component B";
@@ -147,24 +152,18 @@ impl Nsm for TestNsm {
     }
 }
 
-/// One store, reused across boots, so "resume" means what it says.
+/// One bucket and one disk, reused across boots, so "resume" means what it
+/// says.
 struct Store {
-    data: Arc<dyn Backend>,
     roots: Arc<dyn Backend>,
+    disk: Disk,
 }
 
 impl Store {
     fn new() -> Self {
         Store {
-            data: Arc::new(MemoryBackend::new()),
             roots: Arc::new(MemoryBackend::new()),
-        }
-    }
-
-    fn backends(&self) -> Backends {
-        Backends {
-            data: self.data.clone(),
-            roots: self.roots.clone(),
+            disk: Disk::scratch().expect("a scratch disk"),
         }
     }
 
@@ -217,8 +216,7 @@ impl Store {
 
 fn config() -> MountConfig {
     MountConfig {
-        bucket: "data".into(),
-        roots_bucket: Some("roots".into()),
+        roots_bucket: "roots".into(),
         region: "us-east-1".into(),
         endpoint: None,
         access_key_id: None,
@@ -226,17 +224,17 @@ fn config() -> MountConfig {
         session_token: None,
         force_path_style: false,
         bucket_prefix: String::new(),
-        mount_path: "/".into(),
         fs_id: FS_ID,
         min_root_seq: None,
         skip_bucket_probe: true,
         request_timeout: std::time::Duration::from_secs(30),
-        root_retention: s3fs_core::store::config::DEFAULT_ROOT_RETENTION,
+        root_retention: enclave_runtime::DEFAULT_ROOT_RETENTION,
     }
 }
 
-fn boot_config() -> BootConfig {
+fn boot_config(store: &Store) -> BootConfig {
     BootConfig {
+        disk: store.disk.clone(),
         trust: ReceiptTrust::UnsignedEmulator,
     }
 }
@@ -257,15 +255,26 @@ fn record_key(pair: &Pair) -> String {
 }
 
 async fn boot(store: &Store, nsm: &Arc<TestNsm>) -> anyhow::Result<enclave_runtime::Booted> {
-    boot_on(store.backends(), nsm).await
+    boot_on(store, store.roots.clone(), nsm).await
 }
 
+/// A boot of `store`'s disk through `roots`, which may be the store's bucket
+/// seen through something hostile.
 async fn boot_on(
-    backends: Backends,
+    store: &Store,
+    roots: Arc<dyn Backend>,
     nsm: &Arc<TestNsm>,
 ) -> anyhow::Result<enclave_runtime::Booted> {
     let nsm: Arc<dyn Nsm> = nsm.clone();
-    enclave_runtime::boot(&backends, &config(), &boot_config(), &nsm, &key()).await
+    enclave_runtime::boot(
+        &roots,
+        &config(),
+        &boot_config(store),
+        &nsm,
+        &key(),
+        &test_clock(),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -513,9 +522,16 @@ async fn an_unmeasured_guest_is_refused_before_any_key_is_asked_for() {
         asked: AtomicUsize::new(0),
     };
 
-    let err = enclave_runtime::boot(&store.backends(), &config(), &boot_config(), &nsm, &keys)
-        .await
-        .expect_err("must refuse");
+    let err = enclave_runtime::boot(
+        &store.roots,
+        &config(),
+        &boot_config(&store),
+        &nsm,
+        &keys,
+        &test_clock(),
+    )
+    .await
+    .expect_err("must refuse");
     assert!(
         format!("{err:#}").contains("PCR16 is not locked"),
         "{err:#}"
@@ -677,7 +693,7 @@ impl Backend for Interloper {
         self.inner.capabilities()
     }
 
-    async fn head_blob(&self, key: &str) -> Result<BlobMeta, FsError> {
+    async fn head_blob(&self, key: &str) -> Result<BlobMeta, StoreError> {
         self.inner.head_blob(key).await
     }
 
@@ -685,19 +701,19 @@ impl Backend for Interloper {
         &self,
         key: &str,
         range: Option<Range<u64>>,
-    ) -> Result<GetBlobOutput, FsError> {
+    ) -> Result<GetBlobOutput, StoreError> {
         self.inner.get_blob(key, range).await
     }
 
-    async fn get_retained_blob(&self, key: &str) -> Result<GetBlobOutput, FsError> {
+    async fn get_retained_blob(&self, key: &str) -> Result<GetBlobOutput, StoreError> {
         self.inner.get_retained_blob(key).await
     }
 
-    async fn put_blob(&self, input: PutBlobInput) -> Result<BlobMeta, FsError> {
+    async fn put_blob(&self, input: PutBlobInput) -> Result<BlobMeta, StoreError> {
         self.inner.put_blob(input).await
     }
 
-    async fn put_blob_if_not_exists(&self, input: PutBlobInput) -> Result<BlobMeta, FsError> {
+    async fn put_blob_if_not_exists(&self, input: PutBlobInput) -> Result<BlobMeta, StoreError> {
         if input.key.contains(".pair.") {
             let planted = self.plant.lock().unwrap().take();
             if let Some(planted) = planted {
@@ -713,19 +729,19 @@ impl Backend for Interloper {
         self.inner.put_blob_if_not_exists(input).await
     }
 
-    async fn delete_blob(&self, key: &str) -> Result<(), FsError> {
+    async fn delete_blob(&self, key: &str) -> Result<(), StoreError> {
         self.inner.delete_blob(key).await
     }
 
-    async fn list_blobs(&self, input: ListBlobsInput<'_>) -> Result<ListBlobsOutput, FsError> {
+    async fn list_blobs(&self, input: ListBlobsInput<'_>) -> Result<ListBlobsOutput, StoreError> {
         self.inner.list_blobs(input).await
     }
 
-    async fn copy_blob(&self, input: CopyBlobInput) -> Result<BlobMeta, FsError> {
+    async fn copy_blob(&self, input: CopyBlobInput) -> Result<BlobMeta, StoreError> {
         self.inner.copy_blob(input).await
     }
 
-    async fn multipart_begin(&self, input: PutBlobInput) -> Result<MultipartId, FsError> {
+    async fn multipart_begin(&self, input: PutBlobInput) -> Result<MultipartId, StoreError> {
         self.inner.multipart_begin(input).await
     }
 
@@ -735,7 +751,7 @@ impl Backend for Interloper {
         upload_id: &MultipartId,
         part_number: u32,
         body: Bytes,
-    ) -> Result<PartUploadOutput, FsError> {
+    ) -> Result<PartUploadOutput, StoreError> {
         self.inner
             .multipart_upload_part(key, upload_id, part_number, body)
             .await
@@ -748,7 +764,7 @@ impl Backend for Interloper {
         part_number: u32,
         source_key: &str,
         source_range: Range<u64>,
-    ) -> Result<PartUploadOutput, FsError> {
+    ) -> Result<PartUploadOutput, StoreError> {
         self.inner
             .multipart_upload_part_copy(key, upload_id, part_number, source_key, source_range)
             .await
@@ -759,11 +775,11 @@ impl Backend for Interloper {
         key: &str,
         upload_id: &MultipartId,
         parts: Vec<CompletedPart>,
-    ) -> Result<BlobMeta, FsError> {
+    ) -> Result<BlobMeta, StoreError> {
         self.inner.multipart_complete(key, upload_id, parts).await
     }
 
-    async fn multipart_abort(&self, key: &str, upload_id: &MultipartId) -> Result<(), FsError> {
+    async fn multipart_abort(&self, key: &str, upload_id: &MultipartId) -> Result<(), StoreError> {
         self.inner.multipart_abort(key, upload_id).await
     }
 }
@@ -778,11 +794,8 @@ async fn a_first_boot_that_loses_the_race_boots_on_the_winners_record() {
         .await
         .expect("genesis");
 
-    let backends = Backends {
-        data: store.data.clone(),
-        roots: Interloper::planting(store.roots.clone(), Planted::TheSameRecord),
-    };
-    let booted = boot_on(backends, &TestNsm::running(0xaa, GUEST_B))
+    let roots = Interloper::planting(store.roots.clone(), Planted::TheSameRecord);
+    let booted = boot_on(&store, roots, &TestNsm::running(0xaa, GUEST_B))
         .await
         .expect("the loser boots");
     assert_eq!(
@@ -804,14 +817,11 @@ async fn junk_that_wins_the_race_is_refused() {
         .await
         .expect("genesis");
 
-    let backends = Backends {
-        data: store.data.clone(),
-        roots: Interloper::planting(
-            store.roots.clone(),
-            Planted::Bytes(b"not a record".to_vec()),
-        ),
-    };
-    let err = boot_on(backends, &TestNsm::running(0xaa, GUEST_B))
+    let roots = Interloper::planting(
+        store.roots.clone(),
+        Planted::Bytes(b"not a record".to_vec()),
+    );
+    let err = boot_on(&store, roots, &TestNsm::running(0xaa, GUEST_B))
         .await
         .expect_err("must refuse");
     assert!(format!("{err:#}").contains("does not describe"), "{err:#}");

@@ -1,6 +1,6 @@
 //! The gate: no verified assertion, no guest.
 //!
-//! Everything a request must survive before a tenant exists, let alone a warm
+//! Everything a request must survive before a tenant exists, let alone an
 //! instance. [`Gate::verify`] is the only way past it and it either returns a
 //! [`Verified`] tenant or a [`Denied`]; there is no third outcome and no
 //! caller-supplied way to skip it.
@@ -71,11 +71,9 @@ const MAX_TOKEN_CHARS: usize = 128;
 /// What a client is known as, once it has proved it.
 #[derive(Debug, Clone)]
 pub struct Verified {
-    /// Sixteen bytes, matching [`crate::tenant::TenantRoot`] — the plan said
-    /// thirty-two, but the directory layout already used sixteen and one
-    /// number for one thing is worth more than the extra bits. A minted,
-    /// collision-checked 128-bit identifier is ample; it is not a secret and
-    /// nothing derives a key from it.
+    /// Sixteen bytes, derived from the credential id by
+    /// [`crate::auth::credential::tenant_of`] and naming the tenant's dataset.
+    /// It is not a secret and nothing derives a key from it.
     pub tenant_id: [u8; 16],
 }
 

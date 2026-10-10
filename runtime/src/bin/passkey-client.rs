@@ -559,12 +559,26 @@ fn request(
         }
     }
 
+    // A response counts only once it is complete. The runtime streams a body
+    // as the guest writes it and holds back only its end until the guest's
+    // writes are anchored, so a body that stops short — the enclave died, or
+    // the connection was cut — reports an operation that may be rolled back.
     let rest = &raw[split + 4..];
-    let body = if head
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
+    let lower = head.to_ascii_lowercase();
+    let cut_off = || {
+        anyhow::anyhow!(
+            "{method} {path}: the response was cut off before it ended, so what it reports \
+             may not have happened"
+        )
+    };
+    let body = if lower.contains("transfer-encoding: chunked") {
+        dechunk(rest).ok_or_else(cut_off)?
+    } else if let Some(length) = lower
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
     {
-        dechunk(rest)
+        rest.get(..length).ok_or_else(cut_off)?.to_vec()
     } else {
         rest.to_vec()
     };
@@ -824,23 +838,22 @@ fn dump_proof(
     Ok(())
 }
 
-fn dechunk(body: &[u8]) -> Vec<u8> {
+/// The body of a chunked response, or `None` if it never reached its last,
+/// zero-length chunk: a body cut off part-way is not a short body.
+fn dechunk(body: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut rest = body;
-    while let Some(end) = rest.windows(2).position(|w| w == b"\r\n") {
+    loop {
+        let end = rest.windows(2).position(|w| w == b"\r\n")?;
         let header = String::from_utf8_lossy(&rest[..end]);
-        let Ok(size) = usize::from_str_radix(header.split(';').next().unwrap_or("").trim(), 16)
-        else {
-            break;
-        };
+        let size = usize::from_str_radix(header.split(';').next().unwrap_or("").trim(), 16).ok()?;
         rest = &rest[end + 2..];
-        if size == 0 || rest.len() < size {
-            break;
+        if size == 0 {
+            return Some(out);
         }
-        out.extend_from_slice(&rest[..size]);
-        rest = rest.get(size + 2..).unwrap_or(&[]);
+        out.extend_from_slice(rest.get(..size)?);
+        rest = rest.get(size + 2..)?;
     }
-    out
 }
 
 #[derive(Debug)]
@@ -886,6 +899,23 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A response is complete or it is not acted on: the runtime holds back
+    /// only a body's end until its writes are anchored.
+    #[test]
+    fn a_chunked_body_must_reach_its_last_chunk() {
+        assert_eq!(
+            dechunk(b"5\r\nhello\r\n0\r\n\r\n").as_deref(),
+            Some(&b"hello"[..])
+        );
+        assert_eq!(
+            dechunk(b"5\r\nhello\r\n"),
+            None,
+            "cut off before the last chunk"
+        );
+        assert_eq!(dechunk(b"5\r\nhel"), None, "cut off inside a chunk");
+        assert_eq!(dechunk(b""), None);
+    }
     use nitro_attestation::testing::TestChain;
     use nitro_attestation::AttestationHashes;
 

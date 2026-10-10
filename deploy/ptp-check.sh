@@ -35,11 +35,13 @@ done
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$REPO/target/release/enclave-runtime"
-# clock-check never mounts anything, but the CLI requires these.
-DUMMY_ARGS=(--clock-check --clock-source ptp --bucket unused
-            --master-key 00000000000000000000000000000000000000000000000000000000000000ab)
+# A `testing` build, since only it lets a check choose its clock and entropy:
+# a production binary always reads PTP and the NSM, and neither machine here has
+# an NSM. --self-check exits before anything mounts, but the CLI requires a bucket.
+DUMMY_ARGS=(--self-check --roots-bucket unused --clock-source ptp --random-source host)
 
-[[ -x "$BIN" ]] || { echo "build it first: cargo build --release -p enclave-runtime" >&2; exit 1; }
+[[ -x "$BIN" ]] || {
+    echo "build it first: cargo build --release -p enclave-runtime --features testing" >&2; exit 1; }
 
 case "$MODE" in
 container)
@@ -65,7 +67,7 @@ qemu)
         echo "not produce the device, so this mode cannot work without it." >&2
         exit 1; }
 
-    WORK="${TMPDIR:-/tmp}/s3fs-ptp-qemu"
+    WORK="${TMPDIR:-/tmp}/enclave-ptp-qemu"
     mkdir -p "$WORK"
     IMG="$WORK/noble.img"
     SEED="$WORK/seed.iso"
@@ -89,7 +91,7 @@ runcmd:
   - echo "PTP-CHECK-DONE"
   - poweroff
 EOF
-    echo "instance-id: s3fs-ptp" > "$WORK/meta-data"
+    echo "instance-id: enclave-ptp" > "$WORK/meta-data"
     cloud-localds "$SEED" "$WORK/user-data" "$WORK/meta-data"
 
     echo "== booting VM; ptp_kvm exposes the host clock as /dev/ptp0 inside =="

@@ -23,8 +23,6 @@ use std::time::Duration;
 use bytes::{BufMut, Bytes, BytesMut};
 use enclave_runtime::{GuestEnvironment, HostClock, ServeHandle};
 use http_body_util::BodyExt;
-use s3fs_core::backend::memory::MemoryBackend;
-use s3fs_core::{Config, Fs, MasterSecret};
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 
 /// One gRPC frame on its way to the guest, or the error that ended the body.
@@ -142,22 +140,13 @@ impl Deframer {
 // --- harness ----------------------------------------------------------------
 
 async fn grpc_handle() -> ServeHandle {
-    let backend = Arc::new(MemoryBackend::new());
-    let fs = Fs::create(
-        backend.clone(),
-        backend,
-        &MasterSecret::from_bytes([3u8; 32]),
-        [0u8; 16],
-        Arc::new(Config::default()),
-    )
-    .await
-    .expect("creating the filesystem");
+    let fs = enclave_runtime::Zfs::scratch().await;
 
     let (logs, _collector) =
         enclave_runtime::guest_io::start(Arc::new(enclave_runtime::TracingLogSink));
     let guest = GuestEnvironment::new(
         fs,
-        Box::new(HostClock),
+        Arc::new(HostClock),
         Arc::new(nitro_nsm::fake::FakeNsm::new()),
         &[],
         &[],

@@ -36,7 +36,7 @@ fail() {
 # when it does fail the log says which part was missing.
 prepare_enclave_host() {
     local work="${WORK:-$REPO/target/qemu-nitro}"
-    local image="${QEMU_IMAGE:-s3fs-qemu-nitro:latest}"
+    local image="${QEMU_IMAGE:-enclave-qemu-nitro:latest}"
     # Pinned, like the Pebble image beside it. An unpinned build tool makes the
     # harness's behaviour depend on whatever crates.io served that morning.
     local vsock_version="${VSOCK_VERSION:-0.3.0}"

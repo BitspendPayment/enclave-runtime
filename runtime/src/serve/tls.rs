@@ -25,7 +25,7 @@
 //! entropy.
 //!
 //! What makes that argument safe to rely on is that it is checked rather than
-//! assumed: an enclave image sets `S3FS_RANDOM_SOURCE=nsm`, which refuses to
+//! assumed: an enclave image sets `ENCLAVE_RANDOM_SOURCE=nsm`, which refuses to
 //! start without a working `/dev/nsm`. If the runtime got that far, it is in
 //! an enclave.
 

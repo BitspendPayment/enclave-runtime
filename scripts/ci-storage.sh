@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# The block store against a real S3 implementation.
+# The S3 backend against a real S3 implementation: Object Lock, conditional
+# writes and retained-version reads, which the anchor chain and the boot
+# records are built on.
 #
 # These tests start their own MinIO through testcontainers — one per test, which
 # is why they run single-threaded and take a while. That is also why this script
@@ -11,4 +13,4 @@ cd "$REPO"
 "$REPO/scripts/minio-image.sh" >/dev/null
 
 say "MinIO integration"
-cargo test -p s3fs-core --features aws --test minio_integration -- --ignored --test-threads=1
+cargo test -p enclave-runtime --test minio_integration -- --ignored --test-threads=1

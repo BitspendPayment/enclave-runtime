@@ -19,8 +19,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 use enclave_runtime::{GuestEnvironment, HostClock, ServeHandle};
 use http_body_util::{BodyExt, Full};
-use s3fs_core::backend::memory::MemoryBackend;
-use s3fs_core::{Config, Fs, MasterSecret};
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
@@ -45,7 +43,7 @@ async fn handle_for(env: &[(String, String)]) -> ServeHandle {
 ///
 /// Separated so a test can build a *second* handle over the first one's
 /// storage — the only way to ask what survives a restart.
-async fn handle_over_with(fs: Arc<Fs>, env: &[(String, String)]) -> ServeHandle {
+async fn handle_over_with(fs: Arc<enclave_runtime::Zfs>, env: &[(String, String)]) -> ServeHandle {
     // Detached deliberately: the collector runs for as long as this
     // environment can send, which is what a test wants. Production drains it
     // explicitly instead.
@@ -53,7 +51,7 @@ async fn handle_over_with(fs: Arc<Fs>, env: &[(String, String)]) -> ServeHandle 
         enclave_runtime::guest_io::start(std::sync::Arc::new(enclave_runtime::TracingLogSink));
     let guest = GuestEnvironment::new(
         fs,
-        Box::new(HostClock),
+        Arc::new(HostClock),
         Arc::new(nitro_nsm::fake::FakeNsm::new()),
         env,
         &[],
@@ -75,19 +73,10 @@ async fn handle_over_with(fs: Arc<Fs>, env: &[(String, String)]) -> ServeHandle 
 
 /// A runtime filesystem plus a handle.
 async fn handle_for_with(env: &[(String, String)]) -> ServeHandle {
-    let backend = Arc::new(MemoryBackend::new());
     // `create`, not `mount`: mounting stopped formatting an empty store when
     // the boot machine landed, because a store that answers "nothing" is now a
     // refusal rather than an invitation to make a fresh filesystem.
-    let fs = Fs::create(
-        backend.clone(),
-        backend,
-        &MasterSecret::from_bytes([7u8; 32]),
-        [0u8; 16],
-        Arc::new(Config::default()),
-    )
-    .await
-    .expect("creating the memory-backed filesystem");
+    let fs = enclave_runtime::Zfs::scratch().await;
     handle_over_with(fs, env).await
 }
 
@@ -350,7 +339,7 @@ async fn a_trap_dies_with_its_request() {
 /// A tenant id, as the gate would have resolved one.
 ///
 /// These tests exercise what happens *after* authentication — isolation,
-/// warmth, concurrency — so they take the tenant as given. That the tenant can
+/// fresh instances, concurrency — so they take the tenant as given. That the tenant can
 /// only come from a verified assertion is the gate's own business, and
 /// `auth::gate` tests it directly.
 fn identity(name: &str) -> [u8; 16] {
@@ -437,11 +426,11 @@ async fn tenanted() -> ServeHandle {
     handle.with_tenancy(Arc::new(tenancy))
 }
 
-/// A client's own directory persists between their requests, and the warm
-/// instance means their in-memory state does too.
+/// A client's own directory persists between their requests; their
+/// in-memory state does not, because every request gets a fresh instance.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn a_client_keeps_their_own_directory_and_instance() {
+async fn a_client_keeps_their_directory_but_never_an_instance() {
     let handle = tenanted().await;
     let client = identity("a-client");
 
@@ -450,14 +439,11 @@ async fn a_client_keeps_their_own_directory_and_instance() {
         assert_eq!(status, 200, "body: {body}");
         assert_eq!(body.trim(), expected.to_string(), "the directory reset");
     }
-    // And the instance was kept, which a fresh one could never show.
-    for expected in 1..=3 {
+    // And no instance was kept: a second request seeing the first one's
+    // memory would be a call inheriting state it never approved.
+    for _ in 1..=3 {
         let (_, body) = get_as(&handle, "/memory", Some(&client)).await;
-        assert_eq!(
-            body.trim(),
-            expected.to_string(),
-            "the instance was rebuilt"
-        );
+        assert_eq!(body.trim(), "1", "a request reused an instance");
     }
 }
 
@@ -640,8 +626,8 @@ async fn an_anonymous_caller_gets_no_tenant() {
     }
 }
 
-/// A trap takes down one client's instance and touches nobody else — the whole
-/// argument for the per-client boundary, as a test.
+/// A trap takes down one call and touches nobody else — the whole argument
+/// for the per-client boundary, as a test.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
 async fn a_trap_is_contained_to_one_client() {
@@ -652,12 +638,7 @@ async fn a_trap_is_contained_to_one_client() {
     let alice = identity("alice");
     let bob = identity("bob");
 
-    // Bob builds up instance state.
-    for _ in 0..3 {
-        get_as(&handle, "/memory", Some(&bob)).await;
-    }
-
-    // Alice wedges hers.
+    // Alice wedges her call.
     let req = hyper::Request::builder()
         .method("GET")
         .uri("http://enclave.test/hang")
@@ -670,17 +651,14 @@ async fn a_trap_is_contained_to_one_client() {
     .await
     .expect("the watchdog did not fire");
 
-    // Alice's instance was rebuilt; Bob's was never touched.
+    // Alice is served again from a fresh instance, and so is Bob.
     let (status, alices) = get_as(&handle, "/memory", Some(&alice)).await;
     assert_eq!(status, 200, "alice's tenant did not recover: {alices}");
     assert_eq!(alices.trim(), "1", "a trapped instance was reused");
 
-    let (_, bobs) = get_as(&handle, "/memory", Some(&bob)).await;
-    assert_eq!(
-        bobs.trim(),
-        "4",
-        "another client's trap reset bob's instance"
-    );
+    let (status, bobs) = get_as(&handle, "/memory", Some(&bob)).await;
+    assert_eq!(status, 200, "another client's trap stopped bob: {bobs}");
+    assert_eq!(bobs.trim(), "1", "bob's request reused an instance");
 }
 
 /// Their data survives too: a trap discards the poisoned instance and nothing
@@ -737,8 +715,8 @@ async fn one_client_does_not_wait_for_another() {
     let alice = identity("alice");
     let bob = identity("bob");
 
-    // Warm Bob first, so the assertion below measures contention rather than
-    // the cost of a cold mount.
+    // Bob once first, so his dataset exists and the assertion below measures
+    // contention rather than its creation.
     assert_eq!(get_as(&handle, "/counter", Some(&bob)).await.0, 200);
 
     let hung = {

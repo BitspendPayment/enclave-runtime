@@ -16,7 +16,7 @@
 //! That is not a setting. A flag would be something a deployment turns on and a
 //! guest then uses, at which point it stops being a property.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -99,6 +99,9 @@ struct Wake {
 }
 
 /// The guest-facing half: owns the registry and the queue, owns no network.
+/// Wakes held per tenant until their invocation anchors: `(category, reference)`.
+type StagedWakes = HashMap<[u8; 16], Vec<(String, Option<String>)>>;
+
 pub struct Notifier {
     registry: Arc<DeviceRegistry>,
     clock: Arc<WallClockAdapter>,
@@ -111,6 +114,12 @@ pub struct Notifier {
     /// A `std` mutex, never tokio's: `raise` holds it, and `raise` must contain
     /// nothing that can pend.
     inflight: Mutex<HashSet<([u8; 16], String)>>,
+    /// Wakes a guest raised during an invocation, held until its writes are
+    /// anchored. A wake announces "something changed, come look", so sending
+    /// one before the change is durable could wake an owner for a state a
+    /// crash then rewinds. Keyed by tenant, and a tenant is serialised against
+    /// itself, so one invocation stages and delivers before the next.
+    staged: Mutex<StagedWakes>,
     counters: Arc<Counters>,
 }
 
@@ -192,6 +201,40 @@ impl Notifier {
         Ok(())
     }
 
+    /// Hold a wake until the invocation that raised it is anchored. Validated
+    /// now (the guest learns of a bad label at once), delivered later.
+    pub fn stage(&self, tenant: [u8; 16], category: &str, reference: Option<&str>) -> Result<()> {
+        pinpoint::check_labels(category, reference)?;
+        self.staged
+            .lock()
+            .expect("staged poisoned")
+            .entry(tenant)
+            .or_default()
+            .push((category.to_string(), reference.map(str::to_string)));
+        Ok(())
+    }
+
+    /// Deliver a tenant's staged wakes — call once its writes are anchored.
+    pub fn deliver_staged(&self, tenant: [u8; 16]) {
+        let held = self
+            .staged
+            .lock()
+            .expect("staged poisoned")
+            .remove(&tenant)
+            .unwrap_or_default();
+        for (category, reference) in held {
+            // A dropped or capped wake is not the guest's problem now; it is no
+            // longer in a host call that could return the error.
+            let _ = self.raise(tenant, &category, reference.as_deref());
+        }
+    }
+
+    /// Drop a tenant's staged wakes unsent — call if the anchor failed, so a
+    /// wake never outlives the writes it was about.
+    pub fn drop_staged(&self, tenant: [u8; 16]) {
+        self.staged.lock().expect("staged poisoned").remove(&tenant);
+    }
+
     fn release(&self, tenant: [u8; 16], category: &str) {
         self.inflight
             .lock()
@@ -238,6 +281,7 @@ pub fn start(
         clock: clock.clone(),
         tx,
         inflight: Mutex::new(HashSet::new()),
+        staged: Mutex::new(HashMap::new()),
         counters: counters.clone(),
     });
     let task = tokio::spawn(forward(
@@ -491,8 +535,11 @@ pub fn add_to_linker(linker: &mut wasmtime::component::Linker<State>) -> wasmtim
             Box::new(async move {
                 let result = async move {
                     let ctx = context(store.data(), false)?;
+                    // Staged, not sent: delivered once this invocation's writes
+                    // are anchored (see `deliver_staged`), so an owner is never
+                    // woken for a change a crash would then undo.
                     ctx.notifier
-                        .raise(ctx.tenant, &category, reference.as_deref())
+                        .stage(ctx.tenant, &category, reference.as_deref())
                 }
                 .await;
                 Ok((result.map_err(|e| e.to_string()),))
@@ -508,8 +555,7 @@ mod tests {
     use super::pinpoint::testing::{Counted, Recorder, SENT};
     use super::*;
     use crate::clock::HostClock;
-    use s3fs_core::backend::memory::MemoryBackend;
-    use s3fs_core::{Config, Fs, MasterSecret};
+    use crate::zfs::Zfs;
 
     const ALICE: [u8; 16] = [1; 16];
     const BOB: [u8; 16] = [2; 16];
@@ -526,18 +572,9 @@ mod tests {
         Arc<DeviceRegistry>,
         Arc<Recorder>,
     ) {
-        let backend = Arc::new(MemoryBackend::new());
-        let fs = Fs::create(
-            backend.clone(),
-            backend,
-            &MasterSecret::from_bytes([3u8; 32]),
-            [0u8; 16],
-            Arc::new(Config::default()),
-        )
-        .await
-        .unwrap();
+        let fs = Zfs::scratch().await;
         let registry = DeviceRegistry::open(fs).await.unwrap();
-        let clock = Arc::new(WallClockAdapter::new(Box::new(HostClock)).unwrap());
+        let clock = Arc::new(WallClockAdapter::new(Arc::new(HostClock)).unwrap());
         let recorder = Recorder::with(replies);
         let client = PinpointClient::new(
             NotifyConfig {
@@ -562,22 +599,14 @@ mod tests {
     /// assertion about what is in flight becomes a race with that task. Holding
     /// the receiver and never reading it makes the queue stand still.
     async fn detached() -> (Arc<Notifier>, mpsc::Receiver<Wake>) {
-        let backend = Arc::new(MemoryBackend::new());
-        let fs = Fs::create(
-            backend.clone(),
-            backend,
-            &MasterSecret::from_bytes([4u8; 32]),
-            [0u8; 16],
-            Arc::new(Config::default()),
-        )
-        .await
-        .unwrap();
+        let fs = Zfs::scratch().await;
         let (tx, rx) = mpsc::channel::<Wake>(QUEUE_CAPACITY);
         let notifier = Arc::new(Notifier {
             registry: DeviceRegistry::open(fs).await.unwrap(),
-            clock: Arc::new(WallClockAdapter::new(Box::new(HostClock)).unwrap()),
+            clock: Arc::new(WallClockAdapter::new(Arc::new(HostClock)).unwrap()),
             tx,
             inflight: Mutex::new(HashSet::new()),
+            staged: Mutex::new(HashMap::new()),
             counters: Arc::new(Counters::default()),
         });
         (notifier, rx)
@@ -629,6 +658,31 @@ mod tests {
             "raising wakes against a stalled push service took {elapsed:?}"
         );
         forwarder.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_staged_wake_is_sent_only_once_delivered_and_a_dropped_one_never() {
+        let (notifier, mut rx) = detached().await;
+
+        // Staged, not sent.
+        notifier.stage(ALICE, "task-done", Some("job")).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "a staged wake was sent before delivery"
+        );
+
+        // Delivered once the anchor is in: now it reaches the queue.
+        notifier.deliver_staged(ALICE);
+        assert!(
+            rx.try_recv().is_ok(),
+            "a delivered wake did not reach the queue"
+        );
+
+        // A wake whose anchor failed is dropped, not sent.
+        notifier.stage(ALICE, "task-done", Some("job")).unwrap();
+        notifier.drop_staged(ALICE);
+        notifier.deliver_staged(ALICE); // nothing left to deliver
+        assert!(rx.try_recv().is_err(), "a dropped wake was still sent");
     }
 
     #[tokio::test]

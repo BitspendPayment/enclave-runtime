@@ -1,5 +1,12 @@
 # Roadmap
 
+> **Since this was written:** the state moved off the block store below. Tenant
+> data and the runtime's own records are on a ZFS pool on a disk the parent
+> serves over vsock, anchored in the roots bucket after every change — see
+> [STORAGE.md](STORAGE.md). M0–M7 and M9 describe the retired s3fs engine and
+> are kept as history; M8 (key release) shipped. On Nitro the parent serves the
+> pool's EBS volume with stock nbdkit; that path is not yet proven on hardware.
+
 The storage engine is complete (M0–M7, `b11f95b`) and so is the runtime that
 loads a guest and gives it the filesystem (M10). What remains is the enclave's
 own plumbing — proving to KMS which code is running — and reclaiming space.
@@ -66,12 +73,12 @@ register.
 KMS and S3 go through a proxy on the parent. This needs a seam that does not
 exist:
 
-- [`AwsS3BackendConfig`](../crates/s3fs-core/src/backend/aws.rs) has no
+- [`AwsS3BackendConfig`](../runtime/src/store/backend/aws.rs) has no
   `http_client` field, so the SDK cannot be pointed at a vsock connector.
   Add `http_client: Option<SharedHttpClient>` and thread it into
   `connect_unchecked`.
 - Static credentials there are built with `None` expiry
-  ([aws.rs](../crates/s3fs-core/src/backend/aws.rs)), so a KMS-attested
+  ([aws.rs](../runtime/src/store/backend/aws.rs)), so a KMS-attested
   session token expires mid-run with no recovery. Needs a refresh path.
 
 **3c. Prove the enclave can reach IMDS.** The runtime reaches the metadata
@@ -88,7 +95,7 @@ though the network were broken.
 
 **3b. Cover the clock.** The guest's wall clock now comes from `/dev/ptp0`
 (see the README), but two things remain. The Object Lock retention deadline in
-[`RootStore::root_retention`](../crates/s3fs-core/src/store/root.rs) still uses
+`RootStore::root_retention` (in the retired engine) still uses
 `SystemTime::now()` — and a COMPLIANCE deadline computed from a wrong clock
 cannot be corrected afterwards by anyone, which makes it the sharpest version
 of this problem in the codebase. And attestation should eventually cover *which*
@@ -100,7 +107,7 @@ the name it lives under: a `DeleteObject` with no version id writes a delete
 marker, and `HEAD`/`GetObject` then report an Object-Locked record missing while
 it sits underneath, undeletable. That made "hide the tip" a legal S3 call rather
 than a lie from S3, and made a hidden state-origin receipt indistinguishable from
-none — which authorises genesis. [`Backend::get_retained_blob`](../crates/s3fs-core/src/backend/mod.rs)
+none — which authorises genesis. [`Backend::get_retained_blob`](../runtime/src/store/backend/mod.rs)
 reads the version through `ListObjectVersions`; the boot machine and
 `RootStore::exists`/`load` use it. Needs `s3:ListBucketVersions` on the enclave's
 role, and errors rather than answering "absent" without it.
@@ -120,7 +127,7 @@ to be absent and Object Lock keeps it present. The *rollback* half remains —
 `--min-root-seq` is still supplied by hand. Carrying it in the KMS encryption context would make the floor something
 the enclave receives from a service the storage operator does not control —
 the one thing that closes the residual risk documented in
-[`store/root.rs`](../crates/s3fs-core/src/store/root.rs).
+`store/root.rs` (in the retired engine).
 
 ### Testing
 
@@ -209,7 +216,7 @@ crates/
 
 Configuration is environment-first with matching flags, because inside an
 enclave the image's `ENV` lines are the only configuration there is. The guest
-inherits that environment minus anything under `AWS_` or `S3FS_` — credentials
+inherits that environment minus anything under `AWS_` or `ENCLAVE_` — credentials
 and the runtime's own settings — which is the one rule that keeps the master
 key away from the code the enclave exists to contain.
 
@@ -223,10 +230,10 @@ code that reads the data rather than only to the runtime that loads it.
 Almost nothing structural, by design:
 
 - `StaticKey` becomes `KmsAttestedKey` — one more implementation of
-  `enclave_runtime::MasterKeySource`, and `S3FS_MASTER_KEY` stops being read at all.
+  `enclave_runtime::MasterKeySource`, and `ENCLAVE_MASTER_KEY` stops being read at all.
 - `AwsS3BackendConfig` gains the `http_client` field so the SDK can be pointed
   at the parent's vsock proxy, plus a credential refresh path.
 - `RootRecord::attestation` starts carrying the PCR digest, turning the anchor
   chain into a record of *which code* wrote each state.
-- `S3FS_MIN_ROOT_SEQ` moves into the KMS encryption context, so the freshness
+- `ENCLAVE_MIN_ROOT_SEQ` moves into the KMS encryption context, so the freshness
   floor comes from a service the storage operator does not control.

@@ -1,45 +1,57 @@
-//! `enclave-runtime` — run a Wasm guest against the Merkle-anchored
-//! filesystem, inside an AWS Nitro Enclave.
+//! `enclave-runtime` — run a Wasm guest over its tenants' ZFS datasets, inside an AWS Nitro
+//! Enclave.
 //!
-//! An enclave has no shell, no config file, and no operator to type flags at
-//! it. It gets whatever the enclave image baked in, so **every setting reads
-//! from an environment variable**, with a matching flag that wins if present.
-//! `ENV` lines in the image's Dockerfile are the deployment configuration; the
-//! flags exist so the same binary stays drivable by hand while developing.
+//! An enclave has no shell, no config file, and no operator to type flags at it. It gets what its
+//! image baked in: an env file in the image's ramdisk, measured into PCR0 with everything else.
+//! So **every setting reads from an environment variable**, with a matching flag that wins if
+//! present — and changing one means building a new image, exactly as changing a constant does.
+//! That is why there are so few: a setting exists only where two deployments of the same code
+//! need different values. Everything else is a constant here.
 //!
-//! The guest component is **not** in the image. The runtime fetches it at boot
-//! from `--guest-object`, a key in the roots bucket, then measures it into PCR16
-//! and locks that register before it asks KMS for anything — see
-//! [`enclave_runtime::guest`]. PCR0 covers the runtime and *where* the guest
-//! comes from; PCR16 covers *what* arrived. A key policy pinning both releases
-//! the filesystem key to exactly this runtime running exactly this guest, so an
-//! attestation still says which code will read the data — and changing the
-//! guest is a policy edit rather than an image rebuild.
+//! The guest component is **not** in the image. The runtime fetches it at boot from
+//! [`GUEST_OBJECT`] in the roots bucket, then measures it into PCR16 and locks that register
+//! before it asks KMS for anything — see [`enclave_runtime::guest`]. The guest's own settings
+//! travel inside its file and are measured with it — see [`enclave_runtime::env`].
 //!
-//! Argument parsing over [`enclave_runtime`], which is the same crate: the
-//! library half is everything below this file, and lives beside it rather than
-//! inside it so integration tests can reach it.
+//! The master secret comes from KMS, which releases it only against an attestation whose PCR0
+//! and PCR16 match the key policy. The emulator's alternatives — a static key, unsigned receipts,
+//! the host's clock, a local object store — are [`Testing`] settings, compiled into `testing`
+//! builds alone, so no setting can talk a production binary into any of them.
 //!
-//! The master secret comes from `--master-key-source`, which has no default:
-//! `kms` mints it inside the enclave and lets KMS release it only against an
-//! attestation whose PCR0 and PCR16 match the key policy, and `static` takes it from
-//! configuration for development and for the QEMU harness. Supplying a
-//! plaintext key under `kms` is refused rather than ignored — a key in an
-//! environment variable is visible to the parent instance, exactly the party
-//! an enclave exists to exclude.
+//! Argument parsing over [`enclave_runtime`], which is the same crate: the library half is
+//! everything below this file, and lives beside it rather than inside it so integration tests
+//! can reach it.
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use enclave_runtime::{
-    open_clock, open_entropy, serve_component, AcmeConfig, ClockSource, GuestEnvPolicy,
-    GuestEnvironment, GuestSource, MasterKeySource, MountConfig, NetworkConfig, NetworkMode,
-    RandomSource, ReceiptTrust, ServeConfig, TlsMode, DEFAULT_GVFORWARDER, DEFAULT_NSM_DEVICE,
-    DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
+    open_clock, open_entropy, parse_bool_flag, serve_component, AcmeConfig, ClockSource,
+    GuestEnvironment, GuestSource, MasterKeySourceKind, MountConfig, NetworkConfig, NetworkMode,
+    RandomSource, ReceiptTrust, ServeConfig, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE,
+    EXIT_RUNTIME_FAILURE,
 };
+
+/// Where the guest is, in the roots bucket.
+const GUEST_OBJECT: &str = "guest/guest.wasm";
+
+/// Every interface, on 443. Inside an enclave the only interface is the one the parent's proxy
+/// reaches, and 443 is where it forwards.
+const HTTP_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 443);
+
+/// The stream within `--guest-log-group`. One per deployment, so the group alone says where.
+const GUEST_LOG_STREAM: &str = "guest";
+
+/// How long one S3 request may take, before the SDK's retries.
+const S3_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The deployment name in the KMS encryption context. It was a setting; it stays in the context,
+/// with the value every deployment had, so the keys sealed under it still open. The filesystem
+/// id is what tells deployments apart.
+const KMS_ENVIRONMENT: &str = "production";
 
 /// Notification settings, as far as they can be decided without I/O.
 struct NotifySettings {
@@ -60,100 +72,19 @@ fn nonempty(value: &Option<String>) -> Option<String> {
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Run a Wasm guest against a Merkle-anchored S3 filesystem",
+    about = "Run a Wasm guest inside an AWS Nitro Enclave",
     long_about = None
 )]
 struct Cli {
-    /// Enable durable background tasks. Requires authentication and a guest
-    /// exporting run-task from enclave:tasks/background@0.1.0.
-    #[arg(long, env = "S3FS_BACKGROUND_TASKS", default_value = "false", value_parser = enclave_runtime::parse_bool_flag, action = clap::ArgAction::Set)]
-    background_tasks: bool,
-    #[arg(long, env = "S3FS_BACKGROUND_CONCURRENCY", default_value_t = 1)]
-    background_concurrency: usize,
-    #[arg(long, env = "S3FS_BACKGROUND_MAX_RECORDS", default_value_t = 1024)]
-    background_max_records: usize,
-    #[arg(long, env = "S3FS_BACKGROUND_PER_TENANT", default_value_t = 64)]
-    background_per_tenant: usize,
+    /// The Object-Locked bucket: the pool's anchor chain, the boot's origin
+    /// records, the guest, and the sealed ACME cache. COMPLIANCE retention on
+    /// it is the entire rollback guarantee. The state itself is on the pool.
+    #[arg(long, env = "ENCLAVE_ROOTS_BUCKET")]
+    roots_bucket: String,
 
-    /// Guest component to run, as a key in the roots bucket. What an enclave
-    /// image uses.
-    ///
-    /// Fetched at boot, measured into PCR16 and locked before any key is asked
-    /// for. The key is baked into the image, so PCR0 covers where the guest
-    /// comes from; PCR16 covers what arrived. The object itself need not be
-    /// trusted: a substituted one measures to a different PCR16, which a key
-    /// policy pinning the approved guest releases nothing to.
-    #[arg(long, env = "S3FS_GUEST_OBJECT")]
-    guest_object: Option<String>,
-
-    /// Guest component to run, from a local file. For development and tests,
-    /// and measured exactly as an object is. Give this or `--guest-object`.
-    #[arg(long, env = "S3FS_GUEST_PATH")]
-    guest_path: Option<PathBuf>,
-
-    /// Bucket holding the data slabs.
-    #[arg(long, env = "S3FS_BUCKET")]
-    bucket: String,
-
-    /// Bucket holding the signed root records. Defaults to `--bucket`.
-    ///
-    /// These should differ in production: the roots bucket carries Object Lock
-    /// COMPLIANCE retention and is the entire rollback guarantee, while the
-    /// data bucket stays unlocked so dead copy-on-write blocks stay
-    /// reclaimable.
-    #[arg(long, env = "S3FS_ROOTS_BUCKET")]
-    roots_bucket: Option<String>,
-
-    /// Where the master secret comes from.
-    ///
-    /// `kms` mints it inside the enclave and lets KMS release it only against
-    /// an attestation whose PCR0 and PCR16 match the key policy — so a wrong
-    /// image or a wrong guest gets no key at all, rather than a refused mount.
-    /// `static` takes it from `--master-key` and stores it unsealed; it exists
-    /// for development and for the QEMU harness, whose emulated NSM cannot
-    /// produce a document KMS would accept.
-    ///
-    /// No default. This is the one setting that should never be inherited by
-    /// omission, and because the image environment is measured, PCR0 records
-    /// which of the two an enclave was built with.
-    #[arg(long, env = "S3FS_MASTER_KEY_SOURCE",
-          value_parser = enclave_runtime::MasterKeySourceKind::parse)]
-    master_key_source: enclave_runtime::MasterKeySourceKind,
-
-    /// 32-byte master secret, hex encoded. **`--master-key-source=static` only.**
-    ///
-    /// Supplying it under `kms` is refused rather than ignored: a key from
-    /// configuration is a key the parent instance holds, which is precisely
-    /// what KMS release exists to prevent.
-    #[arg(long, env = "S3FS_MASTER_KEY")]
-    master_key: Option<String>,
-
-    /// The customer master key that releases this filesystem's secret. Its
-    /// policy — `kms:RecipientAttestation:PCR0` and `:PCR16`, on both
-    /// `GenerateDataKey` and `Decrypt` — is the security control.
-    #[arg(long, env = "S3FS_KMS_KEY_ID")]
-    kms_key_id: Option<String>,
-
-    /// SSM parameter holding the KMS ciphertext, and nothing else.
-    #[arg(long, env = "S3FS_MASTER_KEY_PARAMETER")]
-    master_key_parameter: Option<String>,
-
-    /// Deployment name, mixed into the KMS encryption context alongside the
-    /// filesystem id — so a staging enclave cannot open a production
-    /// filesystem even when pointed at the same parameter.
-    #[arg(long, env = "S3FS_ENVIRONMENT", default_value = "production")]
-    environment: String,
-
-    /// Endpoint overrides for KMS and SSM, separate from `--endpoint`.
-    ///
-    /// S3's override points at MinIO in development; a MinIO endpoint is not a
-    /// KMS endpoint, and reusing it would fail in a way that reads like a
-    /// credentials problem.
-    #[arg(long, env = "S3FS_KMS_ENDPOINT")]
-    kms_endpoint: Option<String>,
-
-    #[arg(long, env = "S3FS_SSM_ENDPOINT")]
-    ssm_endpoint: Option<String>,
+    /// Key prefix inside the roots bucket, so deployments can share one locked bucket.
+    #[arg(long, env = "ENCLAVE_BUCKET_PREFIX", default_value = "")]
+    bucket_prefix: String,
 
     /// Filesystem identifier, 32 hex characters — the key-derivation salt, so
     /// two filesystems under one master secret stay independent.
@@ -163,232 +94,67 @@ struct Cli {
     /// the store to say which key checks its own signature.
     #[arg(
         long,
-        env = "S3FS_ID",
+        env = "ENCLAVE_ID",
         default_value = "00000000000000000000000000000000"
     )]
     fs_id: String,
 
-    /// Refuse to mount a root record older than this sequence number.
+    /// Refuse a store whose newest anchor is older than this sequence number.
     ///
-    /// The only defence against a store that hides newer roots at a cold
-    /// mount. Everything else about rollback is closed cryptographically; this
+    /// The only defence against a store that hides newer anchors at a cold
+    /// boot. Everything else about rollback is closed cryptographically; this
     /// one needs a number from outside the store.
-    #[arg(long, env = "S3FS_MIN_ROOT_SEQ")]
+    #[arg(long, env = "ENCLAVE_MIN_ROOT_SEQ")]
     min_root_seq: Option<u64>,
 
-    /// How long each root record is locked against deletion, in seconds.
+    /// How long each anchor and boot record is locked against deletion, in seconds.
     ///
     /// COMPLIANCE retention: nobody can shorten it, so the rollback guarantee
     /// lasts this long and so does the roots bucket. Ten years unless the image
     /// says otherwise; a test deployment says a day, so it can be retired.
     /// Baked into the image, so PCR0 tells a client which kind it is talking
     /// to. Under a day is refused: it protects nothing worth the name.
-    #[arg(long, env = "S3FS_ROOT_RETENTION_SECS",
-          default_value_t = s3fs_core::store::config::DEFAULT_ROOT_RETENTION.as_secs(),
+    #[arg(long, env = "ENCLAVE_ROOT_RETENTION_SECS",
+          default_value_t = enclave_runtime::DEFAULT_ROOT_RETENTION.as_secs(),
           value_parser = clap::value_parser!(u64).range(86_400..))]
     root_retention_secs: u64,
-
-    /// Path the guest sees as its preopen root.
-    #[arg(long, env = "S3FS_MOUNT_PATH", default_value = "/")]
-    mount_path: String,
-
-    /// Key prefix inside both buckets.
-    #[arg(long, env = "S3FS_BUCKET_PREFIX", default_value = "")]
-    bucket_prefix: String,
 
     #[arg(long, env = "AWS_REGION", default_value = "us-east-1")]
     region: String,
 
-    /// Endpoint override, e.g. a local MinIO or the parent's vsock proxy.
-    #[arg(long, env = "S3FS_ENDPOINT")]
-    endpoint: Option<String>,
+    /// The customer master key that releases this filesystem's secret. Its
+    /// policy — `kms:RecipientAttestation:PCR0` and `:PCR16`, on both
+    /// `GenerateDataKey` and `Decrypt` — is the security control.
+    #[arg(long, env = "ENCLAVE_KMS_KEY_ID")]
+    kms_key_id: Option<String>,
 
-    #[arg(long, env = "AWS_ACCESS_KEY_ID")]
-    access_key_id: Option<String>,
+    /// SSM parameter holding the KMS ciphertext, and nothing else.
+    #[arg(long, env = "ENCLAVE_MASTER_KEY_PARAMETER")]
+    master_key_parameter: Option<String>,
 
-    #[arg(long, env = "AWS_SECRET_ACCESS_KEY")]
-    secret_access_key: Option<String>,
-
-    #[arg(long, env = "AWS_SESSION_TOKEN")]
-    session_token: Option<String>,
-
-    /// Path-style addressing, required by MinIO and many S3-compatibles.
-    #[arg(long, env = "S3FS_FORCE_PATH_STYLE", value_parser = enclave_runtime::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
-    force_path_style: bool,
-
-    /// Skip the `HeadBucket` startup probe.
-    #[arg(long, env = "S3FS_SKIP_BUCKET_PROBE", value_parser = enclave_runtime::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
-    skip_bucket_probe: bool,
-
-    /// Give the guest nothing but what `--guest-env` names.
+    /// Domain to put in the certificate. Repeatable; at least one.
     ///
-    /// **Use this when running outside an enclave.** Inheritance is right for
-    /// an enclave image, where the environment is curated deployment
-    /// configuration; it is wrong on a developer's machine, where it forwards
-    /// that machine's whole environment to the guest. The denylist below
-    /// withholds this runtime's own credentials, not a `GITHUB_TOKEN` or an
-    /// `SSH_AUTH_SOCK`.
-    ///
-    /// By default it inherits this process's environment minus anything under
-    /// `AWS_` or `S3FS_`, which is where the credentials and this runtime's
-    /// own configuration live.
-    #[arg(long, env = "S3FS_NO_INHERIT_ENV", value_parser = enclave_runtime::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
-    no_inherit_env: bool,
-
-    /// Extra variable for the guest, as `NAME` (inherit that one by name) or
-    /// `NAME=VALUE`. Applied after inheritance, so it overrides — including
-    /// for names that are otherwise withheld. Repeatable, or comma-separated.
-    ///
-    /// Paired with `--no-inherit-env` this is the explicit model: the guest
-    /// gets exactly what is named here and nothing else.
+    /// Let's Encrypt issues it over TLS-ALPN-01 on the serving port. The key
+    /// is generated inside the enclave and never leaves it; what the CA signs
+    /// is what every response's attestation document binds.
     #[arg(
-        long = "guest-env",
-        env = "S3FS_GUEST_ENV",
-        value_delimiter = ',',
-        value_name = "NAME[=VALUE]"
+        long = "tls-domain",
+        env = "ENCLAVE_TLS_DOMAINS",
+        value_delimiter = ','
     )]
-    guest_env: Vec<String>,
-
-    /// Where the guest's wall-clock time comes from.
-    ///
-    /// `ptp` reads the Nitro PTP hardware clock and refuses to start without
-    /// it. `host` uses the system clock, which inside an enclave is whatever
-    /// the hypervisor last set — fine for development, untrusted in
-    /// production. `auto` prefers PTP and warns when it falls back.
-    ///
-    /// An enclave image should set this to `ptp`.
-    #[arg(long, env = "S3FS_CLOCK_SOURCE", default_value = "auto",
-          value_parser = ClockSource::parse)]
-    clock_source: ClockSource,
-
-    /// PTP character device to read.
-    #[arg(long, env = "S3FS_PTP_DEVICE", default_value = DEFAULT_PTP_DEVICE)]
-    ptp_device: PathBuf,
-
-    /// Where the guest's random bytes come from.
-    ///
-    /// `nsm` reads the Nitro Security Module and refuses to start without it.
-    /// `host` uses the kernel, which inside an enclave is NSM-seeded but says
-    /// nothing about it. `auto` prefers NSM and reports a fallback as an error,
-    /// because every key the guest generates afterwards rests on the answer.
-    ///
-    /// An enclave image should set this to `nsm`.
-    #[arg(long, env = "S3FS_RANDOM_SOURCE", default_value = "auto",
-          value_parser = RandomSource::parse)]
-    random_source: RandomSource,
-
-    /// NSM character device to read.
-    #[arg(long, env = "S3FS_NSM_DEVICE", default_value = DEFAULT_NSM_DEVICE)]
-    nsm_device: PathBuf,
-
-    /// How a state-origin receipt must be trusted.
-    ///
-    /// `required` demands a signature chaining to the AWS Nitro root.
-    /// `unsigned-emulator` reads the contents without checking anything,
-    /// because QEMU's emulated NSM does not sign — and because the image's
-    /// environment is measured, PCR0 tells a client which of the two an
-    /// enclave was built with. A production image never sets it.
-    #[arg(long, env = "S3FS_RECEIPT_TRUST", default_value = "required",
-          value_parser = ReceiptTrust::parse)]
-    receipt_trust: ReceiptTrust,
-
-    /// Seconds a guest may take to produce a response head before the request
-    /// is abandoned.
-    ///
-    /// A guest that neither returns nor answers otherwise hangs forever, and
-    /// with one request in flight at a time that is the whole server. Baked
-    /// into the image like every other setting, so PCR0 covers it.
-    #[arg(long, env = "S3FS_REQUEST_TIMEOUT_SECS", default_value_t = 30)]
-    request_timeout_secs: u64,
-
-    /// Seconds one S3 request may take, before the SDK's retries.
-    ///
-    /// Its own setting rather than a reuse of `--request-timeout-secs`, which
-    /// bounds how long a *guest* may take: tuning how long a guest may think
-    /// should not silently change how long a slab read may take, and the two
-    /// have no reason to move together.
-    ///
-    /// It has to be a setting at all because an enclave has no shell. Thirty
-    /// seconds is a guess, and a slow endpoint or a large slab is exactly the
-    /// case where a guess is wrong — with the symptom being a mount that never
-    /// returns rather than an error that names S3.
-    #[arg(long, env = "S3FS_S3_TIMEOUT_SECS", default_value_t = 30)]
-    s3_timeout_secs: u64,
-
-    #[arg(long, env = "S3FS_GUEST_LOG_GROUP")]
-    guest_log_group: Option<String>,
-
-    /// The stream within `--guest-log-group`. Required alongside it.
-    #[arg(long, env = "S3FS_GUEST_LOG_STREAM")]
-    guest_log_stream: Option<String>,
-
-    /// Point the CloudWatch client somewhere else. For tests.
-    ///
-    /// A downgrade path, and worth naming as one: aimed at an `http://`
-    /// endpoint it hands guest output to whatever is listening, in clear. That
-    /// is tolerable only because this is baked into the image, so PCR0 records
-    /// which was built.
-    #[arg(long, env = "S3FS_GUEST_LOG_ENDPOINT")]
-    guest_log_endpoint: Option<String>,
-
-    /// The push application wake signals go through: an AWS End User Messaging Push
-    /// application, whose FCM channel holds the Firebase credential.
-    ///
-    /// Empty means notifications are off — the same layering rule the guest log settings
-    /// follow, so an image can carry the setting and a deployment can blank it. The image names
-    /// the application and nothing else: requests are signed as the instance's own role, so
-    /// there is no credential here to set, or to leak from a published image.
-    #[arg(long, env = "S3FS_PUSH_APP_ID")]
-    push_app_id: Option<String>,
-
-    /// Point the push client at a stub. **Only in a `testing` build**, for tests and the
-    /// emulator: an `http://` endpoint hands wake signals to whatever is listening, and
-    /// requests to it are signed with a placeholder rather than the instance's role.
-    #[cfg(any(test, feature = "testing"))]
-    #[arg(long, env = "S3FS_PUSH_ENDPOINT")]
-    push_endpoint: Option<String>,
-
-    /// Clients kept warm at once.
-    ///
-    /// A warm client costs a wasm linear memory and nothing else — the
-    /// filesystem and its block cache are shared — so this bounds instance
-    /// memory rather than cache memory. Past it, the least recently used idle
-    /// client is dropped; one serving a request is never evicted.
-    #[arg(long, env = "S3FS_MAX_TENANTS", default_value_t = 64)]
-    max_tenants: usize,
-
-    /// Seconds a mounted client may sit idle before it is dropped.
-    #[arg(long, env = "S3FS_TENANT_IDLE_SECS", default_value_t = 900)]
-    tenant_idle_secs: u64,
-
-    /// Requests one client's instance serves before it is rebuilt.
-    ///
-    /// Wasm linear memory never shrinks, so an instance that lived forever
-    /// would only grow. Rebuilding costs ~24 µs and keeps the mount, which is
-    /// the part that costs S3 round trips.
-    #[arg(long, env = "S3FS_MAX_REQUESTS_PER_INSTANCE", default_value_t = 10_000)]
-    max_requests_per_instance: u64,
+    tls_domains: Vec<String>,
 
     /// The WebAuthn relying-party id — the domain passkeys are scoped to.
     ///
-    /// Setting it, with `--webauthn-origin`, is what turns authentication on:
-    /// **every request that could reach the guest then needs a fresh assertion
-    /// bound to exactly that request.** Left unset the runtime serves the guest
-    /// to anyone who can open a connection, which is a development and QEMU
-    /// arrangement and is warned about at startup.
-    ///
-    /// Must match the domain the app is scoped to, and production needs
-    /// browser-trusted TLS on it — see `--tls acme`. Baked into the image, so
-    /// PCR0 records which relying party an enclave will accept assertions for.
-    #[arg(long, env = "S3FS_WEBAUTHN_RP_ID")]
+    /// Setting it is what turns authentication on: **every request that could
+    /// reach the guest then needs a fresh assertion bound to exactly that
+    /// request**, and assertions must claim `https://<rp id>` or one of
+    /// `--webauthn-allowed-origin`. Left unset the runtime serves the guest to
+    /// anyone who can open a connection, which is a development arrangement and
+    /// is warned about at startup. Baked into the image, so PCR0 records which
+    /// relying party an enclave will accept assertions for.
+    #[arg(long, env = "ENCLAVE_WEBAUTHN_RP_ID")]
     webauthn_rp_id: Option<String>,
-
-    /// The exact origin assertions must claim, e.g. `https://cosigner.example.com`.
-    ///
-    /// Compared exactly, not by suffix: a page on another origin must not be
-    /// able to borrow a user's passkey for this one.
-    #[arg(long, env = "S3FS_WEBAUTHN_ORIGIN")]
-    webauthn_origin: Option<String>,
 
     /// A further origin assertions may claim. Repeatable.
     ///
@@ -399,161 +165,191 @@ struct Cli {
     /// Android lets an app claim it only after the app is vouched for by
     /// `https://<rp id>/.well-known/assetlinks.json`.
     ///
-    /// Compared exactly, like `--webauthn-origin`. Baked into the image, so
-    /// PCR0 records which apps an enclave accepts assertions from.
+    /// Compared exactly. Baked into the image, so PCR0 records which apps an
+    /// enclave accepts assertions from.
     #[arg(
         long = "webauthn-allowed-origin",
-        env = "S3FS_WEBAUTHN_ALLOWED_ORIGINS",
+        env = "ENCLAVE_WEBAUTHN_ALLOWED_ORIGINS",
         value_delimiter = ','
     )]
     webauthn_allowed_origins: Vec<String>,
 
-    /// Seconds a challenge is good for.
+    /// The push application wake signals go through: an AWS End User Messaging Push
+    /// application, whose FCM channel holds the Firebase credential.
     ///
-    /// Long enough for a person to look at a prompt and present a finger,
-    /// short enough that a captured assertion is stale before it can be used.
-    #[arg(long, env = "S3FS_CHALLENGE_TTL_SECS", default_value_t = 60)]
-    challenge_ttl_secs: u64,
+    /// Empty means notifications are off, so an image can carry the setting and a
+    /// deployment can blank it. The image names the application and nothing else:
+    /// requests are signed as the instance's own role, so there is no credential
+    /// here to set, or to leak from a published image.
+    #[arg(long, env = "ENCLAVE_PUSH_APP_ID")]
+    push_app_id: Option<String>,
 
-    /// Seconds an interaction token is good for before it is spent.
-    ///
-    /// This bounds the time to *start* an interaction — a person who approves
-    /// something and then puts their phone down should not find the approval
-    /// still live later. It is not how long an interaction may run.
-    #[arg(long, env = "S3FS_INTERACTION_TOKEN_TTL_SECS", default_value_t = 60)]
-    interaction_token_ttl_secs: u64,
+    /// CloudWatch log group for guest output, written to its `guest` stream.
+    /// Empty or unset means the console only.
+    #[arg(long, env = "ENCLAVE_GUEST_LOG_GROUP")]
+    guest_log_group: Option<String>,
 
-    /// Seconds an interaction may run once started.
-    ///
-    /// The other half of the distinction: a stream holds its tenant's single
-    /// slot for its whole life, so this is what bounds how long that tenant's
-    /// next request waits. Enforced by wall clock, because a guest parked in a
-    /// host call executes no wasm and the epoch cannot see it.
-    #[arg(long, env = "S3FS_MAX_INTERACTION_SECS", default_value_t = 300)]
-    max_interaction_secs: u64,
-
-    /// Report on the configured clock and entropy source and exit, without
-    /// mounting or running anything. For diagnosing a deployment, and the only
-    /// thing the emulator harness needs — it touches no storage.
+    /// Report on the clock and entropy source and exit, without mounting or
+    /// running anything. For diagnosing a deployment.
     #[arg(long, alias = "clock-check")]
     self_check: bool,
 
-    /// Address to serve on in `serve` mode.
-    ///
-    /// Binds every interface by default because inside an enclave the only
-    /// interface is the one the parent's proxy reaches, and binding loopback
-    /// there would answer nobody.
-    #[arg(long, env = "S3FS_HTTP_LISTEN", default_value = "0.0.0.0:8080")]
-    http_listen: SocketAddr,
-
-    /// Where the serving certificate comes from.
-    ///
-    /// `acme`, the default, obtains one from Let's Encrypt over TLS-ALPN-01 on
-    /// the same port. It needs `--tls-domain` and outbound network. The key is
-    /// generated inside the enclave and never leaves it; what the CA signs is
-    /// what every response's attestation document binds.
-    ///
-    /// `off` serves plaintext. Inside an enclave that hands every request to
-    /// the parent instance, which is the party this design excludes.
-    ///
-    /// There is deliberately no self-signed mode at all: a certificate an
-    /// operator can mint is one they can mint for an impostor too, and it buys
-    /// nothing the attestation binding does not already give. A deployment with
-    /// no public CA points `--acme-directory` at a private one instead.
-    #[arg(long, env = "S3FS_TLS", default_value = "acme",
-          value_parser = TlsMode::parse)]
-    tls: TlsMode,
-
-    /// Domain to put in the certificate. Repeatable; required for `--tls acme`.
-    #[arg(long = "tls-domain", env = "S3FS_TLS_DOMAINS", value_delimiter = ',')]
-    tls_domains: Vec<String>,
-
-    /// Contact address registered with the ACME provider, for expiry notices.
-    #[arg(
-        long = "acme-contact",
-        env = "S3FS_ACME_CONTACTS",
-        value_delimiter = ','
-    )]
-    acme_contacts: Vec<String>,
-
-    /// ACME directory URL. Defaults to Let's Encrypt production.
-    ///
-    /// Point it at staging while setting a deployment up. Production allows
-    /// five duplicate certificates per week per domain, and an enclave that
-    /// keeps re-issuing will exhaust that and be unable to serve.
-    #[arg(long, env = "S3FS_ACME_DIRECTORY")]
-    acme_directory: Option<String>,
-
-    /// PEM trust root for the ACME directory's own HTTPS certificate.
-    ///
-    /// **Only in a `testing` build.** A real CA serves its API under a
-    /// publicly-trusted certificate and needs nothing here; a test CA like
-    /// Pebble does not, so the QEMU harness supplies its root. A production
-    /// enclave has no such flag, because one that took issuance orders from a
-    /// CA of the operator's choosing would be a different trust model than the
-    /// one this image claims.
-    #[cfg(any(test, feature = "testing"))]
-    #[arg(long, env = "S3FS_ACME_CA")]
-    acme_ca: Option<PathBuf>,
-
-    /// Re-sign attestation documents with a certificate chain minted at boot.
-    ///
-    /// **Only in a `testing` build, and only useful under an emulator.** QEMU's
-    /// NSM produces documents with genuine contents — the real PCR0 of the
-    /// image, the PCR16 the runtime measured — inside an envelope it does not
-    /// sign: its source says *"we don't actually sign the data, so we use -1 as
-    /// the 'alg' value"*, and -1 is not a COSE algorithm. A client meeting one
-    /// has to pass `--unsigned-emulator`, which skips the signature, the chain
-    /// and the validity windows entirely.
-    ///
-    /// With this set, the runtime asks the device for a document and re-signs
-    /// that same payload, so a client pins the reported root and runs every
-    /// check it would run against hardware. It proves nothing about *who*
-    /// produced a document — the key is minted inside an image its operator
-    /// controls — which is why a production binary has no such flag.
-    #[cfg(any(test, feature = "testing"))]
-    #[arg(long, env = "S3FS_COSIGN_ATTESTATIONS", value_parser = enclave_runtime::parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
-    cosign_attestations: bool,
-
-    /// How the enclave reaches the network.
-    ///
-    /// `gvproxy` runs the tap forwarder against the parent's gvproxy, which is
-    /// the only way an enclave gets an interface at all — it has no NIC, only
-    /// vsock. Without it nothing that speaks TCP works: not S3, not ACME, not
-    /// even DNS.
-    ///
-    /// `none` assumes the network is already there, which is true everywhere
-    /// except inside an enclave.
-    ///
-    /// An enclave image should set this to `gvproxy`.
-    #[arg(long, env = "S3FS_NETWORK", default_value = "none",
-          value_parser = NetworkMode::parse)]
-    network: NetworkMode,
-
-    /// The tap forwarder binary, shipped inside the enclave image.
-    #[arg(long, env = "S3FS_GVFORWARDER", default_value = DEFAULT_GVFORWARDER)]
-    gvforwarder: PathBuf,
+    #[cfg_attr(any(test, feature = "testing"), command(flatten))]
+    #[cfg_attr(not(any(test, feature = "testing")), arg(skip = Testing::production()))]
+    testing: Testing,
 
     /// Arguments passed to the guest.
     #[arg(last = true)]
     guest_args: Vec<String>,
 }
 
-impl Cli {
-    /// Where guest output goes, beyond the console.
+/// The settings only a `testing` build has: the emulator's and the tests'.
+///
+/// A production binary has none of these flags. It takes [`Testing::production`], so each
+/// value a production enclave runs with is written once, there, and no deployment can reach
+/// another.
+#[derive(clap::Args, Debug)]
+struct Testing {
+    /// Where the master secret comes from. `static` takes it from `--master-key`
+    /// and stores it unsealed, for the emulator, whose NSM cannot produce a
+    /// document KMS would accept.
+    #[arg(long, env = "ENCLAVE_MASTER_KEY_SOURCE", default_value = "kms",
+          value_parser = MasterKeySourceKind::parse)]
+    master_key_source: MasterKeySourceKind,
+
+    /// 32-byte master secret, hex encoded. `static` only, and refused under
+    /// `kms`: a key from configuration is a key the parent instance holds.
+    #[arg(long, env = "ENCLAVE_MASTER_KEY")]
+    master_key: Option<String>,
+
+    /// `unsigned-emulator` reads a state-origin receipt without checking a
+    /// signature, because the emulator's NSM does not sign.
+    #[arg(long, env = "ENCLAVE_RECEIPT_TRUST", default_value = "required",
+          value_parser = ReceiptTrust::parse)]
+    receipt_trust: ReceiptTrust,
+
+    /// Where the guest's wall-clock time comes from. The emulator has no PTP
+    /// clock; `host` uses the system's.
+    #[arg(long, env = "ENCLAVE_CLOCK_SOURCE", default_value = "ptp",
+          value_parser = ClockSource::parse)]
+    clock_source: ClockSource,
+
+    /// PTP character device to read.
+    #[arg(long, env = "ENCLAVE_PTP_DEVICE", default_value = DEFAULT_PTP_DEVICE)]
+    ptp_device: PathBuf,
+
+    /// Where random bytes come from. `host` is for a machine with no NSM.
+    #[arg(long, env = "ENCLAVE_RANDOM_SOURCE", default_value = "nsm",
+          value_parser = RandomSource::parse)]
+    random_source: RandomSource,
+
+    /// An S3-compatible endpoint in place of AWS's: the emulator's MinIO.
+    #[arg(long, env = "ENCLAVE_ENDPOINT")]
+    endpoint: Option<String>,
+
+    /// Path-style addressing, which MinIO needs.
+    #[arg(long, env = "ENCLAVE_FORCE_PATH_STYLE", value_parser = parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
+    force_path_style: bool,
+
+    /// Static credentials for that endpoint. Production signs as the instance's role.
+    #[arg(long, env = "AWS_ACCESS_KEY_ID")]
+    access_key_id: Option<String>,
+
+    #[arg(long, env = "AWS_SECRET_ACCESS_KEY")]
+    secret_access_key: Option<String>,
+
+    #[arg(long, env = "AWS_SESSION_TOKEN")]
+    session_token: Option<String>,
+
+    /// An ACME directory in place of Let's Encrypt production: Pebble, or staging.
+    #[arg(long, env = "ENCLAVE_ACME_DIRECTORY")]
+    acme_directory: Option<String>,
+
+    /// PEM trust root for the ACME directory's own HTTPS certificate.
     ///
-    /// A group without a stream is refused here rather than at the first write:
-    /// it needs no I/O to know it is wrong, and the same discipline as
-    /// `--webauthn-rp-id`/`--webauthn-origin`. Everything that *does* need the
-    /// network is decided at startup instead, where a transient failure can be
-    /// told apart from a mistake.
+    /// A real CA serves its API under a publicly-trusted certificate and needs
+    /// nothing here; a test CA like Pebble does not, so the emulator supplies
+    /// its root. An enclave that took issuance orders from a CA of the
+    /// operator's choosing would be a different trust model than the one a
+    /// production image claims.
+    #[arg(long, env = "ENCLAVE_ACME_CA")]
+    acme_ca: Option<PathBuf>,
+
+    /// Contact address registered with the ACME directory.
+    #[arg(
+        long = "acme-contact",
+        env = "ENCLAVE_ACME_CONTACTS",
+        value_delimiter = ','
+    )]
+    acme_contacts: Vec<String>,
+
+    /// Point the CloudWatch client somewhere else. An `http://` endpoint hands
+    /// guest output to whatever is listening, in clear.
+    #[arg(long, env = "ENCLAVE_GUEST_LOG_ENDPOINT")]
+    guest_log_endpoint: Option<String>,
+
+    /// Point the push client at a stub: an `http://` endpoint hands wake signals to
+    /// whatever is listening, and requests to it are signed with a placeholder
+    /// rather than the instance's role.
+    #[arg(long, env = "ENCLAVE_PUSH_ENDPOINT")]
+    push_endpoint: Option<String>,
+
+    /// Re-sign attestation documents with a certificate chain minted at boot.
+    ///
+    /// Only useful under an emulator. QEMU's NSM produces documents with
+    /// genuine contents — the real PCR0 of the image, the PCR16 the runtime
+    /// measured — inside an envelope it does not sign: its source says *"we
+    /// don't actually sign the data, so we use -1 as the 'alg' value"*, and -1
+    /// is not a COSE algorithm. A client meeting one has to pass
+    /// `--unsigned-emulator`, which skips the signature, the chain and the
+    /// validity windows entirely.
+    ///
+    /// With this set, the runtime asks the device for a document and re-signs
+    /// that same payload, so a client pins the reported root and runs every
+    /// check it would run against hardware. It proves nothing about *who*
+    /// produced a document — the key is minted inside an image its operator
+    /// controls.
+    #[arg(long, env = "ENCLAVE_COSIGN_ATTESTATIONS", value_parser = parse_bool_flag, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
+    cosign_attestations: bool,
+}
+
+impl Testing {
+    /// What a production enclave runs with.
+    #[cfg_attr(any(test, feature = "testing"), allow(dead_code))]
+    fn production() -> Self {
+        Testing {
+            master_key_source: MasterKeySourceKind::Kms,
+            master_key: None,
+            receipt_trust: ReceiptTrust::Required,
+            clock_source: ClockSource::Ptp,
+            ptp_device: PathBuf::from(DEFAULT_PTP_DEVICE),
+            random_source: RandomSource::Nsm,
+            endpoint: None,
+            force_path_style: false,
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
+            acme_directory: None,
+            acme_ca: None,
+            acme_contacts: Vec::new(),
+            guest_log_endpoint: None,
+            push_endpoint: None,
+            cosign_attestations: false,
+        }
+    }
+}
+
+impl Cli {
     /// Everything about notifications that can be decided without a network.
     ///
     /// A malformed application id fails at boot rather than the first time somebody is waiting
     /// to be woken; whether the application can deliver is the probe's to find out, once there
     /// is a network.
     fn notify_settings(&self) -> Result<Option<NotifySettings>> {
-        match (nonempty(&self.push_app_id), self.push_endpoint()) {
+        match (
+            nonempty(&self.push_app_id),
+            nonempty(&self.testing.push_endpoint),
+        ) {
             (None, None) => Ok(None),
             (None, Some(_)) => anyhow::bail!(
                 "--push-endpoint was given without --push-app-id, so there is no application to \
@@ -569,123 +365,53 @@ impl Cli {
         }
     }
 
-    #[cfg(any(test, feature = "testing"))]
-    fn push_endpoint(&self) -> Option<String> {
-        nonempty(&self.push_endpoint)
-    }
-
-    #[cfg(not(any(test, feature = "testing")))]
-    fn push_endpoint(&self) -> Option<String> {
-        None
-    }
-
-    fn guest_log_config(&self) -> Result<Option<enclave_runtime::CloudWatchConfig>> {
-        // Empty means off, not malformed. The image environment is layered —
-        // the QEMU image inherits production's and overrides what it cannot
-        // use — and setting a variable to "" is how that layer says "not this
-        // one". Treating it as a typo would make the override impossible.
-        let group = self
-            .guest_log_group
-            .as_deref()
-            .map(str::trim)
-            .filter(|g| !g.is_empty());
-        let stream = self
-            .guest_log_stream
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        match (group, stream) {
-            (None, None) => Ok(None),
-            (Some(group), Some(stream)) => Ok(Some(enclave_runtime::CloudWatchConfig {
-                log_group: group.to_string(),
-                log_stream: stream.to_string(),
-                region: self.region.clone(),
-                endpoint: self.guest_log_endpoint.clone(),
-            })),
-            _ => anyhow::bail!(
-                "--guest-log-group and --guest-log-stream must be given together. \
-                 This runtime holds `logs:PutLogEvents` and nothing more, so it cannot \
-                 create a stream it was not told the name of."
-            ),
-        }
-    }
-
-    /// Where the guest comes from: exactly one of the two settings.
+    /// Where guest output goes, beyond the console: the `guest` stream of the configured group.
     ///
-    /// An empty setting counts as unset, for the layering reason
-    /// `guest_log_config` gives.
-    fn guest_source(&self) -> Result<GuestSource> {
-        let object = self
-            .guest_object
-            .as_deref()
-            .map(str::trim)
-            .filter(|key| !key.is_empty());
-        let path = self
-            .guest_path
-            .as_ref()
-            .filter(|path| !path.as_os_str().is_empty());
-        match (object, path) {
-            (Some(key), None) => Ok(GuestSource::Object {
-                key: key.to_string(),
-            }),
-            (None, Some(path)) => Ok(GuestSource::Path(path.clone())),
-            (None, None) => anyhow::bail!(
-                "no guest to run: set --guest-object, a key in the roots bucket, or outside \
-                 an enclave --guest-path"
-            ),
-            (Some(_), Some(_)) => anyhow::bail!(
-                "--guest-object and --guest-path are both set. They name two guests, and \
-                 there is no safe way to guess which was meant."
-            ),
-        }
+    /// Empty means off, not malformed. The image environment is layered — the QEMU image
+    /// inherits production's and blanks what it cannot use — and "" is how that layer says
+    /// "not this one".
+    fn guest_log_config(&self) -> Option<enclave_runtime::CloudWatchConfig> {
+        nonempty(&self.guest_log_group).map(|log_group| enclave_runtime::CloudWatchConfig {
+            log_group,
+            log_stream: GUEST_LOG_STREAM.to_string(),
+            region: self.region.clone(),
+            endpoint: self.testing.guest_log_endpoint.clone(),
+        })
     }
 
     fn mount_config(&self) -> Result<MountConfig> {
         Ok(MountConfig {
-            bucket: self.bucket.clone(),
             roots_bucket: self.roots_bucket.clone(),
             region: self.region.clone(),
-            endpoint: self.endpoint.clone(),
-            access_key_id: self.access_key_id.clone(),
-            secret_access_key: self.secret_access_key.clone(),
-            session_token: self.session_token.clone(),
-            force_path_style: self.force_path_style,
+            endpoint: self.testing.endpoint.clone(),
+            access_key_id: self.testing.access_key_id.clone(),
+            secret_access_key: self.testing.secret_access_key.clone(),
+            session_token: self.testing.session_token.clone(),
+            force_path_style: self.testing.force_path_style,
             bucket_prefix: self.bucket_prefix.clone(),
-            mount_path: self.mount_path.clone(),
             fs_id: enclave_runtime::parse_fs_id(&self.fs_id)?,
             min_root_seq: self.min_root_seq,
-            skip_bucket_probe: self.skip_bucket_probe,
-            request_timeout: Duration::from_secs(self.s3_timeout_secs),
+            skip_bucket_probe: false,
+            request_timeout: S3_TIMEOUT,
             root_retention: Duration::from_secs(self.root_retention_secs),
         })
     }
 
     fn master_key_config(&self) -> Result<enclave_runtime::MasterKeyConfig> {
         Ok(enclave_runtime::MasterKeyConfig {
-            kind: self.master_key_source,
-            master_key: self.master_key.clone(),
+            kind: self.testing.master_key_source,
+            master_key: self.testing.master_key.clone(),
             kms_key_id: self.kms_key_id.clone(),
             parameter: self.master_key_parameter.clone(),
-            environment: self.environment.clone(),
+            environment: KMS_ENVIRONMENT.to_string(),
             fs_id: enclave_runtime::parse_fs_id(&self.fs_id)?,
             region: self.region.clone(),
-            kms_endpoint: self.kms_endpoint.clone(),
-            ssm_endpoint: self.ssm_endpoint.clone(),
-            access_key_id: self.access_key_id.clone(),
-            secret_access_key: self.secret_access_key.clone(),
-            session_token: self.session_token.clone(),
+            kms_endpoint: None,
+            ssm_endpoint: None,
+            access_key_id: self.testing.access_key_id.clone(),
+            secret_access_key: self.testing.secret_access_key.clone(),
+            session_token: self.testing.session_token.clone(),
         })
-    }
-
-    fn env_policy(&self) -> GuestEnvPolicy {
-        if self.no_inherit_env {
-            GuestEnvPolicy::explicit_only(self.guest_env.clone())
-        } else {
-            GuestEnvPolicy {
-                inherit: true,
-                explicit: self.guest_env.clone(),
-            }
-        }
     }
 }
 
@@ -715,14 +441,14 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> Result<enclave_runtime::GuestOutcome> {
     let cli = Cli::parse();
 
-    let clock = open_clock(cli.clock_source, &cli.ptp_device)?;
-    let entropy = open_entropy(cli.random_source, &cli.nsm_device)?;
+    let clock = open_clock(cli.testing.clock_source, &cli.testing.ptp_device)?;
+    let entropy = open_entropy(cli.testing.random_source, Path::new(DEFAULT_NSM_DEVICE))?;
 
     /// Wrap the device so its documents carry a signature, if this build can.
     ///
-    /// Two definitions rather than a runtime branch, for the reason `--acme-ca`
-    /// has two: a production binary has no flag to read, so no deployment can
-    /// talk it into signing attestations with a key it minted itself.
+    /// Two definitions rather than a runtime branch: a production binary has no
+    /// cosigning code at all, so no deployment can talk it into signing
+    /// attestations with a key it minted itself.
     #[cfg(any(test, feature = "testing"))]
     fn cosign(
         cli: &Cli,
@@ -730,7 +456,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     ) -> Result<std::sync::Arc<dyn nitro_nsm::Nsm>> {
         use base64::Engine as _;
 
-        if !cli.cosign_attestations {
+        if !cli.testing.cosign_attestations {
             return Ok(entropy);
         }
         let cosigning = enclave_runtime::testing::CosigningNsm::wrap(entropy)?;
@@ -768,15 +494,14 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     // that mounted first would fail with an S3 error that says nothing about
     // the real cause.
     let _network = enclave_runtime::bring_up(&NetworkConfig {
-        mode: cli.network,
-        gvforwarder: cli.gvforwarder.clone(),
+        mode: NetworkMode::Gvproxy,
         ..Default::default()
     })?;
 
     let keys = enclave_runtime::open_key_source(&cli.master_key_config()?, entropy.clone())?;
-    // Resolved before anything touches the network, so a runtime given no
-    // guest, or two, says so rather than failing somewhere later.
-    let guest_source = cli.guest_source()?;
+    let guest_source = GuestSource::Object {
+        key: GUEST_OBJECT.to_string(),
+    };
     tracing::info!(
         key_source = keys.describe(),
         guest = %guest_source,
@@ -784,13 +509,13 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     );
 
     let mount_config = cli.mount_config()?;
-    let backends = enclave_runtime::connect(&mount_config).await?;
+    let roots = enclave_runtime::connect(&mount_config).await?;
 
     // The guest, before anything asks for a key. KMS releases the key against
     // an attestation carrying PCR16, so PCR16 has to be final by then: measured,
     // and locked so nothing can extend it afterwards. These same bytes are what
     // get compiled and served below, so what was measured is what runs.
-    let component = enclave_runtime::fetch_guest(&guest_source, &backends.roots).await?;
+    let component = enclave_runtime::fetch_guest(&guest_source, &roots).await?;
     let guest_pcr = enclave_runtime::measure_guest(entropy.as_ref(), &component)?;
     tracing::info!(
         guest = %guest_source,
@@ -802,13 +527,15 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     // Decide whether this enclave is entitled to the state it is about to
     // load, before it loads any of it.
     let booted = enclave_runtime::boot(
-        &backends,
+        &roots,
         &mount_config,
         &enclave_runtime::BootConfig {
-            trust: cli.receipt_trust,
+            trust: cli.testing.receipt_trust,
+            disk: enclave_runtime::Disk::Parent,
         },
         &entropy,
         &keys,
+        &clock,
     )
     .await?;
 
@@ -820,33 +547,15 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         "state origin established"
     );
 
-    let mounted = booted.mounted;
-    let fs = mounted.fs.clone();
+    let zfs = booted.zfs.clone();
 
-    // What the image says, then what the guest file says on top: the settings a guest was
-    // deployed with travel inside it, measured into PCR16 with its code — see `env::from_guest`.
-    let env = enclave_runtime::env::with_guest_settings(cli.env_policy().build()?, &component)?;
-
-    /// The ACME directory's trust root, if this build can have one.
-    ///
-    /// Two definitions rather than a runtime branch: a production binary has no
-    /// `--acme-ca` field to read, so the public roots are not something a
-    /// deployment can talk it out of.
-    #[cfg(any(test, feature = "testing"))]
-    fn acme_directory_ca(cli: &Cli) -> anyhow::Result<Option<Vec<u8>>> {
-        match &cli.acme_ca {
-            Some(path) => Ok(Some(anyhow::Context::with_context(
-                std::fs::read(path),
-                || format!("reading the ACME directory trust root {}", path.display()),
-            )?)),
-            None => Ok(None),
-        }
-    }
-
-    #[cfg(not(any(test, feature = "testing")))]
-    fn acme_directory_ca(_cli: &Cli) -> anyhow::Result<Option<Vec<u8>>> {
-        Ok(None)
-    }
+    // The guest's environment is the settings its file carries, measured into PCR16 with its
+    // code, and nothing else — see `env::from_guest`. Names only: a value can be a credential.
+    let env = enclave_runtime::env::from_guest(&component)?;
+    tracing::info!(
+        names = %env.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "),
+        "guest environment: the settings the guest file carries"
+    );
 
     /// Open the emulator's host to guests, but not the runtime's own services on it.
     ///
@@ -859,12 +568,10 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     fn open_dev_host(cli: &Cli) -> anyhow::Result<()> {
         let mut own = Vec::new();
         for url in [
-            &cli.endpoint,
-            &cli.kms_endpoint,
-            &cli.ssm_endpoint,
-            &cli.acme_directory,
-            &cli.guest_log_endpoint,
-            &cli.push_endpoint,
+            &cli.testing.endpoint,
+            &cli.testing.acme_directory,
+            &cli.testing.guest_log_endpoint,
+            &cli.testing.push_endpoint,
         ]
         .into_iter()
         .flatten()
@@ -891,28 +598,26 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         Ok(())
     }
 
-    // One certificate source, or none. There is no third: a certificate the
-    // runtime minted for itself would be one an operator could mint too.
-    let acme = match cli.tls {
-        TlsMode::Off => None,
-        TlsMode::Acme => Some(enclave_runtime::serve::acme::start(
-            &AcmeConfig {
-                domains: cli.tls_domains.clone(),
-                contacts: cli.acme_contacts.clone(),
-                directory: cli.acme_directory.clone(),
-                directory_ca: acme_directory_ca(&cli)?,
-                prefix: mounted.bucket_prefix.clone(),
-            },
-            mounted.data.clone(),
-            mounted.keys.clone(),
-        )?),
+    // One certificate source. There is no second: a certificate the runtime
+    // minted for itself would be one an operator could mint too.
+    let directory_ca = match &cli.testing.acme_ca {
+        Some(path) => Some(std::fs::read(path).with_context(|| {
+            format!("reading the ACME directory trust root {}", path.display())
+        })?),
+        None => None,
     };
-    tracing::info!(
-        variables = env.len(),
-        listen = %cli.http_listen,
-        tls = ?cli.tls,
-        "serving guest"
-    );
+    let acme = Some(enclave_runtime::serve::acme::start(
+        &AcmeConfig {
+            domains: cli.tls_domains.clone(),
+            contacts: cli.testing.acme_contacts.clone(),
+            directory: cli.testing.acme_directory.clone(),
+            directory_ca,
+            prefix: mount_config.bucket_prefix.clone(),
+        },
+        roots.clone(),
+        booted.keys.clone(),
+    )?);
+    tracing::info!(listen = %HTTP_LISTEN, "serving guest");
 
     // Not a choice. An enclave nobody can verify is an enclave for nothing, and
     // a flag that turns verification off is a flag that can be turned off by
@@ -920,31 +625,18 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     // enclave exists to exclude.
     let attestation = Some(entropy.clone());
 
-    // Per-client views of the one filesystem. Each client's guest sees
-    // its own directory as `/`; the mount, the block cache and the
-    // transaction stream are shared, so a client costs a directory
-    // rather than a mount.
+    // Per-client views of the one pool. Each client's guest sees its
+    // own dataset as `/`, through a fresh instance per request, so a
+    // client costs a dataset and a lock.
     //
     // A client is serialised against itself and nobody else, so two
     // clients can execute guest code at the same time. A guest is
     // written for that; it is not a deployment decision.
-    let tenancy = {
-        let limits = enclave_runtime::PoolLimits {
-            max_tenants: cli.max_tenants,
-            idle_timeout: Duration::from_secs(cli.tenant_idle_secs),
-            max_requests_per_instance: cli.max_requests_per_instance,
-        };
-        tracing::info!(
-            max_tenants = limits.max_tenants,
-            "serving each client its own directory of the filesystem"
-        );
-        Some(std::sync::Arc::new(enclave_runtime::Tenancy::new(limits)))
-    };
+    let tenancy = Some(std::sync::Arc::new(enclave_runtime::Tenancy::new(
+        enclave_runtime::PoolLimits::default(),
+    )));
 
-    // WebAuthn, when the deployment named a relying party. Both the
-    // id and the origin or neither: a gate with no origin to compare
-    // against would accept assertions from any page that could reach
-    // it.
+    // WebAuthn, when the deployment named a relying party.
     //
     // Empty entries are dropped, not refused: an image built with no
     // extra origins still sets the variable, to nothing.
@@ -959,26 +651,29 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     // `serve::egress`. Only the emulator widens it, to its host.
     open_dev_host(&cli)?;
 
-    let authentication = match (&cli.webauthn_rp_id, &cli.webauthn_origin) {
-        (Some(rp_id), Some(origin)) => {
+    let authentication = match nonempty(&cli.webauthn_rp_id) {
+        Some(rp_id) => {
+            // What a page on the relying party's own domain claims. Native apps
+            // claim theirs, from `--webauthn-allowed-origin`.
+            let origin = format!("https://{rp_id}");
             let credentials =
-                std::sync::Arc::new(enclave_runtime::FilesystemCredentials::new(fs.clone()));
+                std::sync::Arc::new(enclave_runtime::FilesystemCredentials::new(zfs.clone()));
             let gate = std::sync::Arc::new(enclave_runtime::Gate::new(
-                enclave_runtime::build_relying_party(rp_id, origin, &allowed_origins)?,
+                enclave_runtime::build_relying_party(&rp_id, &origin, &allowed_origins)?,
                 enclave_runtime::ChallengeStore::new(
-                    Duration::from_secs(cli.challenge_ttl_secs),
+                    enclave_runtime::auth::DEFAULT_TTL,
                     enclave_runtime::DEFAULT_CAPACITY,
                 ),
                 credentials.clone(),
                 enclave_runtime::TokenStore::new(
-                    Duration::from_secs(cli.interaction_token_ttl_secs),
+                    enclave_runtime::auth::DEFAULT_TOKEN_TTL,
                     enclave_runtime::DEFAULT_TOKEN_CAPACITY,
                 ),
             ));
             let auth = std::sync::Arc::new(enclave_runtime::AuthEndpoints::new(
                 gate.clone(),
                 credentials,
-                fs.clone(),
+                zfs.clone(),
                 entropy.clone(),
             ));
             tracing::info!(
@@ -989,20 +684,15 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             );
             Some((auth, gate))
         }
-        (None, None) => {
+        None => {
             anyhow::ensure!(
                 allowed_origins.is_empty(),
-                "--webauthn-allowed-origin was given without --webauthn-rp-id and \
-                 --webauthn-origin. With no relying party, authentication is off and \
-                 the origin would be silently ignored."
+                "--webauthn-allowed-origin was given without --webauthn-rp-id. With no \
+                 relying party, authentication is off and the origin would be silently \
+                 ignored."
             );
             None
         }
-        _ => anyhow::bail!(
-            "--webauthn-rp-id and --webauthn-origin must be given together. A gate \
-             with no origin to compare against would accept an assertion from any \
-             page that could reach it."
-        ),
     };
 
     // The console always, and CloudWatch alongside it when configured.
@@ -1016,7 +706,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         vec![std::sync::Arc::new(enclave_runtime::TracingLogSink)];
     let mut log_forwarder = None;
 
-    if let Some(config) = cli.guest_log_config()? {
+    if let Some(config) = cli.guest_log_config() {
         // Which image is writing to this stream. A fixed stream name is
         // shared by every boot and every image, so without this nothing
         // in it says which enclave produced which line.
@@ -1147,28 +837,21 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         enclave_runtime::FanOutSink::new(sinks),
     ));
 
-    let guest = GuestEnvironment::new(fs, clock, entropy, &env, &cli.guest_args, guest_logs)?;
+    let guest = GuestEnvironment::new(zfs, clock, entropy, &env, &cli.guest_args, guest_logs)?;
     let served = serve_component(
         &component,
         guest,
         ServeConfig {
             notify,
-            background_tasks: cli
-                .background_tasks
-                .then_some(enclave_runtime::tasks::TaskLimits {
-                    concurrency: cli.background_concurrency,
-                    timeout: enclave_runtime::tasks::TASK_TIMEOUT,
-                    max_records: cli.background_max_records,
-                    per_tenant: cli.background_per_tenant,
-                }),
-            addr: cli.http_listen,
+            // Whether tasks run is the guest's to say, by exporting `run-task`.
+            background_tasks: Some(Default::default()),
+            addr: HTTP_LISTEN,
             certificate: None,
             acme,
             attestation,
-            request_timeout: Duration::from_secs(cli.request_timeout_secs),
-            max_interaction: Duration::from_secs(cli.max_interaction_secs),
             tenancy,
             authentication,
+            ..ServeConfig::default()
         },
     )
     .await;
@@ -1339,69 +1022,66 @@ mod tests {
     use clap::CommandFactory;
 
     /// The minimum a parse needs, so a test can say only what it is about.
-    ///
-    /// `--master-key-source` is here because it has no default and never
-    /// should: an enclave's key handling is not something to inherit by
-    /// omission. Tests that care which source is chosen pass their own.
     fn cli_from(args: &[&str]) -> Cli {
-        let mut full = vec!["enclave-runtime", "--master-key-source", "static"];
+        let mut full = vec!["enclave-runtime", "--roots-bucket", "b"];
         full.extend_from_slice(args);
         Cli::try_parse_from(full).expect("parse")
     }
 
-    /// The S3 timeout is its own setting, and reaches the mount config. It
-    /// used to be hardcoded here *and* ignored by the backend, so neither half
-    /// of the path worked.
     #[test]
-    fn the_s3_timeout_is_configurable_and_separate_from_the_guest_one() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--s3-timeout-secs",
-            "9",
-            "--request-timeout-secs",
-            "45",
-        ]);
-        assert_eq!(
-            cli.mount_config().expect("valid").request_timeout,
-            Duration::from_secs(9)
-        );
-        // Changing the guest deadline must not move the S3 one.
-        assert_eq!(cli.request_timeout_secs, 45);
+    fn the_cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_roots_bucket_is_required() {
+        assert!(Cli::try_parse_from(["enclave-runtime"]).is_err());
+        assert!(Cli::try_parse_from(["enclave-runtime", "--roots-bucket", "b"]).is_ok());
+    }
+
+    /// What a production enclave runs with: every value written once, in
+    /// `Testing::production`, and nothing a deployment could change.
+    #[test]
+    fn a_production_build_takes_its_key_from_kms_and_its_time_from_ptp() {
+        let production = Testing::production();
+        assert_eq!(production.master_key_source, MasterKeySourceKind::Kms);
+        assert!(production.master_key.is_none());
+        assert_eq!(production.receipt_trust, ReceiptTrust::Required);
+        assert_eq!(production.clock_source, ClockSource::Ptp);
+        assert_eq!(production.random_source, RandomSource::Nsm);
+        assert!(production.endpoint.is_none() && production.access_key_id.is_none());
+        assert!(production.acme_directory.is_none() && production.acme_ca.is_none());
+        assert!(production.push_endpoint.is_none() && production.guest_log_endpoint.is_none());
+        assert!(!production.cosign_attestations);
+
+        // And a testing build's defaults are the same, so an emulator departs
+        // from production only where its image says so.
+        let defaults = cli_from(&[]).testing;
+        assert_eq!(defaults.master_key_source, production.master_key_source);
+        assert_eq!(defaults.receipt_trust, production.receipt_trust);
+        assert_eq!(defaults.clock_source, production.clock_source);
+        assert_eq!(defaults.random_source, production.random_source);
     }
 
     /// Ten years unless the image says otherwise, what it says reaches the
     /// mount, and under a day is refused.
     #[test]
     fn root_retention_is_ten_years_unless_the_image_says_otherwise() {
-        let key = "aa".repeat(32);
-        let cli = cli_from(&["--bucket", "b", "--master-key", &key]);
         assert_eq!(
-            cli.mount_config().expect("valid").root_retention,
-            s3fs_core::store::config::DEFAULT_ROOT_RETENTION
+            cli_from(&[]).mount_config().expect("valid").root_retention,
+            enclave_runtime::DEFAULT_ROOT_RETENTION
         );
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &key,
-            "--root-retention-secs",
-            "86400",
-        ]);
         assert_eq!(
-            cli.mount_config().expect("valid").root_retention,
+            cli_from(&["--root-retention-secs", "86400"])
+                .mount_config()
+                .expect("valid")
+                .root_retention,
             Duration::from_secs(86_400)
         );
         assert!(Cli::try_parse_from([
             "enclave-runtime",
-            "--master-key-source",
-            "static",
-            "--bucket",
+            "--roots-bucket",
             "b",
-            "--master-key",
-            &key,
             "--root-retention-secs",
             "3600",
         ])
@@ -1411,36 +1091,21 @@ mod tests {
     /// Console-only is the default, and takes no client and no credentials.
     #[test]
     fn notifications_are_off_unless_configured() {
-        let cli = cli_from(&["--bucket", "b", "--master-key", &"aa".repeat(32)]);
-        assert!(cli.notify_settings().expect("valid").is_none());
+        assert!(cli_from(&[]).notify_settings().expect("valid").is_none());
     }
 
     /// An image carries the setting; a deployment blanks it. Empty is off, not
     /// malformed — the same rule the guest log settings follow.
     #[test]
     fn an_empty_setting_turns_notifications_off() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--push-app-id",
-            "",
-        ]);
+        let cli = cli_from(&["--push-app-id", ""]);
         assert!(cli.notify_settings().expect("valid").is_none());
     }
 
     /// An application id is all production names: no credential, no endpoint.
     #[test]
     fn an_application_id_is_all_a_deployment_sets() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--push-app-id",
-            "0123456789abcdef0123456789abcdef",
-        ]);
+        let cli = cli_from(&["--push-app-id", "0123456789abcdef0123456789abcdef"]);
         let settings = cli.notify_settings().expect("valid").expect("configured");
         assert_eq!(settings.app_id, "0123456789abcdef0123456789abcdef");
         assert!(settings.endpoint.is_none());
@@ -1449,34 +1114,21 @@ mod tests {
     /// It goes into a URL path, so a malformed one fails at boot.
     #[test]
     fn a_malformed_application_id_is_refused() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--push-app-id",
-            "../channels",
-        ]);
-        assert!(cli.notify_settings().is_err());
+        assert!(cli_from(&["--push-app-id", "../channels"])
+            .notify_settings()
+            .is_err());
     }
 
     #[test]
     fn a_stub_without_an_application_is_refused() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--push-endpoint",
-            "http://127.0.0.1:9180",
-        ]);
-        assert!(cli.notify_settings().is_err());
+        assert!(cli_from(&["--push-endpoint", "http://127.0.0.1:9180"])
+            .notify_settings()
+            .is_err());
     }
 
     #[test]
     fn guest_logging_is_console_only_unless_configured() {
-        let cli = cli_from(&["--bucket", "b", "--master-key", &"aa".repeat(32)]);
-        assert!(cli.guest_log_config().expect("valid").is_none());
+        assert!(cli_from(&[]).guest_log_config().is_none());
     }
 
     /// An empty setting means off, not malformed.
@@ -1486,229 +1138,30 @@ mod tests {
     /// harness enclave refuse to boot, which is how this rule was learned.
     #[test]
     fn an_empty_setting_turns_guest_logging_off() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--guest-log-group",
-            "",
-            "--guest-log-stream",
-            "",
-        ]);
-        assert!(
-            cli.guest_log_config()
-                .expect("empty is off, not an error")
-                .is_none(),
-            "an empty group should mean console-only"
-        );
-    }
-
-    /// Half a destination is a typo, and knowable without touching the network.
-    #[test]
-    fn a_log_group_without_a_stream_is_refused() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--guest-log-group",
-            "/enclave/guest",
-        ]);
-        let error = cli.guest_log_config().unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("--guest-log-stream"), "{message}");
-
-        // And the other way round.
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--guest-log-stream",
-            "guest",
-        ]);
-        assert!(cli.guest_log_config().is_err());
+        assert!(cli_from(&["--guest-log-group", ""])
+            .guest_log_config()
+            .is_none());
     }
 
     #[test]
-    fn a_configured_destination_carries_the_settings_through() {
+    fn a_configured_group_is_written_to_its_guest_stream() {
         let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
             "--region",
             "eu-west-2",
             "--guest-log-group",
             "/enclave/guest",
-            "--guest-log-stream",
-            "guest",
             "--guest-log-endpoint",
             "http://127.0.0.1:4566",
         ]);
-        let config = cli.guest_log_config().expect("valid").expect("configured");
+        let config = cli.guest_log_config().expect("configured");
         assert_eq!(config.log_group, "/enclave/guest");
         assert_eq!(config.log_stream, "guest");
         assert_eq!(config.region, "eu-west-2");
         assert_eq!(config.endpoint.as_deref(), Some("http://127.0.0.1:4566"));
     }
 
-    #[test]
-    fn the_cli_definition_is_valid() {
-        Cli::command().debug_assert();
-    }
-
-    /// There is no default guest. The image used to carry one at a fixed path;
-    /// it carries a key in the roots bucket instead, and a runtime given
-    /// neither says what is missing rather than guessing.
-    #[test]
-    fn a_guest_source_is_required() {
-        let cli = cli_from(&["--bucket", "b", "--master-key", &"aa".repeat(32)]);
-        let err = cli.guest_source().unwrap_err();
-        assert!(format!("{err:#}").contains("--guest-object"), "{err:#}");
-    }
-
-    #[test]
-    fn a_guest_object_is_a_key_in_the_roots_bucket() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--guest-object",
-            "guest/guest.wasm",
-        ]);
-        assert_eq!(
-            cli.guest_source().unwrap(),
-            GuestSource::Object {
-                key: "guest/guest.wasm".into()
-            }
-        );
-    }
-
-    #[test]
-    fn a_guest_path_is_for_local_runs() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--guest-path",
-            "/tmp/other.wasm",
-        ]);
-        assert_eq!(
-            cli.guest_source().unwrap(),
-            GuestSource::Path(PathBuf::from("/tmp/other.wasm"))
-        );
-    }
-
-    #[test]
-    fn two_guest_sources_are_refused() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--guest-object",
-            "guest/guest.wasm",
-            "--guest-path",
-            "/tmp/other.wasm",
-        ]);
-        assert!(cli.guest_source().is_err());
-    }
-
-    /// The image environment is layered, and "" is how a layer says "not this
-    /// one" — the same rule as the guest log settings.
-    #[test]
-    fn an_empty_guest_setting_counts_as_unset() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--guest-object",
-            "",
-            "--guest-path",
-            "/tmp/other.wasm",
-        ]);
-        assert_eq!(
-            cli.guest_source().unwrap(),
-            GuestSource::Path(PathBuf::from("/tmp/other.wasm"))
-        );
-    }
-
-    /// The explicit model, which is what `--no-inherit-env` leaves you with:
-    /// the guest gets exactly what is named and nothing else. This was
-    /// `s3fs-runner`'s whole reason to exist before it was deleted, so it is
-    /// tested here rather than assumed.
-    #[test]
-    fn named_variables_reach_the_guest_when_nothing_is_inherited() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--no-inherit-env",
-            "--guest-env",
-            "LOG_LEVEL=debug",
-        ]);
-        assert_eq!(
-            cli.env_policy().build().unwrap(),
-            vec![("LOG_LEVEL".to_string(), "debug".to_string())]
-        );
-    }
-
-    /// Repeatable *and* comma-separated, because inside an enclave the setting
-    /// arrives as one `S3FS_GUEST_ENV` string and there is nowhere to repeat a
-    /// flag from.
-    #[test]
-    fn guest_env_accepts_a_comma_separated_list() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--no-inherit-env",
-            "--guest-env",
-            "A=1,B=2",
-        ]);
-        let env = cli.env_policy().build().unwrap();
-        assert_eq!(
-            env,
-            vec![
-                ("A".to_string(), "1".to_string()),
-                ("B".to_string(), "2".to_string())
-            ]
-        );
-    }
-
-    #[test]
-    fn the_bucket_and_key_source_are_required() {
-        assert!(Cli::try_parse_from(["enclave-runtime"]).is_err());
-        assert!(Cli::try_parse_from(["enclave-runtime", "--bucket", "b"]).is_err());
-        // A bucket without a key source is not enough: there is no default,
-        // and picking one would mean guessing at how the enclave gets its key.
-        assert!(Cli::try_parse_from([
-            "enclave-runtime",
-            "--bucket",
-            "b",
-            "--master-key",
-            &"ab".repeat(32),
-        ])
-        .is_err());
-    }
-
-    fn key_config(args: &[&str]) -> Result<enclave_runtime::MasterKeyConfig> {
-        let mut full = vec!["--bucket", "b"];
-        full.extend_from_slice(args);
-        Cli::try_parse_from(std::iter::once("enclave-runtime").chain(full.iter().copied()))
-            .expect("parse")
-            .master_key_config()
-    }
-
     fn source_error(args: &[&str]) -> String {
-        let config = key_config(args).expect("config");
+        let config = cli_from(args).master_key_config().expect("config");
         let nsm = std::sync::Arc::new(nitro_nsm::fake::FakeNsm::new());
         format!(
             "{:#}",
@@ -1717,14 +1170,12 @@ mod tests {
         )
     }
 
-    /// The refusal that matters most. A production image that still carried
-    /// `S3FS_MASTER_KEY` would work perfectly — quietly taking its key from
+    /// The refusal that matters most. An image that still carried
+    /// `ENCLAVE_MASTER_KEY` would work perfectly — quietly taking its key from
     /// the parent instance, which is the whole thing KMS release prevents.
     #[test]
     fn a_plaintext_key_is_refused_under_kms() {
         let err = source_error(&[
-            "--master-key-source",
-            "kms",
             "--kms-key-id",
             "arn:aws:kms:eu-west-2:1:key/a",
             "--master-key-parameter",
@@ -1753,103 +1204,40 @@ mod tests {
     #[test]
     fn each_source_names_the_setting_it_is_missing() {
         assert!(source_error(&["--master-key-source", "static"]).contains("--master-key"));
-        assert!(source_error(&["--master-key-source", "kms"]).contains("--kms-key-id"));
-        assert!(source_error(&[
-            "--master-key-source",
-            "kms",
-            "--kms-key-id",
-            "arn:aws:kms:eu-west-2:1:key/a",
-        ])
-        .contains("--master-key-parameter"));
-    }
-
-    /// Warm clients are bounded by default. Each costs a wasm linear memory,
-    /// so an unbounded pool is an enclave that dies of memory exhaustion under
-    /// the load it was built for.
-    #[test]
-    fn the_warm_client_count_is_bounded_by_default() {
-        let cli = cli_from(&["--bucket", "b"]);
-        assert_eq!(cli.max_tenants, 64);
-        assert!(cli.tenant_idle_secs > 0, "idle tenants are never reclaimed");
+        assert!(source_error(&[]).contains("--kms-key-id"));
+        assert!(
+            source_error(&["--kms-key-id", "arn:aws:kms:eu-west-2:1:key/a"])
+                .contains("--master-key-parameter")
+        );
     }
 
     /// The encryption context is built from the filesystem id and the
-    /// environment, so it is the same at mint and at open by construction.
+    /// environment, so it is the same at mint and at open by construction —
+    /// and the environment is the one every deployment always had, so keys
+    /// sealed before it was a constant still open.
     #[test]
     fn the_key_config_carries_the_encryption_context_inputs() {
-        let config = key_config(&[
-            "--master-key-source",
-            "kms",
-            "--fs-id",
-            &"cd".repeat(16),
-            "--environment",
-            "staging",
-        ])
-        .expect("config");
-        assert_eq!(config.environment, "staging");
+        let config = cli_from(&["--fs-id", &"cd".repeat(16)])
+            .master_key_config()
+            .expect("config");
+        assert_eq!(config.environment, "production");
         assert_eq!(config.fs_id, [0xcd; 16]);
     }
 
     #[test]
     fn guest_arguments_come_after_a_separator() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--",
-            "arg1",
-            "--not-our-flag",
-        ]);
+        let cli = cli_from(&["--", "arg1", "--not-our-flag"]);
         assert_eq!(cli.guest_args, vec!["arg1", "--not-our-flag"]);
-    }
-
-    /// The default is inheritance, because a guest that needs configuration
-    /// should get it without every variable being enumerated.
-    #[test]
-    fn the_environment_is_inherited_by_default() {
-        let cli = cli_from(&["--bucket", "b", "--master-key", &"aa".repeat(32)]);
-        assert!(cli.env_policy().inherit);
-    }
-
-    #[test]
-    fn no_inherit_env_switches_to_allowlist_only() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--no-inherit-env",
-            "--guest-env",
-            "RUST_LOG=debug",
-        ]);
-        let policy = cli.env_policy();
-        assert!(!policy.inherit);
-        assert_eq!(policy.explicit, vec!["RUST_LOG=debug"]);
     }
 
     #[test]
     fn an_invalid_filesystem_id_is_rejected_before_anything_is_opened() {
-        let cli = cli_from(&[
-            "--bucket",
-            "b",
-            "--master-key",
-            &"aa".repeat(32),
-            "--fs-id",
-            "not-hex",
-        ]);
-        assert!(cli.mount_config().is_err());
+        assert!(cli_from(&["--fs-id", "not-hex"]).mount_config().is_err());
     }
 
     #[test]
     fn mount_config_carries_the_settings_through() {
         let cli = cli_from(&[
-            "--bucket",
-            "data",
-            "--roots-bucket",
-            "roots",
-            "--master-key",
-            &"aa".repeat(32),
             "--bucket-prefix",
             "tenant",
             "--min-root-seq",
@@ -1857,11 +1245,11 @@ mod tests {
             "--force-path-style",
         ]);
         let cfg = cli.mount_config().unwrap();
-        assert_eq!(cfg.bucket, "data");
-        assert_eq!(cfg.roots_bucket.as_deref(), Some("roots"));
+        assert_eq!(cfg.roots_bucket, "b");
         assert_eq!(cfg.bucket_prefix, "tenant");
         assert_eq!(cfg.min_root_seq, Some(42));
         assert!(cfg.force_path_style);
+        assert_eq!(cfg.request_timeout, S3_TIMEOUT);
     }
 
     /// `ExitCode` is a byte. A guest exit code outside that range must not

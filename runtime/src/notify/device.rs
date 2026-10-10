@@ -2,8 +2,8 @@
 //!
 //! A registration token is a capability: whoever holds one can wake that device
 //! from anywhere, through the Firebase project it was issued for. So tokens live at
-//! `/runtime/devices/<tenant>/`, above every tenant scope and unreachable from
-//! any guest — the same placement, and the same reason, as
+//! `/runtime/devices/<tenant>/` on the pool, outside every tenant's directory
+//! and unreachable from any guest — the same placement, and the same reason, as
 //! [`crate::auth::credential`]. A guest enrols one and asks for a count; it
 //! never reads one back.
 //!
@@ -24,15 +24,14 @@
 //! is kept for ever so it can never be silently reinstated.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
-use s3fs_core::{Fs, FsError, Inode, InodeKind, OpenFlags};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::auth::credential::RUNTIME_DIR;
-use crate::tenant::ensure_dir;
+use crate::zfs::Zfs;
 
 /// Where every tenant's devices live, one directory each.
 pub const DEVICES_DIR: &str = "devices";
@@ -82,11 +81,10 @@ impl Default for DeviceLimits {
 /// Every tenant's devices, held in memory and backed by the filesystem.
 ///
 /// Held in memory because the forwarder needs a tenant's tokens on every wake,
-/// and a `read_dir` per wake is a filesystem transaction — in production an S3
-/// round trip — in the path of a signal whose only value is being prompt.
+/// and a `read_dir` per wake would be disk I/O over vsock in the path of a
+/// signal whose only value is being prompt.
 pub struct DeviceRegistry {
-    fs: Arc<Fs>,
-    dir: Arc<Inode>,
+    dir: PathBuf,
     limits: DeviceLimits,
     devices: Mutex<BTreeMap<[u8; 16], Vec<StoredDevice>>>,
 }
@@ -118,19 +116,17 @@ fn is_hex(name: &str, len: usize) -> bool {
 }
 
 impl DeviceRegistry {
-    pub async fn open(fs: Arc<Fs>) -> Result<Arc<Self>> {
-        Self::open_with_limits(fs, DeviceLimits::default()).await
+    pub async fn open(zfs: Arc<Zfs>) -> Result<Arc<Self>> {
+        Self::open_with_limits(zfs, DeviceLimits::default()).await
     }
 
-    pub async fn open_with_limits(fs: Arc<Fs>, limits: DeviceLimits) -> Result<Arc<Self>> {
+    pub async fn open_with_limits(zfs: Arc<Zfs>, limits: DeviceLimits) -> Result<Arc<Self>> {
         anyhow::ensure!(
             limits.max_devices > 0 && limits.per_tenant > 0,
             "device limits must be positive"
         );
-        let runtime = ensure_dir(&fs, &fs.root(), RUNTIME_DIR).await?;
-        let dir = ensure_dir(&fs, &runtime, DEVICES_DIR).await?;
+        let dir = zfs.runtime_dir(DEVICES_DIR).await?;
         let registry = Arc::new(DeviceRegistry {
-            fs,
             dir,
             limits,
             devices: Mutex::new(BTreeMap::new()),
@@ -146,40 +142,32 @@ impl DeviceRegistry {
         let mut devices: BTreeMap<[u8; 16], Vec<StoredDevice>> = BTreeMap::new();
         let mut total = 0usize;
 
-        for tenant_entry in self.fs.read_dir(&self.dir).await? {
+        let mut tenants = tokio::fs::read_dir(&self.dir).await?;
+        while let Some(tenant_entry) = tenants.next_entry().await? {
+            let tenant_name = tenant_entry.file_name().into_string().unwrap_or_default();
             ensure!(
-                tenant_entry.kind == InodeKind::Directory && is_hex(&tenant_entry.name, 32),
-                "unexpected entry {:?} under /{RUNTIME_DIR}/{DEVICES_DIR}",
-                tenant_entry.name
+                tenant_entry.file_type().await?.is_dir() && is_hex(&tenant_name, 32),
+                "unexpected entry {:?} under {}",
+                tenant_entry.file_name(),
+                self.dir.display()
             );
             let mut tenant = [0u8; 16];
-            hex::decode_to_slice(&tenant_entry.name, &mut tenant)
+            hex::decode_to_slice(&tenant_name, &mut tenant)
                 .context("decoding a tenant directory name")?;
-            let tenant_dir = self
-                .fs
-                .lookup_at(&self.dir, &tenant_entry.name)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
 
-            for entry in self.fs.read_dir(&tenant_dir).await? {
+            let mut entries = tokio::fs::read_dir(tenant_entry.path()).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name().into_string().unwrap_or_default();
                 // A write interrupted before its rename. Nothing published it,
                 // so nothing may read it.
-                if entry.name.ends_with(".tmp") {
-                    self.fs.unlink(&tenant_dir, &entry.name).await?;
+                if name.ends_with(".tmp") {
+                    tokio::fs::remove_file(entry.path()).await?;
                     continue;
                 }
                 total += 1;
 
-                let path = format!(
-                    "/{RUNTIME_DIR}/{DEVICES_DIR}/{}/{}",
-                    tenant_entry.name, entry.name
-                );
-                let h = self.fs.open(&path, OpenFlags::read_only()).await?;
-                let bytes = self.fs.pread(&h, 0, MAX_RECORD + 1).await;
-                // Closed before the read is unwrapped, so a decode failure does
-                // not leak a handle on every attempt.
-                self.fs.close(&h).await?;
-                let bytes = bytes?;
+                let path = entry.path();
+                let bytes = tokio::fs::read(&path).await?;
                 ensure!(bytes.len() <= MAX_RECORD, "oversized device record");
 
                 let device: StoredDevice =
@@ -188,8 +176,9 @@ impl DeviceRegistry {
                     device.version == RECORD_VERSION
                         && device.tenant == tenant
                         && valid_token(&device.token)
-                        && record_name(&device.token) == entry.name,
-                    "invalid device record at {path}"
+                        && record_name(&device.token) == name,
+                    "invalid device record at {}",
+                    path.display()
                 );
                 devices.entry(tenant).or_default().push(device);
             }
@@ -236,7 +225,7 @@ impl DeviceRegistry {
         Ok(devices)
     }
 
-    /// Publish a record: temp file, committed, then renamed into place.
+    /// Publish a record: temp file, then renamed into place.
     ///
     /// The rename is what makes the record visible, so a crash leaves either
     /// the old state or the new one and never a half-written record.
@@ -244,36 +233,22 @@ impl DeviceRegistry {
         let bytes = serde_json::to_vec(device)?;
         ensure!(bytes.len() <= MAX_RECORD, "device record exceeds its limit");
 
-        let tenant_name = hex::encode(device.tenant);
-        let tenant_dir = ensure_dir(&self.fs, &self.dir, &tenant_name).await?;
+        let tenant_dir = self.dir.join(hex::encode(device.tenant));
+        tokio::fs::create_dir_all(&tenant_dir).await?;
         let name = record_name(&device.token);
-        let temp = format!("{name}.tmp");
-
-        // Remove an unpublished write left by a cancelled host call.
-        match self.fs.unlink(&tenant_dir, &temp).await {
-            Ok(()) | Err(FsError::NotFound) => {}
-            Err(e) => return Err(e.into()),
-        }
-        let path = format!("/{RUNTIME_DIR}/{DEVICES_DIR}/{tenant_name}/{temp}");
-        let h = self.fs.open(&path, OpenFlags::create_new()).await?;
-        let write = self.fs.pwrite(&h, 0, &bytes).await;
-        let close = self.fs.close(&h).await;
-        write?;
-        close?; // close commits the complete contents before publication
-        self.fs
-            .rename(&tenant_dir, &temp, &tenant_dir, &name)
-            .await?;
+        // Truncates an unpublished write left by a cancelled host call.
+        let temp = tenant_dir.join(format!("{name}.tmp"));
+        tokio::fs::write(&temp, &bytes).await?;
+        tokio::fs::rename(&temp, tenant_dir.join(name)).await?;
         Ok(())
     }
 
     async fn remove(&self, tenant: [u8; 16], token: &str) -> Result<()> {
-        let tenant_name = hex::encode(tenant);
-        let Ok(tenant_dir) = self.fs.lookup_at(&self.dir, &tenant_name).await else {
-            return Ok(());
-        };
-        match self.fs.unlink(&tenant_dir, &record_name(token)).await {
-            Ok(()) | Err(FsError::NotFound) => Ok(()),
-            Err(e) => Err(anyhow::anyhow!(e)).context("removing a device record"),
+        let path = self.dir.join(hex::encode(tenant)).join(record_name(token));
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).context("removing a device record"),
         }
     }
 
@@ -391,8 +366,9 @@ impl DeviceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3fs_core::backend::memory::MemoryBackend;
-    use s3fs_core::{Config, MasterSecret};
+    use crate::store::backend::memory::MemoryBackend;
+    use crate::store::crypto::{KeyMaterial, MasterSecret};
+    use crate::zfs::{Disk, Zfs};
 
     const ALICE: [u8; 16] = [1; 16];
     const BOB: [u8; 16] = [2; 16];
@@ -401,17 +377,19 @@ mod tests {
         format!("{seed}{}", "x".repeat(MIN_TOKEN_LEN))
     }
 
-    async fn memory() -> Arc<Fs> {
-        let backend = Arc::new(MemoryBackend::new());
-        Fs::create(
-            backend.clone(),
-            backend,
-            &MasterSecret::from_bytes([5u8; 32]),
-            [0u8; 16],
-            Arc::new(Config::default()),
-        )
-        .await
-        .expect("filesystem")
+    async fn memory() -> Arc<Zfs> {
+        Zfs::scratch().await
+    }
+
+    /// Alice's directory of device records.
+    async fn alice_dir(fs: &Zfs) -> PathBuf {
+        let dir = fs
+            .runtime_dir(DEVICES_DIR)
+            .await
+            .unwrap()
+            .join(hex::encode(ALICE));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     async fn registry() -> Arc<DeviceRegistry> {
@@ -588,15 +566,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_published_device_record_survives_a_fresh_filesystem_mount() {
+    async fn a_published_device_record_survives_reopening_the_pool() {
         let backend = Arc::new(MemoryBackend::new());
         let master = MasterSecret::from_bytes([7u8; 32]);
-        let fs = Fs::create(
+        let keys = Arc::new(KeyMaterial::derive(&master, [8u8; 16]).unwrap());
+        let disk = Disk::scratch().unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+        let fs = Zfs::create(
+            &disk,
             backend.clone(),
-            backend.clone(),
+            keys.clone(),
             &master,
-            [8u8; 16],
-            Arc::new(Config::default()),
+            "",
+            day,
+            Arc::new(crate::clock::HostClock),
         )
         .await
         .unwrap();
@@ -606,13 +589,15 @@ mod tests {
         drop(r);
         drop(fs);
 
-        let fs = Fs::mount(
-            backend.clone(),
+        let fs = Zfs::open(
+            &disk,
             backend,
+            keys,
             &master,
-            [8u8; 16],
-            Arc::new(Config::default()),
+            "",
+            day,
             None,
+            Arc::new(crate::clock::HostClock),
         )
         .await
         .unwrap();
@@ -628,12 +613,8 @@ mod tests {
         let r = DeviceRegistry::open(fs.clone()).await.unwrap();
         r.register(ALICE, &token("a"), 1000).await.unwrap();
 
-        let dir = format!("/{RUNTIME_DIR}/{DEVICES_DIR}/{}", hex::encode(ALICE));
-        let h = fs
-            .open(&format!("{dir}/orphan.tmp"), OpenFlags::create_new())
-            .await
-            .unwrap();
-        fs.close(&h).await.unwrap();
+        let dir = alice_dir(&fs).await;
+        std::fs::write(dir.join("orphan.tmp"), b"").unwrap();
         assert_eq!(
             DeviceRegistry::open(fs.clone())
                 .await
@@ -647,15 +628,7 @@ mod tests {
         // A published record that will not decode is a different matter: it is
         // storage this runtime does not understand, and guessing is worse than
         // refusing to start.
-        let h = fs
-            .open(
-                &format!("{dir}/{}", record_name(&token("bad"))),
-                OpenFlags::create_new(),
-            )
-            .await
-            .unwrap();
-        fs.pwrite(&h, 0, b"not json").await.unwrap();
-        fs.close(&h).await.unwrap();
+        std::fs::write(dir.join(record_name(&token("bad"))), b"not json").unwrap();
         assert!(DeviceRegistry::open(fs).await.is_err());
     }
 
@@ -673,16 +646,8 @@ mod tests {
             token: token("forged"),
             created_ms: 1,
         };
-        let path = format!(
-            "/{RUNTIME_DIR}/{DEVICES_DIR}/{}/{}",
-            hex::encode(ALICE),
-            record_name(&forged.token)
-        );
-        let h = fs.open(&path, OpenFlags::create_new()).await.unwrap();
-        fs.pwrite(&h, 0, &serde_json::to_vec(&forged).unwrap())
-            .await
-            .unwrap();
-        fs.close(&h).await.unwrap();
+        let path = alice_dir(&fs).await.join(record_name(&forged.token));
+        std::fs::write(path, serde_json::to_vec(&forged).unwrap()).unwrap();
 
         assert!(DeviceRegistry::open(fs).await.is_err());
     }
@@ -701,16 +666,10 @@ mod tests {
             token: token("real"),
             created_ms: 1,
         };
-        let path = format!(
-            "/{RUNTIME_DIR}/{DEVICES_DIR}/{}/{}",
-            hex::encode(ALICE),
-            record_name(&token("someone-else"))
-        );
-        let h = fs.open(&path, OpenFlags::create_new()).await.unwrap();
-        fs.pwrite(&h, 0, &serde_json::to_vec(&device).unwrap())
+        let path = alice_dir(&fs)
             .await
-            .unwrap();
-        fs.close(&h).await.unwrap();
+            .join(record_name(&token("someone-else")));
+        std::fs::write(path, serde_json::to_vec(&device).unwrap()).unwrap();
 
         assert!(DeviceRegistry::open(fs).await.is_err());
     }
@@ -726,43 +685,26 @@ mod tests {
             token: token("a"),
             created_ms: 1,
         };
-        let dir = ensure_dir(
-            &fs,
-            &fs.lookup_at(&fs.root(), RUNTIME_DIR).await.unwrap(),
-            DEVICES_DIR,
-        )
-        .await
-        .unwrap();
-        ensure_dir(&fs, &dir, &hex::encode(ALICE)).await.unwrap();
-        let path = format!(
-            "/{RUNTIME_DIR}/{DEVICES_DIR}/{}/{}",
-            hex::encode(ALICE),
-            record_name(&device.token)
-        );
-        let h = fs.open(&path, OpenFlags::create_new()).await.unwrap();
-        fs.pwrite(&h, 0, &serde_json::to_vec(&device).unwrap())
-            .await
-            .unwrap();
-        fs.close(&h).await.unwrap();
+        let path = alice_dir(&fs).await.join(record_name(&device.token));
+        std::fs::write(path, serde_json::to_vec(&device).unwrap()).unwrap();
 
         assert!(DeviceRegistry::open(fs).await.is_err());
     }
 
-    /// The registry sits above every tenant scope, so no guest can name it.
+    /// The registry sits outside every tenant's directory, so no guest
+    /// preopen reaches it.
     #[tokio::test]
-    async fn device_records_live_above_every_tenant_scope() {
+    async fn device_records_live_outside_every_tenant_directory() {
         let fs = memory().await;
         let r = DeviceRegistry::open(fs.clone()).await.unwrap();
         r.register(ALICE, &token("a"), 1).await.unwrap();
 
-        let root = fs.root();
-        let runtime = fs.lookup_at(&root, RUNTIME_DIR).await.unwrap();
-        let devices = fs.lookup_at(&runtime, DEVICES_DIR).await.unwrap();
-        assert!(fs.lookup_at(&devices, &hex::encode(ALICE)).await.is_ok());
-
-        // A tenant's scope is a sibling of `/runtime`, never an ancestor.
-        let tenant = crate::tenant::tenant_root_by_id(&fs, ALICE).await.unwrap();
-        assert_ne!(tenant.scope.objid(), root.objid());
-        assert_ne!(tenant.scope.objid(), devices.objid());
+        let records = alice_dir(&fs).await;
+        assert!(records.join(record_name(&token("a"))).exists());
+        let (tenant, _) = fs.tenant_dir(ALICE).await.unwrap();
+        assert!(
+            !records.starts_with(&tenant),
+            "a tenant's directory contains its device records"
+        );
     }
 }

@@ -22,7 +22,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 RECORD = sys.argv[1] if len(sys.argv) > 1 else "/tmp/push-messages.jsonl"
-# The image dials this (flake.nix, S3FS_PUSH_ENDPOINT). Not 9100 and up: Dart DevTools takes those,
+# The image dials this (flake.nix, ENCLAVE_PUSH_ENDPOINT). Not 9100 and up: Dart DevTools takes those,
 # one per VS Code window, and whatever holds the port answers the runtime in the stub's place.
 PORT = 9180
 

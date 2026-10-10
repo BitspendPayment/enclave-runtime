@@ -82,7 +82,7 @@ thing between a compromised client and whatever the guest will do.
 
 ### What a stolen token buys
 
-It is single-use, expires in `--interaction-token-ttl-secs` (60s by default), and
+It is single-use, expires in 60 seconds, and
 is bound to one route. Spending one gets: one interaction with that tenant's
 guest, and whatever the guest will do
 without a further check. It gets nothing about another tenant, and no replay —
@@ -111,7 +111,7 @@ no gate is configured.**
 | **client cancels or disconnects** | the guest's next write fails, the call ends, the instance is dropped and never reused, the tenant lock frees |
 | **head timeout** (`request_timeout`) | bounds only the *response head*. It does not apply once the head is out, so it never ends a healthy stream |
 | **no traffic either way** | the epoch watchdog asks whether bytes moved, not how long the call ran. Sustained silence while executing wasm ends the call |
-| **interaction deadline** (`--max-interaction-secs`, 300s) | a wall clock, checked whether or not wasm is executing — so it reaches a guest blocked in a host call, which the epoch never can. Ends the interaction and frees the tenant |
+| **interaction deadline** (300s) | a wall clock, checked whether or not wasm is executing — so it reaches a guest blocked in a host call, which the epoch never can. Ends the interaction and frees the tenant |
 | **guest spins** | trapped by the epoch, on the same schedule as before streams existed |
 | **guest traps** | the instance is discarded, never reused — a partially-executed call leaves a store that cannot be re-entered |
 | **`grpc-timeout` header** | **not enforced by the runtime.** Forwarded to the guest, which owns it. The runtime's deadlines are its own, so a client cannot lengthen them |

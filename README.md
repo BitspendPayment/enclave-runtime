@@ -36,9 +36,9 @@ The runtime links the standard WASI 0.2 interfaces and serves each one from insi
 | Hash-table seeding | `wasi:random/insecure-seed` | A fresh NSM draw for every instance |
 | An HTTP handler | `wasi:http/incoming-handler` | TLS terminated **inside** the enclave, behind the passkey gate; the runtime sets the caller's tenant in `x-enclave-tenant` |
 | An outbound HTTP request | `wasi:http/outgoing-handler` | **Denied by default.** Exact origins named in the measured image are allowed, verified against web PKI roots compiled into the image |
-| `std::fs` | `wasi:filesystem` | A per-tenant directory in an encrypted, S3-backed store ([how](docs/STORAGE.md)) |
+| `std::fs` | `wasi:filesystem` | A per-tenant ZFS dataset on an encrypted disk, anchored in S3 ([how](docs/STORAGE.md)) |
 | `println!`, `eprintln!` | `wasi:cli/stdout`, `stderr` | Bounded, structured log records tagged `guest`, optionally forwarded to CloudWatch |
-| `std::env::var` | `wasi:cli/environment` | A curated environment: `AWS_*` and `S3FS_*` are never inherited, and the image's values are covered by PCR0 |
+| `std::env::var` | `wasi:cli/environment` | The settings the guest file carries, measured into PCR16; nothing from the runtime's environment |
 | stdin, raw sockets | `wasi:cli/stdin`, `wasi:sockets` | Stdin is closed. Sockets are linked so guests instantiate, but every address is refused |
 
 `wasi:clocks/monotonic-clock` and `wasi:random/insecure` keep wasmtime's host-backed defaults. They measure durations and drive non-cryptographic generators; they never supply a timestamp or a secret.
@@ -63,7 +63,7 @@ An enclave has no NTP. The hypervisor sets its system clock, and the parent inst
 | Push signing | The SigV4 date on every call to the push service. AWS checks it, which makes this the one place an outside party checks the enclave's clock; skew shows up as a refused signature, retried |
 | Notification queue | Device enrollment times and retry backoff |
 
-A read that fails mid-run returns the last good reading and logs a warning. A few milliseconds stale is harmless; a zero timestamp means 1970 dates, expired certificates and rejected tokens. The production image sets `S3FS_CLOCK_SOURCE=ptp`, so a missing device stops the boot, while `auto` falls back to the host clock with a warning. The QEMU image uses the host clock because QEMU has no PTP device.
+A read that fails mid-run returns the last good reading and logs a warning. A few milliseconds stale is harmless; a zero timestamp means 1970 dates, expired certificates and rejected tokens. A production build always reads PTP, so a missing device stops the boot. The emulator's `testing` build uses the host clock, because QEMU has no PTP device.
 
 ### One entropy source
 
@@ -73,10 +73,9 @@ A read that fails mid-run returns the last good reading and logs a warning. A fe
 |---|---|
 | Guest `wasi:random/random` | Every byte, straight from the device (256 bytes per NSM request) |
 | Guest `wasi:random/insecure-seed` | A fresh seed per instance, so no two instances share a hash seed |
-| Tenant IDs | 16 bytes at registration, so the host cannot predict a tenant's directory before it exists |
 | Authentication | Registration and challenge IDs, and the 32-byte single-use tokens that admit a request |
 
-If the device fails, `wasi:random` stops the process rather than return predictable bytes. The clock can serve a stale reading because a stale timestamp is still a real one and a caller can notice. Predictable bytes look random to the guest, and a key built from them can never be detected downstream. The production image sets `S3FS_RANDOM_SOURCE=nsm`, and `auto` falls back to kernel entropy with an error-level log. The TLS key comes from the kernel pool through `aws-lc-rs`. Inside an enclave the NSM is that pool's only seed, and requiring `/dev/nsm` at boot proves the runtime is in an enclave.
+If the device fails, `wasi:random` stops the process rather than return predictable bytes. The clock can serve a stale reading because a stale timestamp is still a real one and a caller can notice. Predictable bytes look random to the guest, and a key built from them can never be detected downstream. A production build always reads the NSM. The TLS key comes from the kernel pool through `aws-lc-rs`. Inside an enclave the NSM is that pool's only seed, and requiring `/dev/nsm` at boot proves the runtime is in an enclave.
 
 `enclave-runtime --self-check` prints the chosen clock, its skew against `CLOCK_REALTIME` and a sanity check of the entropy source, then exits without touching storage.
 
@@ -136,7 +135,7 @@ How notify draws on the rest of the runtime:
 - **Storage.** Device tokens live in `/runtime/devices` in the encrypted store, outside every tenant's scope. A guest enrolls a token and can only ever get a count back.
 - **Delivery** is best effort and bounded. Repeat wakes for one `(tenant, category)` coalesce, and a full queue drops and counts instead of blocking the guest. Transient failures back off, and tokens the service reports gone are pruned. Each tenant can enroll 8 devices; enrolling a ninth evicts the oldest.
 
-A parent that borrows the role can send wake signals through that one application and nothing more. A wake carries no data, and the app's response to any wake is to fetch over the attested channel. Set `S3FS_PUSH_APP_ID` (measured, not secret). See [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md).
+A parent that borrows the role can send wake signals through that one application and nothing more. A wake carries no data, and the app's response to any wake is to fetch over the attested channel. Set `ENCLAVE_PUSH_APP_ID` (measured, not secret). See [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md).
 
 ### `enclave:streams` — let a service talk first
 
@@ -178,7 +177,7 @@ forget:  func(id: string) -> result<_, string>;
 export run-task: func(task-id: string, payload: list<u8>) -> result<list<u8>, string>;
 ```
 
-An approved request can schedule work for later, optionally recurring at intervals of one second or more. `run-at` is Unix milliseconds on the PTP clock. Task records live in the encrypted store and survive restarts. Each run gets a fresh instance, holds the tenant's lock and has a deadline. Failed runs are retried a bounded number of times, and results are kept for `status`. Execution is at least once, so deduplicate by the run ID (`<id>:<generation>:<occurrence>`). Payloads and results are capped at 64 KiB. Enable with `S3FS_BACKGROUND_TASKS=true`; see [docs/BACKGROUND_TASKS.md](docs/BACKGROUND_TASKS.md).
+An approved request can schedule work for later, optionally recurring at intervals of one second or more. `run-at` is Unix milliseconds on the PTP clock. Task records live in the encrypted store and survive restarts. Each run gets a fresh instance, holds the tenant's lock and has a deadline. Failed runs are retried a bounded number of times, and results are kept for `status`. Execution is at least once, so deduplicate by the run ID (`<id>:<generation>:<occurrence>`). Payloads and results are capped at 64 KiB. They run when the guest exports `run-task`; see [docs/BACKGROUND_TASKS.md](docs/BACKGROUND_TASKS.md).
 
 ### Who may call what
 
@@ -198,7 +197,7 @@ Background work cannot grant itself more work, connections or devices. It can on
 
 ### Instances are disposable
 
-A healthy HTTP instance may be reused for the same tenant, but `run-task` and `on-message` always get fresh ones, and any instance can be discarded after a trap, an eviction or a restart. Keep durable state in files and sync or close them before returning, because files a discarded instance left open are released unflushed. A tenant's requests, tasks and message callbacks run one at a time; different tenants run concurrently.
+Every request, `run-task` and `on-message` call gets a fresh instance, dropped when the call ends, so nothing in memory survives from one call to the next. Keep durable state in files and sync or close them before returning, because files an instance left open are released unflushed when it is dropped. A tenant's requests, tasks and message callbacks run one at a time; different tenants run concurrently.
 
 ### All together: a background job wakes its owner
 
@@ -245,7 +244,7 @@ The harness boots the real runtime image in QEMU's `nitro-enclave` machine with 
 rustup target add wasm32-wasip2
 sudo modprobe vsock_loopback
 
-docker build -t s3fs-qemu-nitro:latest deploy/qemu-nitro   # built from source; ~680 MB
+docker build -t enclave-qemu-nitro:latest deploy/qemu-nitro   # built from source; ~680 MB
 cargo install vhost-device-vsock --version 0.3.0 --locked \
   --root target/qemu-nitro/tools
 
@@ -285,7 +284,7 @@ deploy/qemu-nitro/dev-enclave.sh \
   --guest-env SERVICE_URL=http://192.168.127.254:7070
 ```
 
-The guest must export `wasi:http/incoming-handler`, and may use the [WIT capabilities](wit/). The emulator image enables background tasks by default, which requires the guest to export `run-task`. For an HTTP-only guest, add `--guest-env S3FS_BACKGROUND_TASKS=false`. `192.168.127.254` reaches the development host through gvproxy, on every port but the runtime's own; otherwise a guest reaches the public internet and nothing else.
+The guest must export `wasi:http/incoming-handler`, and may use the [WIT capabilities](wit/). Background tasks run if the guest exports `run-task`. `192.168.127.254` reaches the development host through gvproxy, on every port but the runtime's own; otherwise a guest reaches the public internet and nothing else.
 
 There is no bare laptop mode: the runtime measures its guest into PCR16 before it boots, and that needs an NSM. Host integration tests use a fake NSM; QEMU provides an emulated one.
 
@@ -301,10 +300,11 @@ flowchart TB
         Sched["Task scheduler"] --> Guest
         Held["Held connections"] --> Guest
         Dev["PTP clock + NSM"] -.-> Guest
-        Guest --> FS["Encrypted filesystem"]
+        Guest --> FS["ZFS pool on dm-crypt"]
         Guest --> Notify["Notifier"]
     end
-    FS -->|opaque slabs, signed roots| S3[("S3")]
+    FS -->|ciphertext blocks over vsock| Disk[("Parent's disk")]
+    FS -->|signed anchors| S3[("S3, Object Lock")]
     Dev -.->|recipient attestation| KMS["KMS + SSM"]
     Held <-->|attested SSE + POST| Svc["Public services"]
     Notify -->|data-only wake| Push["AWS push → FCM"]
@@ -322,12 +322,12 @@ AWS Nitro attestation, KMS, S3's authenticated responses, Object Lock and the ap
 The image names where the guest lives, an object key in the roots bucket covered by PCR0, and the runtime measures what it actually fetched:
 
 ```text
-fetch component → SHA-256 → extend PCR16 → lock → re-read the register → KMS key release → mount
+fetch component → SHA-256 → extend PCR16 → lock → re-read the register → KMS key release → unlock and import the pool
 ```
 
 The runtime refuses to start if PCR16 was already extended or locked, or if the register after extending or locking does not hold what a client computes from the component (`nitro-attest --measure` and the `guest-release` build compute it). A guest-only update changes PCR16 and the client pins without an image rebuild; changes to runtime code or measured configuration change PCR0.
 
-With `--master-key-source kms`, the runtime places an enclave recipient key in an NSM attestation request. It calls `GenerateDataKey` at genesis and `Decrypt` on resume, and accepts only `CiphertextForRecipient`, never a plaintext fallback. SSM holds the KMS ciphertext, and the roots bucket holds a pointer that is checked by digest. **The KMS key policy is what enforces release:** it must constrain both `kms:GenerateDataKey` and `kms:Decrypt` on both `kms:RecipientAttestation:PCR0` and `kms:RecipientAttestation:PCR16`. **And nobody may be able to change it.** Before every use the runtime reads the key, its policy and its grants from KMS and refuses unless the key is single-region, generated by KMS and customer managed, has no grants, and its policy allows only reading the key, deleting it, and those two actions pinned to this enclave's PCR0 and PCR16 — no `PutKeyPolicy`, no `CreateGrant`, no wildcards ([`keys/policy.rs`](runtime/src/keys/policy.rs)). Such a policy is set once (it needs `BypassPolicyLockoutSafetyCheck`) and is then permanent: what remains to an attacker is deleting the key, which stops the enclave and reveals nothing. `--master-key-source static` is for development and does not protect the key from its operator.
+The runtime places an enclave recipient key in an NSM attestation request. It calls `GenerateDataKey` at genesis and `Decrypt` on resume, and accepts only `CiphertextForRecipient`, never a plaintext fallback. SSM holds the KMS ciphertext, and the roots bucket holds a pointer that is checked by digest. **The KMS key policy is what enforces release:** it must constrain both `kms:GenerateDataKey` and `kms:Decrypt` on both `kms:RecipientAttestation:PCR0` and `kms:RecipientAttestation:PCR16`. **And nobody may be able to change it.** Before every use the runtime reads the key, its policy and its grants from KMS and refuses unless the key is single-region, generated by KMS and customer managed, has no grants, and its policy allows only reading the key, deleting it, and those two actions pinned to this enclave's PCR0 and PCR16 — no `PutKeyPolicy`, no `CreateGrant`, no wildcards ([`keys/policy.rs`](runtime/src/keys/policy.rs)). Such a policy is set once (it needs `BypassPolicyLockoutSafetyCheck`) and is then permanent: what remains to an attacker is deleting the key, which stops the enclave and reveals nothing. The emulator's `testing` build takes a static key instead, which does not protect it from its operator.
 
 The store's own identity is checked at boot too: genesis, resume, upgrade or refusal, decided by an attested origin receipt ([details](docs/STORAGE.md#state-identity-at-boot)).
 
@@ -358,40 +358,48 @@ The approval binds method, path and query, not the body or each message of a str
 
 ## Storage
 
-`wasi:filesystem` is backed by a copy-on-write block store. Blocks are encrypted with AES-256-GCM, checksummed with BLAKE3 and bound to their position in the tree, which hangs off Ed25519-signed, hash-chained root records. S3 holds opaque slabs rather than one object per path, so the storage operator sees neither filenames nor plaintext. Each tenant sees its own directory as `/`, and the runtime, not the guest, keeps `..` and symlinks from leaving it. SQLite runs unmodified in rollback-journal mode ([`guest-sqlite`](examples/guest-sqlite/)).
+Everything the enclave keeps is on one ZFS pool, on a disk the parent serves over vsock and cannot read: dm-crypt sits underneath, under a key derived from the master secret. Each tenant gets its own dataset as `/`, through `wasmtime-wasi`'s filesystem, and nothing above it is reachable. The runtime's own records (passkeys, tasks, streams, devices) live beside the tenants in `/runtime`. SQLite runs unmodified in rollback-journal mode ([`guest-sqlite`](examples/guest-sqlite/)).
 
-The store is single-writer, has no garbage collection yet, and commits through S3, so batch writes. The block tree, commit protocol, state origins, SQLite notes and embedding `s3fs-core` on its own are in [docs/STORAGE.md](docs/STORAGE.md); WASI/POSIX differences are in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
+Rollback is what ZFS alone cannot stop, since the parent holds the disk. So before anything is acknowledged — a response's end, a registration, a task's outcome — the pool is synced and its state anchored. A random value written into the pool is signed, chained and published to an Object-Locked bucket. Boot imports the pool as of the newest anchor and refuses one that does not hold its value. The anchor, the boot checks, the parent side and the limits are in [docs/STORAGE.md](docs/STORAGE.md); WASI differences are in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
 ## Configuration
 
-`cargo run -p enclave-runtime --bin enclave-runtime -- --help` is the definitive reference. Configuration that Nix bakes into the image is measured: changing a bucket, relying party, allowed origin, push application or logging destination changes PCR0, and changing a guest's settings changes PCR16. The `S3FS_` prefix is left over from the filesystem's original name.
+Every setting is baked into the image and measured into PCR0, so changing one means building a new image, just as changing a constant would. A production binary therefore reads only what differs between deployments, and `--help` lists exactly these:
 
-| Area | Main flags / environment |
+| Setting | What it names |
 |---|---|
-| Trusted devices | `--clock-source ptp\|host\|auto`, `--ptp-device`; `--random-source nsm\|host\|auto`, `--nsm-device`; `--self-check` |
-| Component | `--guest-object` / `S3FS_GUEST_OBJECT`, or `--guest-path` / `S3FS_GUEST_PATH` |
-| Key source | Required `--master-key-source kms\|static`; `--kms-key-id`, `--master-key-parameter`, `--environment` |
-| Listener and TLS | `--http-listen`, `--tls`, repeatable `--tls-domain`, `--acme-contact`, `--acme-directory` |
-| WebAuthn | `--webauthn-rp-id`, `--webauthn-origin`, repeatable `--webauthn-allowed-origin` (including `android:apk-key-hash:…`) |
-| Guest environment | The settings the guest file carries, over `--no-inherit-env` and repeatable `--guest-env NAME=VALUE` or `--guest-env NAME` |
-| Background tasks | `--background-tasks true`, concurrency, total-record and per-tenant limits. One attempt may run 600 s, which is not a setting |
-| Notifications | `S3FS_PUSH_APP_ID`, an AWS End User Messaging Push application |
-| Logging | `S3FS_GUEST_LOG_GROUP`, `S3FS_GUEST_LOG_STREAM`; `RUST_LOG` (`guest=warn` filters guest output) |
-| Store | `--bucket`, `--roots-bucket`, `--bucket-prefix`, `--fs-id`, `--region`, `--endpoint`, `--min-root-seq` |
+| `ENCLAVE_ROOTS_BUCKET`, `ENCLAVE_BUCKET_PREFIX` | The Object-Locked bucket, and a key prefix so deployments can share one |
+| `ENCLAVE_ID` | The filesystem id, which salts every key |
+| `ENCLAVE_KMS_KEY_ID`, `ENCLAVE_MASTER_KEY_PARAMETER` | The KMS key that releases the master secret, and the SSM parameter holding its ciphertext |
+| `ENCLAVE_ROOT_RETENTION_SECS`, `ENCLAVE_MIN_ROOT_SEQ` | How long anchors are locked (ten years by default), and a freshness floor from outside the store |
+| `ENCLAVE_TLS_DOMAINS` | The certificate's domains. Let's Encrypt issues it over TLS-ALPN-01 |
+| `ENCLAVE_WEBAUTHN_RP_ID`, `ENCLAVE_WEBAUTHN_ALLOWED_ORIGINS` | The relying party, whose origin is `https://<rp id>`, and further origins such as `android:apk-key-hash:…` |
+| `ENCLAVE_PUSH_APP_ID` | An AWS End User Messaging Push application, or empty for none |
+| `ENCLAVE_GUEST_LOG_GROUP` | A CloudWatch group for guest output, written to its `guest` stream, or empty for the console only |
+| `AWS_REGION` | The region |
+
+Everything else is fixed:
+- KMS releases the master key.
+- Time comes from PTP and randomness from the NSM.
+- The network is gvproxy.
+- The server listens on :443 with an ACME certificate.
+- The guest is `guest/guest.wasm` in the roots bucket.
+- Background tasks run when the guest exports `run-task`.
+- A guest's environment is exactly the settings its file carries ([`guest-env.py`](deploy/qemu-nitro/guest-env.py) writes them), measured into PCR16 with its code. Nothing from the runtime's environment reaches it.
+- `RUST_LOG` sets the runtime's own logging; `guest=warn` filters guest output.
+
+The emulator's alternatives exist only in the `testing` build, which the emulator image uses: a static master key, unsigned receipts, the host clock, MinIO, Pebble, and stubs for push and logs. A production binary has none of these settings and none of that code.
 
 | Runtime limit | Default |
 |---|---:|
 | Unspent interaction token lifetime | 60 s |
 | Maximum interaction lifetime | 300 s |
 | Request progress timeout | 30 s |
-| Cached tenants / idle timeout | 64 / 900 s |
-| Requests before instance recycling | 10,000 |
-| Background concurrency / attempt timeout | 1 / 30 s |
+| Tenant locks held / idle timeout | 64 / 900 s |
+| Background concurrency / attempt timeout | 1 / 600 s |
 | Background records, global / per tenant | 1,024 / 64 |
 | Held connections per tenant / message size | 8 / 256 KiB |
 | Enrolled devices per tenant | 8 |
-
-By default the guest inherits the runtime's environment minus `AWS_*` and `S3FS_*`. Anywhere that environment is not deliberately curated, use `--no-inherit-env` and name each value.
 
 ## Build, test, and deploy
 
@@ -416,7 +424,7 @@ cargo build --release -p enclave-runtime --features testing --bin passkey-client
 **Deploying.** Nix builds the measured enclave image; Packer ([`deploy/ami`](deploy/ami/)) builds the parent AMI; OpenTofu ([`deploy/tofu`](deploy/tofu/)) defines buckets, retention, parent resources and logs.
 
 ```bash
-nix build .#eif                                     # result/s3fs.eif, result/pcr.json
+nix build .#eif                                     # result/enclave.eif, result/pcr.json
 nix build .#guest-release --out-link guest-release  # guest.wasm, guest-pcr16.json
 nix build .#eif --rebuild                           # rebuild and compare
 ```
@@ -439,13 +447,14 @@ Reproducibility, and which inputs remain pinned AWS prebuilt artifacts, are cove
 | Upgrades | A key policy nobody can edit names one PCR0 and one PCR16, so a new runtime or guest cannot open a store made by the old one. A hand-over from the running enclave to an approved successor is not built yet |
 | Delivery | Tasks, held connections, notifications and logs each have their own retry and durability contract; none gives exactly-once side effects |
 | Authorization scope | A passkey approves one interaction on one route, not every payload byte or stream message. Per-message approval needs a host import that is not built yet |
-| Single active writer | No distributed writer coordination, scheduler fencing or multi-enclave failover |
-| Garbage collection | Not implemented; history and orphaned slabs accumulate |
-| Freshness | A cold mount needs an external root-sequence floor (`--min-root-seq`) to rule out rollback |
+| Single active writer | One enclave imports the pool; no failover |
+| Parent disk on Nitro | tofu creates the pool's EBS volume and the AMI serves it with stock nbdkit (`deploy/ami/units/nbdkit.service`); not yet proven on hardware. The emulator serves a disk image with `deploy/qemu-nitro/nbd-stub.py` |
+| Anchors | Serial across tenants; each is a pool sync and an S3 round trip |
+| Freshness | A cold boot needs an external anchor floor (`--min-root-seq`) to rule out a store hiding its newest anchors |
 | Resource isolation | Cache and queue limits exist; per-guest memory quotas and public-service admission control do not |
 | Upgrades | A new PCR16 is not a migration. The guest owns its schema and queued-payload evolution |
 
-The [roadmap](docs/ROADMAP.md) records milestone history and the planned garbage collector.
+The [roadmap](docs/ROADMAP.md) records milestone history.
 
 ## Repository guide
 
@@ -455,7 +464,8 @@ The [roadmap](docs/ROADMAP.md) records milestone history and the planned garbage
 | [`wit`](wit/) | Capability contracts: [`notify`](wit/notify/notify.wit), [`stream`](wit/stream/stream.wit), [`tasks`](wit/tasks/tasks.wit) |
 | [`crates/nitro-nsm`](crates/nitro-nsm/) | NSM device access: entropy, PCRs, attestation requests |
 | [`crates/nitro-attestation`](crates/nitro-attestation/) | Attestation verification and the `nitro-attest` client |
-| [`crates/s3fs-core`](crates/s3fs-core/) | The storage engine ([docs/STORAGE.md](docs/STORAGE.md)) |
+| [`runtime/src/zfs.rs`](runtime/src/zfs.rs), [`nix/kernel-zfs.nix`](nix/kernel-zfs.nix) | Storage: the pool, its disk, the anchor ([docs/STORAGE.md](docs/STORAGE.md)) |
+| [`runtime/src/store`](runtime/src/store/) | The roots bucket's S3 backend, the key hierarchy and signing |
 | [`examples`](examples/) | HTTP (tasks and notify), bidirectional gRPC, and SQLite guests |
 | [`deploy/qemu-nitro`](deploy/qemu-nitro/) | Development enclave, emulator self-test, end-to-end harness |
 | [`deploy/nix`](deploy/nix/), [`nix`](nix/) | Measured configuration and reproducible EIF assembly |

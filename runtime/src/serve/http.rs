@@ -32,16 +32,16 @@ use crate::run::GuestEnvironment;
 use crate::serve::acme::CertificateSlot;
 use crate::serve::attest::{nonce_from_headers, ResponseAttestor};
 use crate::serve::client::apply_tenant;
-use crate::serve::pool::{LiveTenant, PoolLimits, TenantPool};
+use crate::serve::pool::{PoolLimits, TenantPool};
 use crate::serve::progress::{Counting, StreamProgress};
 use crate::state::State;
-use crate::tenant::tenant_root_by_id;
 use nitro_nsm::Nsm;
 
 /// How the guest is served.
 #[derive(Debug)]
 pub struct ServeConfig {
-    /// Opt-in standing authorization for tenant-bound durable tasks.
+    /// Limits for tenant-bound durable tasks, which run when the guest exports `run-task`.
+    /// `None` turns them off whatever the guest exports.
     pub background_tasks: Option<crate::tasks::TaskLimits>,
     /// Opt-in push notifications. The registry and the forwarder are opened
     /// here rather than by the caller, because both need the mounted
@@ -152,17 +152,15 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// holds it until the process ends.
 const DEFAULT_MAX_INTERACTION: Duration = Duration::from_secs(300);
 
-/// A guest instance and the store it is bound to.
+/// A guest instance and the store it is bound to, for one call.
 ///
 /// The two travel together because `instantiate_async` binds a `Proxy` to one
 /// store: separating them would produce a handle that looks usable and
 /// resolves against the wrong memory.
-pub struct GuestInstance {
+struct GuestInstance {
     store: Store<State>,
     proxy: wasmtime_wasi_http::p2::bindings::Proxy,
-    /// Shared with this store's epoch callback, which was installed once and
-    /// outlives every request the instance serves. Reset per call rather than
-    /// replaced, so the callback never holds a stale one.
+    /// Shared with this store's epoch callback.
     progress: Arc<StreamProgress>,
 }
 
@@ -206,9 +204,9 @@ pub struct ServeHandle {
 ///
 /// No backends and no mounting: there is one filesystem, and a client costs a
 /// directory in it. What is per-client is the *view* — which directory the
-/// guest calls `/` — plus a warm instance and a lock.
+/// guest calls `/` — and a lock.
 pub struct Tenancy {
-    pool: TenantPool<GuestInstance>,
+    pool: TenantPool,
 }
 
 impl std::fmt::Debug for Tenancy {
@@ -226,7 +224,7 @@ impl Tenancy {
         }
     }
 
-    pub fn pool(&self) -> &TenantPool<GuestInstance> {
+    pub fn pool(&self) -> &TenantPool {
         &self.pool
     }
 }
@@ -301,7 +299,7 @@ impl ServeHandle {
         &self.guest
     }
 
-    /// Give each authenticated client their own filesystem and warm instance.
+    /// Give each authenticated client their own filesystem and lock.
     pub fn with_tenancy(mut self, tenancy: Arc<Tenancy>) -> Self {
         self.tenancy = Some(tenancy);
         self
@@ -368,13 +366,9 @@ impl ServeHandle {
             .as_ref()
             .context("held connections require tenants")?;
         let checkout = tenancy.pool.checkout(&tenant);
-        let mut guard = checkout.slot().tenant().clone().lock_owned().await;
-        if let Some(t) = guard.as_mut() {
-            t.instance = None;
-        }
+        let _guard = checkout.slot().lock().clone().lock_owned().await;
         let work = async {
-            let scope = crate::tenant::existing_tenant_root(self.guest.fs(), tenant).await?;
-            let state = self.guest.new_state_scoped(scope)?;
+            let state = self.tenant_state(tenant).await?;
             let mut store = Store::new(self.pre.engine(), state);
             store.set_epoch_deadline(1);
             store.epoch_deadline_async_yield_and_update(1);
@@ -410,6 +404,20 @@ impl ServeHandle {
                 bytes.len() <= crate::stream::MAX_MESSAGE,
                 "reply exceeds the message ceiling"
             );
+            // Before the reply leaves: it may say what was written.
+            match self.guest.zfs().anchor_tenant(tenant).await {
+                Ok(()) => {
+                    if let Some(notify) = &self.notify {
+                        notify.deliver_staged(tenant);
+                    }
+                }
+                Err(e) => {
+                    if let Some(notify) = &self.notify {
+                        notify.drop_staged(tenant);
+                    }
+                    return Err(e);
+                }
+            }
             Ok(bytes)
         };
         // The same wall clock that bounds an interaction. A guest parked in a
@@ -419,8 +427,7 @@ impl ServeHandle {
             .context("the guest took too long to answer a message")?
     }
 
-    /// A fresh instance shares the tenant lock; drop its warm HTTP instance so
-    /// no cached database handles survive a background mutation.
+    /// One task run: a fresh instance, under the same tenant lock as requests.
     pub(crate) async fn run_background(
         &self,
         queue: &Arc<crate::tasks::TaskQueue>,
@@ -431,18 +438,14 @@ impl ServeHandle {
             .as_ref()
             .context("background tasks require tenants")?;
         let checkout = tenancy.pool.checkout(&task.tenant);
-        let Ok(mut guard) = checkout.slot().tenant().clone().try_lock_owned() else {
+        let Ok(_guard) = checkout.slot().lock().clone().try_lock_owned() else {
             return Ok(None);
         };
         if !queue.begin(task).await? {
             return Ok(Some(Vec::new()));
         }
-        if let Some(tenant) = guard.as_mut() {
-            tenant.instance = None;
-        }
         let work = async {
-            let scope = crate::tenant::existing_tenant_root(self.guest.fs(), task.tenant).await?;
-            let state = self.guest.new_state_scoped(scope)?;
+            let state = self.tenant_state(task.tenant).await?;
             let mut store = Store::new(self.pre.engine(), state);
             // Yield every tick, even in CPU-only loops, so the wall deadline
             // can cancel both guest code and async host calls.
@@ -471,11 +474,28 @@ impl ServeHandle {
                 .await?;
             let bytes = result.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(bytes.len() <= 64 * 1024, "task result exceeds 64 KiB");
+            // Anchored with the outcome, by the queue's `finish`.
             Ok(Some(bytes))
         };
         tokio::time::timeout(queue.limits.timeout, work)
             .await
             .context("background task deadline exceeded")?
+    }
+
+    /// Deliver a tenant's staged wakes — for the task worker, once `finish` has
+    /// anchored the outcome the wake announces.
+    pub(crate) fn deliver_wakes(&self, tenant: [u8; 16]) {
+        if let Some(notify) = &self.notify {
+            notify.deliver_staged(tenant);
+        }
+    }
+
+    /// Drop a tenant's staged wakes unsent — if the outcome could not be
+    /// anchored.
+    pub(crate) fn drop_wakes(&self, tenant: [u8; 16]) {
+        if let Some(notify) = &self.notify {
+            notify.drop_staged(tenant);
+        }
     }
 
     /// Override the response-head deadline.
@@ -568,7 +588,7 @@ impl ServeHandle {
         }
     }
 
-    /// One request, in this client's own filesystem and warm instance.
+    /// One request, in this client's own filesystem and a fresh instance.
     ///
     /// The lock is held for the whole call — including the body, because
     /// `call_handle` does not return until the guest has finished writing it —
@@ -587,44 +607,23 @@ impl ServeHandle {
         B: hyper::body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
         B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
     {
+        let head = req.method() == hyper::Method::HEAD;
         // Checked out before the lock is taken, so the eviction sweep can see
         // this tenant is busy and leave it alone. The guard releases that mark
         // however the request ends.
         let checkout = tenancy.pool.checkout(&tenant_id);
         // Owned, so it can move into the task below and outlive this function.
-        let mut guard = checkout.slot().tenant().clone().lock_owned().await;
+        let guard = checkout.slot().lock().clone().lock_owned().await;
 
-        if guard.is_none() {
-            // First use of this slot, under the lock — so two simultaneous
-            // first requests from one client resolve to one directory, the
-            // second waiting here rather than racing the first.
-            let opened = tenant_root_by_id(self.guest.fs(), tenant_id).await?;
-            tracing::info!(
-                tenant = %hex::encode(opened.tenant_id),
-                arrival = ?opened.arrival,
-                "tenant directory ready"
-            );
-            *guard = Some(LiveTenant {
-                scope: opened.scope,
-                tenant_id: opened.tenant_id,
-                instance: None,
-                requests: 0,
-            });
+        // Under the lock, so two simultaneous first requests from one client
+        // resolve to one directory, the second waiting here rather than racing
+        // the first into a second `zfs create`.
+        let (dir, arrival) = self.guest.zfs().tenant_dir(tenant_id).await?;
+        if arrival == crate::tenant::Arrival::New {
+            tracing::info!(tenant = %hex::encode(tenant_id), "tenant directory created");
         }
 
-        let tenant = guard.as_mut().expect("just built");
-        // Rebuilt when absent, and when this one has served long enough: wasm
-        // linear memory never shrinks, so an instance that lived forever would
-        // only grow. Cheap — ~24 µs, and no I/O, because there is no
-        // filesystem to bring up with it.
-        let stale = tenant.requests >= tenancy.pool.limits().max_requests_per_instance;
-        if tenant.instance.is_none() || stale {
-            tenant.instance = Some(self.instantiate(tenant.scope.clone()).await?);
-            tenant.requests = 0;
-        }
-        tenant.requests += 1;
-
-        let instance = tenant.instance.as_mut().expect("just built");
+        let mut instance = self.instantiate(&dir).await?;
         instance.store.data_mut().streams =
             self.streams
                 .as_ref()
@@ -650,11 +649,6 @@ impl ServeHandle {
                     tenant: tenant_id,
                     interactive: true,
                 });
-        // Reset every request: the epoch deadline is absolute, so a reused
-        // store would otherwise inherit whatever the last request left. The
-        // same is true of the progress this call will be judged on.
-        instance.store.set_epoch_deadline(self.watchdog());
-        instance.progress.reset();
         let progress = instance.progress.clone();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         // Wrapped before it becomes a guest resource, which is the last point
@@ -671,54 +665,59 @@ impl ServeHandle {
             .http()
             .new_response_outparam(sender)?;
 
+        let zfs = self.guest.zfs().clone();
+        let notify = self.notify.clone();
+        let (anchored_tx, anchored_rx) = tokio::sync::oneshot::channel();
         let task = tokio::task::spawn(async move {
-            // Moved in so the lock outlives the response head. A pooled store
-            // must not be handed to this tenant's next request until the call
-            // has finished writing its body — which is also what makes "one
-            // active request per tenant" true rather than "one set of headers
-            // at a time". Released when this future completes, fails, or is
-            // aborted.
-            let mut guard = guard;
+            // Moved in so the lock outlives the response head: this tenant's
+            // next request waits until the call has finished writing its body,
+            // which is what makes "one active request per tenant" true rather
+            // than "one set of headers at a time". The instance is moved in
+            // too, so it dies with the call however the call ends — finished,
+            // trapped or aborted.
+            let _guard = guard;
             let _checkout = checkout;
-            let tenant = guard.as_mut().expect("held across the call");
-            // Taken out of the slot for the duration, and put back only on a
-            // clean finish. Held *by reference* instead — as this once did —
-            // and an aborted call leaves the instance where it sits: `abort`
-            // drops this future at the await below, so nothing after it runs,
-            // and the next request for this tenant re-enters a store whose
-            // `call_handle` was cancelled part-way through. Ownership is what
-            // makes "an interrupted instance is never reused" true for the
-            // abort path and not only for the trap path, because a dropped
-            // future drops what it owns.
-            let mut instance = tenant.instance.take().expect("built before the call");
+            let mut instance = instance;
             let result = instance
                 .proxy
                 .wasi_http_incoming_handler()
                 .call_handle(&mut instance.store, req, out)
                 .await;
-
-            // One client's instance, and nothing else. The filesystem is
-            // shared and untouched; the next caller for this client gets a
-            // fresh instance over the same directory.
             if result.is_err() {
-                tracing::warn!("guest trapped; this client's instance will be rebuilt");
-            } else if !instance.store.data().resources_settled() {
-                tracing::debug!("guest left resources behind; rebuilding its instance");
-            } else {
-                tenant.instance = Some(instance);
+                tracing::warn!("guest trapped; its instance dies with the call");
             }
+            // Still under the tenant's lock, so its next request cannot write
+            // before this one's writes are anchored.
+            let anchored = zfs.anchor_tenant(tenant_id).await;
+            // Any wake the guest raised rides on that anchor: delivered once the
+            // writes it announces are durable, dropped if they are not.
+            if let Some(notify) = &notify {
+                match anchored {
+                    Ok(()) => notify.deliver_staged(tenant_id),
+                    Err(_) => notify.drop_staged(tenant_id),
+                }
+            }
+            let _ = anchored_tx.send(anchored);
             result
         });
 
-        await_head(self.timeout, self.max_interaction, task, receiver, progress).await
+        let response =
+            await_head(self.timeout, self.max_interaction, task, receiver, progress).await?;
+        after_anchor(response, anchored_rx, head).await
     }
 
-    /// Build an instance whose guest sees `scope` as `/`.
+    /// A background or message run's state: the tenant's dataset as `/`. One
+    /// that has gone is not brought back by work running in its name.
+    async fn tenant_state(&self, tenant: [u8; 16]) -> Result<State> {
+        let dir = self.guest.zfs().existing_tenant_dir(tenant).await?;
+        self.guest.new_state(Some(&dir))
+    }
+
+    /// Build an instance whose guest sees `dir` as `/`.
     ///
-    /// The one place a store and an instance are made, so the per-request path
-    /// and the per-tenant path cannot drift in what a guest is handed.
-    async fn instantiate(&self, scope: Arc<s3fs_core::Inode>) -> Result<GuestInstance> {
-        let mut store = Store::new(self.pre.engine(), self.guest.new_state_scoped(scope)?);
+    /// Every tenant request gets one, used for that call and dropped with it.
+    async fn instantiate(&self, dir: &std::path::Path) -> Result<GuestInstance> {
+        let mut store = Store::new(self.pre.engine(), self.guest.new_state(Some(dir))?);
         let progress = Arc::new(StreamProgress::new());
         store.set_epoch_deadline(self.watchdog());
         self.arm_watchdog(&mut store, progress.clone());
@@ -770,8 +769,9 @@ impl ServeHandle {
         });
     }
 
-    /// The only dispatch path. A fresh store, a fresh instance, both dropped
-    /// when the request ends — so nothing survives but what was committed.
+    /// The only dispatch path without a gate. A fresh store, a fresh instance,
+    /// both dropped when the request ends — so nothing survives but what was
+    /// written to the anonymous directory, and anchored.
     async fn in_fresh_instance<B>(
         &self,
         scheme: Scheme,
@@ -784,9 +784,13 @@ impl ServeHandle {
         // Anonymous callers are one identity, so they queue behind each other.
         // Taken before the store is built: an instance is a wasm linear memory,
         // and building one per waiting request is the exhaustion this prevents.
+        let head = req.method() == hyper::Method::HEAD;
         let anonymous = self.anonymous.clone().lock_owned().await;
 
-        let mut store = Store::new(self.pre.engine(), self.guest.new_state()?);
+        // One shared directory, never the pool's root: that would hand an
+        // unauthenticated guest `/runtime` and every tenant.
+        let (dir, _) = self.guest.zfs().tenant_dir(ANONYMOUS).await?;
+        let mut store = Store::new(self.pre.engine(), self.guest.new_state(Some(&dir))?);
         let progress = Arc::new(StreamProgress::new());
         store.set_epoch_deadline(self.watchdog());
         self.arm_watchdog(&mut store, progress.clone());
@@ -795,6 +799,8 @@ impl ServeHandle {
         let req = store.data_mut().http().new_incoming_request(scheme, req)?;
         let out = store.data_mut().http().new_response_outparam(sender)?;
         let pre = self.pre.clone();
+        let zfs = self.guest.zfs().clone();
+        let (anchored_tx, anchored_rx) = tokio::sync::oneshot::channel();
 
         // The guest runs in its own task so it can keep streaming a body after
         // the status line and headers have gone out. The lock goes with it, so
@@ -802,13 +808,17 @@ impl ServeHandle {
         let task = tokio::task::spawn(async move {
             let _anonymous = anonymous;
             let proxy = pre.instantiate_async(&mut store).await?;
-            proxy
+            let result = proxy
                 .wasi_http_incoming_handler()
                 .call_handle(store, req, out)
-                .await
+                .await;
+            let _ = anchored_tx.send(zfs.anchor_tenant(ANONYMOUS).await);
+            result
         });
 
-        await_head(self.timeout, self.max_interaction, task, receiver, progress).await
+        let response =
+            await_head(self.timeout, self.max_interaction, task, receiver, progress).await?;
+        after_anchor(response, anchored_rx, head).await
     }
 
     /// Prove the guest instantiates, before a single request depends on it.
@@ -824,7 +834,7 @@ impl ServeHandle {
     /// which is nothing new: [`ServeHandle::in_fresh_instance`] runs it on
     /// every request already.
     pub async fn verify_instantiates(&self) -> Result<()> {
-        let mut store = Store::new(self.pre.engine(), self.guest.new_state()?);
+        let mut store = Store::new(self.pre.engine(), self.guest.new_state(None)?);
         // A deadline of its own, or a guest that hangs in `start` would hang
         // the boot rather than failing it.
         store.set_epoch_deadline(self.watchdog());
@@ -970,6 +980,123 @@ fn resumed<S>(stream: &tokio_rustls::server::TlsStream<S>, peer: SocketAddr) -> 
         return true;
     }
     false
+}
+
+/// The directory callers without a gate share. Tenant ids are drawn from the
+/// NSM, so none is ever all zeroes.
+const ANONYMOUS: [u8; 16] = [0; 16];
+
+/// Hold a response's end until what produced it is anchored, so no client can
+/// see it finish before the writes it may describe would survive the host.
+///
+/// A streamed body (no `Content-Length`) streams as the guest writes it — an
+/// event stream or a gRPC call stays one — and only its end, trailers
+/// included, waits. A sized body is held whole: a client counting
+/// `Content-Length` would otherwise have all of it, and act on it, first.
+///
+/// A response that may not have a body — to a HEAD, or a 1xx, 204 or 304 —
+/// is held whole too. hyper never polls a body it may not send, so streamed
+/// it would be complete the moment its head went out.
+// ponytail: a sized body is buffered in memory; hold back just its last frame
+// if a guest ever serves large sized downloads.
+async fn after_anchor(
+    response: hyper::Response<HyperOutgoingBody>,
+    anchored: tokio::sync::oneshot::Receiver<Result<()>>,
+    head: bool,
+) -> Result<hyper::Response<HyperOutgoingBody>> {
+    let status = response.status();
+    let bodiless = head
+        || status.is_informational()
+        || status == hyper::StatusCode::NO_CONTENT
+        || status == hyper::StatusCode::NOT_MODIFIED;
+    if !bodiless
+        && !response
+            .headers()
+            .contains_key(hyper::header::CONTENT_LENGTH)
+    {
+        use http_body_util::BodyExt;
+        return Ok(response.map(|inner| {
+            AnchoredBody {
+                inner,
+                anchored,
+                phase: Phase::Streaming,
+            }
+            .boxed_unsync()
+        }));
+    }
+    let (parts, body) = response.into_parts();
+    let body = http_body_util::BodyExt::collect(body)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?
+        .to_bytes();
+    anchored
+        .await
+        .context("the guest's call ended before its writes were anchored")??;
+    Ok(hyper::Response::from_parts(parts, full(body)))
+}
+
+/// A streamed body whose end waits for the anchor. Anchoring that fails
+/// aborts the stream rather than ending it, so no client sees a clean finish.
+struct AnchoredBody {
+    inner: HyperOutgoingBody,
+    anchored: tokio::sync::oneshot::Receiver<Result<()>>,
+    phase: Phase,
+}
+
+enum Phase {
+    Streaming,
+    /// The guest's body is done; its trailers, if any, wait with its end.
+    Holding(Option<hyper::body::Frame<bytes::Bytes>>),
+    Finished,
+}
+
+impl hyper::body::Body for AnchoredBody {
+    type Data = bytes::Bytes;
+    type Error = wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::future::Future;
+        use std::task::Poll;
+        let this = self.get_mut();
+        loop {
+            match &mut this.phase {
+                Phase::Streaming => match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+                    Poll::Ready(Some(Ok(frame))) if frame.is_data() => {
+                        return Poll::Ready(Some(Ok(frame)))
+                    }
+                    Poll::Ready(Some(Ok(trailers))) => this.phase = Phase::Holding(Some(trailers)),
+                    Poll::Ready(None) => this.phase = Phase::Holding(None),
+                    other => return other,
+                },
+                Phase::Holding(trailers) => {
+                    let outcome = match std::pin::Pin::new(&mut this.anchored).poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Ok(Ok(()))) => Ok(trailers.take()),
+                        Poll::Ready(Ok(Err(e))) => Err(format!("{e:#}")),
+                        Poll::Ready(Err(_)) => Err("the call ended before it was anchored".into()),
+                    };
+                    this.phase = Phase::Finished;
+                    return Poll::Ready(match outcome {
+                        Ok(trailers) => trailers.map(Ok),
+                        Err(why) => {
+                            tracing::error!(error = %why, "a response's writes were not anchored; aborting it");
+                            Some(Err(Self::Error::InternalError(Some(
+                                "the response's writes could not be made durable".into(),
+                            ))))
+                        }
+                    });
+                }
+                Phase::Finished => return Poll::Ready(None),
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        matches!(self.phase, Phase::Finished)
+    }
 }
 
 /// A fixed body, in the shape the guest dispatch wants.
@@ -1502,13 +1629,21 @@ pub async fn serve_component(
     if let Some(tenancy) = &config.tenancy {
         handle = handle.with_tenancy(tenancy.clone());
     }
-    if let Some(limits) = config.background_tasks.take() {
+    // Whether there are tasks is the guest's to say, by exporting `run-task`: the guest is
+    // measured into PCR16, so its exports already are the decision, and a setting beside them
+    // could only disagree.
+    let runs_tasks = handle
+        .background_pre
+        .component()
+        .get_export_index(None, "run-task")
+        .is_some();
+    if let Some(limits) = config.background_tasks.take().filter(|_| runs_tasks) {
         anyhow::ensure!(
             config.authentication.is_some(),
-            "background tasks require authentication"
+            "the guest exports run-task, and background tasks require authentication"
         );
         let queue = crate::tasks::TaskQueue::open(
-            handle.environment().fs().clone(),
+            handle.environment().zfs().clone(),
             handle.environment().clock().clone(),
             limits,
         )
@@ -1522,7 +1657,8 @@ pub async fn serve_component(
     // every send — so enabling this widens nothing.
     if config.tenancy.is_some() && config.authentication.is_some() {
         let registry =
-            crate::stream::StreamRegistry::open_registry(handle.environment().fs().clone()).await?;
+            crate::stream::StreamRegistry::open_registry(handle.environment().zfs().clone())
+                .await?;
         handle = handle.with_streams(registry)?;
     }
     let mut notify_forwarder = None;
@@ -1533,7 +1669,7 @@ pub async fn serve_component(
              from a verified assertion, and without a gate there is none"
         );
         let registry =
-            crate::notify::DeviceRegistry::open(handle.environment().fs().clone()).await?;
+            crate::notify::DeviceRegistry::open(handle.environment().zfs().clone()).await?;
         // Plaintext only where an endpoint override asked for it, which is the
         // emulator harness pointing at a local stub.
         let plaintext = notify
@@ -1588,8 +1724,8 @@ pub async fn serve_component(
         Some((auth, gate)) => server = server.with_authentication(auth, gate),
         None => tracing::warn!(
             "serving with NO authentication: every request reaches the guest without a \
-             WebAuthn assertion. Set --webauthn-rp-id and --webauthn-origin for anything \
-             that is not a development run."
+             WebAuthn assertion. Set --webauthn-rp-id for anything that is not a \
+             development run."
         ),
     }
 
@@ -1869,5 +2005,44 @@ mod concurrency_tests {
                 .is_ok(),
             "a failed guest kept its tenant's lock"
         );
+    }
+
+    /// A response with no body to stream — to a HEAD, or a 204 or 304 — goes
+    /// out only once its writes are anchored, and not at all if they are not.
+    /// hyper never polls such a body, so a streamed one would end at its head.
+    #[tokio::test]
+    async fn a_bodiless_response_waits_for_its_anchor() {
+        let cases = [
+            (hyper::StatusCode::NO_CONTENT, false),
+            (hyper::StatusCode::NOT_MODIFIED, false),
+            (hyper::StatusCode::OK, true),
+        ];
+        for (status, head) in cases {
+            let response = || {
+                hyper::Response::builder()
+                    .status(status)
+                    .body(full(bytes::Bytes::new()))
+                    .unwrap()
+            };
+            let (anchored, anchoring) = oneshot::channel();
+            let mut waiting = Box::pin(after_anchor(response(), anchoring, head));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                    .await
+                    .is_err(),
+                "{status} (head: {head}) went out before its anchor"
+            );
+            anchored.send(Ok(())).unwrap();
+            assert_eq!(waiting.await.unwrap().status(), status);
+
+            let (anchored, anchoring) = oneshot::channel();
+            anchored
+                .send(Err(anyhow::anyhow!("anchor failed")))
+                .unwrap();
+            assert!(
+                after_anchor(response(), anchoring, head).await.is_err(),
+                "{status} (head: {head}) went out though its anchor failed"
+            );
+        }
     }
 }

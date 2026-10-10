@@ -190,8 +190,8 @@ IFS=, read -ra guest_env <<<"$GUEST_ENV"
 for kv in "${guest_env[@]}"; do
     [[ "$kv" =~ ^[A-Z_][A-Z0-9_]*=[A-Za-z0-9:/._-]*$ ]] \
         || { echo "--guest-env $kv: expected NAME=VALUE (letters, digits and :/._- in the value)" >&2; exit 1; }
-    [[ "$kv" != S3FS_* && "$kv" != AWS_* ]] \
-        || { echo "--guest-env $kv: S3FS_ and AWS_ variables are withheld from guests" >&2; exit 1; }
+    [[ "$kv" != ENCLAVE_* && "$kv" != AWS_* ]] \
+        || { echo "--guest-env $kv: ENCLAVE_ and AWS_ variables are withheld from guests" >&2; exit 1; }
 done
 if [[ -n "$WEBAUTHN_ALLOWED_ORIGINS" && -z "$WEBAUTHN_RP_ID" ]]; then
     echo "--allowed-origin needs --rp-id: an app's origin is only ever vouched for by its own domain" >&2
@@ -325,7 +325,8 @@ Or verify the attestation on its own, without touching the guest:
       --pcr0 $EXPECTED_PCR0 --pcr16 $EXPECTED_PCR16
 
 Console:  $CONSOLE
-Store:    http://127.0.0.1:9000  (minioadmin/minioadmin, buckets $DATA_BUCKET and $ROOTS_BUCKET)
+Store:    http://127.0.0.1:9000  (minioadmin/minioadmin, bucket $ROOTS_BUCKET)
+Disk:     $ZFS_IMG (the pool, served on vsock 10809)
 Wakes:    $wakes
 
 To run a new build of your guest, stop this and start it again with the new

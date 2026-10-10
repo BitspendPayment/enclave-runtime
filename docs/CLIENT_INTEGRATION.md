@@ -37,7 +37,7 @@ sudo modprobe vsock_loopback
 Once ever:
 
 ```bash
-docker build -t s3fs-qemu-nitro:latest deploy/qemu-nitro
+docker build -t enclave-qemu-nitro:latest deploy/qemu-nitro
 cargo install vhost-device-vsock --root target/qemu-nitro/tools
 ```
 
@@ -48,7 +48,7 @@ cargo build --release --target wasm32-wasip2   # in your guest's crate
 deploy/qemu-nitro/dev-enclave.sh --guest target/wasm32-wasip2/release/cosigner.wasm
 ```
 
-It builds the enclave image, starts a block store and an ACME CA, boots the
+It builds the enclave image, starts a store, a disk and an ACME CA, boots the
 enclave under QEMU's `nitro-enclave` machine, waits for it to fetch and measure
 your component and obtain a certificate, then prints the three values a client
 pins and stays up. Ctrl-C stops everything it started.
@@ -174,6 +174,20 @@ Your component receives an ordinary `wasi:http` request with
 tenant's own directory. Path traversal out of it is refused by the runtime, not
 by the guest. You do not have to implement tenant separation; you have to not
 work around it.
+
+### A response counts when it ends
+
+The runtime makes a request's writes durable — synced and anchored, see
+[STORAGE.md](STORAGE.md) — before the response *ends*: the last chunk of a
+chunked body, HTTP/2's end of stream, or gRPC's status trailers. A streamed
+body streams as the guest writes it; only its end waits. A body with a
+`Content-Length` is held whole.
+
+So treat a response as an acknowledgement only once it is complete. One that
+stops short — the connection closed before the terminating chunk, or with
+fewer bytes than its `Content-Length` — may describe writes that the next boot
+rolls back. Standard HTTP clients already fail such a response;
+[`passkey-client`](../runtime/src/bin/passkey-client.rs) does too.
 
 ## What changes in an existing verifier
 

@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use s3fs_core::Fs;
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::clock::{TrustedClock, WallClockAdapter};
@@ -61,11 +60,10 @@ pub fn read_component(path: &Path) -> Result<Vec<u8>> {
 /// environments, so both go through here rather than each building a
 /// `WasiCtxBuilder` and drifting.
 ///
-/// The filesystem is shared, deliberately: `Arc<Fs>` is one mounted
-/// filesystem with one transaction stream, so writes from separate requests
-/// land in the same store rather than racing two views of it.
+/// The pool is shared, deliberately: one disk, one anchor chain. What differs
+/// between two clients is only which of its directories each one is handed.
 pub struct GuestEnvironment {
-    fs: Arc<Fs>,
+    zfs: Arc<crate::zfs::Zfs>,
     clock: Arc<WallClockAdapter>,
     entropy: Arc<dyn Nsm>,
     env: Vec<(String, String)>,
@@ -83,18 +81,17 @@ impl GuestEnvironment {
     /// and it put untrusted guest text straight onto the enclave console with
     /// nothing marking it as untrusted.
     pub fn new(
-        fs: Arc<Fs>,
-        clock: Box<dyn TrustedClock>,
+        zfs: Arc<crate::zfs::Zfs>,
+        clock: std::sync::Arc<dyn TrustedClock>,
         entropy: Arc<dyn Nsm>,
         env: &[(String, String)],
         args: &[String],
         logs: GuestLogs,
     ) -> Result<Self> {
         Ok(GuestEnvironment {
-            fs,
-            // One adapter shared by the guest's clock interface and the
-            // filesystem's "now", so `set-times` cannot disagree with
-            // `wall-clock`.
+            zfs,
+            // One adapter shared by the guest's clock and the runtime's own
+            // records, so the two cannot disagree about "now".
             clock: Arc::new(WallClockAdapter::new(clock)?),
             entropy,
             env: env.to_vec(),
@@ -103,23 +100,26 @@ impl GuestEnvironment {
         })
     }
 
-    pub fn fs(&self) -> &Arc<Fs> {
-        &self.fs
+    pub fn zfs(&self) -> &Arc<crate::zfs::Zfs> {
+        &self.zfs
     }
 
     pub fn clock(&self) -> &Arc<WallClockAdapter> {
         &self.clock
     }
 
-    /// Build a fresh [`State`] whose guest sees `scope` as `/`.
+    /// Build a fresh [`State`] whose guest sees `dir` as `/`, or no
+    /// filesystem at all without one.
     ///
-    /// Everything else — the filesystem, the clock, the entropy source, the
-    /// environment, the arguments — is shared. One mounted filesystem, one
-    /// block cache, one transaction stream; what differs between two clients
-    /// is only which directory each of them calls `/`, and that separation is
-    /// enforced by the resolver rather than by anything the guest does.
-    pub fn new_state_scoped(&self, scope: Arc<s3fs_core::Inode>) -> Result<State> {
+    /// Everything else — the clock, the entropy source, the environment, the
+    /// arguments — is shared. Each call draws a new insecure-random seed, so
+    /// two guest instances do not share a hash seed.
+    pub fn new_state(&self, dir: Option<&Path>) -> Result<State> {
         let mut wasi = WasiCtxBuilder::new();
+        if let Some(dir) = dir {
+            use wasmtime_wasi::{DirPerms, FilePerms};
+            wasi.preopened_dir(dir, "/", DirPerms::all(), FilePerms::all())?;
+        }
         // Closed, not inherited. An enclave has no console to read from, so an
         // inherited stdin offered a guest nothing but a handle on whatever the
         // parent had attached to this process. Stated rather than left to the
@@ -154,20 +154,7 @@ impl GuestEnvironment {
         wasi.insecure_random_seed(random.insecure_seed()?);
         wasi.secure_random(random);
 
-        Ok(State::scoped(
-            wasi.build(),
-            self.fs.clone(),
-            scope,
-            self.clock.clone(),
-        ))
-    }
-
-    /// Build a fresh [`State`] with this environment's capabilities.
-    ///
-    /// Each call draws a new insecure-random seed from the entropy source, so
-    /// two guest instances do not share a hash seed.
-    pub fn new_state(&self) -> Result<State> {
-        self.new_state_scoped(self.fs.root())
+        Ok(State::new(wasi.build()))
     }
 }
 
