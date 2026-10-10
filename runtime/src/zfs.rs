@@ -16,21 +16,29 @@
 //! ## The anchor
 //!
 //! Every ZFS block pointer carries its child's checksum, so a pool state is
-//! pinned by its uberblock. But a txg number does not name one: after a
-//! rewound import ZFS hands out the abandoned txgs again, and the abandoned
-//! uberblocks are still on the disk for the host to serve.
+//! pinned by its uberblock. But a txg number does not name one: forks reuse
+//! numbers, and every uberblock the disk ever held may still be on it for the
+//! host to serve.
 //!
-//! So each anchor writes a fresh random value into the pool itself,
-//! `zfs set enclave:anchor=<seq>-<nonce>`, which also syncs everything written
-//! before it. The txg that reached and the nonce are signed, chained to the
-//! anchor before, and published to the roots bucket under Object Lock. Nothing
-//! is acknowledged — a response, a registration, a finished task — until the
-//! anchor covering it exists.
+//! So each anchor writes a fresh random value into the pool itself, the marker
+//! `zfs set enclave:anchor=<seq>-<nonce>-<previous anchor's hash>`, which also
+//! syncs everything written before it. A second sync follows, and the txg that
+//! reached is the one the anchor names. Signed with the nonce, chained to the
+//! anchor before, it is published to the roots bucket under Object Lock.
+//! Nothing is acknowledged — a response, a registration, a finished task —
+//! until the anchor covering it exists.
 //!
-//! Boot imports the pool as of the anchored txg (`zpool import -T`), which
-//! rewinds a pool the enclave synced but died before anchoring, and then reads
-//! the property back from what ZFS actually loaded. A rolled-back disk or an
-//! abandoned fork cannot carry the newest anchor's nonce, so it is refused.
+//! The marker's txg is older than the anchored one, and a write that lands
+//! between the two is acknowledged by the anchor, so the nonce alone does not
+//! pin the state. Boot imports the newest state on the disk and asks the kernel
+//! which txg it loaded. It refuses one older than the anchored txg, and one
+//! whose marker is neither the newest anchor's nor that of an unpublished
+//! successor naming it ([`admit`]). A rolled-back disk, an abandoned fork and
+//! the disk as of the marker are all refused.
+//!
+//! There is no rewind. What an enclave synced and died before anchoring stays,
+//! unacknowledged: rewinding even three txgs can find the anchored state's
+//! blocks reused, and ZFS would then quietly load an older one.
 //!
 //! Anchors cannot be hidden either: they are found by their retained version,
 //! beneath any delete marker, and Object Lock keeps every one. What a cold boot
@@ -151,7 +159,7 @@ impl Anchor {
 
     /// The value written to the pool's `enclave:anchor` property.
     pub fn property(&self) -> String {
-        format!("{}-{}", self.seq, hex::encode(self.nonce))
+        marker(self.seq, &self.nonce, &self.prev)
     }
 
     /// The checks `RootRecord::decode_and_verify` makes, for the same
@@ -330,9 +338,9 @@ impl Zfs {
         Ok(Arc::new(zfs))
     }
 
-    /// Resume: import the pool as of the newest anchor, and refuse it unless
-    /// what ZFS loaded is that anchor's state. `min_seq` is a floor from
-    /// outside the store.
+    /// Resume: import the pool as it is, and refuse it unless the newest
+    /// anchor vouches for what ZFS loaded (see [`admit`]). `min_seq` is a floor
+    /// from outside the store.
     pub async fn open(
         disk: &Disk,
         roots: Arc<dyn Backend>,
@@ -360,41 +368,45 @@ impl Zfs {
             zfs.load(0).await?.hash()
         };
         if zfs.pool {
-            // As of the anchored txg: rewinds a pool synced past it by an
-            // enclave that died before publishing, and fails on one that never
-            // got there. On a disk without txg A it silently takes the newest
-            // txg below it, which is why the property check is not optional.
-            #[cfg(feature = "testing")]
-            let _ = tokio::fs::write("/proc/spl/kstat/zfs/dbgmsg", "0").await;
+            // The newest state on the disk, not `-T` the anchored txg: that
+            // takes the newest uberblock at or below it with no exact match,
+            // and falls back further when one fails to load. Which txg it got
+            // comes from the kernel's own notes on this import, so the log is
+            // emptied first. Unmounted until it is admitted.
+            tokio::fs::write(DBGMSG, "0")
+                .await
+                .context("clearing the ZFS debug log")?;
             run(
                 "zpool",
                 &[
                     "import",
                     "-f",
+                    "-N",
                     "-d",
-                    "/dev/mapper",
+                    MAPPED,
                     "-o",
                     "cachefile=none",
-                    "-T",
-                    &tip.txg.to_string(),
+                    &tip.pool_guid.to_string(),
                     POOL,
                 ],
             )
             .await
-            .context("importing the pool at the anchored txg")?;
+            .context("importing the pool")?;
             #[cfg(feature = "testing")]
             log_loaded_state().await;
-            let loaded = run("zfs", &["get", "-Hp", "-o", "value", PROPERTY, POOL]).await?;
+            let loaded = loaded_txg(&tokio::fs::read_to_string(DBGMSG).await?, POOL);
+            let marker = run("zfs", &["get", "-Hp", "-o", "value", PROPERTY, POOL]).await?;
             let guid = pool_guid().await?;
-            if loaded.trim() != tip.property() || guid != tip.pool_guid {
+            if let Err(why) = admit(&tip, loaded, marker.trim(), guid) {
                 let _ = run("zpool", &["export", POOL]).await;
-                bail!(
-                    "refusing the pool: it holds anchor {:?} in pool {guid}, but the newest anchor is {:?} in pool {}",
-                    loaded.trim(),
-                    tip.property(),
-                    tip.pool_guid
-                );
+                bail!("refusing the pool: {why}");
             }
+            run("zfs", &["mount", "-a"]).await?;
+            tracing::info!(
+                loaded_txg = loaded,
+                marker = marker.trim(),
+                "zfs pool admitted"
+            );
         }
         zfs.pool_guid = tip.pool_guid;
         tracing::info!(
@@ -465,11 +477,28 @@ impl Zfs {
     }
 
     /// Make everything written so far survive the host. Call before telling
-    /// anyone a write happened.
-    pub async fn anchor(&self) -> Result<()> {
+    /// anyone a write happened, and tell nobody if it fails.
+    ///
+    /// It runs in a task of its own, so a caller that is dropped — a deadline,
+    /// an abort, a client that went away — cannot stop it between writing the
+    /// marker and publishing the anchor, and leave the next one to collide
+    /// with an anchor it does not know was published.
+    ///
+    /// Before the marker is written a failure changes nothing and is only
+    /// returned. From the marker on it stops anchoring for good, an uncertain
+    /// publish included: retrying could publish over a lost race, or past a
+    /// state the host has since rewritten.
+    pub async fn anchor(self: &Arc<Self>) -> Result<()> {
         if !self.pool {
             return Ok(());
         }
+        let zfs = self.clone();
+        tokio::spawn(async move { zfs.anchor_now().await })
+            .await
+            .context("the anchor's task died")?
+    }
+
+    async fn anchor_now(&self) -> Result<()> {
         #[cfg(feature = "testing")]
         if self.last.try_lock().is_err() {
             hook("anchor-wait", String::new()).await;
@@ -486,8 +515,6 @@ impl Zfs {
             return Ok(()); // nothing has reached the disk since
         }
         let sync_ms = start.elapsed().as_millis();
-        // Every failure stops anchoring for good: retrying could publish over
-        // a lost race, or past a state the host has since rewritten.
         match self.seal_and_publish(Some(&prev)).await {
             Ok(anchor) => {
                 tracing::info!(
@@ -513,9 +540,10 @@ impl Zfs {
         let mut nonce = [0u8; 32];
         getrandom::fill(&mut nonce).map_err(|e| anyhow!("getrandom: {e}"))?;
         let txg = if self.pool {
-            let value = format!("{seq}-{}", hex::encode(nonce)); // Anchor::property, before there is one
-                                                                 // A sync task: back once the txg holding it, and everything
-                                                                 // written before it, is on the disk.
+            // Anchor::property, before there is an anchor. A sync task: back
+            // once the txg holding it, and everything written before it, is
+            // on the disk.
+            let value = marker(seq, &nonce, &prev.map_or(Hash256::ZERO, Anchor::hash));
             run("zfs", &["set", &format!("{PROPERTY}={value}"), POOL]).await?;
             #[cfg(feature = "testing")]
             hook("after-marker", format!("seq={seq}")).await;
@@ -671,6 +699,100 @@ impl Zfs {
         );
         Ok(())
     }
+}
+
+/// `<seq>-<nonce>-<previous anchor's hash>`, as the pool's `enclave:anchor`.
+/// The hash is what lets a boot recognise the marker of an anchor that was
+/// never published as the successor of the one that was.
+fn marker(seq: u64, nonce: &[u8; 32], prev: &Hash256) -> String {
+    format!(
+        "{seq}-{}-{}",
+        hex::encode(nonce),
+        hex::encode(prev.as_bytes())
+    )
+}
+
+/// Whether the newest anchor vouches for a loaded pool state: the txg ZFS
+/// loaded, the marker it holds and its guid.
+///
+/// The marker's nonce first reaches the disk a txg or more before the txg the
+/// anchor names, and a write that lands between the two is acknowledged by the
+/// anchor. So holding the anchor's marker is not enough; the state must also be
+/// no older than the anchored txg. One that is newer descends from it: nothing
+/// but the enclave writes the marker, and a nonce is written once.
+///
+/// A state may also hold the marker of the next anchor, one the enclave wrote
+/// and died before publishing, naming this one as its predecessor. Either way
+/// everything the anchor covered is there, and anything after it was never
+/// acknowledged, so the boot goes on from it rather than rewinding: a rewind
+/// to a txg some way back can find its blocks already reused.
+fn admit(
+    tip: &Anchor,
+    loaded_txg: Option<u64>,
+    marker: &str,
+    guid: u64,
+) -> std::result::Result<(), String> {
+    let loaded = loaded_txg.ok_or("the kernel did not say which txg it loaded")?;
+    if guid != tip.pool_guid {
+        return Err(format!(
+            "it is pool {guid}, not the anchored pool {}",
+            tip.pool_guid
+        ));
+    }
+    if loaded < tip.txg {
+        return Err(format!(
+            "it loaded txg {loaded}, older than the anchored txg {}",
+            tip.txg
+        ));
+    }
+    // Pools anchored before the marker named its predecessor.
+    let legacy = format!("{}-{}", tip.seq, hex::encode(tip.nonce));
+    if marker == tip.property() || marker == legacy {
+        return Ok(());
+    }
+    if let [seq, nonce, prev] = marker.split('-').collect::<Vec<_>>()[..] {
+        if seq == (tip.seq + 1).to_string()
+            && nonce.len() == 64
+            && prev == hex::encode(tip.hash().as_bytes())
+        {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "it holds anchor {marker:?}, but the newest anchor is {:?}",
+        tip.property()
+    ))
+}
+
+/// Where the kernel keeps its debug log, `zfs_dbgmsg`.
+const DBGMSG: &str = "/proc/spl/kstat/zfs/dbgmsg";
+
+/// The txg of the uberblock an import of `pool` loaded, from the kernel's own
+/// notes on it in the debug log: the `using uberblock with txg=` of the load
+/// that ended `LOADED` with nothing after it. `zpool import` loads the pool
+/// more than once — a trial load, a reload with the trusted config, a retry
+/// at an older txg — and only the last is the pool as imported.
+fn loaded_txg(dbgmsg: &str, pool: &str) -> Option<u64> {
+    let tag = format!("spa_load({pool}, config ");
+    let (mut using, mut loaded) = (None, None);
+    for line in dbgmsg.lines() {
+        let Some((_, rest)) = line.split_once(&tag) else {
+            continue;
+        };
+        let Some((_, note)) = rest.split_once("): ") else {
+            continue;
+        };
+        let note = note.trim();
+        if let Some(txg) = note.strip_prefix("using uberblock with txg=") {
+            using = txg.parse().ok();
+        } else if note == "LOADED" {
+            loaded = using;
+        } else if note == "LOADING" || note == "UNLOADING" || note.starts_with("FAILED") {
+            using = None;
+            loaded = None;
+        }
+    }
+    loaded
 }
 
 /// The newest txg that reached the disk: the last committed row of the pool's
@@ -959,6 +1081,101 @@ txg      birth            state ndirty       nread        nwritten     reads    
 ";
         assert_eq!(witness(kstat), Some(29));
         assert_eq!(witness("txg birth state ndirty nread nwritten\n"), None);
+    }
+
+    /// Shaped as the emulator's kernel logged a boot: a trial load, then the
+    /// load with the trusted config. The two name different txgs here, which
+    /// a host serving two reads differently could make happen; the last is
+    /// the pool as imported. `$import` is a trial under its own name.
+    const PLAIN_IMPORT: &str = "\
+timestamp    message
+1791607760   ffff8880052b5140 spa_misc.c:431:spa_load_note(): spa_load($import, config untrusted): using uberblock with txg=900
+1791607760   ffff8880052b5140 spa_misc.c:431:spa_load_note(): spa_load(enclave, config trusted): LOADING
+1791607760   ffff8880052b5140 spa_misc.c:431:spa_load_note(): spa_load(enclave, config untrusted): using uberblock with txg=845
+1791607760   ffff8880052b5140 spa_misc.c:431:spa_load_note(): spa_load(enclave, config trusted): LOADED
+1791607760   ffff8880052b5140 spa_misc.c:431:spa_load_note(): spa_load(enclave, config trusted): UNLOADING
+1791607760   ffff8880052b5140 spa_misc.c:431:spa_load_note(): spa_load(enclave, config trusted): LOADING
+1791607760   ffff8880052b5140 spa_misc.c:431:spa_load_note(): spa_load(enclave, config untrusted): using uberblock with txg=846
+1791607760   ffff8880052b5140 spa_misc.c:431:spa_load_note(): spa_load(enclave, config trusted): Read 9 log space maps (9 total blocks - blksz = 131072 bytes) in 1 ms
+1791607760   ffff8880052b5140 spa_misc.c:431:spa_load_note(): spa_load(enclave, config trusted): LOADED
+";
+
+    /// And a load that failed at one txg and was retried at an older one.
+    const RETRIED_IMPORT: &str = "\
+1791607707   ffff888003fe2080 spa_misc.c:431:spa_load_note(): spa_load(enclave, config trusted): LOADING
+1791607707   ffff888003fe2080 spa_misc.c:431:spa_load_note(): spa_load(enclave, config untrusted): using uberblock with txg=810
+1791607707   ffff888003fe2080 spa_misc.c:417:spa_load_failed(): spa_load(enclave, config untrusted): FAILED: couldn't get 'config' value in MOS directory [error=5]
+1791607707   ffff888003fe2080 spa_misc.c:431:spa_load_note(): spa_load(enclave, config untrusted): UNLOADING
+1791607707   ffff888003fe2080 spa_misc.c:431:spa_load_note(): spa_load(enclave, config untrusted): spa_load_retry: rewind, max txg: 809
+1791607707   ffff888003fe2080 spa_misc.c:431:spa_load_note(): spa_load(enclave, config untrusted): LOADING
+1791607707   ffff888003fe2080 spa_misc.c:431:spa_load_note(): spa_load(enclave, config untrusted): using uberblock with txg=809
+1791607707   ffff888003fe2080 spa_misc.c:431:spa_load_note(): spa_load(enclave, config trusted): LOADED
+";
+
+    #[test]
+    fn the_loaded_txg_is_the_last_load_that_finished() {
+        assert_eq!(loaded_txg(PLAIN_IMPORT, "enclave"), Some(846));
+        assert_eq!(loaded_txg(RETRIED_IMPORT, "enclave"), Some(809));
+        assert_eq!(
+            loaded_txg(PLAIN_IMPORT, "encl"),
+            None,
+            "another pool's name"
+        );
+        // Anything after the last LOADED means it is not the pool as imported.
+        for after in ["UNLOADING", "FAILED: no valid uberblock found", "LOADING"] {
+            let later = format!("{PLAIN_IMPORT}1 x spa_load(enclave, config trusted): {after}\n");
+            assert_eq!(loaded_txg(&later, "enclave"), None, "{after} after LOADED");
+        }
+        // LOADED with no uberblock named since the load began.
+        let unnamed = "1 x spa_load(enclave, config trusted): LOADING\n\
+                       1 x spa_load(enclave, config trusted): LOADED\n";
+        assert_eq!(loaded_txg(unnamed, "enclave"), None);
+        assert_eq!(loaded_txg("", "enclave"), None);
+    }
+
+    #[test]
+    fn only_the_anchored_state_and_its_descendants_are_admitted() {
+        let k = keys(7);
+        let a0 = Anchor::seal(&k, None, 42, 100, [9u8; 32]);
+        let tip = Anchor::seal(&k, Some(&a0), 42, 846, [8u8; 32]);
+        let mine = tip.property();
+        assert!(
+            admit(&tip, Some(846), &mine, 42).is_ok(),
+            "the anchored txg"
+        );
+        assert!(admit(&tip, Some(900), &mine, 42).is_ok(), "synced past it");
+        // The leg-7 disk: the marker's txg, holding the right nonce.
+        let early = admit(&tip, Some(845), &mine, 42).unwrap_err();
+        assert!(early.contains("older than the anchored txg"), "{early}");
+        assert!(
+            admit(&tip, None, &mine, 42).is_err(),
+            "no word from the kernel"
+        );
+        assert!(admit(&tip, Some(846), &mine, 43).is_err(), "another pool");
+        // Rolled back: the anchor before, at an older txg or not.
+        assert!(admit(&tip, Some(846), &a0.property(), 42).is_err());
+        // The marker of an anchor that died unpublished, naming this one.
+        let next = marker(tip.seq + 1, &[5u8; 32], &tip.hash());
+        assert!(admit(&tip, Some(860), &next, 42).is_ok());
+        // ... but not one naming another predecessor, or two seqs on.
+        assert!(admit(
+            &tip,
+            Some(860),
+            &marker(tip.seq + 1, &[5u8; 32], &a0.hash()),
+            42
+        )
+        .is_err());
+        assert!(admit(
+            &tip,
+            Some(860),
+            &marker(tip.seq + 2, &[5u8; 32], &tip.hash()),
+            42
+        )
+        .is_err());
+        // A pool marked before markers named their predecessor.
+        let legacy = format!("{}-{}", tip.seq, hex::encode(tip.nonce));
+        assert!(admit(&tip, Some(846), &legacy, 42).is_ok());
+        assert!(admit(&tip, Some(845), &legacy, 42).is_err());
     }
 
     #[test]

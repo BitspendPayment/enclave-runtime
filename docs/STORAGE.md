@@ -27,28 +27,44 @@ Without the dm-crypt key, the host can only replay sectors it once saw or scramb
 That leaves three things the host can do:
 - make the disk unreadable, which is denial of service and fails closed;
 - see which sectors are touched, and when;
-- serve an older disk entirely. That is the rollback the anchor exists for.
+- serve an older disk entirely, or one mixing sectors from several. That is the rollback the anchor exists for.
+
+#### What this rests on
+
+- **dm-crypt is confidentiality, not integrity.** Plain AES-XTS authenticates nothing. What it buys is that the host cannot choose plaintext: it can put back a sector's old ciphertext, which decrypts to that sector's old contents, or change it, which decrypts to noise.
+- **ZFS checksums are not MACs.** They are unkeyed. They catch a replayed or scrambled block because the host cannot make a block whose checksum matches what its parent expects. SHA-256 makes that collision-resistant for dataset blocks. The pool's own metadata uses fletcher4, which is not collision-resistant: there the claim rests on the host being limited to old versions of a sector or noise, never content it chose.
+- **The uberblock is the root.** Its own checksum is SHA-256, but any uberblock this pool ever wrote is valid, so which state it names is settled by the anchor: the txg the kernel reports loading, and the nonce inside that state.
+
+None of this has been checked against a host deliberately mixing old and new sectors of one pool; that is still to be tested.
 
 ### The anchor
 
-ZFS pins a pool state by its uberblock, but a txg number does not name one. After a rewound import, ZFS reuses the numbers of the txgs it abandoned, and the abandoned uberblocks are still on the disk for the host to serve. So each anchor writes a fresh random value into the pool itself:
+ZFS pins a pool state by its uberblock, but a txg number does not name one: forks reuse numbers, and the uberblocks of every state the disk held may still be on it for the host to serve. So each anchor writes a fresh random value into the pool itself:
 
 1. `zpool sync`. If no txg has written anything since the last anchor, stop: there is nothing new to anchor.
-2. `zfs set enclave:anchor=<seq>-<nonce>`. This is a sync task: it returns once everything written before it is on the disk.
+2. `zfs set enclave:anchor=<seq>-<nonce>-<previous anchor's hash>`, the marker. This is a sync task: it returns once everything written before it is on the disk.
 3. `zpool sync` again. The property change's frees are deferred two txgs; without this sync every later call would see a write and anchor again.
-4. Read the newest txg that wrote anything, from `/proc/spl/kstat/zfs/enclave/txgs`.
+4. Read the newest txg that wrote anything, from `/proc/spl/kstat/zfs/enclave/txgs`. This is the anchored txg.
 5. Sign `seq | prev hash | fs id | pool guid | txg | nonce` with the anchor key, and publish it to `zfs/anchors/<seq>` with a conditional PUT under Object Lock COMPLIANCE. Read the retained version back, since a delete marker could otherwise let a second writer's PUT through.
 
-Anchors are serialised across the whole enclave. A failed anchor stops anchoring for good: retrying could publish over a lost race.
+Anchors are serialised across the whole enclave, and each runs in a task of its own, so a caller that gives up cannot cut one short. A failure before the marker changes nothing. Any failure from the marker on stops anchoring for good, an uncertain publish included: retrying could publish over a lost race.
 
-On boot, the runtime imports the pool **as of the anchored txg**, with `zpool import -T`, and then reads the property back from what ZFS actually loaded:
+The marker's txg is older than the anchored one, and other tenants write meanwhile. A write landing between the two is covered by the anchor, and its own anchor call finds nothing newer and is acknowledged. So the disk as of the marker holds the anchor's nonce without that write, and the nonce alone does not pin the state.
+
+On boot, the runtime imports the newest state on the disk, unmounted, and reads which txg it loaded from the kernel's own notes on that import (`spa_load(enclave, …): using uberblock with txg=N`, in `/proc/spl/kstat/zfs/dbgmsg`, from the last load that ended `LOADED`). It reads the marker from the loaded pool, and admits the pool only if:
+- its guid is the anchored pool's;
+- the loaded txg is no older than the anchored txg;
+- its marker is the newest anchor's, or that of the next anchor (one written but never published) naming the newest as its predecessor.
 
 | Disk | What happens |
 |---|---|
-| At the anchor | Imported; the nonce matches. |
-| Ahead of the anchor (the enclave died between syncing and publishing) | Rewound to the anchor; the nonce matches. The unanchored writes, which nobody was told about, are gone. |
-| Behind the anchor (rolled back) | ZFS takes the newest txg at or below the anchor's, and that txg holds an older nonce. **Refused.** |
-| An abandoned fork, the history a crash left behind | It never held the newest anchor's nonce. **Refused.** |
+| At the anchor | Admitted. |
+| Ahead of the anchor (the enclave synced, then died before publishing) | Admitted as it is. Nothing past the anchor was acknowledged, and nothing is rewound. |
+| As of the anchor's marker, before its sync | Holds the right nonce, but loaded an older txg. **Refused.** |
+| Behind the anchor (rolled back) | An older txg and an older marker. **Refused.** |
+| An abandoned fork | Its marker is not the newest anchor's, nor one naming it. **Refused.** |
+
+There is no rewind. Before this, boot imported with `zpool import -T <anchored txg>`, which takes the newest uberblock *at or below* that txg and, if that one fails to load, quietly tries older ones. Three txgs after an anchor, its blocks can already have been reused.
 
 Anchors are found by their retained versions, by galloping then bisecting, because they are contiguous and none can be deleted. A host cannot hide the newest one behind a delete marker. A cold boot cannot know on its own whether the store is still adding them; `--min-root-seq` sets a floor from outside.
 
@@ -58,12 +74,12 @@ Anchors are found by their retained versions, by galloping then bisecting, becau
 
 | Write made by | Anchored before |
 |---|---|
-| A request | The response ends. A streamed body streams as written, and only its end (with any trailers, such as gRPC's status) waits. A body with `Content-Length` is held whole, because a client counting bytes would otherwise act on it first. |
+| A request | The response ends. A streamed body streams as written, and only its end (with any trailers, such as gRPC's status) waits. A body with `Content-Length` is held whole, because a client counting bytes would otherwise act on it first. So is a response that cannot have a body (to a HEAD, or a 1xx, 204 or 304), which would otherwise be complete when its head went out. |
 | A held connection's message run | Its reply is sent. |
 | A background task | Its outcome is recorded, and so before any wake about it. |
 | A passkey registration or revocation | The response; the tenant's dataset is created first, so one anchor covers both. |
 
-A crash before the anchor rewinds to the previous one. What is lost was never acknowledged.
+After a crash, the boot goes on from whatever reached the disk. Writes no anchor covered may be there or not; none was acknowledged.
 
 ### Layout
 
@@ -130,19 +146,21 @@ The bucket's identity lives in the measured image: `ENCLAVE_ROOTS_BUCKET` is par
 - two tenants write, and cross-tenant paths are refused;
 - a restart resumes;
 - a rolled-back disk is refused;
-- a crash between sync and publish rewinds;
+- a crash between sync and publish resumes from the disk it left;
 - the abandoned fork is refused;
-- a disk from between an anchor's marker and its sync is refused. **This leg fails today**; see [below](#a-reproduced-flaw-one-nonce-two-states).
+- the disk as of an anchor's marker, before its sync, is refused.
 
 The testing build stops at named points in an anchor and asks the host, over vsock port 9101, whether to go on (`hook` in [`zfs.rs`](../runtime/src/zfs.rs), answered by [`test-hooks.py`](../deploy/qemu-nitro/test-hooks.py)). A leg can hold an anchor there, copy the disk at that exact moment, or kill the enclave between two steps.
 
-### A reproduced flaw: one nonce, two states
+### The flaw the last leg is for
 
-The anchor's nonce reaches the disk in one txg, the marker (`zfs set`), and the anchor names a later one, the second `zpool sync`. Nothing stops another tenant writing between the two. That write lands in the later txg, and the anchor covers it: its own `anchor()` call then finds nothing newer than the anchor's txg and is acknowledged without an anchor of its own. The disk as of the marker holds the same nonce without that write, and `zpool import -T` loads the newest uberblock at or below the anchored txg, with no exact match required.
+The boot once admitted the disk as of an anchor's marker. Leg 7 found it on the emulator:
+1. Alice's anchor was held after its marker, and the disk was copied.
+2. Bob's write was acknowledged behind it; one anchor (111, txg 846) covered both.
+3. Served the copy, the kernel logged `spa_load(enclave, config untrusted): using uberblock with txg=845`.
+4. The boot logged `zfs pool resumed at its anchor seq=111 txg=846`, and bob's acknowledged file was gone.
 
-Leg 7 of the spike, on the emulator: alice's anchor held at `after-marker`, the disk copied, bob's write acknowledged behind it, both covered by anchor 111 at txg 846. Served the copy, the boot logged the kernel's `spa_load(enclave, config untrusted): using uberblock with txg=845` and then `zfs pool resumed at its anchor seq=111 txg=846`. Bob's acknowledged file was gone.
-
-The same leg shows rewinding is not dependable either. In leg 6's honest crash between sync and publish, three txgs past the anchor, `-T 810` failed on txg 810 (`couldn't get 'config' value in MOS directory [error=5]`, its blocks already reused) and ZFS fell back to txg 809, the anchor's own marker. That boot passed only through the same flaw.
+Leg 6 showed the same flaw in an honest crash. Three txgs past anchor 107, `-T 810` failed on txg 810 (`couldn't get 'config' value in MOS directory [error=5]`, its blocks already reused) and ZFS fell back to 809, the anchor's own marker. A boot requiring the exact txg would have refused that disk forever, which is why the boot now admits the newest state rather than rewinding.
 
 ## Running SQLite
 

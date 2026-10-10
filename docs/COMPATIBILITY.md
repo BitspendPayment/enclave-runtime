@@ -13,7 +13,7 @@ Reads, writes, streams, `stat`, `set-times`, `set-size`, directories, `rename-at
 | What | How | Why |
 |---|---|---|
 | `sync`, `sync-data` | Return without making anything durable (`sync=disabled`). | Durability is the anchor, taken before a response ends, a task's outcome is recorded, or a message reply is sent. A guest cannot be told its write is durable earlier than that, and is never told later. |
-| A crash | Rewinds to the last anchor: writes no anchor covered are gone. Anchors cover the whole pool, so another request's anchor may already have kept part of an unfinished request's writes — as a crash on a local disk may keep part of an unsynced write. | Nothing unanchored was acknowledged. |
+| A crash | Goes on from whatever reached the disk: writes no anchor covered may survive in part or not at all — as a crash on a local disk may keep part of an unsynced write. Anchors cover the whole pool, so another request's anchor may already have kept part of an unfinished request's writes. | Nothing unanchored was acknowledged. |
 | Paths out of the preopen | `..` past it, absolute paths and symlinks out of it are refused by `cap-std`. | The tenant's directory is a capability. |
 | `atime` | Not updated. | Reads must not write. |
 | `.zfs` | ZFS's control directory (`snapdir=hidden`) may be reachable by name inside a tenant's own dataset. It holds nothing: no snapshots are taken. | A ZFS default, not exercised by the tests. |
@@ -30,4 +30,4 @@ The runtime's in-process suites run guests over a plain directory standing in fo
 - tasks, streams and devices;
 - streaming responses over HTTP/1.1, HTTP/2 and gRPC.
 
-ZFS itself (the anchor, rewind, rollback and fork refusal) is exercised in the QEMU emulator by [`run-zfs-spike.sh`](../deploy/qemu-nitro/run-zfs-spike.sh) and the end-to-end suite.
+ZFS itself (the anchor, crash recovery, rollback and fork refusal) is exercised in the QEMU emulator by [`run-zfs-spike.sh`](../deploy/qemu-nitro/run-zfs-spike.sh) and the end-to-end suite.

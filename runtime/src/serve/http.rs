@@ -579,6 +579,7 @@ impl ServeHandle {
         B: hyper::body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
         B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
     {
+        let head = req.method() == hyper::Method::HEAD;
         // Checked out before the lock is taken, so the eviction sweep can see
         // this tenant is busy and leave it alone. The guard releases that mark
         // however the request ends.
@@ -664,7 +665,7 @@ impl ServeHandle {
 
         let response =
             await_head(self.timeout, self.max_interaction, task, receiver, progress).await?;
-        after_anchor(response, anchored_rx).await
+        after_anchor(response, anchored_rx, head).await
     }
 
     /// A background or message run's state: the tenant's dataset as `/`. One
@@ -745,6 +746,7 @@ impl ServeHandle {
         // Anonymous callers are one identity, so they queue behind each other.
         // Taken before the store is built: an instance is a wasm linear memory,
         // and building one per waiting request is the exhaustion this prevents.
+        let head = req.method() == hyper::Method::HEAD;
         let anonymous = self.anonymous.clone().lock_owned().await;
 
         // One shared directory, never the pool's root: that would hand an
@@ -778,7 +780,7 @@ impl ServeHandle {
 
         let response =
             await_head(self.timeout, self.max_interaction, task, receiver, progress).await?;
-        after_anchor(response, anchored_rx).await
+        after_anchor(response, anchored_rx, head).await
     }
 
     /// Prove the guest instantiates, before a single request depends on it.
@@ -953,15 +955,26 @@ const ANONYMOUS: [u8; 16] = [0; 16];
 /// event stream or a gRPC call stays one — and only its end, trailers
 /// included, waits. A sized body is held whole: a client counting
 /// `Content-Length` would otherwise have all of it, and act on it, first.
+///
+/// A response that may not have a body — to a HEAD, or a 1xx, 204 or 304 —
+/// is held whole too. hyper never polls a body it may not send, so streamed
+/// it would be complete the moment its head went out.
 // ponytail: a sized body is buffered in memory; hold back just its last frame
 // if a guest ever serves large sized downloads.
 async fn after_anchor(
     response: hyper::Response<HyperOutgoingBody>,
     anchored: tokio::sync::oneshot::Receiver<Result<()>>,
+    head: bool,
 ) -> Result<hyper::Response<HyperOutgoingBody>> {
-    if !response
-        .headers()
-        .contains_key(hyper::header::CONTENT_LENGTH)
+    let status = response.status();
+    let bodiless = head
+        || status.is_informational()
+        || status == hyper::StatusCode::NO_CONTENT
+        || status == hyper::StatusCode::NOT_MODIFIED;
+    if !bodiless
+        && !response
+            .headers()
+            .contains_key(hyper::header::CONTENT_LENGTH)
     {
         use http_body_util::BodyExt;
         return Ok(response.map(|inner| {
@@ -1954,5 +1967,44 @@ mod concurrency_tests {
                 .is_ok(),
             "a failed guest kept its tenant's lock"
         );
+    }
+
+    /// A response with no body to stream — to a HEAD, or a 204 or 304 — goes
+    /// out only once its writes are anchored, and not at all if they are not.
+    /// hyper never polls such a body, so a streamed one would end at its head.
+    #[tokio::test]
+    async fn a_bodiless_response_waits_for_its_anchor() {
+        let cases = [
+            (hyper::StatusCode::NO_CONTENT, false),
+            (hyper::StatusCode::NOT_MODIFIED, false),
+            (hyper::StatusCode::OK, true),
+        ];
+        for (status, head) in cases {
+            let response = || {
+                hyper::Response::builder()
+                    .status(status)
+                    .body(full(bytes::Bytes::new()))
+                    .unwrap()
+            };
+            let (anchored, anchoring) = oneshot::channel();
+            let mut waiting = Box::pin(after_anchor(response(), anchoring, head));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                    .await
+                    .is_err(),
+                "{status} (head: {head}) went out before its anchor"
+            );
+            anchored.send(Ok(())).unwrap();
+            assert_eq!(waiting.await.unwrap().status(), status);
+
+            let (anchored, anchoring) = oneshot::channel();
+            anchored
+                .send(Err(anyhow::anyhow!("anchor failed")))
+                .unwrap();
+            assert!(
+                after_anchor(response(), anchoring, head).await.is_err(),
+                "{status} (head: {head}) went out though its anchor failed"
+            );
+        }
     }
 }

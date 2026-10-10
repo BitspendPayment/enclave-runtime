@@ -4,8 +4,8 @@
 # Tenant data on ZFS, over a disk image the "parent" serves on vsock
 # (nbd-stub.py, standing in for nbdkit and EBS), anchored in the roots bucket
 # after every request (runtime/src/zfs.rs). This plays the hostile host against
-# it — rolling the disk back, serving an abandoned fork, killing the enclave
-# between a sync and its anchor, serving the disk from between an anchor's
+# it — rolling the disk back, killing the enclave between a sync and its
+# anchor, serving an abandoned fork, serving the disk from between an anchor's
 # marker and its sync — and measures what an anchor costs.
 #
 #   deploy/qemu-nitro/run-zfs-spike.sh          a fresh store
@@ -130,7 +130,12 @@ reboot
 [[ "$(signed get --path /files/b.txt)" == "alice-b" ]] || fail "b.txt is gone from the good disk"
 echo "old disk refused; good disk accepted, b.txt present"
 
-say "6/7  a crash between a sync and its anchor rewinds; the abandoned fork is refused"
+# Nothing is rewound: a crash leaves what reached the disk, and the boot goes
+# on from it. Two histories can then grow from one anchor. Once one of them is
+# anchored again, the other is an abandoned fork.
+say "6/7  a crash between a sync and its anchor resumes; the abandoned fork is refused"
+snapshot base                     # at the newest anchor
+reboot
 hooks_start
 hook_rule after-sync abort
 if signed post --path /files/lost.txt --body "never acknowledged" >/dev/null 2>&1; then
@@ -139,17 +144,22 @@ fi
 for _ in $(seq 30); do grep -q "test hook: dying here" <(plain) && break; sleep 1; done
 grep -q "test hook: dying here" <(plain) || fail "the enclave did not die between sync and publish"
 hooks_stop
-snapshot fork                     # synced past the anchor: holds lost.txt
+snapshot fork                     # past the anchor: lost.txt, and the next anchor's unpublished marker
 reboot
-[[ "$BOOT" == served ]] || fail "the enclave could not rewind to its anchor"
+[[ "$BOOT" == served ]] || fail "the enclave refused the disk it crashed on"
+plain | grep -E "zfs pool admitted" | tail -1
+stop                              # nothing asked of it, so nothing anchored on this history
+restore base                      # the other history from the same anchor
+reboot
+[[ "$BOOT" == served ]] || fail "the enclave refused the disk at its anchor"
+[[ "$(signed get --path /files/b.txt)" == "alice-b" ]] || fail "b.txt is gone"
 if signed get --path /files/lost.txt >/dev/null 2>&1; then
-    fail "an unacknowledged write survived the rewind"
+    fail "lost.txt is on a disk that never held it"
 fi
-[[ "$(signed get --path /files/b.txt)" == "alice-b" ]] || fail "b.txt did not survive the rewind"
-signed post --path /files/c.txt --body "alice-c" >/dev/null || fail "alice could not write after the rewind"
-snapshot current
-echo "rewound: lost.txt gone, b.txt kept, c.txt anchored"
-restore fork                      # the host serves the abandoned history
+signed post --path /files/c.txt --body "alice-c" >/dev/null || fail "alice could not write c.txt"
+snapshot current                  # this history is anchored now
+echo "the crashed disk was admitted; from the anchor's own disk, c.txt anchored"
+restore fork                      # the host serves the other history
 reboot
 [[ "$BOOT" == refused ]] || fail "the enclave accepted an abandoned fork"
 plain | grep -oE "refusing the pool[^\"]*" | head -1 || true
@@ -199,4 +209,4 @@ reboot
 echo "the marker's disk refused; the anchored disk accepted, acked.txt present"
 
 echo
-echo "PASS: ZFS spike: anchored writes, isolation, resume, rollback refused, rewind, fork refused, marker disk refused"
+echo "PASS: ZFS spike: anchored writes, isolation, resume, rollback refused, crash resumed, fork refused, marker disk refused"
