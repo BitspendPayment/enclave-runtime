@@ -5,8 +5,8 @@
 # (nbd-stub.py, standing in for nbdkit and EBS), anchored in the roots bucket
 # after every request (runtime/src/zfs.rs). This plays the hostile host against
 # it — rolling the disk back, killing the enclave between a sync and its
-# anchor, serving an abandoned fork, serving the disk from between an anchor's
-# marker and its sync — and measures what an anchor costs.
+# anchor, serving an abandoned fork — measures what an anchor costs, and shows
+# two tenants' pools anchoring independently.
 #
 #   deploy/qemu-nitro/run-zfs-spike.sh          a fresh store
 #   BENCH=200 deploy/qemu-nitro/run-zfs-spike.sh
@@ -51,7 +51,7 @@ snapshot() { stop; cp --sparse=always "$IMG" "$STORE_DIR/$1.img"; }
 snapshot_live() { cp --sparse=always "$IMG" "$STORE_DIR/$1.img"; }
 restore() { stop; cp --sparse=always "$STORE_DIR/$1.img" "$IMG"; }
 
-say "1/7  two tenants write, each in its own dataset, and every write is anchored"
+say "1/7  two tenants write, each in its own pool, and every write is anchored"
 rm -f "$RUNDIR/alice.json" "$RUNDIR/bob.json"
 signed enrol >/dev/null || fail "alice could not enrol"
 signed2 enrol >/dev/null || fail "bob could not enrol"
@@ -65,7 +65,7 @@ ALICE="${tenants[0]:-}"
 grep -q "zfs anchored" <(plain) || fail "no request was anchored"
 echo "alice=$ALICE; $(plain | grep -c 'zfs anchored') anchors so far"
 
-say "2/7  tenants cannot reach each other"
+say "2/7  tenants cannot reach each other across their pools"
 for route in escape stat; do
     for target in "../$ALICE/http-example/a.txt" \
                   "/tenants/$ALICE/http-example/a.txt" \
@@ -169,44 +169,33 @@ reboot
 [[ "$(signed get --path /files/c.txt)" == "alice-c" ]] || fail "c.txt is gone"
 echo "abandoned fork refused; current disk accepted, c.txt present"
 
-# An anchor's nonce reaches the disk in one txg (the marker) and the anchor
-# names a later one (its sync). Another tenant's write that lands between them
-# is acknowledged by that anchor, so a disk from between the two holds the
-# anchor's nonce but not that write. The host serves it.
-say "7/7  a disk from between an anchor's marker and its sync is refused"
+# The same-nonce steal that sank the single pool — one tenant's write landing
+# between another's marker and its sync, acknowledged by an anchor that does
+# not hold it — cannot happen here: each tenant has its own pool, its own
+# marker, its own last-anchor lock. This shows the independence that makes it
+# so: one tenant held mid-anchor does not stop another from anchoring.
+say "7/7  two tenants anchor independently"
 hooks_start
-hook_rule after-marker hold
-before=$(plain | grep -c "zfs anchored" || true)
-signed post --path /files/m.txt --body "alice-m" > "$RUNDIR/alice-m.out" 2>&1 &
+hook_rule after-marker hold       # the first anchor to reach a marker holds there
+signed post --path /files/held.txt --body "alice-held" > "$RUNDIR/alice-held.out" 2>&1 &
 alice=$!
-hook_wait after-marker            # alice's nonce is on the disk; her anchor holds the lock
-snapshot_live marker
-signed2 post --path /files/acked.txt --body "bob-acked" > "$RUNDIR/bob-acked.out" 2>&1 &
+hook_wait after-marker            # alice holds her pool's lock, mid-anchor
+# Bob's pool is a different pool with a different lock, so his write must
+# complete while alice is held — not wait the whole hold out.
+signed2 post --path /files/free.txt --body "bob-free" > "$RUNDIR/bob-free.out" 2>&1 &
 bob=$!
-hook_wait anchor-wait             # bob's guest has written; his anchor waits on alice's
-hook_release after-marker
-wait "$alice" || fail "alice's write failed: $(cat "$RUNDIR/alice-m.out")"
-wait "$bob" || fail "bob's write was not acknowledged: $(cat "$RUNDIR/bob-acked.out")"
-hooks_stop
-published=$(( $(plain | grep -c "zfs anchored" || true) - before ))
-plain | grep "zfs anchored" | tail -"$published"
-[[ "$published" == 1 ]] \
-    || fail "bob's write took an anchor of its own ($published anchors), so the shortcut was not taken: revise the diagnosis"
-[[ "$(signed2 get --path /files/acked.txt)" == "bob-acked" ]] || fail "bob cannot read his acknowledged write"
-snapshot acked                    # holds acked.txt, anchored
-restore marker
-reboot
-if [[ "$BOOT" == served ]]; then
-    plain | grep -E "zfs import: (dbgmsg|txgs)|zfs pool resumed" || true
-    got="$(signed2 get --path /files/acked.txt 2>&1 || true)"
-    fail "REPRODUCED: the enclave served the disk from between the marker and its sync; bob's acknowledged acked.txt now reads: $got"
+for _ in $(seq 60); do kill -0 "$bob" 2>/dev/null || break; sleep 1; done
+if kill -0 "$bob" 2>/dev/null; then
+    hook_release after-marker; wait "$alice" "$bob" 2>/dev/null || true; hooks_stop
+    fail "bob's write did not finish while alice was held: the pools are not independent"
 fi
-plain | grep -oE "refusing the pool[^\"]*" | head -1 || true
-restore acked
-reboot
-[[ "$BOOT" == served ]] || fail "the enclave refused the disk holding bob's write"
-[[ "$(signed2 get --path /files/acked.txt)" == "bob-acked" ]] || fail "acked.txt is gone"
-echo "the marker's disk refused; the anchored disk accepted, acked.txt present"
+wait "$bob" || fail "bob's independent write failed: $(cat "$RUNDIR/bob-free.out")"
+hook_release after-marker
+wait "$alice" || fail "alice's held write failed: $(cat "$RUNDIR/alice-held.out")"
+hooks_stop
+[[ "$(signed2 get --path /files/free.txt)" == "bob-free" ]] || fail "bob's write is gone"
+[[ "$(signed  get --path /files/held.txt)" == "alice-held" ]] || fail "alice's write is gone"
+echo "bob anchored while alice was held: tenants anchor independently"
 
 echo
-echo "PASS: ZFS spike: anchored writes, isolation, resume, rollback refused, crash resumed, fork refused, marker disk refused"
+echo "PASS: ZFS spike: per-tenant pools, isolation, resume, rollback refused, crash resumed, fork refused, independent anchoring"

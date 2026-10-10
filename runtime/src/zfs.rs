@@ -45,6 +45,7 @@
 //! cannot know on its own is whether the store is still adding them; that is
 //! what `--min-root-seq` is for.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -73,7 +74,6 @@ use zeroize::Zeroize;
 use crate::tenant::Arrival;
 
 pub const POOL: &str = "enclave";
-const MAPPED: &str = "/dev/mapper/zcrypt";
 const NBD_DEVICE: &str = "/dev/nbd0";
 /// The parent, as every enclave sees it.
 const PARENT_CID: u32 = 3;
@@ -137,6 +137,56 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 
 fn id_at(b: &[u8], off: usize) -> [u8; 16] {
     b[off..off + 16].try_into().expect("16 bytes")
+}
+
+/// The disk is cut into equal regions, one pool each: region 0 the control
+/// pool, the rest tenant pools. 512-byte sectors; a region is 4 KiB-aligned so
+/// its dm-crypt mapping starts on a block boundary.
+const SECTORS_PER_MIB: u64 = (1024 * 1024) / 512;
+
+/// The default region size until a deployment sets one with `--region-mib`. A
+/// ZFS pool needs only tens of MiB, so this is deliberately small.
+const DEFAULT_REGION_MIB: u64 = 200;
+
+/// A nominal disk size, in regions, for a directory-backed manager: enough for
+/// the tests' tenants without a real disk behind it.
+#[cfg(any(test, feature = "testing"))]
+const SCRATCH_REGIONS: u64 = 64;
+
+/// The region an index occupies, as `(offset_sectors, length_sectors)`, or
+/// `None` if it does not fit. Regions never overlap and never run past the
+/// disk: region `i` is `[i*len, (i+1)*len)`, and a trailing partial region is
+/// unused.
+fn region_bounds(index: u64, region_sectors: u64, disk_sectors: u64) -> Option<(u64, u64)> {
+    let offset = index.checked_mul(region_sectors)?;
+    (offset.checked_add(region_sectors)? <= disk_sectors).then_some((offset, region_sectors))
+}
+
+/// How many whole regions a disk holds: the cap on pools, control included.
+fn region_count(region_sectors: u64, disk_sectors: u64) -> u64 {
+    disk_sectors / region_sectors.max(1)
+}
+
+/// What a pool needs once the manager has mapped its device.
+struct PoolSpec {
+    name: String,
+    mapped: String,
+    kind: PoolKind,
+    pool_id: [u8; 16],
+    tenant_id: [u8; 16],
+    anchor_prefix: String,
+    root: PathBuf,
+    is_pool: bool,
+}
+
+/// One control pool, plus a pool per tenant allocated to a region. The names
+/// and paths each pool uses, derived from its id so two tenants never collide.
+fn tenant_pool_name(pool_id: &[u8; 16]) -> String {
+    // zpool names must start with a letter.
+    format!("p{}", hex::encode(pool_id))
+}
+fn tenant_dev_name(pool_id: &[u8; 16]) -> String {
+    format!("zcrypt-{}", hex::encode(pool_id))
 }
 
 /// One anchored pool state, chained to the one before it.
@@ -294,6 +344,93 @@ fn seal_generation(keys: &KeyMaterial, generation: u64) -> Bytes {
     Bytes::from(b)
 }
 
+fn generation_key(prefix: &str, generation: u64) -> String {
+    format!("{prefix}zfs/generations/{generation:016x}")
+}
+
+/// Does a retained object exist at `key`? A delete marker reads as absent.
+async fn exists_raw(roots: &Arc<dyn Backend>, key: &str) -> Result<bool> {
+    match roots.get_retained_blob(key).await {
+        Ok(_) => Ok(true),
+        Err(StoreError::NotFound) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The newest number of a contiguous, never-deleted chain: existence is
+/// monotone, so gallop then bisect.
+async fn chain_tip(roots: &Arc<dyn Backend>, key: impl Fn(u64) -> String) -> Result<Option<u64>> {
+    if !exists_raw(roots, &key(0)).await? {
+        return Ok(None);
+    }
+    let (mut lo, mut step) = (0u64, 1u64);
+    while let Some(next) = lo.checked_add(step) {
+        if !exists_raw(roots, &key(next)).await? {
+            break;
+        }
+        lo = next;
+        step = step.saturating_mul(2);
+    }
+    let mut hi = lo.saturating_add(step);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if exists_raw(roots, &key(mid)).await? {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(Some(lo))
+}
+
+/// Whether a generation exists, verifying it so a host cannot fence this
+/// enclave out with a record it forged for another filesystem.
+async fn generation_exists(
+    roots: &Arc<dyn Backend>,
+    keys: &KeyMaterial,
+    prefix: &str,
+    generation: u64,
+) -> Result<bool> {
+    let key = generation_key(prefix, generation);
+    if exists_raw(roots, &key).await? {
+        verify_generation(&roots.get_retained_blob(&key).await?.body, keys, generation)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Claim the first unused generation for this boot, racing other boots for it.
+/// Each win is read back, since a delete marker could otherwise let a second
+/// PUT through, as for an anchor.
+async fn claim_generation(
+    roots: &Arc<dyn Backend>,
+    keys: &KeyMaterial,
+    prefix: &str,
+    retention: Duration,
+) -> Result<u64> {
+    for _ in 0..1024 {
+        let generation = chain_tip(roots, |g| generation_key(prefix, g))
+            .await?
+            .map_or(0, |t| t + 1);
+        let key = generation_key(prefix, generation);
+        let body = seal_generation(keys, generation);
+        let input = PutBlobInput::new(key.clone(), body.clone()).with_object_lock(ObjectLock {
+            mode: ObjectLockMode::Compliance,
+            retain_until: std::time::SystemTime::now() + retention,
+        });
+        match roots.put_blob_if_not_exists(input).await {
+            Ok(_) if roots.get_retained_blob(&key).await?.body == body => {
+                tracing::info!(generation, "claimed an enclave generation");
+                return Ok(generation);
+            }
+            Ok(_) | Err(StoreError::AlreadyExists) => continue, // lost the race; try the next
+            Err(e) => return Err(e.into()),
+        }
+    }
+    bail!("could not claim an enclave generation after 1024 tries; the store is being raced")
+}
+
 fn verify_generation(bytes: &[u8], keys: &KeyMaterial, expected: u64) -> StoreResult<()> {
     if bytes.len() != GEN_LEN || &bytes[..8] != GEN_MAGIC {
         return Err(StoreError::Integrity("zfs generation: not a generation"));
@@ -386,34 +523,26 @@ impl std::fmt::Debug for Pool {
 }
 
 impl Pool {
-    /// Genesis: create the pool on a blank disk and publish anchor 0. Refuses a
-    /// disk that already holds a pool, and a bucket that already has anchors.
+    /// Genesis for one pool: create it on its blank device and publish anchor
+    /// 0. Refuses a device that already holds a pool, and a chain that already
+    /// has anchors. The generation is the manager's, claimed once per boot.
     async fn create(
         disk: &Disk,
         roots: Arc<dyn Backend>,
         keys: Arc<KeyMaterial>,
-        master: &MasterSecret,
         prefix: &str,
         retention: Duration,
+        spec: PoolSpec,
+        generation: u64,
     ) -> Result<Arc<Pool>> {
-        let mut zfs = Pool::attach(disk, roots, keys, master, prefix, retention).await?;
+        let mut zfs = Pool::attach(disk, roots, keys, prefix, retention, spec, generation);
         ensure!(
             zfs.find_tip().await?.is_none(),
-            "the roots bucket already has anchors; genesis would start a second history"
+            "this pool's chain already has anchors; genesis would start a second history"
         );
-        zfs.generation = zfs
-            .claim_generation()
-            .await
-            .context("claiming the first enclave generation")?;
         if zfs.pool {
-            // `zpool import` with no pool name lists what it could import.
-            let listed = Command::new("zpool")
-                .args(["import", "-d", "/dev/mapper"])
-                .output()
-                .await
-                .context("running zpool")?;
-            if String::from_utf8_lossy(&listed.stdout).contains("pool:") {
-                bail!("the disk holds a pool but no anchor names it; refusing to guess");
+            if pool_present(&zfs.mapped).await? {
+                bail!("the device holds a pool but no anchor names it; refusing to guess");
             }
             run(
                 "zpool",
@@ -439,59 +568,58 @@ impl Pool {
                 ],
             )
             .await?;
-            for name in ["tenants", "runtime"] {
+            for ds in zfs.datasets() {
+                let mount = zfs.root.join(ds);
                 run(
                     "zfs",
                     &[
                         "create",
                         "-o",
-                        &format!("mountpoint=/{name}"),
-                        &format!("{}/{name}", zfs.name),
+                        &format!("mountpoint={}", mount.display()),
+                        &format!("{}/{ds}", zfs.name),
                     ],
                 )
                 .await?;
             }
             zfs.pool_guid = pool_guid(&zfs.name).await?;
         } else {
-            for name in ["tenants", "runtime"] {
-                tokio::fs::create_dir_all(zfs.root.join(name)).await?;
+            for ds in zfs.datasets() {
+                tokio::fs::create_dir_all(zfs.root.join(ds)).await?;
             }
         }
         let genesis = zfs.seal_and_publish(None).await?;
         zfs.genesis = genesis.hash();
         tracing::info!(
+            name = %zfs.name,
             pool_guid = zfs.pool_guid,
             txg = genesis.txg,
-            "zfs genesis: created the pool"
+            "zfs genesis: created a pool"
         );
         zfs.last = Mutex::new(Ok(genesis));
         Ok(Arc::new(zfs))
     }
 
-    /// Resume: import the pool as it is, and refuse it unless the newest
-    /// anchor vouches for what ZFS loaded (see [`admit`]). `min_seq` is a floor
-    /// from outside the store.
+    /// Resume one pool: import it as it is, and refuse it unless the newest
+    /// anchor vouches for what ZFS loaded (see [`admit`]). `min_seq` floors the
+    /// chain from outside; `expect_genesis` pins which history it must be (a
+    /// tenant pool against its catalog entry).
+    #[allow(clippy::too_many_arguments)]
     async fn open(
         disk: &Disk,
         roots: Arc<dyn Backend>,
         keys: Arc<KeyMaterial>,
-        master: &MasterSecret,
         prefix: &str,
         retention: Duration,
+        spec: PoolSpec,
+        generation: u64,
         min_seq: Option<u64>,
+        expect_genesis: Option<Hash256>,
     ) -> Result<Arc<Pool>> {
-        let mut zfs = Pool::attach(disk, roots, keys, master, prefix, retention).await?;
-        // Before the read-write import below, so a second enclave the host
-        // starts cannot both fork this disk and let the enclave it forked from
-        // go on to publish — the fence in `seal_and_publish` refuses that.
-        zfs.generation = zfs
-            .claim_generation()
-            .await
-            .context("claiming an enclave generation")?;
+        let mut zfs = Pool::attach(disk, roots, keys, prefix, retention, spec, generation);
         let seq = zfs
             .find_tip()
             .await?
-            .context("the roots bucket has no anchors; there is no pool to resume")?;
+            .context("this pool's chain has no anchors; there is nothing to resume")?;
         if let Some(min) = min_seq {
             ensure!(seq >= min, "the newest anchor is {seq}, below the floor of {min}: refusing a rolled-back store");
         }
@@ -504,6 +632,12 @@ impl Pool {
         } else {
             zfs.load(0).await?.hash()
         };
+        if let Some(expected) = expect_genesis {
+            ensure!(
+                zfs.genesis == expected,
+                "this pool is a different history than its catalog entry names"
+            );
+        }
         if zfs.pool {
             // The newest state on the disk, not `-T` the anchored txg: that
             // takes the newest uberblock at or below it with no exact match,
@@ -540,6 +674,7 @@ impl Pool {
             }
             run("zfs", &["mount", "-a"]).await?;
             tracing::info!(
+                name = %zfs.name,
                 loaded_txg = loaded,
                 marker = marker.trim(),
                 "zfs pool admitted"
@@ -547,6 +682,7 @@ impl Pool {
         }
         zfs.pool_guid = tip.pool_guid;
         tracing::info!(
+            name = %zfs.name,
             seq,
             txg = tip.txg,
             pool_guid = zfs.pool_guid,
@@ -556,63 +692,47 @@ impl Pool {
         Ok(Arc::new(zfs))
     }
 
-    /// Bring up the disk under the pool, without touching the pool.
-    async fn attach(
+    /// Build a pool's handle on a device the manager has already mapped. No
+    /// device or dm-crypt work and no generation claim: the manager does both
+    /// once and passes the result in.
+    fn attach(
         disk: &Disk,
         roots: Arc<dyn Backend>,
         keys: Arc<KeyMaterial>,
-        master: &MasterSecret,
         prefix: &str,
         retention: Duration,
-    ) -> Result<Pool> {
-        let (root, pool) = match disk {
-            Disk::Parent => {
-                insmod("/lib/zfs/spl.ko", "")?;
-                insmod("/lib/zfs/zfs.ko", ZFS_PARAMS)?;
-                let size = nbd_attach(NBD_PORT)?;
-                dmcrypt(master, keys.fs_uuid(), size).await?;
-                (PathBuf::from("/"), true)
-            }
-            #[cfg(any(test, feature = "testing"))]
-            Disk::Directory(dir) => (dir.path().to_path_buf(), false),
-        };
-        Ok(Pool {
+        spec: PoolSpec,
+        generation: u64,
+    ) -> Pool {
+        Pool {
             disk: disk.clone(),
             keys,
             roots,
             prefix: prefix.to_string(),
-            anchor_prefix: format!("{prefix}zfs/"),
+            anchor_prefix: spec.anchor_prefix,
             retention,
-            name: POOL.to_string(),
-            mapped: MAPPED.to_string(),
-            kind: PoolKind::Control,
-            pool_id: CONTROL_POOL_ID,
-            tenant_id: [0u8; 16],
-            root,
-            pool,
+            name: spec.name,
+            mapped: spec.mapped,
+            kind: spec.kind,
+            pool_id: spec.pool_id,
+            tenant_id: spec.tenant_id,
+            root: spec.root,
+            pool: spec.is_pool,
             pool_guid: 0,
             genesis: Hash256::ZERO,
-            generation: 0,
+            generation,
             last: Mutex::new(Err("not opened".into())),
-        })
+        }
     }
 
-    /// A pool in a temporary directory with its anchors in memory: what
-    /// in-process tests run on.
-    #[cfg(any(test, feature = "testing"))]
-    async fn scratch_pool() -> Arc<Pool> {
-        let master = MasterSecret::from_bytes([7u8; 32]);
-        let keys = Arc::new(KeyMaterial::derive(&master, [0u8; 16]).expect("deriving keys"));
-        Pool::create(
-            &Disk::scratch().expect("a temporary directory"),
-            Arc::new(crate::store::backend::memory::MemoryBackend::new()),
-            keys,
-            &master,
-            "",
-            Duration::from_secs(3600),
-        )
-        .await
-        .expect("a scratch pool")
+    /// The datasets this kind of pool holds, each mounted at `root`/`name`: the
+    /// control pool keeps the runtime's records, a tenant pool the guest's
+    /// data — the only thing a guest ever sees.
+    fn datasets(&self) -> &'static [&'static str] {
+        match self.kind {
+            PoolKind::Control => &["runtime"],
+            PoolKind::Tenant => &["data"],
+        }
     }
 
     /// The hash of anchor 0: which history this pool is, for the boot receipt.
@@ -715,7 +835,9 @@ impl Pool {
         // which is harmless — nothing was acknowledged, and the next boot's
         // admission handles an unpublished marker. Only a real anchor fences;
         // genesis is guarded by the sealed-key lease instead.
-        if prev.is_some() && self.generation_exists(self.generation + 1).await? {
+        if prev.is_some()
+            && generation_exists(&self.roots, &self.keys, &self.prefix, self.generation + 1).await?
+        {
             bail!(
                 "a newer enclave generation ({}) exists; this one is superseded and will not anchor",
                 self.generation + 1
@@ -737,48 +859,15 @@ impl Pool {
         Ok(anchor)
     }
 
-    /// A tenant's directory: its own dataset, created on first use and
-    /// anchored with whatever created it.
-    pub async fn tenant_dir(&self, tenant_id: [u8; 16]) -> Result<(PathBuf, Arrival)> {
-        let dir = self.tenant_path(tenant_id);
-        if tokio::fs::try_exists(&dir).await? {
-            return Ok((dir, Arrival::Returning));
-        }
-        if self.pool {
-            run(
-                "zfs",
-                &[
-                    "create",
-                    &format!("{}/tenants/{}", self.name, hex::encode(tenant_id)),
-                ],
-            )
-            .await?;
-        } else {
-            tokio::fs::create_dir(&dir).await?;
-        }
-        Ok((dir, Arrival::New))
+    /// Where the guest's files live: the `data` dataset on a tenant pool. The
+    /// only thing a guest ever sees.
+    fn data_dir(&self) -> PathBuf {
+        self.root.join("data")
     }
 
-    /// A tenant's directory, which must already exist. For work that runs on
-    /// a tenant's behalf without them, and so must never bring one back.
-    pub async fn existing_tenant_dir(&self, tenant_id: [u8; 16]) -> Result<PathBuf> {
-        let dir = self.tenant_path(tenant_id);
-        ensure!(
-            tokio::fs::try_exists(&dir).await?,
-            "tenant {} has no directory",
-            hex::encode(tenant_id)
-        );
-        Ok(dir)
-    }
-
-    /// Where a tenant's directory is, whether or not it exists yet.
-    pub fn tenant_path(&self, tenant_id: [u8; 16]) -> PathBuf {
-        self.root.join("tenants").join(hex::encode(tenant_id))
-    }
-
-    /// A directory of runtime state under `/runtime`, out of every guest's
-    /// reach: no preopen names anything above a tenant's own directory.
-    pub async fn runtime_dir(&self, name: &str) -> Result<PathBuf> {
+    /// A directory of runtime records on this pool (the control pool), out of
+    /// every guest's reach — no preopen names anything above a tenant's `data`.
+    async fn runtime_dir(&self, name: &str) -> Result<PathBuf> {
         let dir = self.root.join("runtime").join(name);
         tokio::fs::create_dir_all(&dir).await?;
         Ok(dir)
@@ -790,23 +879,11 @@ impl Pool {
         format!("{}anchors/{seq:016x}", self.anchor_prefix)
     }
 
-    fn generation_key(&self, generation: u64) -> String {
-        format!("{}zfs/generations/{generation:016x}", self.prefix)
-    }
-
     /// The retained version of a key: a delete marker hides an Object-Locked
     /// object from a plain GET while leaving it there, so a plain GET would let
     /// the host roll a chain back with one legal call.
     async fn retained(&self, key: &str) -> StoreResult<Bytes> {
         Ok(self.roots.get_retained_blob(key).await?.body)
-    }
-
-    async fn exists(&self, key: &str) -> Result<bool> {
-        match self.retained(key).await {
-            Ok(_) => Ok(true),
-            Err(StoreError::NotFound) => Ok(false),
-            Err(e) => Err(e.into()),
-        }
     }
 
     async fn load(&self, seq: u64) -> Result<Anchor> {
@@ -818,73 +895,9 @@ impl Pool {
         )?)
     }
 
-    async fn generation_exists(&self, generation: u64) -> Result<bool> {
-        let key = self.generation_key(generation);
-        if self.exists(&key).await? {
-            // Verify it, so a host cannot fence this enclave out with a record
-            // it forged for another filesystem.
-            verify_generation(&self.retained(&key).await?, &self.keys, generation)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// The newest existing number of a contiguous, never-deleted chain:
-    /// existence is monotone, so gallop then bisect.
-    async fn chain_tip(&self, key: impl Fn(u64) -> String) -> Result<Option<u64>> {
-        if !self.exists(&key(0)).await? {
-            return Ok(None);
-        }
-        let (mut lo, mut step) = (0u64, 1u64);
-        while let Some(next) = lo.checked_add(step) {
-            if !self.exists(&key(next)).await? {
-                break;
-            }
-            lo = next;
-            step = step.saturating_mul(2);
-        }
-        let mut hi = lo.saturating_add(step);
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if self.exists(&key(mid)).await? {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        Ok(Some(lo))
-    }
-
+    /// The newest anchor of this pool's chain, or `None` if it has none.
     async fn find_tip(&self) -> Result<Option<u64>> {
-        self.chain_tip(|seq| self.anchor_key(seq)).await
-    }
-
-    /// Claim the first unused generation, racing other boots for it. Each win
-    /// is read back, since a delete marker could otherwise let a second PUT
-    /// through, as for an anchor.
-    async fn claim_generation(&self) -> Result<u64> {
-        for _ in 0..1024 {
-            let generation = self
-                .chain_tip(|g| self.generation_key(g))
-                .await?
-                .map_or(0, |t| t + 1);
-            let key = self.generation_key(generation);
-            let body = seal_generation(&self.keys, generation);
-            let input = PutBlobInput::new(key.clone(), body.clone()).with_object_lock(ObjectLock {
-                mode: ObjectLockMode::Compliance,
-                retain_until: std::time::SystemTime::now() + self.retention,
-            });
-            match self.roots.put_blob_if_not_exists(input).await {
-                Ok(_) if self.retained(&key).await? == body => {
-                    tracing::info!(generation, "claimed an enclave generation");
-                    return Ok(generation);
-                }
-                Ok(_) | Err(StoreError::AlreadyExists) => continue, // lost the race; try the next
-                Err(e) => return Err(e.into()),
-            }
-        }
-        bail!("could not claim an enclave generation after 1024 tries; the store is being raced")
+        chain_tip(&self.roots, |seq| self.anchor_key(seq)).await
     }
 
     /// Publish `seq`, winning or losing the race for it. `If-None-Match`
@@ -910,6 +923,34 @@ impl Pool {
     }
 }
 
+/// One tenant's place in the catalog: which pool is theirs, where it sits, and
+/// which history it must be. Kept on the control pool, out of every guest's
+/// reach, so the host cannot point a tenant at another's pool.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CatalogEntry {
+    version: u32,
+    #[serde(with = "hex_bytes")]
+    pool_id: [u8; 16],
+    region: u64,
+    #[serde(with = "hex_bytes")]
+    genesis: [u8; 32],
+}
+
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(b: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(b))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>, const N: usize>(
+        d: D,
+    ) -> Result<[u8; N], D::Error> {
+        let s = String::deserialize(d)?;
+        let v = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        v.try_into()
+            .map_err(|_| serde::de::Error::custom("wrong length"))
+    }
+}
+
 /// The enclave's storage: the control pool, and a tenant's pool imported as it
 /// is used. One disk underneath, cut into equal regions (see [`region_bounds`]),
 /// each its own dm-crypt device and its own pool with its own anchor chain.
@@ -917,21 +958,52 @@ impl Pool {
 /// The public type the rest of the runtime holds. It routes a tenant's writes
 /// to that tenant's pool and the runtime's own records to the control pool, and
 /// anchors each independently.
+/// A tenant pool, imported once per boot behind its slot.
+type PoolSlot = Arc<tokio::sync::OnceCell<Arc<Pool>>>;
+
 pub struct Zfs {
+    disk: Disk,
+    roots: Arc<dyn Backend>,
+    keys: Arc<KeyMaterial>,
+    /// Held to derive a region's dm-crypt key as tenants arrive.
+    master: MasterSecret,
+    prefix: String,
+    retention: Duration,
+    /// Real ZFS, or a directory stand-in for tests.
+    is_pool: bool,
+    region_sectors: u64,
+    disk_sectors: u64,
+    /// The cap on pools, control included: how many regions the disk holds.
+    max_pools: u64,
+    /// This boot's generation, claimed once; every pool's fence checks it.
+    generation: u64,
     control: Arc<Pool>,
+    /// Tenant pools, imported on demand. The slot (a `OnceCell`) serialises a
+    /// tenant's first access without serialising everyone; steady state is a
+    /// lock-free map read.
+    tenants: std::sync::Mutex<HashMap<[u8; 16], PoolSlot>>,
+    /// A tenant's data directory once its pool is known, for the sync
+    /// `tenant_path`. The disk root, for a path to a tenant not yet seen.
+    tenant_roots: std::sync::Mutex<HashMap<[u8; 16], PathBuf>>,
+    /// Held while a new tenant pool is allocated and its catalog entry written,
+    /// so two different new tenants cannot be handed the same free region.
+    /// Rare (a tenant's first write); imports and steady state never take it.
+    create_lock: Mutex<()>,
+    root_base: PathBuf,
 }
 
 impl std::fmt::Debug for Zfs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Zfs")
             .field("control", &self.control)
+            .field("max_pools", &self.max_pools)
             .finish()
     }
 }
 
 impl Zfs {
-    /// Genesis: bring up the disk, create the control pool, publish its anchor
-    /// 0. Tenant pools are created as tenants arrive.
+    /// Genesis: bring up the disk, create the control pool in region 0, publish
+    /// its anchor 0. Tenant pools are created as tenants arrive.
     pub async fn create(
         disk: &Disk,
         roots: Arc<dyn Backend>,
@@ -940,11 +1012,47 @@ impl Zfs {
         prefix: &str,
         retention: Duration,
     ) -> Result<Arc<Zfs>> {
-        let control = Pool::create(disk, roots, keys, master, prefix, retention).await?;
-        Ok(Arc::new(Zfs { control }))
+        let (root_base, is_pool, disk_sectors) = bring_up(disk)?;
+        let region_sectors = DEFAULT_REGION_MIB * SECTORS_PER_MIB;
+        let generation = claim_generation(&roots, &keys, prefix, retention).await?;
+        let (spec, _) = control_spec(
+            master,
+            &keys,
+            prefix,
+            is_pool,
+            &root_base,
+            region_sectors,
+            disk_sectors,
+        )
+        .await?;
+        let control = Pool::create(
+            disk,
+            roots.clone(),
+            keys.clone(),
+            prefix,
+            retention,
+            spec,
+            generation,
+        )
+        .await?;
+        Ok(Self::assemble(
+            disk,
+            roots,
+            keys,
+            master,
+            prefix,
+            retention,
+            is_pool,
+            region_sectors,
+            disk_sectors,
+            generation,
+            control,
+            root_base,
+        ))
     }
 
     /// Resume: bring up the disk and import the control pool at its anchor.
+    /// `min_seq` floors the control chain from outside.
     pub async fn open(
         disk: &Disk,
         roots: Arc<dyn Backend>,
@@ -954,15 +1062,98 @@ impl Zfs {
         retention: Duration,
         min_seq: Option<u64>,
     ) -> Result<Arc<Zfs>> {
-        let control = Pool::open(disk, roots, keys, master, prefix, retention, min_seq).await?;
-        Ok(Arc::new(Zfs { control }))
+        let (root_base, is_pool, disk_sectors) = bring_up(disk)?;
+        let region_sectors = DEFAULT_REGION_MIB * SECTORS_PER_MIB;
+        let generation = claim_generation(&roots, &keys, prefix, retention).await?;
+        let (spec, _) = control_spec(
+            master,
+            &keys,
+            prefix,
+            is_pool,
+            &root_base,
+            region_sectors,
+            disk_sectors,
+        )
+        .await?;
+        let control = Pool::open(
+            disk,
+            roots.clone(),
+            keys.clone(),
+            prefix,
+            retention,
+            spec,
+            generation,
+            min_seq,
+            None,
+        )
+        .await?;
+        let zfs = Self::assemble(
+            disk,
+            roots,
+            keys,
+            master,
+            prefix,
+            retention,
+            is_pool,
+            region_sectors,
+            disk_sectors,
+            generation,
+            control,
+            root_base,
+        );
+        zfs.validate_catalog().await?;
+        Ok(zfs)
     }
 
     /// In-process test storage: a control pool in a temporary directory.
     #[cfg(any(test, feature = "testing"))]
     pub async fn scratch() -> Arc<Zfs> {
+        let master = MasterSecret::from_bytes([7u8; 32]);
+        let keys = Arc::new(KeyMaterial::derive(&master, [0u8; 16]).expect("deriving keys"));
+        Zfs::create(
+            &Disk::scratch().expect("a temporary directory"),
+            Arc::new(crate::store::backend::memory::MemoryBackend::new()),
+            keys,
+            &master,
+            "",
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("a scratch pool")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        disk: &Disk,
+        roots: Arc<dyn Backend>,
+        keys: Arc<KeyMaterial>,
+        master: &MasterSecret,
+        prefix: &str,
+        retention: Duration,
+        is_pool: bool,
+        region_sectors: u64,
+        disk_sectors: u64,
+        generation: u64,
+        control: Arc<Pool>,
+        root_base: PathBuf,
+    ) -> Arc<Zfs> {
         Arc::new(Zfs {
-            control: Pool::scratch_pool().await,
+            disk: disk.clone(),
+            roots,
+            keys,
+            master: master.clone(),
+            prefix: prefix.to_string(),
+            retention,
+            is_pool,
+            region_sectors,
+            disk_sectors,
+            max_pools: region_count(region_sectors, disk_sectors),
+            generation,
+            control,
+            tenants: std::sync::Mutex::new(HashMap::new()),
+            tenant_roots: std::sync::Mutex::new(HashMap::new()),
+            create_lock: Mutex::new(()),
+            root_base,
         })
     }
 
@@ -978,25 +1169,51 @@ impl Zfs {
         self.control.runtime_dir(name).await
     }
 
-    /// A tenant's data directory, created on first use.
+    /// A tenant's data directory, its pool created on first use.
     pub async fn tenant_dir(&self, tenant_id: [u8; 16]) -> Result<(PathBuf, Arrival)> {
-        self.control.tenant_dir(tenant_id).await
+        let fresh = !self
+            .tenants
+            .lock()
+            .expect("tenants mutex")
+            .contains_key(&tenant_id);
+        let pool = self.tenant_pool(tenant_id, true).await?;
+        let arrival = if fresh {
+            Arrival::New
+        } else {
+            Arrival::Returning
+        };
+        Ok((pool.data_dir(), arrival))
     }
 
-    /// A tenant's data directory, which must already exist. For work that runs
-    /// on a tenant's behalf without them, and so must never bring one back.
+    /// A tenant's data directory, whose pool must already exist. For work that
+    /// runs on a tenant's behalf without them, and so must never bring one back.
     pub async fn existing_tenant_dir(&self, tenant_id: [u8; 16]) -> Result<PathBuf> {
-        self.control.existing_tenant_dir(tenant_id).await
+        Ok(self.tenant_pool(tenant_id, false).await?.data_dir())
     }
 
-    /// Where a tenant's data directory is, whether or not it exists yet.
+    /// Where a tenant's data directory is. Known exactly once the pool has been
+    /// opened; otherwise a path under the disk that does not exist, enough for
+    /// callers only asking whether a tenant's files are there.
     pub fn tenant_path(&self, tenant_id: [u8; 16]) -> PathBuf {
-        self.control.tenant_path(tenant_id)
+        self.tenant_roots
+            .lock()
+            .expect("tenant_roots mutex")
+            .get(&tenant_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.root_base
+                    .join("pools")
+                    .join(format!("absent-{}", hex::encode(tenant_id)))
+                    .join("data")
+            })
     }
 
     /// Anchor a tenant's writes: its own pool, then the control pool for any
     /// record a request of theirs left there. Both before anyone is told.
-    pub async fn anchor_tenant(&self, _tenant_id: [u8; 16]) -> Result<()> {
+    pub async fn anchor_tenant(&self, tenant_id: [u8; 16]) -> Result<()> {
+        if let Some(pool) = self.imported(tenant_id) {
+            pool.anchor().await?;
+        }
         self.control.anchor().await
     }
 
@@ -1004,6 +1221,284 @@ impl Zfs {
     pub async fn anchor_control(&self) -> Result<()> {
         self.control.anchor().await
     }
+
+    /// The tenant's pool if it is already imported this boot.
+    fn imported(&self, tenant_id: [u8; 16]) -> Option<Arc<Pool>> {
+        self.tenants
+            .lock()
+            .expect("tenants mutex")
+            .get(&tenant_id)
+            .and_then(|cell| cell.get().cloned())
+    }
+
+    /// Get the tenant's pool, importing it (or, with `create`, genesis-ing it)
+    /// on first use. A tenant's first access is serialised by its slot; others
+    /// are not.
+    async fn tenant_pool(&self, tenant_id: [u8; 16], create: bool) -> Result<Arc<Pool>> {
+        let cell = {
+            let mut map = self.tenants.lock().expect("tenants mutex");
+            if !map.contains_key(&tenant_id) {
+                ensure!(
+                    (map.len() as u64) + 1 < self.max_pools,
+                    "no free pool region: the disk holds {} pools and all are taken",
+                    self.max_pools
+                );
+                map.insert(tenant_id, PoolSlot::default());
+            }
+            map.get(&tenant_id).expect("just inserted").clone()
+        };
+        let pool = cell
+            .get_or_try_init(|| self.open_or_create_tenant(tenant_id, create))
+            .await?;
+        self.tenant_roots
+            .lock()
+            .expect("tenant_roots mutex")
+            .insert(tenant_id, pool.data_dir());
+        Ok(pool.clone())
+    }
+
+    async fn open_or_create_tenant(&self, tenant_id: [u8; 16], create: bool) -> Result<Arc<Pool>> {
+        match self.read_catalog(tenant_id).await? {
+            Some(entry) => self.import_tenant(tenant_id, entry).await,
+            None if create => self.create_tenant(tenant_id).await,
+            None => bail!("tenant {} has no storage", hex::encode(tenant_id)),
+        }
+    }
+
+    async fn import_tenant(&self, tenant_id: [u8; 16], entry: CatalogEntry) -> Result<Arc<Pool>> {
+        let spec = self
+            .tenant_spec(tenant_id, entry.pool_id, entry.region)
+            .await?;
+        Pool::open(
+            &self.disk,
+            self.roots.clone(),
+            self.keys.clone(),
+            &self.prefix,
+            self.retention,
+            spec,
+            self.generation,
+            None,
+            Some(Hash256::from_bytes(entry.genesis)),
+        )
+        .await
+    }
+
+    async fn create_tenant(&self, tenant_id: [u8; 16]) -> Result<Arc<Pool>> {
+        let _creating = self.create_lock.lock().await;
+        let region = self.free_region().await?;
+        let mut pool_id = [0u8; 16];
+        getrandom::fill(&mut pool_id).map_err(|e| anyhow!("pool id entropy: {e}"))?;
+        let spec = self.tenant_spec(tenant_id, pool_id, region).await?;
+        let pool = Pool::create(
+            &self.disk,
+            self.roots.clone(),
+            self.keys.clone(),
+            &self.prefix,
+            self.retention,
+            spec,
+            self.generation,
+        )
+        .await?;
+        let entry = CatalogEntry {
+            version: 1,
+            pool_id,
+            region,
+            genesis: pool.genesis_hash(),
+        };
+        self.write_catalog(tenant_id, &entry).await?;
+        // The catalog entry is durable before the tenant is served: a crash
+        // before this leaves an unreferenced pool and a free region, nothing
+        // acknowledged.
+        self.control.anchor().await?;
+        tracing::info!(
+            tenant = %hex::encode(tenant_id),
+            region,
+            pool = %tenant_pool_name(&pool_id),
+            "created a tenant pool"
+        );
+        Ok(pool)
+    }
+
+    /// Build a tenant pool's spec, mapping its region as a dm-crypt device.
+    async fn tenant_spec(
+        &self,
+        tenant_id: [u8; 16],
+        pool_id: [u8; 16],
+        region: u64,
+    ) -> Result<PoolSpec> {
+        let (offset, len) = region_bounds(region, self.region_sectors, self.disk_sectors)
+            .with_context(|| format!("region {region} does not fit the disk"))?;
+        let root = self.pool_root(&pool_id);
+        let mapped = if self.is_pool {
+            map_region(
+                &self.master,
+                self.keys.fs_uuid(),
+                PoolKind::Tenant,
+                &pool_id,
+                &tenant_dev_name(&pool_id),
+                offset,
+                len,
+            )
+            .await?
+        } else {
+            String::new()
+        };
+        Ok(PoolSpec {
+            name: tenant_pool_name(&pool_id),
+            mapped,
+            kind: PoolKind::Tenant,
+            pool_id,
+            tenant_id,
+            anchor_prefix: format!("{}zfs/pools/{}/", self.prefix, hex::encode(pool_id)),
+            root,
+            is_pool: self.is_pool,
+        })
+    }
+
+    fn pool_root(&self, pool_id: &[u8; 16]) -> PathBuf {
+        self.root_base.join("pools").join(hex::encode(pool_id))
+    }
+
+    // ---- the catalog, on the control pool ----------------------------------
+
+    async fn catalog_dir(&self) -> Result<PathBuf> {
+        self.control.runtime_dir("catalog").await
+    }
+
+    async fn read_catalog(&self, tenant_id: [u8; 16]) -> Result<Option<CatalogEntry>> {
+        let path = self.catalog_dir().await?.join(hex::encode(tenant_id));
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).context("decoding a catalog entry")?,
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context("reading a catalog entry"),
+        }
+    }
+
+    async fn write_catalog(&self, tenant_id: [u8; 16], entry: &CatalogEntry) -> Result<()> {
+        let dir = self.catalog_dir().await?;
+        let name = hex::encode(tenant_id);
+        let temp = dir.join(format!("{name}.tmp"));
+        tokio::fs::write(&temp, serde_json::to_vec(entry)?).await?;
+        tokio::fs::rename(&temp, dir.join(name)).await?;
+        Ok(())
+    }
+
+    /// Every tenant's entry, dropping any half-written temporary file.
+    async fn catalog(&self) -> Result<Vec<CatalogEntry>> {
+        let mut entries = Vec::new();
+        let mut dir = tokio::fs::read_dir(self.catalog_dir().await?).await?;
+        while let Some(e) = dir.next_entry().await? {
+            let name = e.file_name();
+            if name.to_string_lossy().ends_with(".tmp") {
+                continue;
+            }
+            let bytes = tokio::fs::read(e.path()).await?;
+            entries.push(serde_json::from_slice(&bytes).context("decoding a catalog entry")?);
+        }
+        Ok(entries)
+    }
+
+    /// The lowest region not already a tenant's, 1 and up (0 is the control
+    /// pool's). Refused when the disk is full.
+    async fn free_region(&self) -> Result<u64> {
+        let taken: std::collections::BTreeSet<u64> =
+            self.catalog().await?.iter().map(|e| e.region).collect();
+        (1..self.max_pools)
+            .find(|r| !taken.contains(r))
+            .context("no free pool region: the disk is full")
+    }
+
+    /// At boot: the catalog's regions are distinct, in range, and not the
+    /// control pool's; its pool ids are distinct. A host that tampered with the
+    /// (anchored) control pool is caught before any allocation trusts it.
+    async fn validate_catalog(&self) -> Result<()> {
+        let entries = self.catalog().await?;
+        let mut regions = std::collections::BTreeSet::new();
+        let mut ids = std::collections::BTreeSet::new();
+        for e in &entries {
+            ensure!(e.version == 1, "catalog entry from an unknown version");
+            ensure!(
+                e.region >= 1 && e.region < self.max_pools,
+                "catalog region {} is out of range",
+                e.region
+            );
+            ensure!(
+                regions.insert(e.region),
+                "two tenants share region {}",
+                e.region
+            );
+            ensure!(ids.insert(e.pool_id), "two tenants share a pool id");
+        }
+        tracing::info!(tenants = entries.len(), "tenant catalog validated");
+        Ok(())
+    }
+}
+
+/// Bring up the disk once: the modules and `/dev/nbd0` for a real enclave, or a
+/// directory for tests. Returns `(disk root, real?, disk sectors)`.
+fn bring_up(disk: &Disk) -> Result<(PathBuf, bool, u64)> {
+    match disk {
+        Disk::Parent => {
+            let sectors = bring_up_disk()?;
+            Ok((PathBuf::from("/"), true, sectors))
+        }
+        #[cfg(any(test, feature = "testing"))]
+        Disk::Directory(dir) => Ok((
+            dir.path().to_path_buf(),
+            false,
+            DEFAULT_REGION_MIB * SECTORS_PER_MIB * SCRATCH_REGIONS,
+        )),
+    }
+}
+
+/// The control pool's spec: region 0, the fixed control id, anchors under
+/// `zfs/control/`. Its root is `/` (its `runtime` dataset mounts at `/runtime`)
+/// or the disk directory for tests.
+async fn control_spec(
+    master: &MasterSecret,
+    keys: &KeyMaterial,
+    prefix: &str,
+    is_pool: bool,
+    root_base: &std::path::Path,
+    region_sectors: u64,
+    disk_sectors: u64,
+) -> Result<(PoolSpec, ())> {
+    let (offset, len) = region_bounds(0, region_sectors, disk_sectors)
+        .context("the disk is too small for even the control region")?;
+    let mapped = if is_pool {
+        map_region(
+            master,
+            keys.fs_uuid(),
+            PoolKind::Control,
+            &CONTROL_POOL_ID,
+            "zcrypt-control",
+            offset,
+            len,
+        )
+        .await?
+    } else {
+        String::new()
+    };
+    let root = if is_pool {
+        PathBuf::from("/")
+    } else {
+        root_base.to_path_buf()
+    };
+    Ok((
+        PoolSpec {
+            name: POOL.to_string(),
+            mapped,
+            kind: PoolKind::Control,
+            pool_id: CONTROL_POOL_ID,
+            tenant_id: [0u8; 16],
+            anchor_prefix: format!("{prefix}zfs/control/"),
+            root,
+            is_pool,
+        },
+        (),
+    ))
 }
 
 /// `<seq>-<nonce>-<previous anchor's hash>`, as the pool's `enclave:anchor`.
@@ -1215,23 +1710,56 @@ fn insmod(path: &str, params: &str) -> Result<()> {
     }
 }
 
-async fn dmcrypt(master: &MasterSecret, fs_uuid: &[u8; 16], size: u64) -> Result<()> {
+/// Load the ZFS modules and attach the parent's disk as `/dev/nbd0`, once per
+/// boot. Returns the disk's size in 512-byte sectors.
+fn bring_up_disk() -> Result<u64> {
+    insmod("/lib/zfs/spl.ko", "")?;
+    insmod("/lib/zfs/zfs.ko", ZFS_PARAMS)?;
+    Ok(nbd_attach(NBD_PORT)? / 512)
+}
+
+/// Map one region of `/dev/nbd0` as its own dm-crypt device, returning the
+/// device path. The key is domain-separated by pool kind and id, so one
+/// region's key never decrypts another's; offset and length are the region's,
+/// in 512-byte sectors.
+async fn map_region(
+    master: &MasterSecret,
+    fs_uuid: &[u8; 16],
+    kind: PoolKind,
+    pool_id: &[u8; 16],
+    dev_name: &str,
+    offset_sectors: u64,
+    len_sectors: u64,
+) -> Result<String> {
+    let mut info = b"zfs/dmcrypt/v2".to_vec();
+    info.push(kind.byte());
+    info.extend_from_slice(pool_id);
     let mut key = [0u8; 64]; // two AES-256 keys, for XTS
-    hkdf(master, fs_uuid, b"zfs/dmcrypt/v1", &mut key)?;
+    hkdf(master, fs_uuid, &info, &mut key)?;
+    let mapped = format!("/dev/mapper/{dev_name}");
     let mut table = format!(
-        "0 {} crypt aes-xts-plain64 {} 0 {NBD_DEVICE} 0 1 sector_size:4096\n",
-        size / 512,
+        "0 {len_sectors} crypt aes-xts-plain64 {} 0 {NBD_DEVICE} {offset_sectors} 1 sector_size:4096\n",
         hex::encode(key)
     );
     key.zeroize();
     let r = run_with_input(
         "dmsetup",
-        &["create", "zcrypt", "--noudevsync"],
+        &["create", dev_name, "--noudevsync"],
         Some(&table),
     )
     .await;
     table.zeroize();
-    r.map(drop)
+    r.map(|_| mapped)
+}
+
+/// Whether a device already holds a pool: `zpool import -d <device>` lists one.
+async fn pool_present(mapped: &str) -> Result<bool> {
+    let listed = Command::new("zpool")
+        .args(["import", "-d", mapped])
+        .output()
+        .await
+        .context("running zpool import to probe the device")?;
+    Ok(String::from_utf8_lossy(&listed.stdout).contains("pool:"))
 }
 
 const NBDMAGIC: u64 = 0x4e42_444d_4147_4943;
@@ -1506,6 +2034,55 @@ timestamp    message
     }
 
     #[test]
+    fn regions_tile_the_disk_without_overlap_or_overrun() {
+        let (region, disk) = (400, 1000); // 2 whole regions, 200 sectors spare
+        assert_eq!(region_count(region, disk), 2);
+        assert_eq!(region_bounds(0, region, disk), Some((0, 400)));
+        assert_eq!(region_bounds(1, region, disk), Some((400, 400)));
+        assert_eq!(region_bounds(2, region, disk), None, "the third overruns");
+        let (o0, l0) = region_bounds(0, region, disk).unwrap();
+        assert_eq!(
+            o0 + l0,
+            region_bounds(1, region, disk).unwrap().0,
+            "abut, not overlap"
+        );
+    }
+
+    /// Two tenants get two pools, in two regions, with two ids; each returns to
+    /// its own; a third tenant with no catalog entry is refused existing-only.
+    #[tokio::test]
+    async fn tenants_get_independent_pools() {
+        let fs = Zfs::scratch().await;
+        let (a, _) = fs.tenant_dir([1; 16]).await.unwrap();
+        let (b, _) = fs.tenant_dir([2; 16]).await.unwrap();
+        assert_ne!(a, b, "two tenants shared a data directory");
+        assert_eq!(
+            fs.tenant_dir([1; 16]).await.unwrap().0,
+            a,
+            "a tenant lost its pool"
+        );
+
+        let catalog = fs.catalog().await.unwrap();
+        assert_eq!(catalog.len(), 2);
+        let regions: std::collections::BTreeSet<u64> = catalog.iter().map(|e| e.region).collect();
+        assert_eq!(
+            regions,
+            [1, 2].into(),
+            "tenants did not take regions 1 and 2"
+        );
+        assert_ne!(
+            catalog[0].pool_id, catalog[1].pool_id,
+            "two tenants share a pool id"
+        );
+
+        // existing_tenant_dir never creates: an unknown tenant is refused.
+        assert!(fs.existing_tenant_dir([3; 16]).await.is_err());
+        // but a known one resolves.
+        assert_eq!(fs.existing_tenant_dir([1; 16]).await.unwrap(), a);
+        fs.validate_catalog().await.unwrap();
+    }
+
+    #[test]
     fn a_generation_round_trips_and_refuses_tampering_and_strangers() {
         let k = keys(7);
         let g = seal_generation(&k, 5);
@@ -1548,8 +2125,15 @@ timestamp    message
                 .await
                 .unwrap();
             assert_eq!(next.control.generation, expected);
-            assert!(next.control.generation_exists(expected).await.unwrap());
-            assert!(!next.control.generation_exists(expected + 1).await.unwrap());
+            let c = &next.control;
+            assert!(generation_exists(&c.roots, &c.keys, &c.prefix, expected)
+                .await
+                .unwrap());
+            assert!(
+                !generation_exists(&c.roots, &c.keys, &c.prefix, expected + 1)
+                    .await
+                    .unwrap()
+            );
         }
     }
 

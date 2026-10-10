@@ -1,6 +1,6 @@
 # Storage
 
-Everything the enclave keeps lives on one ZFS pool. That covers each tenant's files and the runtime's own records. The pool sits on a disk the untrusted parent serves over vsock, encrypted with a key the parent never sees. After each change the pool's state is pinned by a signed **anchor** in an Object-Locked S3 bucket. A guest uses ordinary file APIs: `wasi:filesystem` is `wasmtime-wasi`'s, over its tenant's own directory.
+Each tenant's files live on a ZFS pool of their own, and the runtime's own records on a **control pool**. All the pools share one disk the untrusted parent serves over vsock, cut into equal regions, each region its own encrypted device with a key the parent never sees. After each change a pool's state is pinned by a signed **anchor** in an Object-Locked S3 bucket, one chain per pool. A guest uses ordinary file APIs: `wasi:filesystem` is `wasmtime-wasi`'s, over its tenant pool's `data` dataset and nothing else.
 
 This replaced the runtime's original storage engine, s3fs: a copy-on-write filesystem of its own on S3. The design goal is the same: the host cannot read the state, alter it, or roll it back unnoticed. The machinery underneath is ZFS, which has decades of production use behind it.
 
@@ -9,12 +9,25 @@ This replaced the runtime's original storage engine, s3fs: a copy-on-write files
 ### The stack
 
 ```text
-  /tenants/<id>          a dataset per tenant: the guest's only preopen
-  /runtime/...           credentials, tasks, streams, devices
-  pool "enclave"         checksum=sha256, sync=disabled, atime=off
-  /dev/mapper/zcrypt     plain dm-crypt, aes-xts-plain64, key from the master secret
-  /dev/nbd0              the parent's disk: NBD over vsock port 10809
+  /pools/<pool_id>/data          a tenant's pool, mounted here: the guest's only preopen
+  /runtime/{credentials,tasks,streams,devices,catalog}   on the control pool
+  pool "enclave"   (region 0)    the control pool: records and the tenant catalog
+  pool "p<pool_id>" (region N)   a tenant's pool: one data dataset
+  /dev/mapper/zcrypt-<id>        per-region plain dm-crypt, aes-xts-plain64, a key per pool
+  /dev/nbd0                      the parent's disk, cut into equal regions: NBD over vsock 10809
 ```
+
+### A pool per tenant
+
+The disk is divided into fixed, 4 KiB-aligned regions (`region_bounds` in [`zfs.rs`](../runtime/src/zfs.rs)). Region 0 is the control pool; each tenant is allocated one of the rest on first use. A region is mapped as its own `dm-crypt` device, `zcrypt-<pool_id>`, with a key derived `HKDF(master, fs_uuid, "zfs/dmcrypt/v2" ‖ kind ‖ pool_id)` — domain-separated, so one region's key never decrypts another's. On it sits one pool, `p<pool_id>`, with a single `data` dataset the guest sees as `/`.
+
+The **control pool** holds the runtime's records and the **catalog**: one entry per tenant giving its pool id, its region, and the hash of its pool's anchor 0. The catalog is on the control pool, out of every guest's reach, and validated at boot (regions distinct, in range, none the control pool's; pool ids distinct), so the host cannot point a tenant at another's pool. A tenant's pool id is random and minted once, so a deleted tenant's history can never be restarted under a guessed id.
+
+An anchor names the pool it speaks for — a kind (control or tenant), the pool id, and the tenant id, all signed (`ZFSANCH2`) — and a boot refuses an anchor whose pool id is not the one it expected. Each pool anchors on its own chain, under `zfs/control/anchors/` or `zfs/pools/<pool_id>/anchors/`, with its own last-anchor lock, so two tenants anchor independently: one held mid-anchor does not stop another. A tenant pool is imported the first time that tenant is used and kept for the life of the process; the number of pools is bounded by how many regions the disk holds, and registration is refused once none is free.
+
+Because a tenant's data is its own pool, the same-nonce cross-tenant steal the single pool was prone to — one tenant's write landing between another's anchor marker and its sync — cannot happen: an anchor only ever covers its own pool, and a tenant is serialised against itself. Each pool is still verified on import exactly as a boot verifies the control pool (below), so a rolled-back or forked tenant disk is refused when that tenant is next used.
+
+**Capacity.** A region is `--region-mib` (200 MiB by default); a disk of _D_ holds ⌊_D_ / region⌋ pools, control included. A tenant that fills its region gets `ENOSPC`; the disk filling up refuses new registrations, not existing tenants. Growing capacity means a larger disk (more regions); a region is never grown in place, and there is one disk, not one volume per tenant.
 
 - **The pool.** The enclave loads `spl.ko` and `zfs.ko` at boot. They are built against a kernel compiled from AWS's own enclave recipe; see [the parent side](#the-parent-side).
 - **The disk.** The parent's NBD server is reached over vsock. The kernel refuses a vsock socket for NBD, so it is handed one end of a Unix socket pair, and two threads copy between that and the vsock connection.
@@ -77,7 +90,8 @@ Anchors are found by their retained versions, by galloping then bisecting, becau
 | A request | The response ends. A streamed body streams as written, and only its end (with any trailers, such as gRPC's status) waits. A body with `Content-Length` is held whole, because a client counting bytes would otherwise act on it first. So is a response that cannot have a body (to a HEAD, or a 1xx, 204 or 304), which would otherwise be complete when its head went out. |
 | A held connection's message run | Its reply is sent. |
 | A background task | Its outcome is recorded, and so before any wake about it. |
-| A passkey registration or revocation | The response; the tenant's dataset is created first, so one anchor covers both. |
+| A passkey registration | The response. The tenant's pool is created and its catalog entry written and anchored on the control pool first, then the credential, so both are durable before the user is told they are registered. |
+| A passkey revocation | The response; the credential is on the control pool, anchored before the response. |
 
 After a crash, the boot goes on from whatever reached the disk. Writes no anchor covered may be there or not; none was acknowledged.
 
@@ -85,12 +99,13 @@ After a crash, the boot goes on from whatever reached the disk. Writes no anchor
 
 | Path | What |
 |---|---|
-| `/tenants/<id>` | A dataset per tenant, created at registration. An id is the first 16 bytes of a SHA-256 of the passkey's credential id. A guest without a gate (development only) gets the all-zero id. |
-| `/runtime/credentials/<id>` | Passkeys, CBOR, one file each. |
-| `/runtime/tasks/`, `/runtime/streams/` | JSON records, each written to a temporary file and renamed over the record. |
-| `/runtime/devices/<tenant>/<sha256(token)>` | Push registrations. |
+| `/pools/<pool_id>/data` | A tenant's pool, mounted here, created on first use. A tenant id is the first 16 bytes of a SHA-256 of the passkey's credential id; a guest without a gate (development only) gets the all-zero id. The pool id is random, in the catalog. |
+| `/runtime/catalog/<tenant>` | One JSON entry per tenant: pool id, region, genesis hash. On the control pool. |
+| `/runtime/credentials/<id>` | Passkeys, CBOR, one file each. On the control pool. |
+| `/runtime/tasks/`, `/runtime/streams/` | JSON records, each written to a temporary file and renamed over the record. On the control pool. |
+| `/runtime/devices/<tenant>/<sha256(token)>` | Push registrations. On the control pool. |
 
-No guest can reach `/runtime` or another tenant. A guest's only preopen is its own dataset, and `wasmtime-wasi` resolves paths through `cap-std`, which refuses `..` past the preopen, absolute paths and symlinks out of it.
+No guest can reach `/runtime` (it is on the control pool) or another tenant (it is a different pool, a different encrypted device). A guest's only preopen is its own pool's `data` dataset, and `wasmtime-wasi` resolves paths through `cap-std`, which refuses `..` past the preopen, absolute paths and symlinks out of it. The runtime's records stay on the control pool for now; moving each tenant's records into its own pool is a later step.
 
 ### Defaults
 
@@ -125,8 +140,8 @@ The receipt commits to BLAKE3 over CBOR of `("zfs/state-origin/v1", fs id, roots
 
 | Observed state | Outcome |
 |---|---|
-| No receipt and no sealed key | **Genesis.** Mint the key, take the lease (a conditional PUT of the sealed key), create the pool on a blank disk and publish anchor 0, attest the receipt, and record the pair. |
-| Receipt and key verify; this pair has a record | **Resume:** import at the newest anchor, as above. |
+| No receipt and no sealed key | **Genesis.** Mint the key, take the lease (a conditional PUT of the sealed key), create the control pool in region 0 and publish its anchor 0, attest the receipt, and record the pair. Tenant pools come later, as tenants arrive. |
+| Receipt and key verify; this pair has a record | **Resume:** import the control pool at its newest anchor, as above, and validate the catalog. Tenant pools are imported on demand, each verified the same way. |
 | Receipt and key verify; this pair has no record | **Upgrade:** record the new pair. |
 | Only one of receipt and key | Refuse. |
 | A pool on the disk but no anchor, or anchors but genesis | Refuse. |
@@ -185,8 +200,10 @@ Use the default rollback journal (`DELETE`). WAL needs shared memory that WASI d
 
 ## Limits
 
-- **One writer per pool.** One enclave imports it; there is no second mount to race.
-- **Anchors are serial** across all tenants, and each is a pool sync plus an S3 round trip.
+- **One writer per pool.** One enclave imports each pool; there is no second mount to race. A per-boot generation fence (`zfs/generations/<g>`) stops a second enclave the host starts from letting the first go on to acknowledge a write it has forked away from.
+- **Anchors are per pool**, so two tenants anchor independently; each anchor is a pool sync plus an S3 round trip. A request also anchors the control pool when it leaves a record there (that cost drops to nothing for a pure-data request once the operation boundary tracks it).
+- **A tenant's records are still on the control pool.** Until they move into the tenant's own pool, a request that writes one anchors the control pool too, which serialises those writes across tenants.
+- **No tenant-pool eviction yet.** A tenant pool is kept imported for the life of the process; the cap is how many regions the disk holds.
 - **The image carries ZFS userspace.** The nixpkgs build references systemd, Python and nfs-utils, about 370 MB of the image. Repackaging only `zpool`, `zfs` and their libraries would recover most of it.
 - **EBS is single-AZ.** Restoring a snapshot is a rollback, and the boot refuses it. Disaster recovery means recovering the newest disk, not an older one.
 - **The host sees access patterns:** which sectors, when, and how much.
