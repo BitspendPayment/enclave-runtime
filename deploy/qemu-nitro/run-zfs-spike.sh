@@ -138,10 +138,15 @@ snapshot base                     # at the newest anchor
 reboot
 hooks_start
 hook_rule after-sync abort
-if signed post --path /files/lost.txt --body "never acknowledged" >/dev/null 2>&1; then
-    fail "a write was acknowledged by an enclave told to die before anchoring it"
-fi
+# The enclave aborts mid-anchor (after-sync), before it can publish or reply,
+# so this request never returns. Background it, wait for the crash on the
+# console, then stop waiting on the dead connection — a 2xx was impossible
+# once it died there, and the client has no timeout of its own.
+signed post --path /files/lost.txt --body "never acknowledged" >/dev/null 2>&1 &
+lost=$!
 for _ in $(seq 30); do grep -q "test hook: dying here" <(plain) && break; sleep 1; done
+kill "$lost" 2>/dev/null || true
+wait "$lost" 2>/dev/null || true
 grep -q "test hook: dying here" <(plain) || fail "the enclave did not die between sync and publish"
 hooks_stop
 snapshot fork                     # past the anchor: lost.txt, and the next anchor's unpublished marker

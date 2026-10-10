@@ -6,7 +6,6 @@
 //! Recovery tolerates unpublished temporary files, never malformed live records.
 //! Execution is at least once: handlers must deduplicate their effects by run ID.
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -113,7 +112,6 @@ struct Records {
 }
 pub struct TaskQueue {
     zfs: Arc<Zfs>,
-    dir: PathBuf,
     clock: Arc<WallClockAdapter>,
     pub limits: TaskLimits,
     records: Mutex<Records>,
@@ -132,64 +130,70 @@ impl TaskQueue {
                 && !limits.timeout.is_zero(),
             "task limits must be positive"
         );
-        let dir = zfs.runtime_dir(DIR).await?;
         let queue = Arc::new(Self {
             zfs,
-            dir,
             clock,
             limits,
             records: Mutex::new(Records::default()),
             changed: Notify::new(),
         });
+        // Each tenant's tasks are on its own pool. Scan only the tenants the
+        // catalog flags as having background work, so a restart need not import
+        // every pool to find the tasks due.
         let mut records = queue.records.lock().await;
-        let mut entries = tokio::fs::read_dir(&queue.dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry
-                .file_name()
-                .into_string()
-                .ok()
-                .context("non-UTF-8 task record name")?;
-            if name.ends_with(".tmp") {
-                tokio::fs::remove_file(entry.path()).await?;
-                continue;
+        for tenant in queue.zfs.background_tenants().await? {
+            let dir = queue.zfs.tenant_runtime_dir(tenant, DIR).await?;
+            let mut entries = tokio::fs::read_dir(&dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .ok()
+                    .context("non-UTF-8 task record name")?;
+                if name.ends_with(".tmp") {
+                    tokio::fs::remove_file(entry.path()).await?;
+                    continue;
+                }
+                ensure!(
+                    records.tasks.len() < queue.limits.max_records,
+                    "task store exceeds configured quota"
+                );
+                let bytes = tokio::fs::read(entry.path()).await?;
+                ensure!(bytes.len() <= MAX_RECORD, "oversized task record");
+                let mut task: Task =
+                    serde_json::from_slice(&bytes).context("decoding task record")?;
+                ensure!(
+                    task.version == 1
+                        && valid_id(&task.id)
+                        && task.tenant == tenant
+                        && task.key() == name
+                        && task.payload.len() <= MAX_PAYLOAD
+                        && task.result.len() <= MAX_PAYLOAD
+                        && task.interval_ms.is_none_or(|i| i >= 1000),
+                    "invalid task record"
+                );
+                // Retry interrupted attempts with their original occurrence ID.
+                if task.status == Status::Running {
+                    task.status = if task.attempts >= MAX_ATTEMPTS {
+                        Status::Failed
+                    } else {
+                        Status::Pending
+                    };
+                    task.error = Some("enclave stopped during execution".into());
+                    queue.write(&task).await?;
+                    tracing::warn!(tenant = %hex::encode(task.tenant), task = %task.id,
+                        status = ?task.status, attempts = task.attempts,
+                        "background task attempt interrupted by a restart");
+                }
+                if task.status == Status::Pending {
+                    // Recovery jitter stops a fleet of overdue tasks firing together.
+                    let due = task
+                        .run_at
+                        .max(queue.now().saturating_add(offset(&task.key(), 1000)));
+                    records.due.insert((due, task.key()));
+                }
+                records.tasks.insert(task.key(), task);
             }
-            ensure!(
-                records.tasks.len() < queue.limits.max_records,
-                "task store exceeds configured quota"
-            );
-            let bytes = tokio::fs::read(entry.path()).await?;
-            ensure!(bytes.len() <= MAX_RECORD, "oversized task record");
-            let mut task: Task = serde_json::from_slice(&bytes).context("decoding task record")?;
-            ensure!(
-                task.version == 1
-                    && valid_id(&task.id)
-                    && task.key() == name
-                    && task.payload.len() <= MAX_PAYLOAD
-                    && task.result.len() <= MAX_PAYLOAD
-                    && task.interval_ms.is_none_or(|i| i >= 1000),
-                "invalid task record"
-            );
-            // Retry interrupted attempts with their original occurrence ID.
-            if task.status == Status::Running {
-                task.status = if task.attempts >= MAX_ATTEMPTS {
-                    Status::Failed
-                } else {
-                    Status::Pending
-                };
-                task.error = Some("enclave stopped during execution".into());
-                queue.write(&task).await?;
-                tracing::warn!(tenant = %hex::encode(task.tenant), task = %task.id,
-                    status = ?task.status, attempts = task.attempts,
-                    "background task attempt interrupted by a restart");
-            }
-            if task.status == Status::Pending {
-                // Recovery jitter prevents a fleet of overdue tasks firing together.
-                let due = task
-                    .run_at
-                    .max(queue.now().saturating_add(offset(&task.key(), 1000)));
-                records.due.insert((due, task.key()));
-            }
-            records.tasks.insert(task.key(), task);
         }
         drop(records);
         Ok(queue)
@@ -200,10 +204,11 @@ impl TaskQueue {
     async fn write(&self, task: &Task) -> Result<()> {
         let bytes = serde_json::to_vec(task)?;
         ensure!(bytes.len() <= MAX_RECORD, "task record exceeds limit");
+        let dir = self.zfs.tenant_runtime_dir(task.tenant, DIR).await?;
         // Truncates an unpublished write left by a cancelled host call.
-        let temp = self.dir.join(format!("{}.tmp", task.key()));
+        let temp = dir.join(format!("{}.tmp", task.key()));
         tokio::fs::write(&temp, &bytes).await?;
-        tokio::fs::rename(&temp, self.dir.join(task.key())).await?;
+        tokio::fs::rename(&temp, dir.join(task.key())).await?;
         Ok(())
     }
     pub async fn enqueue(
@@ -221,6 +226,10 @@ impl TaskQueue {
             "interval must be at least 1000 ms"
         );
         self.zfs.existing_tenant_dir(tenant).await?;
+        // The tenant's pool must be scanned on the next boot, so flag it before
+        // its first record is written: durable (on the control pool) ahead of
+        // the record, so a crash never leaves a task the scan would miss.
+        self.zfs.mark_background(tenant).await?;
         let mut r = self.records.lock().await;
         let k = key(tenant, &id);
         if let Some(old) = r.tasks.get(&k) {
@@ -288,7 +297,8 @@ impl TaskQueue {
             !r.active.contains(&k) && r.tasks.get(&k).context("no such task")?.terminal(),
             "task is still active"
         );
-        tokio::fs::remove_file(self.dir.join(&k)).await?;
+        let dir = self.zfs.tenant_runtime_dir(tenant, DIR).await?;
+        tokio::fs::remove_file(dir.join(&k)).await?;
         r.tasks.remove(&k);
         Ok(())
     }
@@ -775,12 +785,17 @@ mod tests {
     #[tokio::test]
     async fn unpublished_files_are_ignored_but_live_corruption_is_refused() {
         let (q, _) = queue(Default::default()).await;
-        std::fs::write(q.dir.join("orphan.tmp"), b"incomplete").unwrap();
+        add(&q, 1, "job", 0).await; // flags tenant 1 and creates its task dir
+        let dir = q.zfs.tenant_runtime_dir([1; 16], DIR).await.unwrap();
+        std::fs::write(dir.join("orphan.tmp"), b"incomplete").unwrap();
         let recovered = TaskQueue::open(q.zfs.clone(), q.clock.clone(), Default::default())
             .await
             .unwrap();
-        assert!(recovered.due().await.is_none());
-        std::fs::write(q.dir.join("bad"), b"").unwrap();
+        assert!(
+            recovered.status([1; 16], "job").await.is_ok(),
+            "the real task was lost"
+        );
+        std::fs::write(dir.join("bad"), b"").unwrap();
         assert!(
             TaskQueue::open(q.zfs.clone(), q.clock.clone(), Default::default())
                 .await

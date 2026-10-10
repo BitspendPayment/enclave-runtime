@@ -586,6 +586,15 @@ impl Pool {
                     ],
                 )
                 .await?;
+                // Keep a little space for records a guest cannot fill: a full
+                // `data` dataset must not stop a task or stream being recorded.
+                if *ds == "runtime" {
+                    run(
+                        "zfs",
+                        &["set", "reservation=16M", &format!("{}/{ds}", zfs.name)],
+                    )
+                    .await?;
+                }
             }
             zfs.pool_guid = pool_guid(&zfs.name).await?;
         } else {
@@ -734,10 +743,13 @@ impl Pool {
     /// The datasets this kind of pool holds, each mounted at `root`/`name`: the
     /// control pool keeps the runtime's records, a tenant pool the guest's
     /// data — the only thing a guest ever sees.
+    /// A tenant pool holds `data` (the guest's only preopen) and `runtime`
+    /// (its tasks and streams, out of the guest's reach). The control pool
+    /// holds `runtime` alone: the catalog, credentials and devices.
     fn datasets(&self) -> &'static [&'static str] {
         match self.kind {
             PoolKind::Control => &["runtime"],
-            PoolKind::Tenant => &["data"],
+            PoolKind::Tenant => &["data", "runtime"],
         }
     }
 
@@ -940,6 +952,11 @@ struct CatalogEntry {
     region: u64,
     #[serde(with = "hex_bytes")]
     genesis: [u8; 32],
+    /// Whether this tenant has background work (a task or a stream). Boot
+    /// imports and scans only the pools so flagged, so a scheduled task runs
+    /// again after a restart without importing every tenant.
+    #[serde(default)]
+    background: bool,
 }
 
 mod hex_bytes {
@@ -1310,6 +1327,7 @@ impl Zfs {
             pool_id,
             region,
             genesis: pool.genesis_hash(),
+            background: false,
         };
         self.write_catalog(tenant_id, &entry).await?;
         // The catalog entry is durable before the tenant is served: a crash
@@ -1391,17 +1409,25 @@ impl Zfs {
         Ok(())
     }
 
-    /// Every tenant's entry, dropping any half-written temporary file.
-    async fn catalog(&self) -> Result<Vec<CatalogEntry>> {
+    /// Every tenant and its entry, dropping any half-written temporary file.
+    /// The filename is the tenant id.
+    async fn catalog(&self) -> Result<Vec<([u8; 16], CatalogEntry)>> {
         let mut entries = Vec::new();
         let mut dir = tokio::fs::read_dir(self.catalog_dir().await?).await?;
         while let Some(e) = dir.next_entry().await? {
-            let name = e.file_name();
-            if name.to_string_lossy().ends_with(".tmp") {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".tmp") {
                 continue;
             }
+            let id: [u8; 16] = hex::decode(&name)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .with_context(|| format!("catalog file {name} is not a tenant id"))?;
             let bytes = tokio::fs::read(e.path()).await?;
-            entries.push(serde_json::from_slice(&bytes).context("decoding a catalog entry")?);
+            entries.push((
+                id,
+                serde_json::from_slice(&bytes).context("decoding a catalog entry")?,
+            ));
         }
         Ok(entries)
     }
@@ -1409,11 +1435,52 @@ impl Zfs {
     /// The lowest region not already a tenant's, 1 and up (0 is the control
     /// pool's). Refused when the disk is full.
     async fn free_region(&self) -> Result<u64> {
-        let taken: std::collections::BTreeSet<u64> =
-            self.catalog().await?.iter().map(|e| e.region).collect();
+        let taken: std::collections::BTreeSet<u64> = self
+            .catalog()
+            .await?
+            .iter()
+            .map(|(_, e)| e.region)
+            .collect();
         (1..self.max_pools)
             .find(|r| !taken.contains(r))
             .context("no free pool region: the disk is full")
+    }
+
+    /// The tenants with background work, for the boot scan to import and load.
+    pub async fn background_tenants(&self) -> Result<Vec<[u8; 16]>> {
+        Ok(self
+            .catalog()
+            .await?
+            .into_iter()
+            .filter(|(_, e)| e.background)
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    /// A directory for a tenant's own runtime records (its tasks, its streams),
+    /// on the tenant's pool, out of the guest's reach. The pool must exist.
+    pub async fn tenant_runtime_dir(&self, tenant_id: [u8; 16], name: &str) -> Result<PathBuf> {
+        self.tenant_pool(tenant_id, false)
+            .await?
+            .runtime_dir(name)
+            .await
+    }
+
+    /// Mark a tenant as having background work, so the next boot scans its
+    /// pool. Durable on the control pool before the record itself, so a crash
+    /// never leaves a record the boot scan would miss; a flag with no record
+    /// behind it only costs a spurious scan. A no-op once set.
+    pub async fn mark_background(&self, tenant_id: [u8; 16]) -> Result<()> {
+        let mut entry = self
+            .read_catalog(tenant_id)
+            .await?
+            .with_context(|| format!("tenant {} has no catalog entry", hex::encode(tenant_id)))?;
+        if entry.background {
+            return Ok(());
+        }
+        entry.background = true;
+        self.write_catalog(tenant_id, &entry).await?;
+        self.control.anchor().await
     }
 
     /// At boot: the catalog's regions are distinct, in range, and not the
@@ -1423,7 +1490,7 @@ impl Zfs {
         let entries = self.catalog().await?;
         let mut regions = std::collections::BTreeSet::new();
         let mut ids = std::collections::BTreeSet::new();
-        for e in &entries {
+        for (_, e) in &entries {
             ensure!(e.version == 1, "catalog entry from an unknown version");
             ensure!(
                 e.region >= 1 && e.region < self.max_pools,
@@ -1551,9 +1618,7 @@ fn admit(
             tip.txg
         ));
     }
-    // Pools anchored before the marker named its predecessor.
-    let legacy = format!("{}-{}", tip.seq, hex::encode(tip.nonce));
-    if marker == tip.property() || marker == legacy {
+    if marker == tip.property() {
         return Ok(());
     }
     if let [seq, nonce, prev] = marker.split('-').collect::<Vec<_>>()[..] {
@@ -2033,10 +2098,10 @@ timestamp    message
             42
         )
         .is_err());
-        // A pool marked before markers named their predecessor.
-        let legacy = format!("{}-{}", tip.seq, hex::encode(tip.nonce));
-        assert!(admit(&tip, Some(846), &legacy, 42).is_ok());
-        assert!(admit(&tip, Some(845), &legacy, 42).is_err());
+        // The 2-field marker shape is not a successor and is refused.
+        assert!(
+            admit(&tip, Some(846), &format!("{}-{}", tip.seq, hex::encode(tip.nonce)), 42).is_err()
+        );
     }
 
     #[test]
@@ -2070,14 +2135,15 @@ timestamp    message
 
         let catalog = fs.catalog().await.unwrap();
         assert_eq!(catalog.len(), 2);
-        let regions: std::collections::BTreeSet<u64> = catalog.iter().map(|e| e.region).collect();
+        let regions: std::collections::BTreeSet<u64> =
+            catalog.iter().map(|(_, e)| e.region).collect();
         assert_eq!(
             regions,
             [1, 2].into(),
             "tenants did not take regions 1 and 2"
         );
         assert_ne!(
-            catalog[0].pool_id, catalog[1].pool_id,
+            catalog[0].1.pool_id, catalog[1].1.pool_id,
             "two tenants share a pool id"
         );
 

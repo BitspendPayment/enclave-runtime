@@ -194,7 +194,7 @@ struct Live {
 
 /// The registry, and the supervisor that keeps its instructions true.
 pub struct StreamRegistry {
-    dir: std::path::PathBuf,
+    zfs: Arc<Zfs>,
     records: Mutex<BTreeMap<([u8; 16], String), StreamRecord>>,
     live: Mutex<BTreeMap<([u8; 16], String), Live>>,
     /// Woken when a record appears or goes. `notify_one`, never `notify_waiters`: there is exactly
@@ -226,9 +226,8 @@ pub struct StreamContext {
 
 impl StreamRegistry {
     pub async fn open_registry(zfs: Arc<Zfs>) -> Result<Arc<Self>> {
-        let dir = zfs.runtime_dir(DIR).await?;
         let registry = Arc::new(Self {
-            dir,
+            zfs,
             records: Mutex::new(BTreeMap::new()),
             live: Mutex::new(BTreeMap::new()),
             changed: Notify::new(),
@@ -239,28 +238,35 @@ impl StreamRegistry {
 
         // Everything standing, read back before anything is served. A record on
         // disk is the whole of a connection's existence, so this is also the
-        // answer to "what reconnects after a restart": this loop.
+        // answer to "what reconnects after a restart": this loop. Each tenant's
+        // records are on its own pool; scan only the pools the catalog flags.
         let mut records = registry.records.lock().await;
-        let mut entries = tokio::fs::read_dir(&registry.dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry
-                .file_name()
-                .into_string()
-                .ok()
-                .context("non-UTF-8 stream record name")?;
-            if name.ends_with(".tmp") {
-                tokio::fs::remove_file(entry.path()).await?;
-                continue;
+        for tenant in registry.zfs.background_tenants().await? {
+            let dir = registry.zfs.tenant_runtime_dir(tenant, DIR).await?;
+            let mut entries = tokio::fs::read_dir(&dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .ok()
+                    .context("non-UTF-8 stream record name")?;
+                if name.ends_with(".tmp") {
+                    tokio::fs::remove_file(entry.path()).await?;
+                    continue;
+                }
+                let bytes = tokio::fs::read(entry.path()).await?;
+                ensure!(bytes.len() <= MAX_RECORD, "oversized stream record");
+                let record: StreamRecord =
+                    serde_json::from_slice(&bytes).context("decoding a stream record")?;
+                ensure!(
+                    record.version == 1
+                        && valid_id(&record.id)
+                        && record.tenant == tenant
+                        && record.key() == name,
+                    "malformed stream record {name}"
+                );
+                records.insert((record.tenant, record.id.clone()), record);
             }
-            let bytes = tokio::fs::read(entry.path()).await?;
-            ensure!(bytes.len() <= MAX_RECORD, "oversized stream record");
-            let record: StreamRecord =
-                serde_json::from_slice(&bytes).context("decoding a stream record")?;
-            ensure!(
-                record.version == 1 && valid_id(&record.id) && record.key() == name,
-                "malformed stream record {name}"
-            );
-            records.insert((record.tenant, record.id.clone()), record);
         }
         drop(records);
         Ok(registry)
@@ -276,6 +282,9 @@ impl StreamRegistry {
     pub async fn open(&self, tenant: [u8; 16], id: String, origin: String) -> Result<()> {
         ensure!(valid_id(&id), "a stream id is 1..=64 of [A-Za-z0-9_-]");
         Origin::parse(&origin).context("that is not an origin")?;
+        // The tenant's pool must be scanned on the next boot; flag it (durable
+        // on the control pool) before its first record is written.
+        self.zfs.mark_background(tenant).await?;
 
         let mut records = self.records.lock().await;
         if let Some(existing) = records.get(&(tenant, id.clone())) {
@@ -309,7 +318,8 @@ impl StreamRegistry {
     pub async fn close(&self, tenant: [u8; 16], id: &str) -> Result<()> {
         let mut records = self.records.lock().await;
         if let Some(record) = records.remove(&(tenant, id.to_string())) {
-            match tokio::fs::remove_file(self.dir.join(record.key())).await {
+            let dir = self.zfs.tenant_runtime_dir(tenant, DIR).await?;
+            match tokio::fs::remove_file(dir.join(record.key())).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
@@ -431,9 +441,10 @@ impl StreamRegistry {
     async fn publish(&self, record: &StreamRecord) -> Result<()> {
         let bytes = serde_json::to_vec(record)?;
         ensure!(bytes.len() <= MAX_RECORD, "stream record exceeds limit");
-        let temp = self.dir.join(format!("{}.tmp", record.key()));
+        let dir = self.zfs.tenant_runtime_dir(record.tenant, DIR).await?;
+        let temp = dir.join(format!("{}.tmp", record.key()));
         tokio::fs::write(&temp, &bytes).await?;
-        tokio::fs::rename(&temp, self.dir.join(record.key())).await?;
+        tokio::fs::rename(&temp, dir.join(record.key())).await?;
         Ok(())
     }
 
