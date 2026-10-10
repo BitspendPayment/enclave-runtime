@@ -405,7 +405,19 @@ impl ServeHandle {
                 "reply exceeds the message ceiling"
             );
             // Before the reply leaves: it may say what was written.
-            self.guest.zfs().anchor_tenant(tenant).await?;
+            match self.guest.zfs().anchor_tenant(tenant).await {
+                Ok(()) => {
+                    if let Some(notify) = &self.notify {
+                        notify.deliver_staged(tenant);
+                    }
+                }
+                Err(e) => {
+                    if let Some(notify) = &self.notify {
+                        notify.drop_staged(tenant);
+                    }
+                    return Err(e);
+                }
+            }
             Ok(bytes)
         };
         // The same wall clock that bounds an interaction. A guest parked in a
@@ -468,6 +480,22 @@ impl ServeHandle {
         tokio::time::timeout(queue.limits.timeout, work)
             .await
             .context("background task deadline exceeded")?
+    }
+
+    /// Deliver a tenant's staged wakes — for the task worker, once `finish` has
+    /// anchored the outcome the wake announces.
+    pub(crate) fn deliver_wakes(&self, tenant: [u8; 16]) {
+        if let Some(notify) = &self.notify {
+            notify.deliver_staged(tenant);
+        }
+    }
+
+    /// Drop a tenant's staged wakes unsent — if the outcome could not be
+    /// anchored.
+    pub(crate) fn drop_wakes(&self, tenant: [u8; 16]) {
+        if let Some(notify) = &self.notify {
+            notify.drop_staged(tenant);
+        }
     }
 
     /// Override the response-head deadline.
@@ -638,6 +666,7 @@ impl ServeHandle {
             .new_response_outparam(sender)?;
 
         let zfs = self.guest.zfs().clone();
+        let notify = self.notify.clone();
         let (anchored_tx, anchored_rx) = tokio::sync::oneshot::channel();
         let task = tokio::task::spawn(async move {
             // Moved in so the lock outlives the response head: this tenant's
@@ -659,7 +688,16 @@ impl ServeHandle {
             }
             // Still under the tenant's lock, so its next request cannot write
             // before this one's writes are anchored.
-            let _ = anchored_tx.send(zfs.anchor_tenant(tenant_id).await);
+            let anchored = zfs.anchor_tenant(tenant_id).await;
+            // Any wake the guest raised rides on that anchor: delivered once the
+            // writes it announces are durable, dropped if they are not.
+            if let Some(notify) = &notify {
+                match anchored {
+                    Ok(()) => notify.deliver_staged(tenant_id),
+                    Err(_) => notify.drop_staged(tenant_id),
+                }
+            }
+            let _ = anchored_tx.send(anchored);
             result
         });
 

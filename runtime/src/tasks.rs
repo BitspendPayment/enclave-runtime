@@ -340,7 +340,18 @@ impl TaskQueue {
         current.status = Status::Running;
         current.attempts += 1;
         self.write(&current).await?;
+        // Anchor the attempt before running it, so a task that crashes the
+        // enclave still spends the attempt: without this the Running record
+        // rewinds with the crash, the attempt count never advances, and a task
+        // that brings the enclave down loops on it for ever instead of failing
+        // at MAX_ATTEMPTS.
+        let tenant = current.tenant;
         r.tasks.insert(current.key(), current);
+        drop(r);
+        self.zfs
+            .anchor_tenant(tenant)
+            .await
+            .context("anchoring a task attempt")?;
         Ok(true)
     }
     async fn finish(&self, task: &Task, outcome: Result<Option<Vec<u8>>>) -> Result<()> {
@@ -436,7 +447,14 @@ impl TaskQueue {
                 let guest = guest.clone();
                 workers.spawn(async move {
                     let result = guest.run_background(&queue, &task).await;
-                    queue.finish(&task, result).await
+                    let finished = queue.finish(&task, result).await;
+                    // The task's wake rides on `finish`'s anchor: delivered once
+                    // the outcome it announces is durable, dropped otherwise.
+                    match &finished {
+                        Ok(()) => guest.deliver_wakes(task.tenant),
+                        Err(_) => guest.drop_wakes(task.tenant),
+                    }
+                    finished
                 });
             }
             let next = self.records.lock().await.due.first().map(|(at, _)| *at);

@@ -89,9 +89,12 @@ Anchors are found by their retained versions, by galloping then bisecting, becau
 |---|---|
 | A request | The response ends. A streamed body streams as written, and only its end (with any trailers, such as gRPC's status) waits. A body with `Content-Length` is held whole, because a client counting bytes would otherwise act on it first. So is a response that cannot have a body (to a HEAD, or a 1xx, 204 or 304), which would otherwise be complete when its head went out. |
 | A held connection's message run | Its reply is sent. |
-| A background task | Its outcome is recorded, and so before any wake about it. |
+| A background task | Its outcome is recorded. Its attempt is also anchored before it runs, so a task that crashes the enclave still spends the attempt rather than looping on it for ever. |
+| A wake | The invocation that raised it is anchored. A `wake` the guest raises during a request, a message or a task is held and delivered only once that invocation's writes are durable — never before, since a wake tells an owner to come and look. If the anchor fails, the wake is dropped. |
 | A passkey registration | The response. The tenant's pool is created and its catalog entry written and anchored on the control pool first, then the credential, so both are durable before the user is told they are registered. |
 | A passkey revocation | The response; the credential is on the control pool, anchored before the response. |
+
+One effect still precedes its anchor: a **stream dial or send** (`enclave:streams`). When a guest opens a stream or sends on one, the runtime dials or `POST`s the far side during the invocation, before that invocation's record is anchored. It is left this way deliberately — the dial carries no committed state (it is an attested request, and the far side deduplicates, so a crash before the anchor simply rewinds the stream record and the supervisor re-establishes or drops it on the next boot), and deferring it would mean reworking the reconnect supervisor. Moving it behind the anchor, like wakes, is the remaining piece of the one-operation boundary.
 
 After a crash, the boot goes on from whatever reached the disk. Writes no anchor covered may be there or not; none was acknowledged.
 
