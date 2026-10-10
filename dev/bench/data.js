@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790404529773,
+  "lastUpdate": 1791644864368,
   "repoUrl": "https://github.com/BitspendPayment/enclave-runtime",
   "entries": {
     "Benchmark": [
@@ -113,6 +113,48 @@ window.BENCHMARK_DATA = {
             "name": "directory_lookup/10000",
             "value": 13009,
             "range": "± 313",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "joshuaaruokhaitech@gmail.com",
+            "name": "Aruokhai Joshua",
+            "username": "aruokhai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c2ea60ea573ba294cd9a807a9bf3b174d78e7378",
+          "message": "Merge pull request #3 from BitspendPayment/nitro-deployment\n\nZFS storage: per-tenant pools and the rollback-integrity fix",
+          "timestamp": "2026-10-10T17:59:16+03:00",
+          "tree_id": "275e6ad5dbc3e849ec250ed7ef3b85f2f6135002",
+          "url": "https://github.com/BitspendPayment/enclave-runtime/commit/c2ea60ea573ba294cd9a807a9bf3b174d78e7378"
+        },
+        "date": 1791644863781,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "guest/instantiate",
+            "value": 34886,
+            "range": "± 2408",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/trivial",
+            "value": 125501,
+            "range": "± 7063",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/committing",
+            "value": 834533,
+            "range": "± 1164455",
             "unit": "ns/iter"
           }
         ]
