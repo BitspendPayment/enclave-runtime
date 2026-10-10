@@ -285,8 +285,17 @@ pub struct Zfs {
     disk: Disk,
     keys: Arc<KeyMaterial>,
     roots: Arc<dyn Backend>,
+    /// The global bucket prefix, under which the generation chain lives.
     prefix: String,
+    /// This pool's anchor-chain prefix in the bucket; `{prefix}zfs/` for the
+    /// one pool today, `{prefix}zfs/pools/<id>/` once there is a pool per
+    /// tenant. Anchors hang off it, generations do not: they are global.
+    anchor_prefix: String,
     retention: Duration,
+    /// The zpool's name, e.g. `enclave`.
+    name: String,
+    /// The dm-crypt device the pool sits on, e.g. `/dev/mapper/zcrypt`.
+    mapped: String,
     /// `/` on the pool; a directory for [`Disk::Directory`].
     root: PathBuf,
     pool: bool,
@@ -360,8 +369,8 @@ impl Zfs {
                     "sync=disabled",
                     "-O",
                     "mountpoint=none",
-                    POOL,
-                    MAPPED,
+                    &zfs.name,
+                    &zfs.mapped,
                 ],
             )
             .await?;
@@ -372,12 +381,12 @@ impl Zfs {
                         "create",
                         "-o",
                         &format!("mountpoint=/{name}"),
-                        &format!("{POOL}/{name}"),
+                        &format!("{}/{name}", zfs.name),
                     ],
                 )
                 .await?;
             }
-            zfs.pool_guid = pool_guid().await?;
+            zfs.pool_guid = pool_guid(&zfs.name).await?;
         } else {
             for name in ["tenants", "runtime"] {
                 tokio::fs::create_dir_all(zfs.root.join(name)).await?;
@@ -446,22 +455,22 @@ impl Zfs {
                     "-f",
                     "-N",
                     "-d",
-                    MAPPED,
+                    &zfs.mapped,
                     "-o",
                     "cachefile=none",
                     &tip.pool_guid.to_string(),
-                    POOL,
+                    &zfs.name,
                 ],
             )
             .await
             .context("importing the pool")?;
             #[cfg(feature = "testing")]
-            log_loaded_state().await;
-            let loaded = loaded_txg(&tokio::fs::read_to_string(DBGMSG).await?, POOL);
-            let marker = run("zfs", &["get", "-Hp", "-o", "value", PROPERTY, POOL]).await?;
-            let guid = pool_guid().await?;
+            log_loaded_state(&zfs.name).await;
+            let loaded = loaded_txg(&tokio::fs::read_to_string(DBGMSG).await?, &zfs.name);
+            let marker = run("zfs", &["get", "-Hp", "-o", "value", PROPERTY, &zfs.name]).await?;
+            let guid = pool_guid(&zfs.name).await?;
             if let Err(why) = admit(&tip, loaded, marker.trim(), guid) {
-                let _ = run("zpool", &["export", POOL]).await;
+                let _ = run("zpool", &["export", &zfs.name]).await;
                 bail!("refusing the pool: {why}");
             }
             run("zfs", &["mount", "-a"]).await?;
@@ -507,7 +516,10 @@ impl Zfs {
             keys,
             roots,
             prefix: prefix.to_string(),
+            anchor_prefix: format!("{prefix}zfs/"),
             retention,
+            name: POOL.to_string(),
+            mapped: MAPPED.to_string(),
             root,
             pool,
             pool_guid: 0,
@@ -573,8 +585,8 @@ impl Zfs {
             .map_err(|e| anyhow!("zfs anchoring stopped after a failure: {e}"))?
             .clone();
         let start = Instant::now();
-        run("zpool", &["sync", POOL]).await?;
-        let synced = synced_txg().await?;
+        run("zpool", &["sync", &self.name]).await?;
+        let synced = synced_txg(&self.name).await?;
         if synced == prev.txg {
             return Ok(()); // nothing has reached the disk since
         }
@@ -608,14 +620,14 @@ impl Zfs {
             // once the txg holding it, and everything written before it, is
             // on the disk.
             let value = marker(seq, &nonce, &prev.map_or(Hash256::ZERO, Anchor::hash));
-            run("zfs", &["set", &format!("{PROPERTY}={value}"), POOL]).await?;
+            run("zfs", &["set", &format!("{PROPERTY}={value}"), &self.name]).await?;
             #[cfg(feature = "testing")]
             hook("after-marker", format!("seq={seq}")).await;
             // Its frees are deferred two txgs, and would otherwise reach the
             // disk on the next sync: every later call would see a write and
             // anchor again, read-only ones included.
-            run("zpool", &["sync", POOL]).await?;
-            let txg = synced_txg().await?;
+            run("zpool", &["sync", &self.name]).await?;
+            let txg = synced_txg(&self.name).await?;
             if let Some(p) = prev {
                 ensure!(
                     txg > p.txg,
@@ -660,7 +672,7 @@ impl Zfs {
                 "zfs",
                 &[
                     "create",
-                    &format!("{POOL}/tenants/{}", hex::encode(tenant_id)),
+                    &format!("{}/tenants/{}", self.name, hex::encode(tenant_id)),
                 ],
             )
             .await?;
@@ -698,7 +710,7 @@ impl Zfs {
     // ---- the anchor chain, in the roots bucket -----------------------------
 
     fn anchor_key(&self, seq: u64) -> String {
-        format!("{}zfs/anchors/{seq:016x}", self.prefix)
+        format!("{}anchors/{seq:016x}", self.anchor_prefix)
     }
 
     fn generation_key(&self, generation: u64) -> String {
@@ -931,8 +943,8 @@ fn witness(kstat: &str) -> Option<u64> {
         .max()
 }
 
-async fn synced_txg() -> Result<u64> {
-    let kstat = tokio::fs::read_to_string(format!("/proc/spl/kstat/zfs/{POOL}/txgs")).await?;
+async fn synced_txg(pool: &str) -> Result<u64> {
+    let kstat = tokio::fs::read_to_string(format!("/proc/spl/kstat/zfs/{pool}/txgs")).await?;
     witness(&kstat).context("the pool's txg history shows nothing written")
 }
 
@@ -940,14 +952,14 @@ async fn synced_txg() -> Result<u64> {
 /// legs of `run-zfs-spike.sh` — the import's own notes from the debug log, and
 /// the first txgs the pool opened after it.
 #[cfg(feature = "testing")]
-async fn log_loaded_state() {
+async fn log_loaded_state(pool: &str) {
     let dbgmsg = tokio::fs::read_to_string("/proc/spl/kstat/zfs/dbgmsg")
         .await
         .unwrap_or_default();
     for line in dbgmsg.lines().filter(|l| l.contains("spa_load(")) {
         tracing::info!(line, "zfs import: dbgmsg");
     }
-    let txgs = tokio::fs::read_to_string(format!("/proc/spl/kstat/zfs/{POOL}/txgs"))
+    let txgs = tokio::fs::read_to_string(format!("/proc/spl/kstat/zfs/{pool}/txgs"))
         .await
         .unwrap_or_default();
     for line in txgs.lines().skip(1).take(4) {
@@ -982,8 +994,8 @@ async fn hook(point: &'static str, detail: String) {
     }
 }
 
-async fn pool_guid() -> Result<u64> {
-    let out = run("zpool", &["get", "-Hp", "-o", "value", "guid", POOL]).await?;
+async fn pool_guid(pool: &str) -> Result<u64> {
+    let out = run("zpool", &["get", "-Hp", "-o", "value", "guid", pool]).await?;
     out.trim().parse().context("parsing the pool guid")
 }
 
