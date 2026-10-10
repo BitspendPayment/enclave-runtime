@@ -394,7 +394,7 @@ impl TaskQueue {
         // The outcome and whatever the guest wrote reach the anchor together,
         // before anything — a waiting client, a wake — can be told of it.
         self.zfs
-            .anchor()
+            .anchor_tenant(current.tenant)
             .await
             .context("anchoring a task outcome")?;
         // A failure is logged with its reason. The record is sealed, so

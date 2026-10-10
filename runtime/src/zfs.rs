@@ -339,8 +339,8 @@ impl Disk {
     }
 }
 
-/// The pool, opened and anchored.
-pub struct Zfs {
+/// One ZFS pool: its device, its anchor chain, its last-anchor lock.
+struct Pool {
     /// Held so a [`Disk::Directory`] lives as long as the pool on it.
     #[allow(dead_code)]
     disk: Disk,
@@ -376,27 +376,27 @@ pub struct Zfs {
     last: Mutex<std::result::Result<Anchor, String>>,
 }
 
-impl std::fmt::Debug for Zfs {
+impl std::fmt::Debug for Pool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Zfs")
+        f.debug_struct("Pool")
             .field("root", &self.root)
             .field("pool_guid", &self.pool_guid)
             .finish()
     }
 }
 
-impl Zfs {
+impl Pool {
     /// Genesis: create the pool on a blank disk and publish anchor 0. Refuses a
     /// disk that already holds a pool, and a bucket that already has anchors.
-    pub async fn create(
+    async fn create(
         disk: &Disk,
         roots: Arc<dyn Backend>,
         keys: Arc<KeyMaterial>,
         master: &MasterSecret,
         prefix: &str,
         retention: Duration,
-    ) -> Result<Arc<Zfs>> {
-        let mut zfs = Zfs::attach(disk, roots, keys, master, prefix, retention).await?;
+    ) -> Result<Arc<Pool>> {
+        let mut zfs = Pool::attach(disk, roots, keys, master, prefix, retention).await?;
         ensure!(
             zfs.find_tip().await?.is_none(),
             "the roots bucket already has anchors; genesis would start a second history"
@@ -471,7 +471,7 @@ impl Zfs {
     /// Resume: import the pool as it is, and refuse it unless the newest
     /// anchor vouches for what ZFS loaded (see [`admit`]). `min_seq` is a floor
     /// from outside the store.
-    pub async fn open(
+    async fn open(
         disk: &Disk,
         roots: Arc<dyn Backend>,
         keys: Arc<KeyMaterial>,
@@ -479,8 +479,8 @@ impl Zfs {
         prefix: &str,
         retention: Duration,
         min_seq: Option<u64>,
-    ) -> Result<Arc<Zfs>> {
-        let mut zfs = Zfs::attach(disk, roots, keys, master, prefix, retention).await?;
+    ) -> Result<Arc<Pool>> {
+        let mut zfs = Pool::attach(disk, roots, keys, master, prefix, retention).await?;
         // Before the read-write import below, so a second enclave the host
         // starts cannot both fork this disk and let the enclave it forked from
         // go on to publish — the fence in `seal_and_publish` refuses that.
@@ -564,7 +564,7 @@ impl Zfs {
         master: &MasterSecret,
         prefix: &str,
         retention: Duration,
-    ) -> Result<Zfs> {
+    ) -> Result<Pool> {
         let (root, pool) = match disk {
             Disk::Parent => {
                 insmod("/lib/zfs/spl.ko", "")?;
@@ -576,7 +576,7 @@ impl Zfs {
             #[cfg(any(test, feature = "testing"))]
             Disk::Directory(dir) => (dir.path().to_path_buf(), false),
         };
-        Ok(Zfs {
+        Ok(Pool {
             disk: disk.clone(),
             keys,
             roots,
@@ -600,10 +600,10 @@ impl Zfs {
     /// A pool in a temporary directory with its anchors in memory: what
     /// in-process tests run on.
     #[cfg(any(test, feature = "testing"))]
-    pub async fn scratch() -> Arc<Zfs> {
+    async fn scratch_pool() -> Arc<Pool> {
         let master = MasterSecret::from_bytes([7u8; 32]);
         let keys = Arc::new(KeyMaterial::derive(&master, [0u8; 16]).expect("deriving keys"));
-        Zfs::create(
+        Pool::create(
             &Disk::scratch().expect("a temporary directory"),
             Arc::new(crate::store::backend::memory::MemoryBackend::new()),
             keys,
@@ -907,6 +907,102 @@ impl Zfs {
             "another writer published anchor {seq} first"
         );
         Ok(())
+    }
+}
+
+/// The enclave's storage: the control pool, and a tenant's pool imported as it
+/// is used. One disk underneath, cut into equal regions (see [`region_bounds`]),
+/// each its own dm-crypt device and its own pool with its own anchor chain.
+///
+/// The public type the rest of the runtime holds. It routes a tenant's writes
+/// to that tenant's pool and the runtime's own records to the control pool, and
+/// anchors each independently.
+pub struct Zfs {
+    control: Arc<Pool>,
+}
+
+impl std::fmt::Debug for Zfs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Zfs")
+            .field("control", &self.control)
+            .finish()
+    }
+}
+
+impl Zfs {
+    /// Genesis: bring up the disk, create the control pool, publish its anchor
+    /// 0. Tenant pools are created as tenants arrive.
+    pub async fn create(
+        disk: &Disk,
+        roots: Arc<dyn Backend>,
+        keys: Arc<KeyMaterial>,
+        master: &MasterSecret,
+        prefix: &str,
+        retention: Duration,
+    ) -> Result<Arc<Zfs>> {
+        let control = Pool::create(disk, roots, keys, master, prefix, retention).await?;
+        Ok(Arc::new(Zfs { control }))
+    }
+
+    /// Resume: bring up the disk and import the control pool at its anchor.
+    pub async fn open(
+        disk: &Disk,
+        roots: Arc<dyn Backend>,
+        keys: Arc<KeyMaterial>,
+        master: &MasterSecret,
+        prefix: &str,
+        retention: Duration,
+        min_seq: Option<u64>,
+    ) -> Result<Arc<Zfs>> {
+        let control = Pool::open(disk, roots, keys, master, prefix, retention, min_seq).await?;
+        Ok(Arc::new(Zfs { control }))
+    }
+
+    /// In-process test storage: a control pool in a temporary directory.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn scratch() -> Arc<Zfs> {
+        Arc::new(Zfs {
+            control: Pool::scratch_pool().await,
+        })
+    }
+
+    /// The hash of the control pool's anchor 0: which history this enclave is,
+    /// for the boot receipt.
+    pub fn genesis_hash(&self) -> [u8; 32] {
+        self.control.genesis_hash()
+    }
+
+    /// A directory of runtime records on the control pool, out of every guest's
+    /// reach: credentials, tasks, streams, devices, the tenant catalog.
+    pub async fn runtime_dir(&self, name: &str) -> Result<PathBuf> {
+        self.control.runtime_dir(name).await
+    }
+
+    /// A tenant's data directory, created on first use.
+    pub async fn tenant_dir(&self, tenant_id: [u8; 16]) -> Result<(PathBuf, Arrival)> {
+        self.control.tenant_dir(tenant_id).await
+    }
+
+    /// A tenant's data directory, which must already exist. For work that runs
+    /// on a tenant's behalf without them, and so must never bring one back.
+    pub async fn existing_tenant_dir(&self, tenant_id: [u8; 16]) -> Result<PathBuf> {
+        self.control.existing_tenant_dir(tenant_id).await
+    }
+
+    /// Where a tenant's data directory is, whether or not it exists yet.
+    pub fn tenant_path(&self, tenant_id: [u8; 16]) -> PathBuf {
+        self.control.tenant_path(tenant_id)
+    }
+
+    /// Anchor a tenant's writes: its own pool, then the control pool for any
+    /// record a request of theirs left there. Both before anyone is told.
+    pub async fn anchor_tenant(&self, _tenant_id: [u8; 16]) -> Result<()> {
+        self.control.anchor().await
+    }
+
+    /// Anchor the control pool: a credential, a catalog entry.
+    pub async fn anchor_control(&self) -> Result<()> {
+        self.control.anchor().await
     }
 }
 
@@ -1446,14 +1542,14 @@ timestamp    message
         let first = Zfs::create(&disk, backend.clone(), km.clone(), &master, "", day)
             .await
             .unwrap();
-        assert_eq!(first.generation, 0);
+        assert_eq!(first.control.generation, 0);
         for expected in 1..=2 {
             let next = Zfs::open(&disk, backend.clone(), km.clone(), &master, "", day, None)
                 .await
                 .unwrap();
-            assert_eq!(next.generation, expected);
-            assert!(next.generation_exists(expected).await.unwrap());
-            assert!(!next.generation_exists(expected + 1).await.unwrap());
+            assert_eq!(next.control.generation, expected);
+            assert!(next.control.generation_exists(expected).await.unwrap());
+            assert!(!next.control.generation_exists(expected + 1).await.unwrap());
         }
     }
 

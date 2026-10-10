@@ -405,7 +405,7 @@ impl ServeHandle {
                 "reply exceeds the message ceiling"
             );
             // Before the reply leaves: it may say what was written.
-            self.guest.zfs().anchor().await?;
+            self.guest.zfs().anchor_tenant(tenant).await?;
             Ok(bytes)
         };
         // The same wall clock that bounds an interaction. A guest parked in a
@@ -659,7 +659,7 @@ impl ServeHandle {
             }
             // Still under the tenant's lock, so its next request cannot write
             // before this one's writes are anchored.
-            let _ = anchored_tx.send(zfs.anchor().await);
+            let _ = anchored_tx.send(zfs.anchor_tenant(tenant_id).await);
             result
         });
 
@@ -774,7 +774,7 @@ impl ServeHandle {
                 .wasi_http_incoming_handler()
                 .call_handle(store, req, out)
                 .await;
-            let _ = anchored_tx.send(zfs.anchor().await);
+            let _ = anchored_tx.send(zfs.anchor_tenant(ANONYMOUS).await);
             result
         });
 

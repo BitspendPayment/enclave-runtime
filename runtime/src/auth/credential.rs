@@ -137,7 +137,7 @@ impl FilesystemCredentials {
         // the anchor did not cover would be a passkey the user believes works
         // and the next boot has never heard of.
         self.zfs
-            .anchor()
+            .anchor_control()
             .await
             .context("anchoring a credential record")?;
 
@@ -164,7 +164,10 @@ impl FilesystemCredentials {
             .await
             .context("writing a credential record")?;
         // A revocation a rewind could undo is not one.
-        self.zfs.anchor().await.context("anchoring a revocation")?;
+        self.zfs
+            .anchor_control()
+            .await
+            .context("anchoring a revocation")?;
         // The cache is what the gate reads, so it must not outlive the
         // decision to revoke by even one request.
         if let Some(cached) = self
