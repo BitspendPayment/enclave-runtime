@@ -208,6 +208,55 @@ impl Anchor {
     }
 }
 
+const GEN_MAGIC: &[u8; 8] = b"ZFSGEN01";
+// magic | generation | fs_uuid | pubkey | sig
+const GEN_OFF_G: usize = 8;
+const GEN_OFF_FS_UUID: usize = GEN_OFF_G + 8;
+const GEN_OFF_PUBKEY: usize = GEN_OFF_FS_UUID + 16;
+const GEN_SIGNED_LEN: usize = GEN_OFF_PUBKEY + ED25519_PUBLIC_KEY_LEN;
+const GEN_LEN: usize = GEN_SIGNED_LEN + ED25519_SIGNATURE_LEN;
+
+/// A boot's generation claim. One per enclave start, chained only by its
+/// number: a running enclave stops anchoring for good once a higher one
+/// exists, so a second enclave the host starts while the first is mid-anchor
+/// cannot let the first acknowledge a write the second has forked away from.
+/// Signed and Object-Locked like an anchor, so the host can neither forge one
+/// for another filesystem nor hide the newest.
+fn seal_generation(keys: &KeyMaterial, generation: u64) -> Bytes {
+    let mut b = Vec::with_capacity(GEN_LEN);
+    b.extend_from_slice(GEN_MAGIC);
+    b.extend_from_slice(&generation.to_be_bytes());
+    b.extend_from_slice(keys.fs_uuid());
+    b.extend_from_slice(keys.public_key());
+    let sig = sign::sign(keys.signing_key(), &b);
+    b.extend_from_slice(&sig);
+    Bytes::from(b)
+}
+
+fn verify_generation(bytes: &[u8], keys: &KeyMaterial, expected: u64) -> StoreResult<()> {
+    if bytes.len() != GEN_LEN || &bytes[..8] != GEN_MAGIC {
+        return Err(StoreError::Integrity("zfs generation: not a generation"));
+    }
+    if &bytes[GEN_OFF_PUBKEY..GEN_SIGNED_LEN] != keys.public_key() {
+        return Err(StoreError::Integrity(
+            "zfs generation: signed by an unexpected key",
+        ));
+    }
+    let sig: [u8; ED25519_SIGNATURE_LEN] = bytes[GEN_SIGNED_LEN..].try_into().expect("64 bytes");
+    sign::verify(keys.public_key(), &bytes[..GEN_SIGNED_LEN], &sig)?;
+    if &bytes[GEN_OFF_FS_UUID..GEN_OFF_PUBKEY] != keys.fs_uuid() {
+        return Err(StoreError::Integrity(
+            "zfs generation: belongs to another filesystem",
+        ));
+    }
+    if u64_at(bytes, GEN_OFF_G) != expected {
+        return Err(StoreError::Integrity(
+            "zfs generation: number does not match its key",
+        ));
+    }
+    Ok(())
+}
+
 /// Where the pool lives.
 #[derive(Debug, Clone)]
 pub enum Disk {
@@ -243,6 +292,9 @@ pub struct Zfs {
     pool: bool,
     pool_guid: u64,
     genesis: Hash256,
+    /// This boot's generation. An anchor refuses to publish once generation
+    /// `+ 1` exists, so a superseded enclave cannot acknowledge anything.
+    generation: u64,
     /// The newest published anchor, or why anchoring stopped. Held for the
     /// whole of an anchor, so they run one at a time.
     // ponytail: one lock for every tenant; group waiting callers onto one
@@ -275,6 +327,10 @@ impl Zfs {
             zfs.find_tip().await?.is_none(),
             "the roots bucket already has anchors; genesis would start a second history"
         );
+        zfs.generation = zfs
+            .claim_generation()
+            .await
+            .context("claiming the first enclave generation")?;
         if zfs.pool {
             // `zpool import` with no pool name lists what it could import.
             let listed = Command::new("zpool")
@@ -351,6 +407,13 @@ impl Zfs {
         min_seq: Option<u64>,
     ) -> Result<Arc<Zfs>> {
         let mut zfs = Zfs::attach(disk, roots, keys, master, prefix, retention).await?;
+        // Before the read-write import below, so a second enclave the host
+        // starts cannot both fork this disk and let the enclave it forked from
+        // go on to publish — the fence in `seal_and_publish` refuses that.
+        zfs.generation = zfs
+            .claim_generation()
+            .await
+            .context("claiming an enclave generation")?;
         let seq = zfs
             .find_tip()
             .await?
@@ -449,6 +512,7 @@ impl Zfs {
             pool,
             pool_guid: 0,
             genesis: Hash256::ZERO,
+            generation: 0,
             last: Mutex::new(Err("not opened".into())),
         })
     }
@@ -565,6 +629,18 @@ impl Zfs {
         };
         #[cfg(feature = "testing")]
         hook("after-sync", format!("seq={seq} txg={txg}")).await;
+        // The fence, checked as late as possible before the publish that would
+        // acknowledge these writes: if a newer enclave has booted, this one is
+        // superseded and must not publish. The marker is already on the disk,
+        // which is harmless — nothing was acknowledged, and the next boot's
+        // admission handles an unpublished marker. Only a real anchor fences;
+        // genesis is guarded by the sealed-key lease instead.
+        if prev.is_some() && self.generation_exists(self.generation + 1).await? {
+            bail!(
+                "a newer enclave generation ({}) exists; this one is superseded and will not anchor",
+                self.generation + 1
+            );
+        }
         let anchor = Anchor::seal(&self.keys, prev, self.pool_guid, txg, nonce);
         self.publish(seq, anchor.encoded()).await?;
         #[cfg(feature = "testing")]
@@ -625,42 +701,54 @@ impl Zfs {
         format!("{}zfs/anchors/{seq:016x}", self.prefix)
     }
 
-    /// The retained version: a delete marker hides an Object-Locked object
-    /// from a plain GET while leaving it there, so a plain GET would let the
-    /// host roll the chain back with one legal call.
-    async fn retained(&self, seq: u64) -> StoreResult<Bytes> {
-        Ok(self
-            .roots
-            .get_retained_blob(&self.anchor_key(seq))
-            .await?
-            .body)
+    fn generation_key(&self, generation: u64) -> String {
+        format!("{}zfs/generations/{generation:016x}", self.prefix)
     }
 
-    async fn load(&self, seq: u64) -> Result<Anchor> {
-        Ok(Anchor::decode_and_verify(
-            &self.retained(seq).await?,
-            &self.keys,
-            seq,
-        )?)
+    /// The retained version of a key: a delete marker hides an Object-Locked
+    /// object from a plain GET while leaving it there, so a plain GET would let
+    /// the host roll a chain back with one legal call.
+    async fn retained(&self, key: &str) -> StoreResult<Bytes> {
+        Ok(self.roots.get_retained_blob(key).await?.body)
     }
 
-    async fn exists(&self, seq: u64) -> Result<bool> {
-        match self.retained(seq).await {
+    async fn exists(&self, key: &str) -> Result<bool> {
+        match self.retained(key).await {
             Ok(_) => Ok(true),
             Err(StoreError::NotFound) => Ok(false),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// The newest anchor. Anchors are contiguous and never deleted, so
-    /// existence is monotone in `seq`: gallop, then bisect.
-    async fn find_tip(&self) -> Result<Option<u64>> {
-        if !self.exists(0).await? {
+    async fn load(&self, seq: u64) -> Result<Anchor> {
+        Ok(Anchor::decode_and_verify(
+            &self.retained(&self.anchor_key(seq)).await?,
+            &self.keys,
+            seq,
+        )?)
+    }
+
+    async fn generation_exists(&self, generation: u64) -> Result<bool> {
+        let key = self.generation_key(generation);
+        if self.exists(&key).await? {
+            // Verify it, so a host cannot fence this enclave out with a record
+            // it forged for another filesystem.
+            verify_generation(&self.retained(&key).await?, &self.keys, generation)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// The newest existing number of a contiguous, never-deleted chain:
+    /// existence is monotone, so gallop then bisect.
+    async fn chain_tip(&self, key: impl Fn(u64) -> String) -> Result<Option<u64>> {
+        if !self.exists(&key(0)).await? {
             return Ok(None);
         }
         let (mut lo, mut step) = (0u64, 1u64);
         while let Some(next) = lo.checked_add(step) {
-            if !self.exists(next).await? {
+            if !self.exists(&key(next)).await? {
                 break;
             }
             lo = next;
@@ -669,7 +757,7 @@ impl Zfs {
         let mut hi = lo.saturating_add(step);
         while hi - lo > 1 {
             let mid = lo + (hi - lo) / 2;
-            if self.exists(mid).await? {
+            if self.exists(&key(mid)).await? {
                 lo = mid;
             } else {
                 hi = mid;
@@ -678,13 +766,44 @@ impl Zfs {
         Ok(Some(lo))
     }
 
+    async fn find_tip(&self) -> Result<Option<u64>> {
+        self.chain_tip(|seq| self.anchor_key(seq)).await
+    }
+
+    /// Claim the first unused generation, racing other boots for it. Each win
+    /// is read back, since a delete marker could otherwise let a second PUT
+    /// through, as for an anchor.
+    async fn claim_generation(&self) -> Result<u64> {
+        for _ in 0..1024 {
+            let generation = self
+                .chain_tip(|g| self.generation_key(g))
+                .await?
+                .map_or(0, |t| t + 1);
+            let key = self.generation_key(generation);
+            let body = seal_generation(&self.keys, generation);
+            let input = PutBlobInput::new(key.clone(), body.clone()).with_object_lock(ObjectLock {
+                mode: ObjectLockMode::Compliance,
+                retain_until: std::time::SystemTime::now() + self.retention,
+            });
+            match self.roots.put_blob_if_not_exists(input).await {
+                Ok(_) if self.retained(&key).await? == body => {
+                    tracing::info!(generation, "claimed an enclave generation");
+                    return Ok(generation);
+                }
+                Ok(_) | Err(StoreError::AlreadyExists) => continue, // lost the race; try the next
+                Err(e) => return Err(e.into()),
+            }
+        }
+        bail!("could not claim an enclave generation after 1024 tries; the store is being raced")
+    }
+
     /// Publish `seq`, winning or losing the race for it. `If-None-Match`
     /// alone does not decide that race — a delete marker over the winner lets
     /// a second conditional PUT through — the retained version does, so it is
     /// read back.
     async fn publish(&self, seq: u64, body: Bytes) -> Result<()> {
         let key = self.anchor_key(seq);
-        let input = PutBlobInput::new(key, body.clone()).with_object_lock(ObjectLock {
+        let input = PutBlobInput::new(key.clone(), body.clone()).with_object_lock(ObjectLock {
             mode: ObjectLockMode::Compliance,
             retain_until: std::time::SystemTime::now() + self.retention,
         });
@@ -694,7 +813,7 @@ impl Zfs {
             Err(e) => return Err(e.into()),
         }
         ensure!(
-            self.retained(seq).await? == body,
+            self.retained(&key).await? == body,
             "another writer published anchor {seq} first"
         );
         Ok(())
@@ -1176,6 +1295,54 @@ timestamp    message
         let legacy = format!("{}-{}", tip.seq, hex::encode(tip.nonce));
         assert!(admit(&tip, Some(846), &legacy, 42).is_ok());
         assert!(admit(&tip, Some(845), &legacy, 42).is_err());
+    }
+
+    #[test]
+    fn a_generation_round_trips_and_refuses_tampering_and_strangers() {
+        let k = keys(7);
+        let g = seal_generation(&k, 5);
+        assert_eq!(g.len(), GEN_LEN);
+        assert!(verify_generation(&g, &k, 5).is_ok());
+        assert!(
+            verify_generation(&g, &k, 6).is_err(),
+            "number from another key"
+        );
+        assert!(
+            verify_generation(&g, &keys(8), 5).is_err(),
+            "another master"
+        );
+        let mut flipped = g.to_vec();
+        flipped[GEN_OFF_G + 7] ^= 1;
+        assert!(verify_generation(&flipped, &k, 5).is_err());
+        assert!(
+            verify_generation(&g[..GEN_LEN - 1], &k, 5).is_err(),
+            "truncated"
+        );
+    }
+
+    /// Each boot claims the next generation, and the fence it leaves behind is
+    /// verifiable. Directory-backed, so this is the claim logic, not the pool.
+    #[tokio::test]
+    async fn boots_claim_generations_in_order() {
+        use crate::store::backend::memory::MemoryBackend;
+        let backend = Arc::new(MemoryBackend::new());
+        let master = MasterSecret::from_bytes([7; 32]);
+        let km = Arc::new(KeyMaterial::derive(&master, [1u8; 16]).unwrap());
+        let disk = Disk::scratch().unwrap();
+        let day = Duration::from_secs(86_400);
+
+        let first = Zfs::create(&disk, backend.clone(), km.clone(), &master, "", day)
+            .await
+            .unwrap();
+        assert_eq!(first.generation, 0);
+        for expected in 1..=2 {
+            let next = Zfs::open(&disk, backend.clone(), km.clone(), &master, "", day, None)
+                .await
+                .unwrap();
+            assert_eq!(next.generation, expected);
+            assert!(next.generation_exists(expected).await.unwrap());
+            assert!(!next.generation_exists(expected + 1).await.unwrap());
+        }
     }
 
     #[test]
