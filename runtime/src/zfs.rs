@@ -1120,6 +1120,18 @@ impl Zfs {
     ) -> Result<Arc<Zfs>> {
         let (root_base, is_pool, disk_sectors) = bring_up(disk)?;
         let region_sectors = DEFAULT_REGION_MIB * SECTORS_PER_MIB;
+        // Refuse a store from before the per-tenant layout (v1: one pool, its
+        // anchors under `zfs/`) with a clear message, before touching anything
+        // — not the opaque "no anchors" a v2 import would otherwise give. It is
+        // migrated offline, never resumed or reformatted in place.
+        if !exists_raw(&roots, &format!("{prefix}zfs/control/anchors/{:016x}", 0)).await?
+            && exists_raw(&roots, &format!("{prefix}zfs/anchors/{:016x}", 0)).await?
+        {
+            bail!(
+                "this roots bucket holds a store from before the per-tenant pool layout (v1); \
+                 it must be migrated offline, not resumed — see docs/COMPATIBILITY.md"
+            );
+        }
         let generation = claim_generation(&roots, &keys, prefix, retention, &clock).await?;
         let (spec, _) = control_spec(
             master,
@@ -2146,6 +2158,45 @@ timestamp    message
             42
         )
         .is_err());
+    }
+
+    /// A bucket holding a pre-per-tenant (v1) store — anchors under `zfs/`,
+    /// none under `zfs/control/` — is refused with a migration message, not
+    /// resumed, and before a generation is claimed.
+    #[tokio::test]
+    async fn a_v1_store_is_refused_with_a_migration_message() {
+        use crate::store::backend::memory::MemoryBackend;
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        // A v1 anchor 0 at the old prefix, and nothing under zfs/control/.
+        backend
+            .put_blob(PutBlobInput::new(
+                "zfs/anchors/0000000000000000".to_string(),
+                Bytes::from_static(b"a v1 anchor"),
+            ))
+            .await
+            .unwrap();
+        let master = MasterSecret::from_bytes([7; 32]);
+        let km = Arc::new(KeyMaterial::derive(&master, [1u8; 16]).unwrap());
+        let err = Zfs::open(
+            &Disk::scratch().unwrap(),
+            backend.clone(),
+            km,
+            &master,
+            "",
+            Duration::from_secs(86_400),
+            None,
+            Arc::new(crate::clock::HostClock),
+        )
+        .await
+        .expect_err("a v1 store must be refused");
+        assert!(
+            format!("{err:#}").contains("per-tenant pool layout (v1)"),
+            "wrong error: {err:#}"
+        );
+        // It refused before claiming a generation: the bucket is untouched.
+        assert!(!exists_raw(&backend, "zfs/generations/0000000000000000")
+            .await
+            .unwrap());
     }
 
     #[test]

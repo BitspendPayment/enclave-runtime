@@ -22,6 +22,28 @@ Reads, writes, streams, `stat`, `set-times`, `set-size`, directories, `rename-at
 
 Shared memory, `mmap` and advisory locks are not in WASI, so SQLite needs `locking_mode=EXCLUSIVE` and `temp_store=MEMORY`, and cannot use WAL. See [STORAGE.md](STORAGE.md#running-sqlite).
 
+## Storage format versions
+
+The state-origin receipt names a layout version (`zfs/state-origin/vN`), so a store cannot be opened under a runtime that means something different by it.
+
+| Version | Layout |
+|---|---|
+| v1 | One ZFS pool for the whole enclave, its anchors under `{prefix}zfs/`. |
+| v2 | A control pool and a pool per tenant, anchors under `{prefix}zfs/control/` and `{prefix}zfs/pools/<id>/`. Current. |
+
+A v2 runtime **refuses a v1 store rather than touching it**: it finds the v1 anchors, sees no v2 control pool, and stops with a message pointing here — before it claims a generation, imports, or writes anything. A v1 store is never resumed or reformatted in place. (The safety does not rest on the version string alone: a v1 store still holds its sealed key, so the boot takes the resume path, not genesis, and so can never mint a second history over it.)
+
+### Migrating a v1 store to v2
+
+There is no in-place migration; the layouts put the bytes in different places. The procedure is offline and keeps the original until the new store is proven:
+
+1. Leave the v1 EBS volume and its roots-bucket prefix **untouched** — do not boot a v2 runtime against them.
+2. Bring up v2 on a **new** volume and a **new** bucket prefix (a fresh genesis).
+3. Re-establish each tenant from the application's own source of truth, or copy guest data out of the v1 store with a one-off v1-capable reader and back in through v2. Tenant pools are created on first use.
+4. Retire the v1 volume and prefix only once the v2 store is verified serving.
+
+Guest data does not carry across automatically: a tenant's v1 files lived in one shared pool, and v2 puts each tenant's in its own.
+
 ## Test coverage
 
 The runtime's in-process suites run guests over a plain directory standing in for the pool (`zfs::Disk::Directory`):

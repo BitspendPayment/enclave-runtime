@@ -86,8 +86,9 @@ const PURPOSE_PAIR: &str = "state-pair";
 
 /// Schema string inside the `state_root` pre-image. Bump it and every existing
 /// receipt stops verifying, which is the intended effect of changing what a
-/// receipt means.
-const STATE_ROOT_SCHEMA: &str = "zfs/state-origin/v1";
+/// receipt means. `v2` is the per-tenant pool layout: a control pool and a
+/// pool per tenant, versus the single pool `v1` named.
+const STATE_ROOT_SCHEMA: &str = "zfs/state-origin/v2";
 
 /// Which boot this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
