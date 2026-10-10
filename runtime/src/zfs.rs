@@ -74,9 +74,10 @@ const NBD_PORT: u32 = 10809;
 const PROPERTY: &str = "enclave:anchor";
 /// No txg starts on a timer, a request's writes fit in one txg, and the txg
 /// history reaches back further than the gap between two anchors.
+/// The debug log records which uberblock an import loaded.
 const ZFS_PARAMS: &str = "zfs_txg_timeout=3600 zfs_txg_history=4096 \
     zfs_arc_max=268435456 zfs_dirty_data_max=268435456 zfs_dirty_data_sync_percent=90 \
-    spa_load_verify_data=0";
+    spa_load_verify_data=0 zfs_dbgmsg_enable=1";
 
 const ANCHOR_MAGIC: &[u8; 8] = b"ZFSANCH1";
 
@@ -363,6 +364,8 @@ impl Zfs {
             // enclave that died before publishing, and fails on one that never
             // got there. On a disk without txg A it silently takes the newest
             // txg below it, which is why the property check is not optional.
+            #[cfg(feature = "testing")]
+            let _ = tokio::fs::write("/proc/spl/kstat/zfs/dbgmsg", "0").await;
             run(
                 "zpool",
                 &[
@@ -379,6 +382,8 @@ impl Zfs {
             )
             .await
             .context("importing the pool at the anchored txg")?;
+            #[cfg(feature = "testing")]
+            log_loaded_state().await;
             let loaded = run("zfs", &["get", "-Hp", "-o", "value", PROPERTY, POOL]).await?;
             let guid = pool_guid().await?;
             if loaded.trim() != tip.property() || guid != tip.pool_guid {
@@ -465,6 +470,10 @@ impl Zfs {
         if !self.pool {
             return Ok(());
         }
+        #[cfg(feature = "testing")]
+        if self.last.try_lock().is_err() {
+            hook("anchor-wait", String::new()).await;
+        }
         let mut last = self.last.lock().await;
         let prev = last
             .as_ref()
@@ -508,6 +517,8 @@ impl Zfs {
                                                                  // A sync task: back once the txg holding it, and everything
                                                                  // written before it, is on the disk.
             run("zfs", &["set", &format!("{PROPERTY}={value}"), POOL]).await?;
+            #[cfg(feature = "testing")]
+            hook("after-marker", format!("seq={seq}")).await;
             // Its frees are deferred two txgs, and would otherwise reach the
             // disk on the next sync: every later call would see a write and
             // anchor again, read-only ones included.
@@ -525,16 +536,11 @@ impl Zfs {
             0
         };
         #[cfg(feature = "testing")]
-        if prev.is_some() && std::env::var_os("ENCLAVE_ZFS_CRASH_BEFORE_ANCHOR").is_some() {
-            tracing::error!(
-                seq,
-                txg,
-                "ENCLAVE_ZFS_CRASH_BEFORE_ANCHOR: dying between sync and publish"
-            );
-            std::process::abort();
-        }
+        hook("after-sync", format!("seq={seq} txg={txg}")).await;
         let anchor = Anchor::seal(&self.keys, prev, self.pool_guid, txg, nonce);
         self.publish(seq, anchor.encoded()).await?;
+        #[cfg(feature = "testing")]
+        hook("after-publish", format!("seq={seq} txg={txg}")).await;
         Ok(anchor)
     }
 
@@ -687,6 +693,52 @@ fn witness(kstat: &str) -> Option<u64> {
 async fn synced_txg() -> Result<u64> {
     let kstat = tokio::fs::read_to_string(format!("/proc/spl/kstat/zfs/{POOL}/txgs")).await?;
     witness(&kstat).context("the pool's txg history shows nothing written")
+}
+
+/// Testing only: what the kernel says it loaded, as evidence for the rollback
+/// legs of `run-zfs-spike.sh` — the import's own notes from the debug log, and
+/// the first txgs the pool opened after it.
+#[cfg(feature = "testing")]
+async fn log_loaded_state() {
+    let dbgmsg = tokio::fs::read_to_string("/proc/spl/kstat/zfs/dbgmsg")
+        .await
+        .unwrap_or_default();
+    for line in dbgmsg.lines().filter(|l| l.contains("spa_load(")) {
+        tracing::info!(line, "zfs import: dbgmsg");
+    }
+    let txgs = tokio::fs::read_to_string(format!("/proc/spl/kstat/zfs/{POOL}/txgs"))
+        .await
+        .unwrap_or_default();
+    for line in txgs.lines().skip(1).take(4) {
+        tracing::info!(line, "zfs import: txgs");
+    }
+}
+
+/// Testing only: the vsock port `deploy/qemu-nitro/test-hooks.py` answers on.
+#[cfg(feature = "testing")]
+const TEST_HOOK_PORT: u32 = 9101;
+
+/// Testing only: stop at a named point in an anchor until the host says to go
+/// on, or die there, so a test can copy the disk at an exact moment or kill the
+/// enclave between two steps. With nothing listening on the port it returns at
+/// once.
+#[cfg(feature = "testing")]
+async fn hook(point: &'static str, detail: String) {
+    let line = format!("{point} {detail}\n");
+    let reply = tokio::task::spawn_blocking(move || -> io::Result<String> {
+        let mut v = vsock_connect(PARENT_CID, TEST_HOOK_PORT)?;
+        v.write_all(line.as_bytes())?;
+        let mut reply = String::new();
+        io::BufRead::read_line(&mut io::BufReader::new(v), &mut reply)?;
+        Ok(reply)
+    })
+    .await;
+    if let Ok(Ok(reply)) = reply {
+        if reply.trim() == "abort" {
+            tracing::error!(point, detail, "test hook: dying here");
+            std::process::abort();
+        }
+    }
 }
 
 async fn pool_guid() -> Result<u64> {

@@ -131,7 +131,18 @@ The bucket's identity lives in the measured image: `ENCLAVE_ROOTS_BUCKET` is par
 - a restart resumes;
 - a rolled-back disk is refused;
 - a crash between sync and publish rewinds;
-- the abandoned fork is refused.
+- the abandoned fork is refused;
+- a disk from between an anchor's marker and its sync is refused. **This leg fails today**; see [below](#a-reproduced-flaw-one-nonce-two-states).
+
+The testing build stops at named points in an anchor and asks the host, over vsock port 9101, whether to go on (`hook` in [`zfs.rs`](../runtime/src/zfs.rs), answered by [`test-hooks.py`](../deploy/qemu-nitro/test-hooks.py)). A leg can hold an anchor there, copy the disk at that exact moment, or kill the enclave between two steps.
+
+### A reproduced flaw: one nonce, two states
+
+The anchor's nonce reaches the disk in one txg, the marker (`zfs set`), and the anchor names a later one, the second `zpool sync`. Nothing stops another tenant writing between the two. That write lands in the later txg, and the anchor covers it: its own `anchor()` call then finds nothing newer than the anchor's txg and is acknowledged without an anchor of its own. The disk as of the marker holds the same nonce without that write, and `zpool import -T` loads the newest uberblock at or below the anchored txg, with no exact match required.
+
+Leg 7 of the spike, on the emulator: alice's anchor held at `after-marker`, the disk copied, bob's write acknowledged behind it, both covered by anchor 111 at txg 846. Served the copy, the boot logged the kernel's `spa_load(enclave, config untrusted): using uberblock with txg=845` and then `zfs pool resumed at its anchor seq=111 txg=846`. Bob's acknowledged file was gone.
+
+The same leg shows rewinding is not dependable either. In leg 6's honest crash between sync and publish, three txgs past the anchor, `-T 810` failed on txg 810 (`couldn't get 'config' value in MOS directory [error=5]`, its blocks already reused) and ZFS fell back to txg 809, the anchor's own marker. That boot passed only through the same flaw.
 
 ## Running SQLite
 

@@ -65,8 +65,6 @@ RUNDIR="${RUNDIR:-$WORK/$PREFIX}"
 STORE_DIR="$WORK/$PREFIX-store"
 KEEP_STORE="${KEEP_STORE:-}"
 FRESH_STORE="${FRESH_STORE:-}"
-# Testing only: an image that dies between a ZFS sync and its anchor's publish.
-ZFS_CRASH_BEFORE_ANCHOR="${ZFS_CRASH_BEFORE_ANCHOR:-}"
 # A bundle records what its image was built with and which container images it runs on. Read
 # before the defaults below so those names reach them, and read here rather than only in
 # dev-enclave.sh so that run-e2e.sh can drive a bundle too. Every line of it is written so a
@@ -300,7 +298,7 @@ enclave_build_image() {
         return
     fi
     say "building the enclave image"
-    if [[ -n "${WEBAUTHN_RP_ID:-}${TLS_DOMAIN}${PUSH_APP_ID}${ZFS_CRASH_BEFORE_ANCHOR}" ]]; then
+    if [[ -n "${WEBAUTHN_RP_ID:-}${TLS_DOMAIN}${PUSH_APP_ID}" ]]; then
         # The same image configured differently. Not a package — flake outputs take no arguments —
         # so the flake's `lib.eifQemu` is called directly, which reading the flake by path needs
         # --impure for. dev-enclave.sh has already held every value to a shape that cannot break
@@ -323,7 +321,6 @@ enclave_build_image() {
             [[ -n "$ACME_CONTACT" ]] && args+=" acmeContacts = [ \"$ACME_CONTACT\" ];"
         fi
         [[ -n "$PUSH_APP_ID" ]] && args+=" pushAppId = \"$PUSH_APP_ID\";"
-        [[ -n "$ZFS_CRASH_BEFORE_ANCHOR" ]] && args+=" zfsCrashBeforeAnchor = true;"
         nix_expr "eif-qemu (${args# })" "$RUNDIR/eif" \
             "((builtins.getFlake \"git+file://$REPO\").lib.\${builtins.currentSystem}.eifQemu {$args })"
     else
@@ -493,6 +490,7 @@ enclave_start_parent() {
     # kernel boots and then nothing happens at all.
     python3 "$REPO/deploy/qemu-nitro/heartbeat.py" 9000 > "$RUNDIR/heartbeat.log" 2>&1 &
     pids+=($!)
+    hooks_start
 
     # AWS would refuse an invented registration token, and a laptop has no
     # instance role to sign with. The stub answers the two calls the runtime
@@ -691,6 +689,34 @@ fail() {
 }
 
 nonce() { openssl rand 20 | basenc --base64url | tr -d '='; }
+
+# Points in an anchor where the testing build asks the host whether to go on
+# (test-hooks.py). The parent always runs the listener: with no rule every
+# point continues at once, where with nobody listening each ask would wait out
+# vsock's two-second connect timeout.
+#   hooks_start                   a fresh listener, with no rules
+#   hook_rule after-marker hold   the next anchor to reach it waits there
+#   hook_wait after-marker        until one has arrived
+#   hook_release after-marker     and lets it go
+hooks_start() {
+    [[ -n "${HOOKS_PID:-}" ]] && { kill "$HOOKS_PID" 2>/dev/null || true; wait "$HOOKS_PID" 2>/dev/null || true; }
+    : > "$RUNDIR/hooks.rules"; : > "$RUNDIR/hooks.release"
+    python3 "$REPO/deploy/qemu-nitro/test-hooks.py" 9101 "$RUNDIR" > "$RUNDIR/hooks.log" 2>&1 &
+    HOOKS_PID=$!
+    pids+=("$HOOKS_PID")
+    for _ in $(seq 50); do grep -q listening "$RUNDIR/hooks.log" && return; sleep 0.1; done
+    fail "test-hooks.py did not start: $(cat "$RUNDIR/hooks.log")"
+}
+hooks_stop() { : > "$RUNDIR/hooks.rules"; }
+hook_rule() { echo "$1 $2" >> "$RUNDIR/hooks.rules"; }
+hook_release() { echo "$1" >> "$RUNDIR/hooks.release"; }
+hook_wait() {
+    for _ in $(seq $((TIMEOUT * 5))); do
+        grep -q "^$1 " "$RUNDIR/hooks.log" && return
+        sleep 0.2
+    done
+    fail "no anchor reached $1 within ${TIMEOUT}s"
+}
 
 # The enclave takes its address by DHCP from gvproxy, fetches and measures its
 # guest, then mounts over the network before it listens, so this waits on the

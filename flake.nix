@@ -410,9 +410,6 @@
         # the host's instance role (gvproxy maps `.253` to its metadata service). Null keeps the
         # stub on the host. Not a secret: the application's FCM channel holds the credential.
         pushAppId ? null,
-        # Testing only: die between a ZFS sync and its anchor's publish. See
-        # deploy/qemu-nitro/run-zfs-spike.sh.
-        zfsCrashBeforeAnchor ? false,
       }: callEif (runtimeImage // {
         payload = runtimeImage.payload // {
           "enclave-runtime" = "${enclave-runtime-testing}/bin/enclave-runtime";
@@ -522,8 +519,6 @@
           ENCLAVE_PUSH_APP_ID = pushAppId;
         } // nixpkgs.lib.optionalAttrs (allowedOrigins != [ ]) {
           ENCLAVE_WEBAUTHN_ALLOWED_ORIGINS = nixpkgs.lib.concatStringsSep "," allowedOrigins;
-        } // nixpkgs.lib.optionalAttrs zfsCrashBeforeAnchor {
-          ENCLAVE_ZFS_CRASH_BEFORE_ANCHOR = "1";
         };
       });
 
